@@ -1,801 +1,562 @@
 ---
 name: langgraph-architect
-description: "Design and implement LangGraph state machines for multi-agent orchestration, particularly for JIT capability synthesis pipelines. Use this skill when building state graphs with task decomposition stages, skill gap detection, capability generation workflows, verification pipelines, or any multi-step orchestration requiring conditional branching, checkpointing, or parallel execution. Triggers include: mentions of 'LangGraph', 'state graph', 'orchestration flow', 'agent pipeline', 'workflow automation', 'state machine design', or when implementing systems that coordinate multiple agents or tools through sequential/parallel stages. Also use when designing systems with human-in-the-loop approval, error recovery, or state persistence requirements."
+description: "Design and implement LangGraph state machines for multi-agent orchestration. Use this skill whenever building workflows or agents with LangGraph — including state graph design, multi-step orchestration, conditional routing, parallel execution, human-in-the-loop patterns, checkpointing, streaming, or multi-agent coordination. Triggers include: mentions of 'LangGraph', 'state graph', 'orchestration', 'agent pipeline', 'workflow automation', 'state machine', 'Command API', 'interrupt', 'entrypoint', 'checkpointer', or when implementing systems that coordinate multiple agents or tools through sequential/parallel stages. Also use when the user needs help choosing between Graph API vs Functional API, designing state schemas with reducers, adding persistence or streaming, or wiring up human approval gates. Even if the user doesn't say 'LangGraph' explicitly, trigger this skill when they describe multi-step agent workflows with branching, persistence, or coordination needs."
 ---
 
 # LangGraph Architect
 
-Design and implement production-ready LangGraph state machines for complex multi-agent orchestration.
+Design and implement production-ready LangGraph workflows and agents. Covers both the Graph API (explicit nodes/edges) and the Functional API (`@entrypoint`/`@task` decorators), with modern patterns including the Command API, `interrupt()` for human-in-the-loop, durable execution, streaming, and cross-thread memory.
+
+For deeper coverage of specific topics, see the reference files in `references/`.
 
 ## Quick Reference
 
 | Task | Approach |
 |------|----------|
-| Design new state graph | Start with state schema → nodes → edges → workflow pattern |
-| Add checkpointing | Use SQLite memory saver or Postgres for persistence |
-| Conditional routing | Define edge function that returns next node name |
-| Parallel execution | Use `send()` API to fan out, reducer to fan in |
-| Human-in-the-loop | Use `.interrupt()` before sensitive operations |
+| Design new workflow | Choose API → define state → implement nodes → wire edges → compile |
+| Choose Graph vs Functional | Graph for complex branching/fan-out; Functional for linear/loop-heavy flows |
+| Route from a node | Return `Command(update={...}, goto="next_node")` |
+| Parallel fan-out/fan-in | `Send()` API (Graph) or spawn multiple `@task` futures (Functional) |
+| Human-in-the-loop | Call `interrupt()` inside a node; resume with `Command(resume=value)` |
+| Add persistence | Compile with `checkpointer=` (MemorySaver for dev, PostgresSaver for prod) |
+| Stream output | `graph.stream(inputs, stream_mode="updates")` or `"messages"` / `"custom"` |
+| Cross-thread memory | Use `InMemoryStore` (dev) or `PostgresStore` (prod) via `runtime.store` |
+| Error recovery | `RetryPolicy` on `add_node` for transient; `Command` loop-back for LLM-recoverable |
 
 ---
 
-## When to Use LangGraph vs Alternatives
+## Choosing an API
 
-**Use LangGraph when:**
-- Multiple stages with conditional branching (if X then Y else Z)
-- Need state persistence (resume after crash/restart)
-- Human approval gates required
-- Parallel execution with result aggregation
-- Complex error recovery (retry, fallback, escalation)
+LangGraph offers two co-equal APIs. Pick based on your workflow's shape:
 
-**Don't use LangGraph for:**
-- Simple sequential chains (use LangChain LCEL or plain Python)
-- Single LLM call with tools (use basic agent loop)
-- Purely deterministic workflows (use plain Python functions)
-
----
-
-## Core Architecture Patterns
-
-### Pattern 1: Linear Pipeline (Task Decomposition → Gap Detection → Generation)
+**Graph API** — Define explicit nodes and edges. Best when you need complex branching, fan-out/fan-in with `Send()`, or visual graph inspection. Gives you fine-grained control over execution topology.
 
 ```python
-from langgraph.graph import StateGraph, END
-from typing import TypedDict, Annotated
-from operator import add
+from langgraph.graph import StateGraph, START, END
 
-class PipelineState(TypedDict):
-    task_description: str
-    task_graph: dict  # Output of decomposition
-    capability_gaps: list[dict]  # Output of gap detection
-    generated_artifacts: list[dict]  # Output of generation
-    errors: Annotated[list[str], add]  # Accumulate errors across stages
-
-workflow = StateGraph(PipelineState)
-
-# Define nodes (each is a function that receives state and returns updated state)
-workflow.add_node("decompose_task", decompose_task_node)
-workflow.add_node("detect_gaps", detect_gaps_node)
-workflow.add_node("generate_capabilities", generate_capabilities_node)
-
-# Define edges (linear flow)
-workflow.set_entry_point("decompose_task")
-workflow.add_edge("decompose_task", "detect_gaps")
-workflow.add_edge("detect_gaps", "generate_capabilities")
-workflow.add_edge("generate_capabilities", END)
-
-graph = workflow.compile()
+builder = StateGraph(MyState)
+builder.add_node("step_a", step_a_fn)
+builder.add_node("step_b", step_b_fn)
+builder.add_edge(START, "step_a")
+builder.add_edge("step_a", "step_b")
+builder.add_edge("step_b", END)
+graph = builder.compile()
 ```
 
-### Pattern 2: Conditional Routing (Route Based on Capability Type)
+**Functional API** — Use `@entrypoint` and `@task` decorators with normal Python control flow (if/else, while, for). Best for linear pipelines, simple loops, or when the Graph API feels like overhead.
 
 ```python
-def route_by_capability_type(state: PipelineState) -> str:
-    """Router function that decides next node based on state"""
-    gap = state["current_gap"]
-    
-    if gap["type"] == "mcp_tool":
-        return "generate_mcp_tool"
-    elif gap["type"] == "agent_skill":
-        return "generate_skill"
-    elif gap["type"] == "new_agent":
-        return "spawn_agent"
-    else:
-        return "error_handler"
+from langgraph.func import entrypoint, task
 
-workflow = StateGraph(PipelineState)
+@task
+def analyze(data: str):
+    return llm.invoke(f"Analyze: {data}").content
 
-workflow.add_node("classify_gap", classify_gap_node)
-workflow.add_node("generate_mcp_tool", generate_mcp_tool_node)
-workflow.add_node("generate_skill", generate_skill_node)
-workflow.add_node("spawn_agent", spawn_agent_node)
-workflow.add_node("error_handler", error_handler_node)
+@task
+def summarize(analysis: str):
+    return llm.invoke(f"Summarize: {analysis}").content
 
-workflow.set_entry_point("classify_gap")
-
-# Conditional edges: router function returns next node name
-workflow.add_conditional_edges(
-    "classify_gap",
-    route_by_capability_type,
-    {
-        "generate_mcp_tool": "generate_mcp_tool",
-        "generate_skill": "generate_skill",
-        "spawn_agent": "spawn_agent",
-        "error_handler": "error_handler"
-    }
-)
-
-workflow.add_edge("generate_mcp_tool", END)
-workflow.add_edge("generate_skill", END)
-workflow.add_edge("spawn_agent", END)
-workflow.add_edge("error_handler", END)
+@entrypoint()
+def pipeline(data: str):
+    result = analyze(data).result()
+    return summarize(result).result()
 ```
 
-### Pattern 3: Parallel Execution with Fan-Out/Fan-In
-
-Use when multiple capabilities can be verified in parallel:
-
-```python
-from langgraph.constants import Send
-
-class VerificationState(TypedDict):
-    capabilities: list[dict]  # Multiple capabilities to verify
-    verification_results: Annotated[list[dict], add]  # Results accumulate
-
-def fan_out_verification(state: VerificationState):
-    """Send each capability to verification in parallel"""
-    return [
-        Send("verify_capability", {"capability": cap})
-        for cap in state["capabilities"]
-    ]
-
-workflow = StateGraph(VerificationState)
-
-workflow.add_node("verify_capability", verify_capability_node)
-workflow.add_node("aggregate_results", aggregate_results_node)
-
-workflow.set_entry_point("fan_out_verification")
-workflow.add_conditional_edges("fan_out_verification", fan_out_verification)
-workflow.add_edge("verify_capability", "aggregate_results")
-workflow.add_edge("aggregate_results", END)
-```
-
-### Pattern 4: Human-in-the-Loop Approval Gates
-
-Use for plan approval before implementation:
-
-```python
-from langgraph.checkpoint.sqlite import SqliteSaver
-
-class ApprovalState(TypedDict):
-    plan: dict
-    approved: bool | None
-    feedback: str
-
-def should_wait_for_approval(state: ApprovalState) -> str:
-    if state.get("approved") is None:
-        return "request_approval"  # Will interrupt here
-    elif state["approved"]:
-        return "execute_plan"
-    else:
-        return "revise_plan"
-
-workflow = StateGraph(ApprovalState)
-
-workflow.add_node("generate_plan", generate_plan_node)
-workflow.add_node("request_approval", request_approval_node)
-workflow.add_node("execute_plan", execute_plan_node)
-workflow.add_node("revise_plan", revise_plan_node)
-
-workflow.set_entry_point("generate_plan")
-workflow.add_edge("generate_plan", "request_approval")
-
-# Interrupt before execution - human provides approval via state update
-workflow.add_conditional_edges(
-    "request_approval",
-    should_wait_for_approval,
-    {
-        "execute_plan": "execute_plan",
-        "revise_plan": "revise_plan",
-        "request_approval": "request_approval"  # Loop until approved
-    }
-)
-
-workflow.add_edge("revise_plan", "request_approval")
-workflow.add_edge("execute_plan", END)
-
-# Compile with checkpointer for state persistence
-memory = SqliteSaver.from_conn_string(":memory:")
-graph = workflow.compile(checkpointer=memory, interrupt_before=["request_approval"])
-
-# Invoke with config to enable resumption
-config = {"configurable": {"thread_id": "plan-123"}}
-result = graph.invoke(initial_state, config)
-
-# Later: human approves, resume from checkpoint
-graph.invoke({"approved": True, "feedback": "Looks good"}, config)
-```
-
-### Pattern 5: Error Recovery with Retry Logic
-
-```python
-class RobustState(TypedDict):
-    task: dict
-    attempt_count: int
-    max_retries: int
-    result: dict | None
-    error: str | None
-
-def should_retry(state: RobustState) -> str:
-    if state["result"] is not None:
-        return "success"
-    elif state["attempt_count"] < state["max_retries"]:
-        return "retry"
-    else:
-        return "failed"
-
-def increment_attempt(state: RobustState) -> RobustState:
-    state["attempt_count"] += 1
-    return state
-
-workflow = StateGraph(RobustState)
-
-workflow.add_node("execute_task", execute_task_node)
-workflow.add_node("increment_attempt", increment_attempt)
-workflow.add_node("success_handler", success_handler_node)
-workflow.add_node("failure_handler", failure_handler_node)
-
-workflow.set_entry_point("execute_task")
-
-workflow.add_conditional_edges(
-    "execute_task",
-    should_retry,
-    {
-        "success": "success_handler",
-        "retry": "increment_attempt",
-        "failed": "failure_handler"
-    }
-)
-
-workflow.add_edge("increment_attempt", "execute_task")  # Loop back
-workflow.add_edge("success_handler", END)
-workflow.add_edge("failure_handler", END)
-```
+Both APIs support checkpointing, streaming, `interrupt()`, and `@task` for durable execution. The Graph API additionally supports `Send()` for dynamic fan-out and visual graph rendering. You can use `@task` inside Graph API nodes too — they're not mutually exclusive.
 
 ---
 
 ## State Schema Design
 
-### Principle: Structured State Over Conversation History
+State is the shared data structure all nodes read from and write to. Design it carefully — it's the backbone of your workflow.
 
-Instead of passing full conversation histories between nodes (token-expensive, lossy), use typed schemas that represent the "world state" at each stage.
+**Core principles:**
+- Store raw data, format prompts on-demand inside nodes. This lets different nodes format the same data differently without coupling state to presentation.
+- Use `TypedDict` for performance. Pydantic `BaseModel` works too but is slower.
+- Use reducers (`Annotated[..., reducer]`) only for fields that should accumulate. Most fields should replace on update.
 
-**Bad (Lossy):**
-```python
-class State(TypedDict):
-    messages: list[str]  # Natural language, hard to parse
-```
-
-**Good (Structured):**
-```python
-class State(TypedDict):
-    task_description: str
-    subtasks: list[dict]  # Structured: {id, description, dependencies, required_capabilities}
-    capability_gaps: list[dict]  # Structured: {name, type, confidence, reason}
-    errors: Annotated[list[str], add]  # Accumulate across nodes
-```
-
-### Using Annotated for Reducers
-
-When state fields should accumulate (not replace):
+### Basic state with reducers
 
 ```python
-from typing import Annotated
+from typing import TypedDict, Annotated
 from operator import add
 
-class State(TypedDict):
-    # Replace on update
-    current_stage: str
-    
-    # Accumulate on update
-    errors: Annotated[list[str], add]
-    logs: Annotated[list[dict], add]
+class WorkflowState(TypedDict):
+    input_data: str                          # Replaces on update
+    classification: dict | None              # Replaces on update
+    results: Annotated[list[dict], add]      # Accumulates across nodes
+    errors: Annotated[list[str], add]        # Accumulates across nodes
 ```
 
-### Schema Evolution
+### MessagesState for chat-based agents
 
-As your pipeline discovers new capability types, the schema evolves:
+For LLM message histories, use the built-in `MessagesState` instead of rolling your own. Its `add_messages` reducer handles message ID tracking, updates (not just appends), and deserialization:
 
 ```python
-# Version 1
-class CapabilityGap(TypedDict):
-    name: str
-    type: Literal["mcp_tool", "agent_skill"]
+from langgraph.graph import MessagesState
 
-# Version 2 - adds new capability type
-class CapabilityGap(TypedDict):
-    name: str
-    type: Literal["mcp_tool", "agent_skill", "new_agent"]
-    spawn_config: dict | None  # New field for agent spawning
+class AgentState(MessagesState):
+    # Inherits: messages: Annotated[list[AnyMessage], add_messages]
+    tool_results: list[dict]
+    turn_count: int
 ```
 
-Plan for schema versioning from the start if your system will evolve.
+`add_messages` also works as a standalone function: `messages = add_messages(messages, [response, *tool_results])`. For managing message history size (trimming, removal, summarization), see `references/memory-and-store.md`.
 
----
+### Input/Output schemas and private state
 
-## Node Implementation Guidelines
-
-### Node Function Signature
+Control what's visible at the graph boundary vs what nodes share internally:
 
 ```python
-def node_function(state: StateType) -> dict:
-    """
-    Each node receives current state and returns updates.
-    
-    Returns:
-        dict: Partial state update (only changed fields)
-    """
-    # Extract what you need from state
-    task = state["task_description"]
-    
-    # Do work (call LLM, run tool, etc.)
-    result = do_work(task)
-    
-    # Return ONLY the fields you're updating
-    return {
-        "result": result,
-        "current_stage": "completed"
-    }
-```
+class InputState(TypedDict):
+    user_query: str
 
-### Common Node Patterns
+class OutputState(TypedDict):
+    answer: str
 
-**LLM-based node:**
-```python
-from langchain_anthropic import ChatAnthropic
+class OverallState(InputState, OutputState):
+    # Private fields — nodes can read/write but not exposed as input/output
+    search_results: list[str]
+    reasoning_chain: list[dict]
 
-def llm_node(state: State) -> dict:
-    llm = ChatAnthropic(model="claude-sonnet-4-20250514")
-    
-    prompt = f"Analyze this task: {state['task_description']}"
-    response = llm.invoke(prompt)
-    
-    return {"analysis": response.content}
-```
-
-**Tool-calling node:**
-```python
-def tool_node(state: State) -> dict:
-    # Call external tool/API
-    result = external_api.query(state["query"])
-    
-    return {"api_result": result}
-```
-
-**Validation node:**
-```python
-def validation_node(state: State) -> dict:
-    errors = []
-    
-    if not state.get("required_field"):
-        errors.append("Missing required field")
-    
-    return {
-        "errors": errors,
-        "is_valid": len(errors) == 0
-    }
+builder = StateGraph(OverallState, input=InputState, output=OutputState)
 ```
 
 ---
 
-## Checkpointing and Persistence
+## The Command API
 
-### Why Checkpoint?
-
-- **Resume after crash**: Don't lose progress on long-running pipelines
-- **Human-in-the-loop**: Pause for approval, resume later
-- **Debugging**: Inspect state at any point in execution
-- **Replay**: Re-run from specific checkpoint
-
-### SQLite Checkpointing (Development)
+`Command` is the modern way to combine state updates and routing in a single return. It replaces the need for separate conditional edge functions in most cases:
 
 ```python
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command
+from typing import Literal
 
-memory = SqliteSaver.from_conn_string("checkpoints.db")
-graph = workflow.compile(checkpointer=memory)
+def classify_and_route(state: WorkflowState) -> Command[Literal["handle_bug", "handle_question", "escalate"]]:
+    classification = llm.with_structured_output(Classification).invoke(state["input_data"])
 
-# Each invocation gets a thread_id for isolation
-config = {"configurable": {"thread_id": "pipeline-run-123"}}
-result = graph.invoke(initial_state, config)
-
-# Resume from same thread
-result2 = graph.invoke(updated_state, config)
-```
-
-### Postgres Checkpointing (Production)
-
-```python
-from langgraph.checkpoint.postgres import PostgresSaver
-
-checkpointer = PostgresSaver.from_conn_string(
-    "postgresql://user:pass@localhost/db"
-)
-graph = workflow.compile(checkpointer=checkpointer)
-```
-
-### Streaming with Checkpoints
-
-```python
-for chunk in graph.stream(initial_state, config, stream_mode="updates"):
-    print(f"Node {chunk} updated state")
-    # State automatically checkpointed after each node
-```
-
----
-
-## Multi-Agent Coordination Patterns
-
-### Pattern: Orchestrator + Worker Agents
-
-Your JIT pipeline might coordinate multiple agents. Here's how to structure it:
-
-```python
-class OrchestratorState(TypedDict):
-    task: str
-    worker_results: Annotated[list[dict], add]
-    orchestrator_decision: str | None
-
-def spawn_workers(state: OrchestratorState):
-    """Fan out to multiple worker agents"""
-    subtasks = decompose(state["task"])
-    
-    return [
-        Send("worker_agent", {"subtask": subtask})
-        for subtask in subtasks
-    ]
-
-def worker_agent(state: dict) -> dict:
-    """Each worker processes its subtask independently"""
-    result = process_subtask(state["subtask"])
-    return {"worker_results": [result]}
-
-def orchestrator_synthesize(state: OrchestratorState) -> dict:
-    """Orchestrator combines worker results"""
-    synthesis = synthesize_results(state["worker_results"])
-    return {"orchestrator_decision": synthesis}
-
-workflow = StateGraph(OrchestratorState)
-workflow.add_node("worker_agent", worker_agent)
-workflow.add_node("orchestrator_synthesize", orchestrator_synthesize)
-
-workflow.set_entry_point("spawn_workers")
-workflow.add_conditional_edges("spawn_workers", spawn_workers)
-workflow.add_edge("worker_agent", "orchestrator_synthesize")
-workflow.add_edge("orchestrator_synthesize", END)
-```
-
-### Pattern: Agent Team with Shared Task List
-
-Integrate with Claude Code agent teams:
-
-```python
-class TeamState(TypedDict):
-    shared_tasks: list[dict]
-    completed_tasks: Annotated[list[dict], add]
-    active_teammates: list[str]
-
-def assign_task_to_teammate(state: TeamState) -> str:
-    """Route unclaimed tasks to available teammates"""
-    unclaimed = [t for t in state["shared_tasks"] if not t.get("claimed_by")]
-    
-    if unclaimed and state["active_teammates"]:
-        return "assign_task"
-    elif all(t.get("completed") for t in state["shared_tasks"]):
-        return "finalize"
+    if classification.urgency == "critical":
+        goto = "escalate"
+    elif classification.intent == "bug":
+        goto = "handle_bug"
     else:
-        return "wait"
+        goto = "handle_question"
 
-workflow = StateGraph(TeamState)
-workflow.add_node("assign_task", assign_task_node)
-workflow.add_node("wait", wait_node)
-workflow.add_node("finalize", finalize_node)
+    return Command(update={"classification": classification.model_dump()}, goto=goto)
+```
 
-workflow.set_entry_point("assign_task")
-workflow.add_conditional_edges(
-    "assign_task",
-    assign_task_to_teammate,
-    {
-        "assign_task": "assign_task",
-        "wait": "wait",
-        "finalize": "finalize"
-    }
+The `Literal` type annotation on the return type tells LangGraph which nodes this node can route to — this is required for graph rendering and validation.
+
+**When to still use `add_conditional_edges`:** When routing logic is pure (no state updates needed) and you want it separate from the node function, or for backwards compatibility. But `Command` is now the recommended default.
+
+**Command in subgraphs** — use `Command(goto=Command.PARENT)` to hand control back from a subgraph to the parent graph. This is essential for multi-agent handoffs.
+
+---
+
+## Human-in-the-Loop with `interrupt()`
+
+The `interrupt()` function is the primary mechanism for pausing execution and waiting for human input. Call it inside any node:
+
+```python
+from langgraph.types import interrupt, Command
+
+def review_node(state: WorkflowState) -> Command[Literal["execute", END]]:
+    # interrupt() MUST come before any side effects — the node reruns from
+    # the beginning on resume, so anything before interrupt() runs twice
+    decision = interrupt({
+        "draft": state["draft_response"],
+        "message": "Please review and approve"
+    })
+
+    if decision["approved"]:
+        return Command(
+            update={"draft_response": decision.get("edited", state["draft_response"])},
+            goto="execute"
+        )
+    return Command(goto=END)
+```
+
+Resume with `Command(resume=...)`:
+
+```python
+# Graph pauses at interrupt(). Later, resume:
+result = graph.invoke(Command(resume={"approved": True}), config)
+```
+
+### Critical rules for `interrupt()`
+
+1. **Don't wrap in bare `try/except`** — `interrupt()` raises a special exception to pause. Catching it breaks the mechanism.
+2. **Don't reorder or conditionally skip** — interrupts are matched by index on resume. If you have multiple `interrupt()` calls, they must execute in the same order every time.
+3. **Side effects before `interrupt()` must be idempotent** — the node reruns from the beginning on resume.
+4. **Only pass JSON-serializable values** to `interrupt()`.
+5. **Requires a checkpointer** — compile with `checkpointer=` to enable.
+
+### Common HITL patterns
+
+See `references/hitl-patterns.md` for full examples of: approve/reject with routing, review and edit state, interrupts inside `@tool` functions, and multi-step input validation loops.
+
+---
+
+## Error Handling
+
+Use the right strategy for each error type:
+
+| Error Type | Strategy | Mechanism |
+|---|---|---|
+| **Transient** (network, rate limits) | Automatic retry | `RetryPolicy` on `add_node` |
+| **LLM-recoverable** (tool failure, bad parse) | Loop back with error context | `Command(update={"error": msg}, goto="agent")` |
+| **User-fixable** (missing info, ambiguous input) | Pause for input | `interrupt()` |
+| **Unexpected** | Let bubble up | Don't catch what you can't handle |
+
+```python
+from langgraph.types import RetryPolicy
+
+# Transient: automatic retry with backoff
+builder.add_node(
+    "call_api", api_node,
+    retry_policy=RetryPolicy(max_attempts=3, retry_on=ConnectionError)
 )
-```
 
----
-
-## Testing and Debugging
-
-### Visualize Your Graph
-
-```python
-from IPython.display import Image, display
-
-# Generate Mermaid diagram
-display(Image(graph.get_graph().draw_mermaid_png()))
-```
-
-### Inspect State at Each Step
-
-```python
-for step in graph.stream(initial_state, config, stream_mode="values"):
-    print(f"Current state: {step}")
-```
-
-### Unit Test Individual Nodes
-
-```python
-def test_decompose_task_node():
-    state = {
-        "task_description": "Build a data pipeline",
-        "subtasks": []
-    }
-    
-    result = decompose_task_node(state)
-    
-    assert "subtasks" in result
-    assert len(result["subtasks"]) > 0
-    assert all("id" in task for task in result["subtasks"])
-```
-
-### Integration Test Full Graph
-
-```python
-def test_full_pipeline():
-    initial_state = {
-        "task_description": "Generate MCP tool for ChromaDB queries"
-    }
-    
-    result = graph.invoke(initial_state)
-    
-    assert result["generated_artifacts"]
-    assert result["verification_results"][0]["passed"]
-```
-
----
-
-## Common Pitfalls and Solutions
-
-### Pitfall 1: State Bloat
-
-**Problem:** State grows unboundedly as you add fields.
-
-**Solution:** Use reducers only when necessary. For most fields, replacement is fine:
-
-```python
-# Good - replaces on update
-current_stage: str
-
-# Good - accumulates intentionally
-errors: Annotated[list[str], add]
-
-# Bad - accumulates unintentionally
-intermediate_results: list  # Should this accumulate or replace?
-```
-
-### Pitfall 2: Infinite Loops
-
-**Problem:** Conditional edges create cycles without exit condition.
-
-**Solution:** Always include loop counter and max iterations:
-
-```python
-class State(TypedDict):
-    iteration: int
-    max_iterations: int
-
-def should_continue(state: State) -> str:
-    if state["iteration"] >= state["max_iterations"]:
-        return "exit"
-    elif condition_met(state):
-        return "exit"
-    else:
-        return "continue"
-```
-
-### Pitfall 3: Missing Error Handling
-
-**Problem:** Node crashes kill entire graph execution.
-
-**Solution:** Wrap node logic in try/except and accumulate errors:
-
-```python
-def robust_node(state: State) -> dict:
+# LLM-recoverable: store error and loop back
+def tool_node(state) -> Command[Literal["agent", "tool_node"]]:
     try:
-        result = risky_operation(state)
-        return {"result": result}
-    except Exception as e:
-        return {
-            "errors": [f"Node failed: {str(e)}"],
-            "result": None
-        }
+        result = run_tool(state["tool_call"])
+        return Command(update={"tool_result": result}, goto="agent")
+    except ToolError as e:
+        return Command(update={"tool_result": f"Error: {e}"}, goto="agent")
 ```
 
-### Pitfall 4: Token-Heavy Conversation Passing
+### Loop safety
 
-**Problem:** Passing full LLM conversation histories between nodes.
-
-**Solution:** Extract structured data from conversations:
+Protect against infinite loops with `RemainingSteps`:
 
 ```python
-# Bad
-def node(state):
-    messages = state["full_conversation"]  # Huge token cost
-    
-# Good
-def node(state):
-    extracted_facts = state["structured_analysis"]  # Compact
+from langgraph.managed import RemainingSteps
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+    remaining_steps: RemainingSteps
+
+def agent_node(state):
+    if state["remaining_steps"] <= 2:
+        return {"messages": [AIMessage(content="Stopping — too many iterations.")]}
+    # ... normal agent logic
 ```
 
 ---
 
-## Performance Optimization
+## Persistence and Checkpointing
 
-### Batch Operations
-
-When processing multiple items, use parallel execution:
+Checkpointing enables resume-after-crash, human-in-the-loop, time travel, and debugging.
 
 ```python
-def process_batch(state: State):
-    return [
-        Send("process_item", {"item": item})
-        for item in state["items"]
-    ]
+from langgraph.checkpoint.memory import MemorySaver  # Dev/test
+# from langgraph.checkpoint.postgres import PostgresSaver  # Production
+
+graph = builder.compile(checkpointer=MemorySaver())
+config = {"configurable": {"thread_id": "session-123"}}
+result = graph.invoke(inputs, config)
+
+# Resume after interrupt or failure (None = resume from last checkpoint):
+result = graph.invoke(None, config)
 ```
 
-### Async Nodes (for I/O-bound operations)
+**Time travel** — browse history, fork, and replay:
 
 ```python
-async def async_node(state: State) -> dict:
-    results = await asyncio.gather(
-        fetch_from_api_1(state["query"]),
-        fetch_from_api_2(state["query"])
-    )
-    return {"results": results}
+for snapshot in graph.get_state_history(config):
+    print(snapshot.config, snapshot.values)
 
-# Compile with async support
-graph = workflow.compile()
-result = await graph.ainvoke(initial_state)
+# Fork from checkpoint and resume
+fork_config = {**config, "configurable": {**config["configurable"], "checkpoint_id": "abc"}}
+graph.update_state(fork_config, {"field": "new_value"}, as_node="some_node")
+graph.invoke(None, fork_config)
 ```
 
-### Lazy Loading of Resources
+**Cross-thread memory** — for data persisting across threads (user profiles, shared knowledge), use `Store`. See `references/memory-and-store.md` for Store API, semantic search, checkpointer options (Postgres, Redis, MongoDB, Cosmos), and encryption.
 
-Don't load heavy resources in node definitions:
+---
+
+## Durable Execution
+
+LangGraph checkpoints at node boundaries. If a node reruns on resume, side effects may execute twice. Wrap them in `@task` — this works in both Functional API entrypoints AND Graph API nodes:
 
 ```python
-# Bad - loads on graph compilation
-llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+from langgraph.func import task
 
-def node(state):
-    return {"result": llm.invoke(state["prompt"])}
+@task
+def send_email(to: str, body: str):
+    """Won't re-execute on resume if already completed."""
+    return email_service.send(to=to, body=body)
 
-# Good - loads on node execution
-def node(state):
-    llm = ChatAnthropic(model="claude-sonnet-4-20250514")
-    return {"result": llm.invoke(state["prompt"])}
+def notification_node(state):
+    result = send_email(state["email"], state["body"]).result()
+    return {"sent": True}
+```
+
+**Durability modes**: `"async"` (default, checkpoint in background), `"sync"` (block until written), `"exit"` (checkpoint only at completion). Pass as `graph.stream(inputs, config, durability="sync")`.
+
+---
+
+## Streaming
+
+Five stream modes, usable individually or combined:
+
+| Mode | What it streams |
+|------|----------------|
+| `values` | Full state after each node |
+| `updates` | State delta from each node |
+| `messages` | LLM tokens as generated (for chat UIs) |
+| `custom` | Custom data via `get_stream_writer()` |
+| `debug` | Internal execution events |
+
+```python
+# Combine modes — returns (mode, chunk) tuples
+for mode, chunk in graph.stream(inputs, config, stream_mode=["updates", "messages"]):
+    if mode == "messages":
+        print(chunk.content, end="", flush=True)
+    elif mode == "updates":
+        print(f"\nNode finished: {chunk}")
+```
+
+Emit custom data from nodes with `get_stream_writer()` — see `references/streaming-deep-dive.md` for custom streaming, subgraph streaming, async patterns, and non-LangChain LLM streaming.
+
+---
+
+## Runtime Configuration
+
+Use `context_schema` and `Runtime` for clean dependency injection:
+
+```python
+from langgraph.runtime import Runtime
+
+class AppContext(TypedDict):
+    llm_provider: str
+    db_connection: str
+
+builder = StateGraph(MyState, context_schema=AppContext)
+
+def my_node(state: MyState, runtime: Runtime[AppContext]):
+    llm = init_chat_model(runtime.context.llm_provider)
+    return {"messages": [llm.invoke(state["messages"])]}
+
+graph = builder.compile()
+graph.invoke(inputs, context={"llm_provider": "anthropic", "db_connection": "..."})
 ```
 
 ---
 
-## Integration with Your Thesis System
+## Core Workflow Patterns
 
-### Recommended Graph Structure for JIT Pipeline
+### Pattern 1: Routing with Command
 
 ```python
-class JITPipelineState(TypedDict):
-    # Input
-    task_description: str
-    
-    # Pillar 1: JIT Capability Pipeline
-    task_graph: dict | None
-    capability_gaps: list[dict]
-    classified_gaps: list[dict]
-    generated_artifacts: list[dict]
-    
-    # Pillar 2: Verification
-    verification_queue: list[dict]
-    verification_results: Annotated[list[dict], add]
-    
-    # Pillar 3: Granularity Optimizer
-    registry_snapshot: dict | None
-    optimization_proposals: list[dict]
-    
-    # Coordination
-    current_pillar: Literal["pipeline", "verification", "optimization"]
-    errors: Annotated[list[str], add]
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command
+from typing import Literal
 
-workflow = StateGraph(JITPipelineState)
+class State(TypedDict):
+    input: str
+    category: str | None
+    output: str | None
 
-# Pillar 1 nodes
-workflow.add_node("decompose_task", decompose_task_node)
-workflow.add_node("detect_gaps", detect_gaps_node)
-workflow.add_node("classify_gaps", classify_gaps_node)
-workflow.add_node("generate_capabilities", generate_capabilities_node)
+def classify(state: State) -> Command[Literal["handle_a", "handle_b", "handle_c"]]:
+    category = llm.with_structured_output(Category).invoke(state["input"])
+    return Command(update={"category": category.name}, goto=f"handle_{category.name}")
 
-# Pillar 2 nodes
-workflow.add_node("static_scan", tier1_static_scan_node)
-workflow.add_node("behavioral_test", tier2_behavioral_test_node)
-workflow.add_node("adversarial_probe", tier3_adversarial_probe_node)
+def handle_a(state: State):
+    return {"output": llm.invoke(f"Handle category A: {state['input']}").content}
 
-# Pillar 3 nodes
-workflow.add_node("compute_metrics", compute_metrics_node)
-workflow.add_node("propose_operations", propose_operations_node)
-workflow.add_node("apply_operations", apply_operations_node)
-
-# Flow
-workflow.set_entry_point("decompose_task")
-workflow.add_edge("decompose_task", "detect_gaps")
-workflow.add_edge("detect_gaps", "classify_gaps")
-workflow.add_edge("classify_gaps", "generate_capabilities")
-workflow.add_edge("generate_capabilities", "static_scan")
-workflow.add_edge("static_scan", "behavioral_test")
-workflow.add_edge("behavioral_test", "adversarial_probe")
-workflow.add_edge("adversarial_probe", "compute_metrics")
-workflow.add_edge("compute_metrics", "propose_operations")
-workflow.add_edge("propose_operations", "apply_operations")
-workflow.add_edge("apply_operations", END)
-
-memory = SqliteSaver.from_conn_string("jit_pipeline.db")
-graph = workflow.compile(checkpointer=memory)
+builder = StateGraph(State)
+builder.add_node("classify", classify)
+builder.add_node("handle_a", handle_a)
+builder.add_node("handle_b", handle_b)
+builder.add_node("handle_c", handle_c)
+builder.add_edge(START, "classify")
+# No add_conditional_edges needed — Command handles routing
+builder.add_edge("handle_a", END)
+builder.add_edge("handle_b", END)
+builder.add_edge("handle_c", END)
+graph = builder.compile()
 ```
+
+### Pattern 2: Parallel Fan-Out/Fan-In with Send
+
+```python
+from langgraph.types import Send
+
+class MainState(TypedDict):
+    items: list[dict]
+    results: Annotated[list[dict], add]
+
+class WorkerState(TypedDict):
+    item: dict
+    results: Annotated[list[dict], add]
+
+def fan_out(state: MainState):
+    return [Send("process_item", {"item": item}) for item in state["items"]]
+
+def process_item(state: WorkerState):
+    result = do_work(state["item"])
+    return {"results": [result]}
+
+builder = StateGraph(MainState)
+builder.add_node("process_item", process_item)
+builder.add_node("synthesize", synthesize_fn)
+builder.add_conditional_edges(START, fan_out, ["process_item"])
+builder.add_edge("process_item", "synthesize")
+builder.add_edge("synthesize", END)
+```
+
+For fan-out with uneven branch lengths, use `defer=True` on the reduce node to wait for all branches:
+
+```python
+builder.add_node("synthesize", synthesize_fn, defer=True)
+```
+
+### Pattern 3: Tool-Calling Agent (ReAct Loop)
+
+```python
+from langgraph.graph import MessagesState, START, END
+from langchain.messages import SystemMessage, ToolMessage
+
+tools_by_name = {t.name: t for t in tools}
+llm_with_tools = llm.bind_tools(tools)
+
+def agent(state: MessagesState):
+    return {"messages": [llm_with_tools.invoke(
+        [SystemMessage(content="You are a helpful assistant.")] + state["messages"]
+    )]}
+
+def tool_executor(state: MessagesState):
+    return {"messages": [
+        ToolMessage(content=str(tools_by_name[c["name"]].invoke(c["args"])), tool_call_id=c["id"])
+        for c in state["messages"][-1].tool_calls
+    ]}
+
+def should_continue(state: MessagesState):
+    return "tools" if state["messages"][-1].tool_calls else END
+
+builder = StateGraph(MessagesState)
+builder.add_node("agent", agent)
+builder.add_node("tools", tool_executor)
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", should_continue, ["tools", END])
+builder.add_edge("tools", "agent")
+graph = builder.compile()
+```
+
+### Pattern 4: Evaluator-Optimizer Loop
+
+```python
+def generate(state) -> Command[Literal["evaluate"]]:
+    prompt = f"Improve: {state['feedback']}\n{state['draft']}" if state.get("feedback") \
+             else f"Write about: {state['topic']}"
+    return Command(update={"draft": llm.invoke(prompt).content}, goto="evaluate")
+
+def evaluate(state) -> Command[Literal["generate", END]]:
+    grade = evaluator_llm.with_structured_output(Grade).invoke(state["draft"])
+    if grade.passed:
+        return Command(goto=END)
+    return Command(update={"feedback": grade.feedback}, goto="generate")
+```
+
+### Pattern 5: Subgraph Multi-Agent Coordination
+
+Two approaches for composing agents as subgraphs:
+
+```python
+# Option 1: Add compiled graph as node (shared state keys auto-mapped)
+agent_a_graph = build_agent_a()  # Returns compiled StateGraph
+builder.add_node("agent_a", agent_a_graph)
+
+# Option 2: Invoke from node (different schemas — you map state manually)
+def run_agent_a(state: OrchestratorState):
+    result = agent_a_graph.invoke({"task": state["task"], "messages": []})
+    return {"result": result["messages"][-1].content}
+builder.add_node("agent_a", run_agent_a)
+```
+
+Only compile the parent graph with a checkpointer — it auto-propagates to subgraphs. For subgraphs needing isolated memory (per-agent message history), compile with `checkpointer=True`. Use `Command(goto=Command.PARENT)` for subgraph-to-parent handoffs.
+
+---
+
+## Node-Level Features
+
+### Caching expensive nodes
+
+```python
+from langgraph.types import CachePolicy
+from langgraph.cache.memory import InMemoryCache
+
+builder.add_node("expensive_lookup", lookup_fn, cache_policy=CachePolicy(ttl=120))
+graph = builder.compile(cache=InMemoryCache())
+```
+
+### The Overwrite escape hatch
+
+Normally, fields with reducers accumulate. To force-replace a reducer field:
+
+```python
+from langgraph.types import Overwrite
+
+def reset_node(state):
+    return {"messages": Overwrite([])}  # Clears the list instead of appending
+```
+
+Only one node can use `Overwrite` on a given key per superstep.
 
 ---
 
 ## Quick Start Template
 
-Copy this to bootstrap a new LangGraph project:
-
 ```python
-from langgraph.graph import StateGraph, END
-from typing import TypedDict, Annotated, Literal
-from operator import add
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.types import Command, interrupt
+from langgraph.checkpoint.memory import MemorySaver
+from langchain.chat_models import init_chat_model
+from typing import Literal
 
-# 1. Define state schema
-class MyState(TypedDict):
-    input: str
+class MyState(MessagesState):
     result: str | None
-    errors: Annotated[list[str], add]
 
-# 2. Define nodes
-def process_input(state: MyState) -> dict:
-    try:
-        result = do_work(state["input"])
-        return {"result": result}
-    except Exception as e:
-        return {"errors": [str(e)]}
+def process(state: MyState) -> Command[Literal["review", END]]:
+    response = init_chat_model("claude-sonnet-4-5-20250929").invoke(state["messages"])
+    return Command(update={"messages": [response], "result": response.content},
+                   goto="review" if needs_review(response) else END)
 
-# 3. Build graph
-workflow = StateGraph(MyState)
-workflow.add_node("process", process_input)
-workflow.set_entry_point("process")
-workflow.add_edge("process", END)
+def review(state: MyState) -> Command[Literal["process", END]]:
+    decision = interrupt({"draft": state["result"], "action": "Review this"})
+    if decision.get("approved"):
+        return Command(goto=END)
+    return Command(update={"messages": [HumanMessage(content=decision["feedback"])]}, goto="process")
 
-# 4. Compile with checkpointing
-memory = SqliteSaver.from_conn_string(":memory:")
-graph = workflow.compile(checkpointer=memory)
+builder = StateGraph(MyState)
+builder.add_node("process", process)
+builder.add_node("review", review)
+builder.add_edge(START, "process")
+graph = builder.compile(checkpointer=MemorySaver())
 
-# 5. Run
-result = graph.invoke(
-    {"input": "test"},
-    config={"configurable": {"thread_id": "1"}}
-)
-print(result)
+result = graph.invoke({"messages": [HumanMessage(content="Analyze this")]},
+                      {"configurable": {"thread_id": "1"}})
 ```
 
 ---
 
-## Further Resources
+## Common Pitfalls
 
-- **LangGraph docs**: https://langchain-ai.github.io/langgraph/
-- **Checkpointing guide**: https://langchain-ai.github.io/langgraph/how-tos/persistence/
-- **Multi-agent examples**: https://langchain-ai.github.io/langgraph/tutorials/multi_agent/
+- **State bloat** — Use reducers only for fields that genuinely accumulate. Most fields should replace on update.
+- **Infinite loops** — Use `RemainingSteps` or a manual counter. Always have an exit condition.
+- **Side effects re-executing** — Wrap API calls/writes in `@task` for durability, or ensure idempotency.
+- **`interrupt()` in try/except** — Never catch the exception `interrupt()` raises. It's the pause mechanism, not an error.
+- **Parallel file conflicts** — In fan-out, ensure each worker owns distinct files/resources.
+- **Missing checkpointer** — Without it, `interrupt()` won't work and state won't persist.
 
 ---
 
-## Summary
+## Further Reading
 
-LangGraph excels at orchestrating complex, stateful workflows with:
-- Conditional branching based on state
-- Parallel execution with fan-out/fan-in
-- State persistence for resumption
-- Human-in-the-loop approval gates
-- Multi-agent coordination
-
-For your thesis system:
-- Use structured state schemas (not conversation histories)
-- Checkpoint at every stage for debugging
-- Design for three pillars as separate node groups
-- Plan for schema evolution as you discover new capability types
-- Test individual nodes before integrating into full graph
+- `references/hitl-patterns.md` — Detailed human-in-the-loop patterns (approve/reject, edit, tool interrupts, validation loops)
+- `references/memory-and-store.md` — Cross-thread memory, semantic search on Store, summarization
+- `references/streaming-deep-dive.md` — Subgraph streaming, LLM token streaming, streaming with HITL
+- **LangGraph docs**: https://docs.langchain.com/langgraph/
