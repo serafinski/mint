@@ -44,7 +44,7 @@ These are used by the skill generator (Iteration 2) and the verification gate (I
 | `langfuse-tracing` | ✅ Done | LangFuse observability patterns |
 | `langgraph-architect` | ✅ Done | LangGraph architecture patterns + reference files |
 | `langgraph-docs` | ✅ Done | Live LangGraph documentation fetching |
-| `mcp-tool-dev` | Start of Iteration 2 | MCP tool development and server management |
+| `mcp-builder` | ✅ Done | MCP server development (FastMCP, tool design, testing, evaluation) |
 | `verification-patterns` | Start of Iteration 3 | AST scanning, adversarial testing patterns |
 
 ---
@@ -244,8 +244,8 @@ Require plan approval before implementation.
    - Use Command API for routing between nodes
    - Trace everything with LangFuse
 
-### Skills to create first
-- `.claude/skills/mcp-tool-dev/SKILL.md`
+### Skills
+The `mcp-builder` skill (already installed) covers MCP server development patterns, FastMCP for Python, tool design, testing, and evaluation. No new skill needed for this iteration.
 
 ### Prompting strategy
 *Phase A (single session):* Build the task decomposition DeepAgent and the classifier. The DeepAgent is a `create_deep_agent()` call wrapped in a LangGraph node function. Test it in isolation — verify that `write_todos` planning works and `response_format` returns structured subtasks.
@@ -259,7 +259,7 @@ Create an agent team with 3 teammates:
   (FastMCP) from a CapabilityDescriptor. The server manager spawns them as
   subprocesses, health-checks them, and tears them down. Write integration
   tests that generate a simple tool and verify it serves via MCP protocol.
-  See the mcp-tool-dev skill for conventions.
+  See the mcp-builder skill for conventions.
 - "skill-gen" teammate: implement the skill generator in
   src/orchestrator/generators/skill.py. Generate SKILL.md files + optional
   scripts/references/assets from CapabilityDescriptor, conforming to the

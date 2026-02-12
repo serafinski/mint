@@ -112,9 +112,9 @@ The following skills are available in `.claude/skills/` and must be followed:
 - **langgraph-architect** — LangGraph architecture patterns: Command API for routing, Send for fan-out, `interrupt()` for HITL, error handling, persistence, streaming, runtime config. Has reference files in `references/` for HITL patterns and streaming deep dives.
 - **langgraph-docs** — Fetches live LangGraph documentation from `https://docs.langchain.com/llms.txt` for up-to-date API guidance. Use when the langgraph-architect skill doesn't cover a specific API question.
 - **deep-agents** — When and how to use DeepAgents vs. plain LangGraph nodes. DeepAgents are complete agent graphs invoked from within pipeline nodes.
+- **mcp-builder** — MCP server development guide (FastMCP for Python, TypeScript SDK). Covers tool design, implementation, testing, and evaluation. Has reference files for Python/TypeScript patterns and best practices. Use for both hand-written and generated MCP tools.
 
 Additional skills will be added in later iterations:
-- **mcp-tool-dev** (Iteration 2) — MCP tool development and dynamic server management patterns.
 - **verification-patterns** (Iteration 3) — AST scanning, adversarial testing, and verification gate patterns.
 
 ## Package Management
