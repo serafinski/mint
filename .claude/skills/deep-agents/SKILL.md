@@ -27,9 +27,10 @@ The `deepagents` package provides an agent harness with built-in planning (`writ
 
 ```python
 from deepagents import create_deep_agent
+from langchain.chat_models import init_chat_model
 
 agent = create_deep_agent(
-    model="claude-sonnet-4-5-20250929",  # or a ChatModel instance
+    model=init_chat_model("deepseek:deepseek-reasoner"),  # thinking mode for DeepAgents
     tools=[my_tool],
     system_prompt="You are...",
     # Optional:
@@ -64,11 +65,12 @@ A DeepAgent is a complete graph. To use it inside the larger LangGraph pipeline,
 
 ```python
 from deepagents import create_deep_agent
+from langchain.chat_models import init_chat_model
 from src.schemas.task import TaskState
 
 # Create the agent once at module level
 decomposition_agent = create_deep_agent(
-    model="claude-sonnet-4-5-20250929",
+    model=init_chat_model("deepseek:deepseek-reasoner"),
     system_prompt="""You are a task decomposition specialist.
 
     Break the given task into independent subtasks.
@@ -96,7 +98,7 @@ For the adversarial probing tier, the DeepAgent needs to execute code in isolati
 
 ```python
 adversarial_agent = create_deep_agent(
-    model="claude-sonnet-4-5-20250929",
+    model=init_chat_model("deepseek:deepseek-reasoner"),
     system_prompt="""You are a red-team agent testing whether a generated
     capability is genuinely functional or faking its outputs.
 
@@ -122,11 +124,11 @@ research_subagent = {
     "description": "Analyzes capability gaps in depth",
     "system_prompt": "You analyze capability gaps and classify them...",
     "tools": [registry_search_tool],
-    "model": "claude-sonnet-4-5-20250929",
+    "model": "deepseek:deepseek-chat",
 }
 
 orchestrator = create_deep_agent(
-    model="claude-sonnet-4-5-20250929",
+    model=init_chat_model("deepseek:deepseek-reasoner"),
     system_prompt="You orchestrate the JIT capability pipeline...",
     subagents=[research_subagent],
 )
@@ -193,9 +195,30 @@ These rules are enforced by `tools/quick_validate.py`:
 
 ## Model Selection
 
-Use `claude-sonnet-4-5-20250929` for DeepAgents by default — good balance of reasoning quality and cost. For particularly complex decompositions, consider Opus. Never use Haiku for DeepAgents because the multi-step planning loop requires strong reasoning.
+Use `deepseek-reasoner` (thinking mode, DeepSeek-V3.2) for DeepAgents by default — the thinking mode suits multi-step planning, adversarial reasoning, and complex investigation tasks. Use `deepseek-chat` (non-thinking mode, DeepSeek-V3.2) for plain LangGraph nodes where speed and cost matter more than deep reasoning.
 
-Use the `model="provider:model"` format for quick switching (e.g., `"openai:gpt-5"`).
+Use `init_chat_model("provider:model")` for provider-agnostic switching:
+
+```python
+from langchain.chat_models import init_chat_model
+
+# For DeepAgents (complex reasoning)
+reasoning_llm = init_chat_model("deepseek:deepseek-reasoner")
+agent = create_deep_agent(model=reasoning_llm, ...)
+
+# For plain nodes (fast, single-step)
+fast_llm = init_chat_model("deepseek:deepseek-chat")
+
+# Switch to Anthropic if needed (e.g., for evaluation comparison)
+anthropic_llm = init_chat_model("anthropic:claude-sonnet-4-5-20250929")
+```
+
+| Component | Model | Why |
+|---|---|---|
+| Task decomposition (DeepAgent) | `deepseek-reasoner` | Multi-step planning benefits from thinking |
+| Adversarial probing (DeepAgent) | `deepseek-reasoner` | Attack strategy needs deep reasoning |
+| Failure analysis (DeepAgent, optional) | `deepseek-reasoner` | Complex investigation |
+| Classifier, generators, behavioral testing | `deepseek-chat` | Single-step, speed matters |
 
 ## Token Budget
 

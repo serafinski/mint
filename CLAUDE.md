@@ -20,6 +20,9 @@ See `docs/thesis_proposal.md` for full details.
 
 - **LangGraph** - Multi-agent orchestration and pipeline graphs
 - **DeepAgents** (`deepagents` package) - Agent harness with built-in planning (`write_todos`), file system context management, subagent spawning, and conversation summarization. Used for task decomposition (Pillar 1) and adversarial probing (Pillar 2).
+- **LLM Provider** - DeepSeek via `langchain-deepseek` for cost efficiency. Provider-agnostic via `init_chat_model("provider:model")`.
+  - `deepseek-reasoner` (thinking mode, DeepSeek-V3.2) — for DeepAgents and complex reasoning (decomposition, adversarial probing, failure analysis)
+  - `deepseek-chat` (non-thinking mode, DeepSeek-V3.2) — for plain LangGraph nodes and single-step tasks (classification, generation, behavioral testing)
 - **Claude Code** - Code generation (development tool only, not part of the runtime system)
 - **MCP SDK** - Tool serving (Python, FastMCP pattern)
 - **ChromaDB** - Skill registry (semantic search with hierarchical embeddings)
@@ -32,18 +35,18 @@ See `docs/thesis_proposal.md` for full details.
 
 DeepAgents (`create_deep_agent()`) return a `CompiledStateGraph` — a complete agent with built-in planning, file system tools, subagent delegation, and context management. They are NOT LangGraph nodes. To use them in the pipeline, invoke them from within a node function.
 
-| Component | Implementation | Why |
-|---|---|---|
-| Task decomposition | **DeepAgent** (invoked from node) | Multi-step planning with `write_todos`, file-based context for large task descriptions |
-| Capability classifier | Plain LangGraph node | Rule-based heuristics with LLM fallback — single-step |
-| MCP tool generator | Plain LangGraph node | Single-pass code generation with retry on failure |
-| Skill generator | Plain LangGraph node | Structured text generation targeting DeepAgents skill format |
-| Agent generator | Plain LangGraph node | System prompt + config generation |
-| Tier 1 static scanner | Plain Python (no LLM) | AST + regex, deterministic |
-| Tier 2 behavioral testing | Plain LangGraph node | Test input generation + execution |
-| Tier 3 adversarial probing | **DeepAgent** (invoked from node) | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
-| Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | Multi-step investigation of why capabilities fail |
-| Granularity operations | Plain LangGraph node | Metrics-driven decisions, mostly deterministic |
+| Component | Implementation | Model | Why |
+|---|---|---|---|
+| Task decomposition | **DeepAgent** (invoked from node) | `deepseek-reasoner` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
+| Capability classifier | Plain LangGraph node | `deepseek-chat` | Rule-based heuristics with LLM fallback — single-step |
+| MCP tool generator | Plain LangGraph node | `deepseek-chat` | Single-pass code generation with retry on failure |
+| Skill generator | Plain LangGraph node | `deepseek-chat` | Structured text generation targeting DeepAgents skill format |
+| Agent generator | Plain LangGraph node | `deepseek-chat` | System prompt + config generation |
+| Tier 1 static scanner | Plain Python (no LLM) | — | AST + regex, deterministic |
+| Tier 2 behavioral testing | Plain LangGraph node | `deepseek-chat` | Test input generation + execution |
+| Tier 3 adversarial probing | **DeepAgent** (invoked from node) | `deepseek-reasoner` | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
+| Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | `deepseek-reasoner` | Multi-step investigation of why capabilities fail |
+| Granularity operations | Plain LangGraph node | `deepseek-chat` | Metrics-driven decisions, mostly deterministic |
 
 ### DeepAgents Skill Ecosystem
 
@@ -187,6 +190,23 @@ class TaskState(BaseModel):
 
 Use the **Command API** for routing (return `Command(update={...}, goto="next_node")` instead of separate conditional edge functions). Use **Send** for parallel fan-out/fan-in. Use `interrupt()` for human-in-the-loop gates. See the `langgraph-architect` skill and its `references/` directory for detailed patterns.
 
+### LLM Initialization
+
+Use `init_chat_model()` for provider-agnostic LLM access. Never hardcode a provider import:
+
+```python
+from langchain.chat_models import init_chat_model
+
+# For plain nodes (fast, single-step)
+llm = init_chat_model("deepseek:deepseek-chat")
+
+# For DeepAgents (complex reasoning)
+reasoning_llm = init_chat_model("deepseek:deepseek-reasoner")
+
+# Switch provider without changing code
+llm = init_chat_model("anthropic:claude-sonnet-4-5-20250929")
+```
+
 ### DeepAgents Integration
 
 Use DeepAgents only where multi-step autonomous reasoning adds value (see the table above). Key points:
@@ -252,6 +272,7 @@ When working on this project:
 - **LangGraph llms.txt**: https://docs.langchain.com/llms.txt
 - **DeepAgents docs**: https://docs.langchain.com/oss/python/deepagents/overview/
 - **DeepAgents PyPI**: https://pypi.org/project/deepagents/
+- **DeepSeek API docs**: https://api-docs.deepseek.com/
 - **DeepAgents skill spec**: See `tools/quick_validate.py` and `tools/init_skill.py` for format rules
 - **uv docs**: https://docs.astral.sh/uv/
 - **MCP specification**: https://modelcontextprotocol.io/
