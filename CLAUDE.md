@@ -230,25 +230,111 @@ Keep track of:
 
 This data feeds into the granularity optimizer and thesis evaluation.
 
+## Architectural Constraints (Post-Iteration-0 Critique)
+
+### Testbed Decision
+
+The evaluation testbed is the **Business Analytics Pipeline** — data ingestion, transformation, ML training, inference, and report generation tasks. This was chosen over the Factory Simulation because it naturally produces diverse capability types (MCP tools for deterministic ingestion, Skills for domain workflows, Agents for stateful analysis), exercising all three artifact classifications.
+
+### DeepAgent Operational Boundaries
+
+Every DeepAgent invocation (`create_deep_agent()`) must respect these constraints:
+
+| Constraint | Value | Notes |
+|---|---|---|
+| `max_steps` (decomposition) | 10 | Bounded planning task |
+| `max_steps` (adversarial probing) | 15 | Needs more exploration room |
+| `max_steps` (failure analysis) | 10 | Focused investigation |
+| Node-level timeout (decomposition) | 120s | Prevents pipeline hang |
+| Node-level timeout (adversarial) | 180s | Allows sandbox execution |
+| Initialization | Fresh every invocation | No state carried between calls |
+| Output contract | `response_format=PydanticModel` | Structured output, not free-text |
+| Fallback on timeout/max_steps | Return partial results with error flag | Pipeline continues degraded |
+
+If a DeepAgent exceeds its budget, the LangGraph node returns a partial result with an error flag — the pipeline does not hang.
+
+### Verification Gate: Tiered Cost Optimization
+
+The verification layer uses fail-fast to avoid wasting tokens:
+
+1. **Tier 0** (Skills only): `tools/quick_validate.py` structural check (~0 cost)
+2. **Tier 1**: Static scanner (~0 cost). **Critical findings → reject immediately, skip Tier 2/3**
+3. **Tier 2**: Behavioral testing (moderate cost). Only if Tier 1 passes or has High/Medium only
+4. **Tier 3**: Adversarial probing (high cost). Only if Tier 2 passes
+
+Never run Tier 2/3 on a capability that Tier 1 has already condemned as Critical.
+
+### Pillar 3: Type-Scoped Operations
+
+Evolutionary operations are scoped by artifact type:
+
+| Operation | MCP Tools | Skills | Agents |
+|---|---|---|---|
+| **Prune** | ✅ | ✅ | ✅ |
+| **Split** | ❌ (future work) | ✅ | ✅ |
+| **Merge** | ❌ (future work) | ✅ | ❌ |
+
+The formal framework (utility function, metrics, convergence) applies to all types. Implementation is scoped to where LLMs can reliably perform the operations. MCP tool code refactoring is documented as future work.
+
+Always check `capability_type` before attempting split/merge. If someone tries to split/merge an MCP tool, reject gracefully with a clear message — don't silently skip.
+
+### LLM Output Robustness
+
+All LLM-calling nodes must implement:
+
+1. **Few-shot prompting**: Include at least one complete valid example in every generator prompt (MCP tool, Skill, Agent). Don't just give the schema — give a full example of correct output.
+2. **Repair pass**: If Pydantic validation fails, send raw output + validation error back to the model once. If repair also fails, return an error.
+3. **LangFuse logging**: Log every malformed output, validation error, and repair attempt.
+
+### MCP Server Management
+
+For the thesis prototype, use `importlib` dynamic imports + sandbox execution rather than subprocess MCP servers. Generated tools follow FastMCP structure but are loaded dynamically, not deployed as persistent servers. This avoids subprocess lifecycle complexity (zombie processes, port conflicts, health checks) while preserving the generate → verify → load → execute loop.
+
+Full MCP server deployment is production future work (Chapter 7).
+
+### Minimum Viable Scope
+
+If timeline pressure forces scope reduction:
+
+| Pillar | Full | Minimum | What You Lose |
+|---|---|---|---|
+| **1 (Pipeline)** | MCP tools + Skills + Agents | MCP tools only | Classification trivial, less diversity |
+| **2 (Verification)** | Tier 1 + 2 + 3 | Tier 1 + 2 only | Lose adversarial DeepAgent; discuss theoretically |
+| **3 (Optimizer)** | Prune + Split + Merge | Prune only + formal framework | Demonstrate framework theoretically; simulation still shows convergence |
+
+### Critique Checkpoints
+
+| When | Question |
+|---|---|
+| After Iteration 2 | Are generated capabilities good enough for verification to work with? |
+| After Iteration 5 | Does evaluation design produce thesis data? |
+
 ## What's Built
 
-Nothing yet — starting Iteration 0.
+### Iteration 0 (Complete)
+
+- **`src/schemas/`** — Pydantic state schemas: `CapabilityType` (StrEnum), `CapabilityDescriptor`, `TaskState`, `GapItem`, `MatchItem`. All use `extra="forbid"`, `Field(description=...)`, `datetime.now(UTC)`.
+- **`src/registry/store.py`** — ChromaDB-backed skill registry with cosine similarity search, gap detection (threshold 0.3), and `seed_registry()` with 3 hand-written tools (fibonacci, csv-parser, date-formatter). Supports `collection_name` parameter for test isolation.
+- **`src/orchestrator/pipeline.py`** — 3-node LangGraph graph (`intake` → `gap_detection` → `report`) using Command API for routing. Classifies registry matches vs. gaps based on similarity threshold.
+- **`src/mcp_tools/fibonacci.py`** — Hand-written FastMCP tool with `Annotated[int, Field()]` for flat MCP parameter schema, tool annotations (`readOnlyHint`, `idempotentHint`, etc.), async implementation.
+- **`demo.py`** — End-to-end demo showing both paths (capability found + MCP call, gap detected). Wired with LangFuse `CallbackHandler` via `config={"callbacks": [...]}`.
+- **`sandbox/Dockerfile`** — Minimal Python 3.11-slim container, non-root `sandbox` user, no network access.
+- **`Makefile`** — Convenience targets: `test`, `lint`, `format` (all via `uv run`).
+- **Tests** — 30 unit tests across 4 files (`test_schemas.py`, `test_registry.py`, `test_pipeline.py`, `test_fibonacci.py`) + 2 integration tests (`test_mcp_fibonacci.py`).
 
 ## Current Iteration
 
-**Iteration 0: Scaffolding & Prove the Loop**
-- Set up src/ directory structure
-- Docker sandbox for isolated execution
-- Minimal schemas, ChromaDB registry, gap detection
-- Hand-written MCP fibonacci tool
-- Minimal LangGraph pipeline (intake → gap_detection → report)
-- LangFuse tracing
+**Iteration 0 is complete.** Next: Iteration 1 (Production Registry, Schemas & Metrics).
 
 See `docs/iteration_plan.md` for the full plan.
 
 ## Stable Interfaces
 
-None yet — everything is still being shaped.
+The following modules are implemented and tested. Import from them; avoid modifying unless explicitly required:
+
+- **`src/schemas/`** — `CapabilityType`, `CapabilityDescriptor`, `TaskState`, `GapItem`, `MatchItem` (will be expanded in Iteration 1)
+- **`src/registry/store.py`** — `SkillRegistry`, `seed_registry()` (will be upgraded to hierarchical search in Iteration 1)
+- **`src/mcp_tools/fibonacci.py`** — Reference MCP tool implementation
 
 ## Notes for AI Agents
 
