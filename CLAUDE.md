@@ -313,18 +313,26 @@ If timeline pressure forces scope reduction:
 
 ### Iteration 0 (Complete)
 
-- **`src/schemas/`** — Pydantic state schemas: `CapabilityType` (StrEnum), `CapabilityDescriptor`, `TaskState`, `GapItem`, `MatchItem`. All use `extra="forbid"`, `Field(description=...)`, `datetime.now(UTC)`.
-- **`src/registry/store.py`** — ChromaDB-backed skill registry with cosine similarity search, gap detection (threshold 0.3), and `seed_registry()` with 3 hand-written tools (fibonacci, csv-parser, date-formatter). Supports `collection_name` parameter for test isolation.
 - **`src/orchestrator/pipeline.py`** — 3-node LangGraph graph (`intake` → `gap_detection` → `report`) using Command API for routing. Classifies registry matches vs. gaps based on similarity threshold.
 - **`src/mcp_tools/fibonacci.py`** — Hand-written FastMCP tool with `Annotated[int, Field()]` for flat MCP parameter schema, tool annotations (`readOnlyHint`, `idempotentHint`, etc.), async implementation.
 - **`demo.py`** — End-to-end demo showing both paths (capability found + MCP call, gap detected). Wired with LangFuse `CallbackHandler` via `config={"callbacks": [...]}`.
 - **`sandbox/Dockerfile`** — Minimal Python 3.11-slim container, non-root `sandbox` user, no network access.
 - **`Makefile`** — Convenience targets: `test`, `lint`, `format` (all via `uv run`).
-- **Tests** — 30 unit tests across 4 files (`test_schemas.py`, `test_registry.py`, `test_pipeline.py`, `test_fibonacci.py`) + 2 integration tests (`test_mcp_fibonacci.py`).
+
+### Iteration 1 (Complete)
+
+- **`src/schemas/`** — 14 Pydantic models across 4 files, all with `extra="forbid"`, `Field(description=...)`, StrEnum:
+  - `capability.py`: `CapabilityType`, `CapabilityDescriptor` (expanded with `input_schema`, `output_schema`, `tags`, `domain`, `is_active`, `metadata`)
+  - `task.py`: `TaskStatus`, `SubTask`, `ClassifiedGap`, `GeneratedArtifact`, `TaskState` (expanded with subtasks, classified_gaps, generated_artifacts, verification_results, status, errors, trace_id), `GapItem`, `MatchItem`
+  - `verification.py`: `Severity`, `VerificationFinding`, `VerificationReport`
+  - `metrics.py`: `InvocationRecord`, `GranularityMetrics`
+- **`src/registry/store.py`** — Production ChromaDB registry with hierarchical embeddings (`{domain} > {type} > {name}: {description}`), full CRUD (`get`, `update`, `deactivate`, `delete`, `list_all`), `min_confidence` filtering, 8 seeded capabilities across 3 types and 5 domains.
+- **`src/registry/metrics.py`** — DuckDB metrics store tracking invocations and capability lifecycle events. Computes four granularity metrics: `reuse_rate`, `success_rate`, `avg_token_cost`, `maintenance_burden`. Supports `compute_granularity_metrics()` aggregate and persistence to disk.
+- **Tests** — 115 passing: 57 schema tests, 29 registry tests, 17 metrics tests, 6 pipeline tests, 4 fibonacci tests, 2 integration tests.
 
 ## Current Iteration
 
-**Iteration 0 is complete.** Next: Iteration 1 (Production Registry, Schemas & Metrics).
+**Iteration 1 is complete.** Next: Iteration 2 (JIT Capability Pipeline).
 
 See `docs/iteration_plan.md` for the full plan.
 
@@ -332,8 +340,9 @@ See `docs/iteration_plan.md` for the full plan.
 
 The following modules are implemented and tested. Import from them; avoid modifying unless explicitly required:
 
-- **`src/schemas/`** — `CapabilityType`, `CapabilityDescriptor`, `TaskState`, `GapItem`, `MatchItem` (will be expanded in Iteration 1)
-- **`src/registry/store.py`** — `SkillRegistry`, `seed_registry()` (will be upgraded to hierarchical search in Iteration 1)
+- **`src/schemas/`** — All 14 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState`, `TaskStatus`, `SubTask`, `ClassifiedGap`, `GeneratedArtifact`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
+- **`src/registry/store.py`** — `SkillRegistry` (full CRUD + hierarchical search), `seed_registry()`
+- **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + 4 granularity metric queries)
 - **`src/mcp_tools/fibonacci.py`** — Reference MCP tool implementation
 
 ## Notes for AI Agents

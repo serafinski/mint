@@ -100,9 +100,22 @@ These are used by the skill generator (Iteration 2) and the verification gate (I
 
 ---
 
-## Iteration 1: Production Registry, Schemas & Metrics (Weeks 2–3)
+## Iteration 1: Production Registry, Schemas & Metrics (Weeks 2–3) ✅ COMPLETE
 
 **Goal:** Upgrade the proof-of-concept into production-quality foundations.
+
+### What was built
+- **`src/schemas/`** — 14 Pydantic models across 4 files, all with `extra="forbid"`, `Field(description=...)`, StrEnum:
+  - `capability.py`: `CapabilityType`, `CapabilityDescriptor` (expanded with `input_schema`, `output_schema`, `tags`, `domain`, `is_active`, `metadata` — all with defaults for backward compat)
+  - `task.py`: `TaskStatus` (9-value StrEnum), `SubTask`, `ClassifiedGap`, `GeneratedArtifact`, `TaskState` (expanded with subtasks, classified_gaps, generated_artifacts, verification_results, status, errors, trace_id), `GapItem`, `MatchItem`
+  - `verification.py` (NEW): `Severity` (5-value StrEnum), `VerificationFinding`, `VerificationReport`
+  - `metrics.py` (NEW): `InvocationRecord`, `GranularityMetrics`
+- **`src/registry/store.py`** — Production ChromaDB registry with hierarchical embeddings (`{domain} > {type} > {name}: {description}`), full CRUD (`get`, `update`, `deactivate`, `delete`, `list_all` with filters), `min_confidence` search filtering, `seed_registry()` with 8 capabilities (5 MCP_TOOL, 2 SKILL, 1 AGENT) across 5 domains.
+- **`src/registry/metrics.py`** (NEW) — DuckDB metrics store with two tables (`invocations`, `capability_events`). Records invocations and lifecycle events. Computes four granularity metrics: `reuse_rate`, `success_rate`, `avg_token_cost`, `maintenance_burden`. Aggregate via `compute_granularity_metrics()`. Supports persistence to disk and context manager pattern.
+- **Tests** — 115 passing: 57 schema tests, 29 registry tests, 17 metrics tests, 6 pipeline tests, 4 fibonacci tests, 2 integration tests. All lint clean.
+
+### Note on gap detection
+Gap detection (`detect_gaps()`) remains in `src/registry/store.py` rather than a separate `gap_detection.py` file. It was already implemented in Iteration 0 and upgraded with hierarchical search support. A dedicated `src/orchestrator/gap_detection.py` module will be created in Iteration 2 when the full pipeline graph is built.
 
 ### Tasks
 
@@ -149,13 +162,13 @@ Create an agent team with 3 teammates:
 Require plan approval before implementation.
 ```
 
-### Exit criteria
+### Exit criteria: ✅ All met
 - All schemas validate and serialize cleanly
 - Registry supports hierarchical search with persistence
 - Gap detection works against the seeded registry
 - Metrics store records and queries the four key metrics
 - All tests pass
-- **Update CLAUDE.md**
+- CLAUDE.md updated
 
 ---
 

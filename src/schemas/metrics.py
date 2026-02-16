@@ -1,0 +1,49 @@
+from datetime import UTC, datetime
+
+from pydantic import BaseModel, Field
+
+
+class InvocationRecord(BaseModel):
+    """Record of a single capability invocation for metrics tracking."""
+
+    capability_id: str = Field(..., description="ID of the invoked capability")
+    task_id: str = Field(..., description="ID of the task that triggered the invocation")
+    success: bool = Field(..., description="Whether the invocation succeeded")
+    token_cost: int = Field(..., ge=0, description="Token cost of the invocation")
+    latency_ms: float = Field(..., ge=0.0, description="Latency in milliseconds")
+    error_message: str | None = Field(
+        default=None, description="Error message if the invocation failed"
+    )
+    invoked_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        description="When the invocation occurred",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class GranularityMetrics(BaseModel):
+    """Computed granularity metrics for the optimizer feedback loop."""
+
+    capability_id: str = Field(..., description="ID of the capability being measured")
+    reuse_rate: float = Field(
+        ..., ge=0.0, le=1.0, description="Fraction of tasks that reuse this capability"
+    )
+    success_rate: float = Field(
+        ..., ge=0.0, le=1.0, description="Fraction of invocations that succeed"
+    )
+    token_cost: float = Field(
+        ..., ge=0.0, description="Average token cost per invocation"
+    )
+    maintenance_burden: float = Field(
+        ..., ge=0.0, description="Estimated maintenance cost metric"
+    )
+    computed_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        description="When these metrics were computed",
+    )
+    window_size: int = Field(
+        ..., description="Number of invocations in the computation window"
+    )
+
+    model_config = {"extra": "forbid"}
