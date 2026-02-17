@@ -194,14 +194,15 @@ Before starting, decide between two approaches for loading generated MCP tools:
    - Invoked from within a LangGraph node function (DeepAgents are complete graphs, not nodes)
    - Use `response_format` for structured output (Pydantic model with subtasks)
    - System prompt instructs the agent to plan decomposition, produce subtasks with capability annotations, and write results to files
-   - Use `deepseek-reasoner` as the model
-   - **Operational boundaries:** `max_steps=10`, timeout at node level (120s), fresh initialization per invocation
+   - Use `deepseek-chat` as the model (`deepseek-reasoner` lacks `tool_choice` support required by DeepAgents)
+   - **Operational boundaries:** `recursion_limit=25` (~12 logical steps; each tool call = 2 graph steps), timeout at node level (120s), fresh initialization per invocation
    - Trace with LangFuse via callback handler
 
 2. **Capability classifier** (`src/orchestrator/classifier.py`)
    - Plain LangGraph node (no DeepAgent — straightforward classification)
-   - Rule-based heuristics: deterministic+stateless → MCP tool, procedural+domain → skill, stateful+planning → agent
-   - LLM-assisted fallback for ambiguous cases
+   - LLM-based semantic classification with `temperature=0` and `with_structured_output`
+   - Few-shot prompt with intent-focused category definitions (action nature, not domain vocabulary)
+   - *Revised from rule-based keywords during implementation: keyword lists were too broad (LLM fallback never triggered) and classified by syntax rather than intent*
 
 3. **MCP tool generator** (`src/orchestrator/generators/mcp_tool.py`)
    - Plain LangGraph node

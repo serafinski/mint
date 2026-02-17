@@ -21,8 +21,8 @@ See `docs/thesis_proposal.md` for full details.
 - **LangGraph** - Multi-agent orchestration and pipeline graphs
 - **DeepAgents** (`deepagents` package) - Agent harness with built-in planning (`write_todos`), file system context management, subagent spawning, and conversation summarization. Used for task decomposition (Pillar 1) and adversarial probing (Pillar 2).
 - **LLM Provider** - DeepSeek via `langchain-deepseek` for cost efficiency. Provider-agnostic via `init_chat_model("provider:model")`.
-  - `deepseek-reasoner` (thinking mode, DeepSeek-V3.2) — for DeepAgents and complex reasoning (decomposition, adversarial probing, failure analysis)
-  - `deepseek-chat` (non-thinking mode, DeepSeek-V3.2) — for plain LangGraph nodes and single-step tasks (classification, generation, behavioral testing)
+  - `deepseek-chat` (DeepSeek-V3.2) — for all LLM tasks including DeepAgents and plain LangGraph nodes
+  - `deepseek-reasoner` (thinking mode) — **not usable with DeepAgents** due to missing `tool_choice` support; reserved for direct LLM calls without tool use
 - **Claude Code** - Code generation (development tool only, not part of the runtime system)
 - **MCP SDK** - Tool serving (Python, FastMCP pattern)
 - **ChromaDB** - Skill registry (semantic search with hierarchical embeddings)
@@ -37,15 +37,15 @@ DeepAgents (`create_deep_agent()`) return a `CompiledStateGraph` — a complete 
 
 | Component | Implementation | Model | Why |
 |---|---|---|---|
-| Task decomposition | **DeepAgent** (invoked from node) | `deepseek-reasoner` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
-| Capability classifier | Plain LangGraph node | `deepseek-chat` | Rule-based heuristics with LLM fallback — single-step |
+| Task decomposition | **DeepAgent** (invoked from node) | `deepseek-chat` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
+| Capability classifier | Plain LangGraph node | `deepseek-chat` | LLM classification with structured output (`temperature=0`) — single-step |
 | MCP tool generator | Plain LangGraph node | `deepseek-chat` | Single-pass code generation with retry on failure |
 | Skill generator | Plain LangGraph node | `deepseek-chat` | Structured text generation targeting DeepAgents skill format |
 | Agent generator | Plain LangGraph node | `deepseek-chat` | System prompt + config generation |
 | Tier 1 static scanner | Plain Python (no LLM) | — | AST + regex, deterministic |
 | Tier 2 behavioral testing | Plain LangGraph node | `deepseek-chat` | Test input generation + execution |
-| Tier 3 adversarial probing | **DeepAgent** (invoked from node) | `deepseek-reasoner` | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
-| Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | `deepseek-reasoner` | Multi-step investigation of why capabilities fail |
+| Tier 3 adversarial probing | **DeepAgent** (invoked from node) | `deepseek-chat` | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
+| Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | `deepseek-chat` | Multi-step investigation of why capabilities fail |
 | Granularity operations | Plain LangGraph node | `deepseek-chat` | Metrics-driven decisions, mostly deterministic |
 
 ### DeepAgents Skill Ecosystem
@@ -200,8 +200,8 @@ from langchain.chat_models import init_chat_model
 # For plain nodes (fast, single-step)
 llm = init_chat_model("deepseek:deepseek-chat")
 
-# For DeepAgents (complex reasoning)
-reasoning_llm = init_chat_model("deepseek:deepseek-reasoner")
+# For DeepAgents (also deepseek-chat — reasoner lacks tool_choice support)
+agent_llm = init_chat_model("deepseek:deepseek-chat")
 
 # Switch provider without changing code
 llm = init_chat_model("anthropic:claude-sonnet-4-5-20250929")
@@ -242,9 +242,9 @@ Every DeepAgent invocation (`create_deep_agent()`) must respect these constraint
 
 | Constraint | Value | Notes |
 |---|---|---|
-| `max_steps` (decomposition) | 10 | Bounded planning task |
-| `max_steps` (adversarial probing) | 15 | Needs more exploration room |
-| `max_steps` (failure analysis) | 10 | Focused investigation |
+| `recursion_limit` (decomposition) | 25 | ~12 logical steps; each tool call = 2 graph steps |
+| `recursion_limit` (adversarial probing) | 35 | Needs more exploration room |
+| `recursion_limit` (failure analysis) | 25 | Focused investigation |
 | Node-level timeout (decomposition) | 120s | Prevents pipeline hang |
 | Node-level timeout (adversarial) | 180s | Allows sandbox execution |
 | Initialization | Fresh every invocation | No state carried between calls |
@@ -330,9 +330,17 @@ If timeline pressure forces scope reduction:
 - **`src/registry/metrics.py`** — DuckDB metrics store tracking invocations and capability lifecycle events. Computes four granularity metrics: `reuse_rate`, `success_rate`, `avg_token_cost`, `maintenance_burden`. Supports `compute_granularity_metrics()` aggregate and persistence to disk.
 - **Tests** — 115 passing: 57 schema tests, 29 registry tests, 17 metrics tests, 6 pipeline tests, 4 fibonacci tests, 2 integration tests.
 
+### Iteration 2 Phase A (Complete)
+
+- **`src/orchestrator/decomposition.py`** — DeepAgent (`create_deep_agent`) wrapped in a LangGraph node. Uses `deepseek-chat` (reasoner lacks `tool_choice`), `response_format=DecompositionResult`, 120s timeout via `ThreadPoolExecutor`, `recursion_limit=25`. Falls back to treating the whole task as one subtask on error.
+- **`src/orchestrator/classifier.py`** — LLM-only classification with `temperature=0` and `with_structured_output(ClassificationResult)`. Shared LLM instance via lazy singleton. Falls back to `MCP_TOOL` with 0.3 confidence on LLM failure.
+- **`src/orchestrator/prompts/`** — Prompt package with `decomposition.py` and `classifier.py`. Classifier prompt uses intent-focused category definitions with few-shot examples and lowercase enum values (`mcp_tool`, `skill`, `agent`).
+- **`src/schemas/task.py`** — Added `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `GeneratorInput` (18 total schema types across 4 files).
+- **Tests** — 143 unit + 7 integration (3 decomposition, 4 classifier) = 150 passing.
+
 ## Current Iteration
 
-**Iteration 1 is complete.** Next: Iteration 2 (JIT Capability Pipeline).
+**Iteration 2 in progress — Phase A complete.** Next: Phase B (generators via Agent Team), then Phase C (pipeline wiring).
 
 See `docs/iteration_plan.md` for the full plan.
 
@@ -340,7 +348,10 @@ See `docs/iteration_plan.md` for the full plan.
 
 The following modules are implemented and tested. Import from them; avoid modifying unless explicitly required:
 
-- **`src/schemas/`** — All 14 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState`, `TaskStatus`, `SubTask`, `ClassifiedGap`, `GeneratedArtifact`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
+- **`src/schemas/`** — All 18 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState`, `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact`, `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
+- **`src/orchestrator/decomposition.py`** — `decomposition_node()` (DeepAgent-backed task decomposition)
+- **`src/orchestrator/classifier.py`** — `classify_gap()`, `classifier_node()` (LLM-based classification)
+- **`src/orchestrator/prompts/`** — `DECOMPOSITION_SYSTEM_PROMPT`, `CLASSIFICATION_PROMPT`
 - **`src/registry/store.py`** — `SkillRegistry` (full CRUD + hierarchical search), `seed_registry()`
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + 4 granularity metric queries)
 - **`src/mcp_tools/fibonacci.py`** — Reference MCP tool implementation

@@ -14,7 +14,7 @@ The `deepagents` package provides an agent harness with built-in planning (`writ
 | Task decomposition | **Yes** | Needs planning, exploration, critique — multi-step |
 | Adversarial probing | **Yes** | Needs to plan attacks, execute probes, adapt strategy |
 | Failure analysis (optimizer) | **Optional** | Useful for investigating complex failure patterns |
-| Capability classifier | No | Rule-based + single LLM fallback |
+| Capability classifier | No | LLM classification (single call, `temperature=0`) |
 | MCP tool/skill/agent generators | No | Single-pass generation with retry on failure |
 | Static scanner | No | Deterministic AST + regex, no LLM |
 | Behavioral testing | No | Test generation + sandbox execution |
@@ -30,7 +30,7 @@ from deepagents import create_deep_agent
 from langchain.chat_models import init_chat_model
 
 agent = create_deep_agent(
-    model=init_chat_model("deepseek:deepseek-reasoner"),  # thinking mode for DeepAgents
+    model=init_chat_model("deepseek:deepseek-chat"),  # reasoner lacks tool_choice support
     tools=[my_tool],
     system_prompt="You are...",
     # Optional:
@@ -70,7 +70,7 @@ from src.schemas.task import TaskState
 
 # Create the agent once at module level
 decomposition_agent = create_deep_agent(
-    model=init_chat_model("deepseek:deepseek-reasoner"),
+    model=init_chat_model("deepseek:deepseek-chat"),  # reasoner lacks tool_choice support
     system_prompt="""You are a task decomposition specialist.
 
     Break the given task into independent subtasks.
@@ -98,7 +98,7 @@ For the adversarial probing tier, the DeepAgent needs to execute code in isolati
 
 ```python
 adversarial_agent = create_deep_agent(
-    model=init_chat_model("deepseek:deepseek-reasoner"),
+    model=init_chat_model("deepseek:deepseek-chat"),
     system_prompt="""You are a red-team agent testing whether a generated
     capability is genuinely functional or faking its outputs.
 
@@ -128,7 +128,7 @@ research_subagent = {
 }
 
 orchestrator = create_deep_agent(
-    model=init_chat_model("deepseek:deepseek-reasoner"),
+    model=init_chat_model("deepseek:deepseek-chat"),
     system_prompt="You orchestrate the JIT capability pipeline...",
     subagents=[research_subagent],
 )
@@ -195,18 +195,18 @@ These rules are enforced by `tools/quick_validate.py`:
 
 ## Model Selection
 
-Use `deepseek-reasoner` (thinking mode, DeepSeek-V3.2) for DeepAgents by default — the thinking mode suits multi-step planning, adversarial reasoning, and complex investigation tasks. Use `deepseek-chat` (non-thinking mode, DeepSeek-V3.2) for plain LangGraph nodes where speed and cost matter more than deep reasoning.
+Use `deepseek-chat` (DeepSeek-V3.2) for all components, including DeepAgents. The `deepseek-reasoner` (thinking mode) does **not** support `tool_choice`, which DeepAgents requires for tool calling. This was discovered during Iteration 2 integration testing — the reasoner model rejects requests with `tool_choice` set, causing all DeepAgent invocations to fail.
 
 Use `init_chat_model("provider:model")` for provider-agnostic switching:
 
 ```python
 from langchain.chat_models import init_chat_model
 
-# For DeepAgents (complex reasoning)
-reasoning_llm = init_chat_model("deepseek:deepseek-reasoner")
-agent = create_deep_agent(model=reasoning_llm, ...)
+# For DeepAgents (deepseek-chat — reasoner lacks tool_choice support)
+agent_llm = init_chat_model("deepseek:deepseek-chat")
+agent = create_deep_agent(model=agent_llm, ...)
 
-# For plain nodes (fast, single-step)
+# For plain nodes (same model, single-step)
 fast_llm = init_chat_model("deepseek:deepseek-chat")
 
 # Switch to Anthropic if needed (e.g., for evaluation comparison)
@@ -215,9 +215,9 @@ anthropic_llm = init_chat_model("anthropic:claude-sonnet-4-5-20250929")
 
 | Component | Model | Why |
 |---|---|---|
-| Task decomposition (DeepAgent) | `deepseek-reasoner` | Multi-step planning benefits from thinking |
-| Adversarial probing (DeepAgent) | `deepseek-reasoner` | Attack strategy needs deep reasoning |
-| Failure analysis (DeepAgent, optional) | `deepseek-reasoner` | Complex investigation |
+| Task decomposition (DeepAgent) | `deepseek-chat` | `deepseek-reasoner` lacks `tool_choice` support |
+| Adversarial probing (DeepAgent) | `deepseek-chat` | Same limitation |
+| Failure analysis (DeepAgent, optional) | `deepseek-chat` | Same limitation |
 | Classifier, generators, behavioral testing | `deepseek-chat` | Single-step, speed matters |
 
 ## Token Budget

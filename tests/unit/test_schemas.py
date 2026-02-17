@@ -3,11 +3,15 @@ import pytest
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.metrics import GranularityMetrics, InvocationRecord
 from src.schemas.task import (
+    ClassificationResult,
     ClassifiedGap,
+    DecompositionResult,
     GapItem,
     GeneratedArtifact,
+    GeneratorInput,
     MatchItem,
     SubTask,
+    SubTaskItem,
     TaskState,
     TaskStatus,
 )
@@ -759,3 +763,94 @@ def test_gap_item_rejects_extra():
 def test_match_item_requires_capability():
     with pytest.raises(ValueError):
         MatchItem(score=0.5)
+
+
+# --- SubTaskItem ---
+
+
+def test_subtask_item_rejects_extra():
+    with pytest.raises(ValueError):
+        SubTaskItem(
+            description="Do something",
+            required_capabilities=["cap-a"],
+            unknown_field="oops",
+        )
+
+
+# --- DecompositionResult ---
+
+
+def test_decomposition_result_rejects_extra():
+    with pytest.raises(ValueError):
+        DecompositionResult(
+            subtasks=[],
+            reasoning="test",
+            unknown_field="oops",
+        )
+
+
+# --- ClassificationResult ---
+
+
+def test_classification_result_rejects_extra():
+    with pytest.raises(ValueError):
+        ClassificationResult(
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="test",
+            unknown_field="oops",
+        )
+
+
+# --- GeneratorInput ---
+
+
+def test_generator_input_valid():
+    gap = ClassifiedGap(
+        description="Parse CSV",
+        query="parse CSV",
+        classified_type=CapabilityType.MCP_TOOL,
+        confidence=0.9,
+        rationale="Atomic operation",
+    )
+    gi = GeneratorInput(gap=gap, task_context="Analyse sales data")
+    assert gi.gap.classified_type == CapabilityType.MCP_TOOL
+    assert gi.task_context == "Analyse sales data"
+
+
+def test_generator_input_default_context():
+    gap = ClassifiedGap(
+        description="Sort numbers",
+        query="sort numbers",
+        classified_type=CapabilityType.MCP_TOOL,
+        confidence=0.9,
+        rationale="Deterministic",
+    )
+    gi = GeneratorInput(gap=gap)
+    assert gi.task_context == ""
+
+
+def test_generator_input_rejects_extra():
+    gap = ClassifiedGap(
+        description="Sort numbers",
+        query="sort numbers",
+        classified_type=CapabilityType.MCP_TOOL,
+        confidence=0.9,
+        rationale="Deterministic",
+    )
+    with pytest.raises(ValueError):
+        GeneratorInput(gap=gap, unknown_field="oops")
+
+
+def test_generator_input_roundtrip():
+    gap = ClassifiedGap(
+        description="Data pipeline",
+        query="data pipeline",
+        classified_type=CapabilityType.SKILL,
+        confidence=0.85,
+        rationale="Multi-step",
+    )
+    gi = GeneratorInput(gap=gap, task_context="Build analytics")
+    roundtripped = GeneratorInput.model_validate_json(gi.model_dump_json())
+    assert roundtripped.gap.classified_type == CapabilityType.SKILL
+    assert roundtripped.task_context == "Build analytics"
