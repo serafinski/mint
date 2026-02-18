@@ -176,15 +176,17 @@ Require plan approval before implementation.
 
 **Goal:** Build Pillar 1 end-to-end without verification. Decompose tasks, detect gaps, classify, generate, dynamically load, and register.
 
-### Decision point: MCP server management strategy
+### ✅ Decision: MCP tool loading strategy → Option B (dynamic import)
 
-Before starting, decide between two approaches for loading generated MCP tools:
+Generated MCP tools are loaded via `importlib` in a sandboxed subprocess — **not** as persistent FastMCP server processes. The tool loader lives in `src/orchestrator/tool_loader.py`.
 
-**Option A: Subprocess MCP servers** (`server_manager.py`). Spawn each generated tool as a FastMCP server subprocess, health-check it, register the endpoint. This is production-realistic but adds subprocess lifecycle complexity, zombie process risk, and port management overhead.
+**Why not subprocess MCP servers:** Zombie processes, port management, and health-check overhead are orthogonal to the thesis contribution. Option B preserves the same FastMCP code format and upgrade path while keeping lifecycle simple. Tier 2 behavioral testing (Iteration 3) reuses the same loader directly — no duplication.
 
-**Option B: Dynamic import + sandbox execution.** Generate MCP-compliant code (FastMCP structure) but load it via `importlib` in a sandboxed subprocess rather than running a persistent server. Simpler lifecycle, same generation/verification loop, avoids subprocess management. Mention full MCP server deployment as production future work in Chapter 7.
+**Full MCP server deployment** is documented as production future work in Chapter 7.
 
-**Recommendation:** Start with Option B. If it works cleanly, keep it. If you need persistent servers for evaluation realism, upgrade to Option A for Iteration 5.
+### ✅ Decision: Generated skills landing path → `.deepagents/skills/`
+
+Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in the project root — **not** `src/skills/` (removed). DeepAgents loads project-level skills from `.deepagents/skills/` automatically, so no copy or symlink step is needed. User-level (`~/.deepagents/<agent>/skills/`) is reserved for stable, hand-curated skills.
 
 ### Tasks
 
@@ -212,8 +214,8 @@ Before starting, decide between two approaches for loading generated MCP tools:
    - **Repair pass:** if Pydantic validation fails on the response, send raw output + validation error back to the model once
    - Output: Python function + FastMCP server wrapper + basic test harness
 
-4. **MCP tool loading** (`src/orchestrator/server_manager.py` or `tool_loader.py`)
-   - Based on decision point above: either subprocess lifecycle manager or importlib dynamic loader
+4. **MCP tool loading** (`src/orchestrator/tool_loader.py`)
+   - Dynamic import via importlib + sandboxed subprocess execution (see decided loading strategy in this file)
    - Registry integration: new tool → load → register
    - Cleanup on process exit
 
@@ -244,19 +246,23 @@ Before starting, decide between two approaches for loading generated MCP tools:
 Create an agent team with 3 teammates:
 - "mcp-gen" teammate: implement the MCP tool generator in
   src/orchestrator/generators/mcp_tool.py AND the tool loader in
-  src/orchestrator/server_manager.py (or tool_loader.py). The generator produces
-  Python MCP tools (FastMCP) from a CapabilityDescriptor. Include at least one
-  complete few-shot example of a valid MCP tool in the generator prompt. Add a
-  repair pass for malformed output. The loader handles dynamic import and
-  execution. Write integration tests that generate a simple tool and verify it
-  executes correctly. See the mcp-builder skill for conventions.
+  src/orchestrator/tool_loader.py. Loading strategy: dynamic import via importlib
+  (NOT subprocess MCP servers — see the decided loading strategy above).
+  The generator produces Python MCP tools (FastMCP) from a CapabilityDescriptor.
+  Include at least one complete few-shot example of a valid MCP tool in the
+  generator prompt. Add a repair pass for malformed output. The loader handles
+  importlib dynamic loading and sandboxed subprocess execution. Write integration
+  tests that generate a simple tool and verify it executes correctly.
+  See the mcp-builder skill for conventions.
 - "skill-gen" teammate: implement the skill generator in
-  src/orchestrator/generators/skill.py. Generate SKILL.md files + optional
-  scripts/references/assets from CapabilityDescriptor, conforming to the
-  DeepAgents skill format. Include a complete few-shot example in the prompt.
-  Run tools/quick_validate.py on every generated skill as a structural pre-check.
-  Use tools/init_skill.py as a reference for the expected template. Write tests
-  including a test that validates the generated skill passes quick_validate.py.
+  src/orchestrator/generators/skill.py. Generated skills must be written to
+  .deepagents/skills/<skill-name>/ (NOT src/skills/ — see the decided landing
+  path above). Generate SKILL.md files + optional scripts/references/assets from
+  CapabilityDescriptor, conforming to the DeepAgents skill format. Include a
+  complete few-shot example in the prompt. Run tools/quick_validate.py on every
+  generated skill as a structural pre-check. Use tools/init_skill.py as a
+  reference for the expected template. Write tests including a test that validates
+  the generated skill passes quick_validate.py.
 - "agent-gen" teammate: implement the agent generator in
   src/orchestrator/generators/agent.py. Generate system prompts and LangGraph
   node configs. For DeepAgent-type agents, also produce skill configurations.
@@ -269,7 +275,7 @@ use the existing schemas from src/schemas/.
 
 ### Exit criteria
 - DeepAgent decomposition produces structured subtask breakdowns using `write_todos` and `response_format`
-- DeepAgent respects `max_steps` limit and completes within timeout
+- DeepAgent respects `recursion_limit` and completes within timeout
 - LangFuse traces show the DeepAgent's planning and tool-calling loop
 - Pipeline decomposes tasks, detects gaps, classifies, and generates capabilities
 - Generated MCP tools load dynamically and respond to calls
@@ -313,10 +319,30 @@ Before starting Iteration 3, assess: Are the generated capabilities good enough 
    - Writes intermediate analysis to files (context management)
    - Tests network-disconnected behavior
    - Uses `response_format=AdversarialFindings` for structured output
-   - **Operational boundaries:** `max_steps=15`, timeout at node level (180s), fresh initialization
+   - **Operational boundaries:** `recursion_limit=35`, timeout at node level (180s), fresh initialization
    - **Only runs if Tier 2 passes**
    - **Focused on 3 specific attack patterns:** (1) hidden demo/sample mode detection, (2) network-disconnect behavioral change, (3) ground-truth comparison where available
    - Trace with LangFuse
+
+   > ⚠️ **The `execute` tool is not yet defined.** The adversarial DeepAgent needs a tool
+   > that runs code in an isolated environment and returns stdout/stderr/exit code. This
+   > tool must be built **before Iteration 3 starts** — it is a prerequisite for the
+   > adversarial DeepAgent to function. Options:
+   >
+   > **Option A:** Hand-write `src/verification/sandbox_tool.py` — a FastMCP-style tool
+   > that runs a Python snippet in a restricted subprocess (no network, limited CPU/mem)
+   > using the existing `sandbox/Dockerfile`. Register it with the adversarial DeepAgent
+   > via `create_deep_agent(tools=[sandbox_execute])`.
+   >
+   > **Option B:** Reuse the Iteration 2 MCP tool loader (`src/orchestrator/tool_loader.py`).
+   > The loader already handles sandboxed subprocess execution — wrap it as a tool the
+   > adversarial agent can call.
+   >
+   > **Recommendation:** Option B — avoids duplication and validates that the tool loader
+   > works end-to-end before verification depends on it.
+   >
+   > **Action:** At the start of Iteration 3, before spawning the agent team, implement
+   > and test the `execute` tool interface. Add it to the `adversarial` teammate's brief.
 
 4. **Verification gate** (`src/verification/gate.py`)
    - Combines all three tiers with tiered cost optimization:
@@ -349,13 +375,13 @@ Create an agent team with 4 teammates:
   Implement as a DeepAgent (create_deep_agent with sandbox backend). The agent
   uses write_todos for planning, execute tool for running probes, file system
   for intermediate analysis. Use response_format for structured findings.
-  max_steps=15, timeout=180s. Focus on 3 attack patterns: hidden demo mode,
+  recursion_limit=35, timeout=180s. Focus on 3 attack patterns: hidden demo mode,
   network-disconnect behavior change, ground-truth comparison.
   Trace with LangFuse. See the deep-agents skill for patterns. Write tests.
 - "devil" teammate: after the other 3 finish, review all tiers and find ways a
   malicious or lazy code generator could bypass each tier. Pay special attention
   to whether the adversarial DeepAgent's probing can be tricked. Document
-  findings in docs/decisions/verification-hardening.md.
+  findings in docs/iteration_plan.md or CLAUDE.md.
 Have teammates share findings with each other. Require plan approval.
 ```
 
@@ -364,7 +390,7 @@ Have teammates share findings with each other. Require plan approval.
 - Tier 1 Critical findings block immediately (no Tier 2/3 invocation)
 - Skill validation via `quick_validate.py` integrated into the gate
 - Behavioral tests distinguish real from mock tools
-- Adversarial DeepAgent runs multi-step probing within max_steps and timeout
+- Adversarial DeepAgent runs multi-step probing within recursion_limit and timeout
 - LangFuse traces show the adversarial agent's full execution (planning, tool calls, file writes)
 - The full gate rejects bad capabilities, passes good ones
 - Pipeline retries generation on failure (max 3 attempts with feedback)
@@ -584,14 +610,14 @@ DeepAgents are powerful but expensive and unpredictable. These constraints apply
 
 | Constraint | Value | Rationale |
 |---|---|---|
-| `max_steps` (decomposition) | 10 | Decomposition is bounded — there are only so many subtasks |
-| `max_steps` (adversarial) | 15 | Adversarial probing needs more exploration room |
-| `max_steps` (failure analysis) | 10 | Failure analysis is focused investigation |
+| `recursion_limit` (decomposition) | 25 | ~12 logical steps; each tool call = 2 graph steps |
+| `recursion_limit` (adversarial) | 35 | Adversarial probing needs more exploration room |
+| `recursion_limit` (failure analysis) | 25 | Failure analysis is focused investigation |
 | Node-level timeout (decomposition) | 120s | Prevents pipeline hang if agent loops |
 | Node-level timeout (adversarial) | 180s | Longer for sandbox execution |
 | Initialization | Fresh every time | No state carried between invocations |
 | Output contract | `response_format=PydanticModel` | Structured output, not free-text parsing |
-| Fallback | If timeout/max_steps hit, return partial results with error flag | Pipeline continues with degraded data rather than hanging |
+| Fallback | If timeout/recursion_limit hit, return partial results with error flag | Pipeline continues with degraded data rather than hanging |
 
 Monitor all DeepAgent metrics via LangFuse. If costs are too high, replace with plain LangGraph nodes (single LLM call + structured output) and document the quality tradeoff in the thesis.
 
@@ -663,7 +689,7 @@ These are full feasibility reviews, not just exit criteria checks. Budget 1–2 
 | LLM generation quality too low | Few-shot prompting, repair pass, start simple |
 | Verification too strict | Tune Tier 1 thresholds; tiered cost gate prevents wasting tokens on doomed artifacts |
 | Verification too loose | Devil's advocate in Iter 3; manual audit in Iter 6 |
-| DeepAgent hangs/loops | max_steps limit, node-level timeout, fallback to partial results |
+| DeepAgent hangs/loops | recursion_limit, node-level timeout, fallback to partial results |
 | DeepAgent costs too high | Track via LangFuse; fall back to plain nodes if needed |
 | Optimizer tries to merge MCP tool code | Type constraint check prevents this; graceful rejection |
 | Optimizer doesn't converge | Debug with simulation harness; simplify distribution |

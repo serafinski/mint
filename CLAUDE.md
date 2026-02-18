@@ -69,7 +69,7 @@ src/
 │   ├── classifier.py       # Capability classification
 │   ├── gap_detection.py    # Skill gap detection
 │   ├── pipeline.py         # Main LangGraph pipeline graph
-│   ├── server_manager.py   # Dynamic MCP server lifecycle
+│   ├── tool_loader.py      # Dynamic MCP tool loading (importlib, not subprocess servers)
 │   └── generators/         # Capability generators
 │       ├── mcp_tool.py
 │       ├── skill.py
@@ -89,8 +89,10 @@ src/
 │   └── simulation.py       # Simulation harness
 ├── schemas/            # Shared Pydantic state schemas (single source of truth)
 ├── mcp_tools/          # Generated & hand-built MCP tools
-├── skills/             # Generated SKILL.md files (runtime skills, not .claude/skills)
 └── agents/             # Agent configs & system prompts
+
+.deepagents/
+└── skills/             # Generated skills runtime location — DeepAgents loads from here automatically
 
 tools/                  # Development & validation utilities
 ├── quick_validate.py       # DeepAgents skill validator (structural checks)
@@ -253,6 +255,14 @@ Every DeepAgent invocation (`create_deep_agent()`) must respect these constraint
 
 If a DeepAgent exceeds its budget, the LangGraph node returns a partial result with an error flag — the pipeline does not hang.
 
+### MCP Tool Loading Strategy
+
+Generated MCP tools are loaded via `importlib` dynamic import in a sandboxed subprocess (`src/orchestrator/tool_loader.py`). **Not** persistent FastMCP server processes — no ports, no health checks, no zombie process risk. The same loader is reused by Tier 2 behavioral testing in Iteration 3. Full MCP server deployment is future work (Chapter 7).
+
+### Generated Skills Landing Path
+
+Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in the project root. DeepAgents loads project-level skills from this path automatically — no copy or symlink step needed. `src/skills/` does not exist and should not be used. User-level `~/.deepagents/<agent>/skills/` is reserved for stable, hand-curated skills only.
+
 ### Verification Gate: Tiered Cost Optimization
 
 The verification layer uses fail-fast to avoid wasting tokens:
@@ -368,7 +378,7 @@ When working on this project:
 6. **DeepAgents where appropriate** — Use for task decomposition and adversarial probing; plain nodes for everything else. Remember: DeepAgents are invoked from nodes, not wired as nodes.
 7. **Generated skills must conform to DeepAgents format** — SKILL.md + optional scripts/references/assets. Validate with `tools/quick_validate.py`.
 8. **Ask before making architectural decisions** — Many design choices are still being explored
-9. **Document decisions** — Update this file or `docs/decisions/` when important choices are made
+9. **Document decisions** — Update this file or `docs/iteration_plan.md` when important choices are made (not `docs/decisions/` — all agents read CLAUDE.md and the iteration plan; separate decision files drift out of sync)
 10. **Work incrementally** — Build and test one component at a time
 11. **Tests are mandatory** — No module is done without tests (see `testing-conventions` skill)
 
