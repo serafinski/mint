@@ -1,0 +1,339 @@
+"""Agent generator — LLM-based agent configuration synthesis.
+
+Generates agent configurations (system prompt, LangGraph node config, and
+optionally a DeepAgents SKILL.md) for capability gaps classified as AGENT.
+
+This is a plain LangGraph node (no DeepAgent) because agent config generation
+is a single-step LLM task with structured output.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+from typing import Literal
+
+from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
+from langgraph.graph import END
+from langgraph.types import Command
+from pydantic import BaseModel, Field
+
+from src.orchestrator.generators.skill import _extract_skill_name, _validate_skill_content
+from src.orchestrator.prompts.agent_generator import AGENT_GENERATOR_PROMPT, AGENT_REPAIR_PROMPT
+from src.schemas.capability import CapabilityType
+from src.schemas.task import ClassifiedGap, GeneratedArtifact, TaskState, TaskStatus
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Skills output directory (mirrors skill.py — generated DeepAgent skills land here)
+# ---------------------------------------------------------------------------
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+SKILLS_OUTPUT_DIR = _PROJECT_ROOT / ".deepagents" / "skills"
+
+
+# ---------------------------------------------------------------------------
+# Internal structured-output model (not part of src/schemas/)
+# ---------------------------------------------------------------------------
+
+
+class AgentGenerationResult(BaseModel):
+    """LLM output schema for agent configuration generation."""
+
+    agent_name: str = Field(..., description="Hyphen-case agent identifier (max 64 chars)")
+    system_prompt: str = Field(..., description="Markdown system prompt for the agent")
+    node_name: str = Field(..., description="Snake_case LangGraph node function name")
+    model: str = Field(
+        default="deepseek:deepseek-chat",
+        description="LLM model identifier",
+    )
+    tools: list[str] = Field(default_factory=list, description="Tool names the agent needs")
+    description: str = Field(..., description="One-sentence summary of what the agent does")
+    is_deep_agent: bool = Field(
+        default=False,
+        description="Whether this agent requires DeepAgent (multi-step autonomous reasoning)",
+    )
+    skill_content: str | None = Field(
+        default=None,
+        description="SKILL.md content if is_deep_agent is true, otherwise null",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+# ---------------------------------------------------------------------------
+# Shared LLM instance (lazy initialisation)
+# ---------------------------------------------------------------------------
+
+_agent_gen_llm = None
+
+
+def _get_llm():
+    """Lazily create the agent generator LLM on first use."""
+    global _agent_gen_llm  # noqa: PLW0603
+    if _agent_gen_llm is None:
+        from langchain.chat_models import init_chat_model
+
+        _agent_gen_llm = init_chat_model("deepseek:deepseek-chat")
+    return _agent_gen_llm
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+_HYPHEN_CASE_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_SNAKE_CASE_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+# ---------------------------------------------------------------------------
+# LangFuse event helper
+# ---------------------------------------------------------------------------
+
+
+def _emit_langfuse_event(
+    langfuse_handler: object | None,
+    name: str,
+    level: str,
+    metadata: dict,
+) -> None:
+    """Emit a named event to LangFuse, linked to the active trace if available.
+
+    Uses ``langfuse_handler.last_trace_id`` to associate the event with the
+    preceding LLM invocation span.  Silently no-ops if LangFuse is unavailable.
+    """
+    try:
+        from langfuse import Langfuse
+        from langfuse.types import TraceContext
+
+        trace_id: str | None = getattr(langfuse_handler, "last_trace_id", None)
+        lf = Langfuse()
+        lf.create_event(
+            trace_context=TraceContext(trace_id=trace_id) if trace_id else None,
+            name=name,
+            level=level,  # type: ignore[arg-type]
+            metadata=metadata,
+        )
+        lf.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _validate_result(result: AgentGenerationResult) -> list[str]:
+    """Return a list of validation error strings (empty if valid)."""
+    errors: list[str] = []
+
+    if not result.system_prompt.strip():
+        errors.append("system_prompt must be non-empty")
+
+    if not result.agent_name.strip():
+        errors.append("agent_name must be non-empty")
+    elif not _HYPHEN_CASE_RE.match(result.agent_name):
+        errors.append(
+            f"agent_name '{result.agent_name}' must be hyphen-case "
+            "(lowercase letters, digits, hyphens; no leading/trailing/double hyphens)"
+        )
+    elif len(result.agent_name) > 64:
+        errors.append(f"agent_name too long ({len(result.agent_name)} chars, max 64)")
+
+    if not result.node_name.strip():
+        errors.append("node_name must be non-empty")
+    elif not _SNAKE_CASE_RE.match(result.node_name):
+        errors.append(f"node_name '{result.node_name}' must be valid snake_case")
+
+    if not result.description.strip():
+        errors.append("description must be non-empty")
+
+    if result.is_deep_agent and not result.skill_content:
+        errors.append("skill_content is required when is_deep_agent is true")
+
+    if result.skill_content:
+        if not result.skill_content.startswith("---"):
+            errors.append("skill_content must start with YAML frontmatter (---)")
+        else:
+            # Run full quick_validate.py check (same as skill generator does)
+            is_valid, msg = _validate_skill_content(result.skill_content, result.agent_name)
+            if not is_valid:
+                errors.append(f"skill_content failed validation: {msg}")
+            else:
+                # Verify the frontmatter name matches agent_name so DeepAgents can load the skill
+                content_name = _extract_skill_name(result.skill_content)
+                if content_name and content_name != result.agent_name:
+                    errors.append(
+                        f"skill_content frontmatter name '{content_name}' must match "
+                        f"agent_name '{result.agent_name}'"
+                    )
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Single-agent generation
+# ---------------------------------------------------------------------------
+
+
+def _generate_single_agent(
+    gap: ClassifiedGap,
+    task_context: str,
+    *,
+    output_dir: Path | None = None,
+) -> tuple[GeneratedArtifact | None, str | None]:
+    """Generate an agent config for a single classified gap.
+
+    Returns (artifact, error). Exactly one will be non-None.
+    """
+    llm = _get_llm()
+    structured_llm = llm.with_structured_output(AgentGenerationResult)
+
+    prompt = AGENT_GENERATOR_PROMPT.format(
+        description=gap.description,
+        query=gap.query,
+        task_context=task_context,
+    )
+
+    # LangFuse tracing
+    langfuse_handler = None
+    try:
+        langfuse_handler = LangFuseCallbackHandler()
+        callbacks = [langfuse_handler]
+    except Exception:  # noqa: BLE001
+        callbacks = []
+
+    config = {"callbacks": callbacks} if callbacks else {}
+
+    # First attempt
+    try:
+        result: AgentGenerationResult = structured_llm.invoke(prompt, config=config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Agent generation LLM call failed for %r: %s", gap.query, exc)
+        return None, f"Agent generation failed for '{gap.query}': {exc}"
+
+    # Validate
+    validation_errors = _validate_result(result)
+
+    # Repair pass (one attempt)
+    if validation_errors:
+        logger.warning(
+            "Validation failed for agent %r — triggering repair pass. "
+            "Errors: %s. Malformed output: %s",
+            gap.query,
+            validation_errors,
+            result.model_dump_json(),
+        )
+        _emit_langfuse_event(
+            langfuse_handler,
+            "agent.validation_failure",
+            "WARNING",
+            {"gap_query": gap.query, "errors": validation_errors},
+        )
+        repair_prompt = AGENT_REPAIR_PROMPT.format(
+            original_prompt=prompt,
+            validation_errors="\n".join(f"- {e}" for e in validation_errors),
+            previous_output=result.model_dump_json(indent=2),
+        )
+        try:
+            result = structured_llm.invoke(repair_prompt, config=config)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Agent generation repair failed for %r: %s", gap.query, exc)
+            _emit_langfuse_event(
+                langfuse_handler,
+                "agent.repair_llm_failure",
+                "ERROR",
+                {"gap_query": gap.query, "error": str(exc)},
+            )
+            return None, f"Agent generation repair failed for '{gap.query}': {exc}"
+
+        validation_errors = _validate_result(result)
+        if validation_errors:
+            error_str = "; ".join(validation_errors)
+            logger.warning(
+                "Agent generation still invalid after repair for %r: %s",
+                gap.query,
+                error_str,
+            )
+            _emit_langfuse_event(
+                langfuse_handler,
+                "agent.repair_validation_failure",
+                "ERROR",
+                {"gap_query": gap.query, "errors": validation_errors},
+            )
+            return None, f"Agent generation invalid after repair for '{gap.query}': {error_str}"
+
+    # Build the agent_config dict
+    node_config = {
+        "name": result.node_name,
+        "model": result.model,
+        "tools": result.tools,
+        "description": result.description,
+    }
+
+    agent_config: dict = {
+        "system_prompt": result.system_prompt,
+        "node_config": node_config,
+        "is_deep_agent": result.is_deep_agent,
+    }
+
+    if result.is_deep_agent and result.skill_content:
+        agent_config["skill_content"] = result.skill_content
+        # Write the DeepAgent skill to disk so the DeepAgents runtime can load it
+        skill_dir = (output_dir or SKILLS_OUTPUT_DIR) / result.agent_name
+        try:
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(result.skill_content)
+        except OSError as exc:
+            error_msg = (
+                f"Failed to write DeepAgent skill '{result.agent_name}' to disk: {exc}"
+            )
+            logger.error(error_msg)
+            return None, error_msg
+        logger.info("Wrote DeepAgent skill '%s' to %s", result.agent_name, skill_dir)
+
+    artifact = GeneratedArtifact(
+        capability_name=result.agent_name,
+        capability_type=CapabilityType.AGENT,
+        agent_config=agent_config,
+    )
+
+    return artifact, None
+
+
+# ---------------------------------------------------------------------------
+# LangGraph node
+# ---------------------------------------------------------------------------
+
+
+def generate_agent(
+    state: TaskState,
+    # TODO Phase C: change signature to accept GeneratorInput (single ClassifiedGap
+    # + task_context) instead of full TaskState.  The graph will use Send() to
+    # fan out each gap individually.  Route to verification gate instead of END.
+) -> Command[Literal["__end__"]]:
+    """Generate agent configurations for all AGENT-typed gaps.
+
+    Skips gaps that are not classified as AGENT. On LLM failure, records
+    the error and continues with the next gap.
+    """
+    artifacts: list[GeneratedArtifact] = list(state.generated_artifacts)
+    errors: list[str] = list(state.errors)
+
+    agent_gaps = [
+        g for g in state.classified_gaps if g.classified_type == CapabilityType.AGENT
+    ]
+
+    for gap in agent_gaps:
+        artifact, error = _generate_single_agent(gap, state.task_description)
+        if artifact is not None:
+            artifacts.append(artifact)
+        if error is not None:
+            errors.append(error)
+
+    return Command(
+        update={
+            "generated_artifacts": artifacts,
+            "status": TaskStatus.GENERATING,
+            "errors": errors,
+        },
+        goto=END,
+    )

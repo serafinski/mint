@@ -26,4 +26,30 @@ would be needed to accomplish it.
 
 Return your decomposition via the structured output format. Every subtask must
 have at least one required capability.
+
+### Example output (for "Build a CSV report: load sales.csv, compute revenue per region,
+### generate summary table"):
+
+```json
+{
+  "subtasks": [
+    {
+      "description": "Load and parse the sales CSV file into structured records",
+      "required_capabilities": ["parse CSV file", "file I/O"],
+      "depends_on": []
+    },
+    {
+      "description": "Compute total revenue per region from the parsed records",
+      "required_capabilities": ["aggregate by column", "compute sum"],
+      "depends_on": [0]
+    },
+    {
+      "description": "Generate a formatted summary table with per-region revenue",
+      "required_capabilities": ["tabular report generation"],
+      "depends_on": [1]
+    }
+  ],
+  "reasoning": "Three sequential phases: load, compute, report. Each step depends on the prior one."
+}
+```
 """

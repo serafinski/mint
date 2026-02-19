@@ -1,4 +1,9 @@
-"""Unit tests for the capability classifier."""
+"""Unit tests for the capability classifier.
+
+LLM-calling behaviour is covered by ``tests/integration/test_classifier.py``
+with real DeepSeek calls.  These tests cover schema validation and the
+classifier node's routing logic (patching ``classify_gap``, not the LLM).
+"""
 
 from __future__ import annotations
 
@@ -6,10 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.orchestrator.classifier import (
-    classifier_node,
-    classify_gap,
-)
+from src.orchestrator.classifier import classifier_node, classify_gap
 from src.schemas.capability import CapabilityType
 from src.schemas.task import (
     ClassificationResult,
@@ -52,131 +54,139 @@ class TestClassificationResult:
 
 
 # ---------------------------------------------------------------------------
-# classify_gap — LLM-based classification
+# classify_gap — LLM success and failure paths (mocking _get_llm)
 # ---------------------------------------------------------------------------
 
 
-def _mock_llm_chain(return_value):
-    """Set up mock init_chat_model → with_structured_output → invoke chain."""
+def _make_mock_llm(response=None, raises=None):
+    """Return a mock LLM chain (llm.with_structured_output().invoke() pattern)."""
     mock_llm = MagicMock()
     mock_structured = MagicMock()
     mock_llm.with_structured_output.return_value = mock_structured
-    mock_structured.invoke.return_value = return_value
-    return mock_llm, mock_structured
+    if raises is not None:
+        mock_structured.invoke.side_effect = raises
+    else:
+        mock_structured.invoke.return_value = response
+    return mock_llm
 
 
 class TestClassifyGap:
-    @pytest.fixture(autouse=True)
-    def _reset_classifier_llm(self):
-        """Reset the lazy-init LLM singleton so each test gets a fresh mock."""
-        import src.orchestrator.classifier as mod
+    def _gap(self, description="Parse CSV file", query="parse CSV"):
+        return GapItem(description=description, query=query)
 
-        mod._classifier_llm = None
-        yield
-        mod._classifier_llm = None
-
-    def test_successful_classification(self):
-        """LLM returns a valid ClassificationResult → ClassifiedGap produced."""
-        result = ClassificationResult(
-            classified_type=CapabilityType.SKILL,
-            confidence=0.9,
-            rationale="Multi-step data workflow",
-        )
-        mock_llm, _ = _mock_llm_chain(result)
-
-        gap = GapItem(
-            description="Data cleaning pipeline for records",
-            query="data cleaning pipeline",
-        )
-
-        with patch("langchain.chat_models.init_chat_model", return_value=mock_llm):
-            classified = classify_gap(gap)
-
-        assert classified.classified_type == CapabilityType.SKILL
-        assert classified.confidence == 0.9
-        assert classified.rationale == "Multi-step data workflow"
-        assert classified.description == gap.description
-        assert classified.query == gap.query
-
-    def test_temperature_zero(self):
-        """init_chat_model is called with temperature=0 for determinism."""
-        result = ClassificationResult(
+    def test_success_returns_classified_gap(self):
+        """Successful LLM call produces a ClassifiedGap with the right fields."""
+        mock_response = ClassificationResult(
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.95,
-            rationale="Stateless function",
+            rationale="Deterministic parse",
         )
-        mock_llm, _ = _mock_llm_chain(result)
+        gap = self._gap()
 
-        gap = GapItem(description="Parse JSON", query="parse JSON")
+        with patch(
+            "src.orchestrator.classifier._get_llm",
+            return_value=_make_mock_llm(mock_response),
+        ):
+            result = classify_gap(gap)
 
-        with patch("langchain.chat_models.init_chat_model", return_value=mock_llm) as mock_init:
+        assert isinstance(result, ClassifiedGap)
+        assert result.classified_type == CapabilityType.MCP_TOOL
+        assert result.confidence == 0.95
+        assert result.description == gap.description
+        assert result.query == gap.query
+
+    def test_llm_failure_falls_back_to_mcp_tool(self):
+        """When LLM raises any exception, classify_gap returns MCP_TOOL with confidence 0.3."""
+        gap = self._gap()
+
+        with patch(
+            "src.orchestrator.classifier._get_llm",
+            return_value=_make_mock_llm(raises=RuntimeError("API error")),
+        ):
+            result = classify_gap(gap)
+
+        assert result.classified_type == CapabilityType.MCP_TOOL
+        assert result.confidence == 0.3
+        assert result.description == gap.description
+        assert result.query == gap.query
+        assert "LLM classification failed" in result.rationale
+
+    def test_llm_failure_rationale_contains_error(self):
+        """Fallback rationale includes the original exception message."""
+        gap = self._gap()
+
+        with patch(
+            "src.orchestrator.classifier._get_llm",
+            return_value=_make_mock_llm(raises=ValueError("rate limit exceeded")),
+        ):
+            result = classify_gap(gap)
+
+        assert "rate limit exceeded" in result.rationale
+
+    def test_uses_structured_output_with_classification_result(self):
+        """classify_gap calls with_structured_output(ClassificationResult)."""
+        mock_response = ClassificationResult(
+            classified_type=CapabilityType.SKILL,
+            confidence=0.8,
+            rationale="Multi-step workflow",
+        )
+        gap = self._gap()
+        mock_llm = _make_mock_llm(mock_response)
+
+        with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
             classify_gap(gap)
 
-        mock_init.assert_called_once_with("deepseek:deepseek-chat", temperature=0)
+        mock_llm.with_structured_output.assert_called_once_with(ClassificationResult)
 
-    def test_prompt_includes_gap_fields(self):
-        """The prompt sent to the LLM contains the gap description and query."""
-        result = ClassificationResult(
+    def test_langfuse_callbacks_forwarded_to_llm(self):
+        """classify_gap passes a callbacks config to structured_llm.invoke when LangFuse is up."""
+        mock_response = ClassificationResult(
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.9,
-            rationale="Atomic operation",
+            rationale="test",
         )
-        mock_llm, mock_structured = _mock_llm_chain(result)
+        gap = self._gap()
+        mock_llm = _make_mock_llm(mock_response)
+        mock_handler = MagicMock()
 
-        gap = GapItem(
-            description="Compute SHA-256 hash of a file",
-            query="compute file hash",
-        )
-
-        with patch("langchain.chat_models.init_chat_model", return_value=mock_llm):
+        with (
+            patch("src.orchestrator.classifier._get_llm", return_value=mock_llm),
+            patch(
+                "src.orchestrator.classifier.LangFuseCallbackHandler",
+                return_value=mock_handler,
+            ),
+        ):
             classify_gap(gap)
 
-        call_args = mock_structured.invoke.call_args
-        prompt_sent = call_args[0][0]
-        assert "Compute SHA-256 hash of a file" in prompt_sent
-        assert "compute file hash" in prompt_sent
+        invoke_call = mock_llm.with_structured_output.return_value.invoke
+        config_arg = invoke_call.call_args.kwargs.get("config", {})
+        assert "callbacks" in config_arg
+        assert mock_handler in config_arg["callbacks"]
 
-    def test_llm_failure_defaults_to_mcp_tool(self):
-        """If the LLM call fails, default to MCP_TOOL with low confidence."""
-        mock_llm = MagicMock()
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.side_effect = RuntimeError("API error")
-
+    def test_gap_fields_preserved_on_success(self):
+        """description and query from the GapItem are preserved in the result."""
         gap = GapItem(
-            description="Something unusual",
-            query="something unusual",
+            description="Run a multi-step ETL pipeline",
+            query="ETL pipeline orchestration",
         )
-
-        with patch("langchain.chat_models.init_chat_model", return_value=mock_llm):
-            classified = classify_gap(gap)
-
-        assert classified.classified_type == CapabilityType.MCP_TOOL
-        assert classified.confidence == 0.3
-        assert "failed" in classified.rationale.lower()
-
-    def test_returns_classified_gap_type(self):
-        """classify_gap always returns a ClassifiedGap instance."""
-        result = ClassificationResult(
+        mock_response = ClassificationResult(
             classified_type=CapabilityType.AGENT,
-            confidence=0.85,
-            rationale="Requires planning",
-        )
-        mock_llm, _ = _mock_llm_chain(result)
-
-        gap = GapItem(
-            description="Autonomous investigation",
-            query="autonomous investigation agent",
+            confidence=0.7,
+            rationale="Needs planning",
         )
 
-        with patch("langchain.chat_models.init_chat_model", return_value=mock_llm):
-            classified = classify_gap(gap)
+        with patch(
+            "src.orchestrator.classifier._get_llm",
+            return_value=_make_mock_llm(mock_response),
+        ):
+            result = classify_gap(gap)
 
-        assert isinstance(classified, ClassifiedGap)
+        assert result.description == "Run a multi-step ETL pipeline"
+        assert result.query == "ETL pipeline orchestration"
 
 
 # ---------------------------------------------------------------------------
-# Classifier node
+# Classifier node — routing logic (patches classify_gap, not the LLM)
 # ---------------------------------------------------------------------------
 
 
@@ -275,3 +285,111 @@ class TestClassifierNode:
 
         for item in cmd.update["classified_gaps"]:
             assert isinstance(item, ClassifiedGap)
+
+    def test_fallback_classification_added_to_errors(self):
+        """When classify_gap returns a fallback result, the node records it in state.errors."""
+        state = TaskState(
+            task_description="Test",
+            gaps=[GapItem(description="Parse CSV", query="parse-csv")],
+        )
+
+        fallback = ClassifiedGap(
+            description="Parse CSV",
+            query="parse-csv",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.3,
+            rationale="LLM classification failed (API error); defaulting to MCP_TOOL",
+        )
+
+        with patch("src.orchestrator.classifier.classify_gap", return_value=fallback):
+            cmd = classifier_node(state)
+
+        assert len(cmd.update.get("errors", [])) == 1
+        assert "parse-csv" in cmd.update["errors"][0]
+
+    def test_fallback_classification_still_produces_classified_gap(self):
+        """A fallback classification is still included in classified_gaps."""
+        state = TaskState(
+            task_description="Test",
+            gaps=[GapItem(description="Parse CSV", query="parse-csv")],
+        )
+
+        fallback = ClassifiedGap(
+            description="Parse CSV",
+            query="parse-csv",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.3,
+            rationale="LLM classification failed (API error); defaulting to MCP_TOOL",
+        )
+
+        with patch("src.orchestrator.classifier.classify_gap", return_value=fallback):
+            cmd = classifier_node(state)
+
+        assert len(cmd.update["classified_gaps"]) == 1
+        assert cmd.update["classified_gaps"][0].classified_type == CapabilityType.MCP_TOOL
+
+    def test_preserves_existing_errors(self):
+        """classifier_node propagates pre-existing errors from state."""
+        state = TaskState(
+            task_description="Test",
+            gaps=[],
+            errors=["pre-existing error from decomposition"],
+        )
+        cmd = classifier_node(state)
+
+        assert "pre-existing error from decomposition" in cmd.update["errors"]
+
+    def test_classify_gap_unhandled_exception_propagates(self):
+        """Unexpected exceptions raised by classify_gap propagate from classifier_node.
+
+        classify_gap itself has comprehensive exception handling and should not
+        normally raise. This test documents the current behaviour for the edge
+        case where an exception does escape classify_gap (e.g., a Pydantic
+        validation failure during ClassifiedGap instantiation).
+        """
+        state = TaskState(
+            task_description="Test",
+            gaps=[GapItem(description="Parse CSV", query="parse-csv")],
+        )
+
+        with (
+            patch(
+                "src.orchestrator.classifier.classify_gap",
+                side_effect=RuntimeError("unexpected internal error"),
+            ),
+            pytest.raises(RuntimeError, match="unexpected internal error"),
+        ):
+            classifier_node(state)
+
+    def test_preserves_existing_classified_gaps(self):
+        """classifier_node accumulates into existing classified_gaps, not replaces them."""
+        existing = ClassifiedGap(
+            description="Pre-classified gap from earlier pass",
+            query="pre-existing",
+            classified_type=CapabilityType.AGENT,
+            confidence=0.8,
+            rationale="Pre-existing",
+        )
+        state = TaskState(
+            task_description="Incremental classification",
+            gaps=[
+                GapItem(description="New tool needed", query="new-tool"),
+            ],
+            classified_gaps=[existing],
+        )
+
+        new_result = ClassifiedGap(
+            description="New tool needed",
+            query="new-tool",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.95,
+            rationale="Atomic operation",
+        )
+
+        with patch("src.orchestrator.classifier.classify_gap", return_value=new_result):
+            cmd = classifier_node(state)
+
+        classified = cmd.update["classified_gaps"]
+        assert len(classified) == 2
+        assert classified[0].query == "pre-existing"
+        assert classified[1].query == "new-tool"
