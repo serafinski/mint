@@ -32,6 +32,7 @@ class SubTaskItem(BaseModel):
     description: str = Field(..., description="What this subtask needs to accomplish")
     required_capabilities: list[str] = Field(
         ...,
+        min_length=1,
         description="Capability names or search queries needed for this subtask",
     )
     depends_on: list[int] = Field(

@@ -7,7 +7,7 @@ structured subtask output.
 Operational boundaries (from CLAUDE.md):
 - ``recursion_limit=25`` (max steps)
 - Node-level timeout: 120 s
-- Fresh initialization per invocation (stateless)
+- Graph is a stateless CompiledStateGraph; state is fresh per ``.invoke()`` call
 - On timeout / error: return partial results with error flag
 """
 
@@ -25,6 +25,39 @@ from src.orchestrator.prompts.decomposition import DECOMPOSITION_SYSTEM_PROMPT
 from src.schemas.task import DecompositionResult, SubTask, TaskState, TaskStatus
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# LangFuse event helper
+# ---------------------------------------------------------------------------
+
+
+def _emit_langfuse_event(
+    langfuse_handler: object | None,
+    name: str,
+    level: str,
+    metadata: dict,
+) -> None:
+    """Emit a named event to LangFuse, linked to the active trace if available.
+
+    Silently no-ops if LangFuse is unavailable.
+    """
+    try:
+        from langfuse import Langfuse
+        from langfuse.types import TraceContext
+
+        trace_id: str | None = getattr(langfuse_handler, "last_trace_id", None)
+        lf = Langfuse()
+        lf.create_event(
+            trace_context=TraceContext(trace_id=trace_id) if trace_id else None,
+            name=name,
+            level=level,  # type: ignore[arg-type]
+            metadata=metadata,
+        )
+        lf.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Operational boundaries
@@ -70,6 +103,7 @@ def decomposition_node(
     """
     agent = _get_agent()
 
+    langfuse_handler = None
     try:
         langfuse_handler = LangFuseCallbackHandler()
         callbacks = [langfuse_handler]
@@ -113,9 +147,21 @@ def decomposition_node(
     except concurrent.futures.TimeoutError:
         errors.append(f"Decomposition agent timed out after {DECOMPOSITION_TIMEOUT_S}s")
         logger.error("DecompositionAgent: timed out after %ds", DECOMPOSITION_TIMEOUT_S)
+        _emit_langfuse_event(
+            langfuse_handler,
+            "decomposition.timeout",
+            "ERROR",
+            {"timeout_s": DECOMPOSITION_TIMEOUT_S},
+        )
     except Exception as exc:  # noqa: BLE001
         errors.append(f"Decomposition agent error: {exc}")
         logger.exception("DecompositionAgent: unexpected error")
+        _emit_langfuse_event(
+            langfuse_handler,
+            "decomposition.error",
+            "ERROR",
+            {"error": str(exc)},
+        )
 
     # Fallback: if no subtasks were produced, treat the whole task as one subtask
     if not subtasks:

@@ -344,13 +344,21 @@ If timeline pressure forces scope reduction:
 
 - **`src/orchestrator/decomposition.py`** — DeepAgent (`create_deep_agent`) wrapped in a LangGraph node. Uses `deepseek-chat` (reasoner lacks `tool_choice`), `response_format=DecompositionResult`, 120s timeout via `ThreadPoolExecutor`, `recursion_limit=25`. Falls back to treating the whole task as one subtask on error.
 - **`src/orchestrator/classifier.py`** — LLM-only classification with `temperature=0` and `with_structured_output(ClassificationResult)`. Shared LLM instance via lazy singleton. Falls back to `MCP_TOOL` with 0.3 confidence on LLM failure.
-- **`src/orchestrator/prompts/`** — Prompt package with `decomposition.py` and `classifier.py`. Classifier prompt uses intent-focused category definitions with few-shot examples and lowercase enum values (`mcp_tool`, `skill`, `agent`).
+- **`src/orchestrator/prompts/`** — Prompt package with `decomposition.py`, `classifier.py`, `mcp_tool_generator.py`, `skill_generator.py`, `agent_generator.py`. All generator prompts include complete few-shot examples.
 - **`src/schemas/task.py`** — Added `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `GeneratorInput` (18 total schema types across 4 files).
 - **Tests** — 143 unit + 7 integration (3 decomposition, 4 classifier) = 150 passing.
 
+### Iteration 2 Phase B (Complete)
+
+- **`src/orchestrator/generators/mcp_tool.py`** — Plain LangGraph node. Generates FastMCP Python tools from `ClassifiedGap`. Validates syntax + FastMCP structure (`FastMCP`, `@mcp.tool`, `async def`). One-shot repair pass on failure. LangFuse tracing.
+- **`src/orchestrator/generators/skill.py`** — Plain LangGraph node. Generates SKILL.md files from `ClassifiedGap`. Validates with `tools/quick_validate.py` + non-empty body check. Repair pass. Writes to `.deepagents/skills/<name>/SKILL.md`. LangFuse tracing.
+- **`src/orchestrator/generators/agent.py`** — Plain LangGraph node. Generates system prompts + LangGraph node configs. Detects DeepAgent vs. plain agent. For DeepAgent-type, generates SKILL.md content AND writes it to `.deepagents/skills/<agent-name>/SKILL.md`. Repair pass. LangFuse tracing.
+- **`src/orchestrator/tool_loader.py`** — `ToolLoader` class. Loads generated MCP tools via `importlib` dynamic import. Executes in sandboxed subprocess. `register_tool()` registers loaded tools in `SkillRegistry`. Cleanup on exit via `atexit`.
+- **Tests** — 288 passing (268 unit + 20 integration). Integration tests skip without `DEEPSEEK_API_KEY`.
+
 ## Current Iteration
 
-**Iteration 2 in progress — Phase A complete.** Next: Phase B (generators via Agent Team), then Phase C (pipeline wiring).
+**Iteration 2 in progress — Phases A and B complete.** Next: Phase C (pipeline wiring — gap detection node, full LangGraph graph connecting decomposition → gap detection → classification → generation → loading → registration).
 
 See `docs/iteration_plan.md` for the full plan.
 
@@ -361,7 +369,9 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/schemas/`** — All 18 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState`, `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact`, `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
 - **`src/orchestrator/decomposition.py`** — `decomposition_node()` (DeepAgent-backed task decomposition)
 - **`src/orchestrator/classifier.py`** — `classify_gap()`, `classifier_node()` (LLM-based classification)
-- **`src/orchestrator/prompts/`** — `DECOMPOSITION_SYSTEM_PROMPT`, `CLASSIFICATION_PROMPT`
+- **`src/orchestrator/prompts/`** — All prompt constants for decomposition, classification, and all three generators
+- **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` (LangGraph nodes; all use `goto=END` as Phase C placeholder)
+- **`src/orchestrator/tool_loader.py`** — `ToolLoader` (load, execute, register_tool, cleanup), `LoadedTool`, `ToolResult`
 - **`src/registry/store.py`** — `SkillRegistry` (full CRUD + hierarchical search), `seed_registry()`
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + 4 granularity metric queries)
 - **`src/mcp_tools/fibonacci.py`** — Reference MCP tool implementation

@@ -30,6 +30,21 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _reset_decomposition_agent():
+    """Reset the cached DeepAgent singleton before each test for isolation.
+
+    ``_get_agent()`` uses a module-level singleton.  Resetting it ensures
+    each test starts with a fresh agent (avoids state carry-over between tests).
+    """
+    import src.orchestrator.decomposition as decomp
+
+    original = decomp._decomposition_agent
+    decomp._decomposition_agent = None
+    yield
+    decomp._decomposition_agent = original
+
+
 class TestDecompositionIntegration:
     """Live DeepAgent integration tests."""
 
@@ -98,7 +113,11 @@ class TestDecompositionIntegration:
         for msg in messages:
             if hasattr(msg, "tool_calls") and msg.tool_calls:
                 for tc in msg.tool_calls:
-                    tool_calls_found.append(tc.get("name", ""))
+                    # ToolCall can be a TypedDict (dict-like) or an object
+                    if isinstance(tc, dict):
+                        tool_calls_found.append(tc.get("name", ""))
+                    else:
+                        tool_calls_found.append(getattr(tc, "name", ""))
 
         assert "write_todos" in tool_calls_found, (
             f"Expected write_todos in tool calls, found: {tool_calls_found}"

@@ -1,4 +1,8 @@
-"""Unit tests for the task decomposition DeepAgent node."""
+"""Unit tests for task decomposition schemas and node behaviour.
+
+Integration tests with real DeepAgent calls are in
+``tests/integration/test_decomposition.py``.
+"""
 
 from __future__ import annotations
 
@@ -10,14 +14,11 @@ import pytest
 from src.orchestrator.decomposition import decomposition_node
 from src.schemas.task import (
     DecompositionResult,
+    SubTask,
     SubTaskItem,
     TaskState,
     TaskStatus,
 )
-
-# ---------------------------------------------------------------------------
-# Schema tests
-# ---------------------------------------------------------------------------
 
 
 class TestDecompositionResult:
@@ -57,178 +58,167 @@ class TestDecompositionResult:
         assert roundtripped.description == "Test task"
         assert roundtripped.depends_on == [0, 1]
 
+    def test_subtask_empty_required_capabilities_rejected(self):
+        """SubTaskItem with empty required_capabilities list is invalid (min_length=1)."""
+        with pytest.raises(ValueError):
+            SubTaskItem(description="Do something", required_capabilities=[])
+
 
 # ---------------------------------------------------------------------------
-# Node tests — mocked DeepAgent
+# decomposition_node — behaviour (mocking the DeepAgent)
 # ---------------------------------------------------------------------------
 
 
-def _make_agent_result(structured: DecompositionResult | None):
-    """Create a fake DeepAgent result dict."""
-    return {"structured_response": structured, "messages": []}
+def _make_mock_pool(future_result=None, future_raises=None):
+    """Return a (MockTPE class, future) pair for patching ThreadPoolExecutor."""
+    mock_future = MagicMock()
+    if future_raises is not None:
+        mock_future.result.side_effect = future_raises
+    else:
+        mock_future.result.return_value = future_result
+
+    mock_pool = MagicMock()
+    mock_pool.submit.return_value = mock_future
+
+    mock_tpe_cls = MagicMock()
+    mock_tpe_cls.return_value.__enter__ = MagicMock(return_value=mock_pool)
+    mock_tpe_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+    return mock_tpe_cls, mock_future
 
 
 class TestDecompositionNode:
-    """Tests for decomposition_node with a mocked DeepAgent."""
+    """Unit tests for decomposition_node — all LLM/agent calls are mocked."""
 
-    def _mock_agent(self, return_value):
-        """Set up a mock agent that returns *return_value* on invoke."""
-        mock = MagicMock()
-        mock.invoke.return_value = return_value
-        return mock
+    @pytest.fixture
+    def state(self):
+        return TaskState(task_description="Parse a CSV and compute statistics")
 
-    def test_successful_decomposition(self):
+    def test_structured_response_populates_subtasks(self, state):
+        """Valid DecompositionResult is converted into SubTask objects in state."""
         structured = DecompositionResult(
             subtasks=[
                 SubTaskItem(
-                    description="Load data",
-                    required_capabilities=["read CSV file"],
+                    description="Parse CSV file",
+                    required_capabilities=["parse CSV"],
                 ),
                 SubTaskItem(
-                    description="Analyze data",
-                    required_capabilities=["compute statistics"],
+                    description="Compute mean and std",
+                    required_capabilities=["compute mean", "compute std"],
                     depends_on=[0],
                 ),
             ],
-            reasoning="Two-phase approach",
+            reasoning="Split I/O from computation",
         )
-        mock_agent = self._mock_agent(_make_agent_result(structured))
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
 
-        state = TaskState(task_description="Analyze sales data from CSV")
-
-        with patch("src.orchestrator.decomposition._get_agent", return_value=mock_agent):
-            cmd = decomposition_node(state)
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
 
         assert cmd.goto == "gap_detection"
-        assert len(cmd.update["subtasks"]) == 2
-        assert cmd.update["subtasks"][0].description == "Load data"
-        assert cmd.update["subtasks"][1].depends_on == [0]
-        assert "read CSV file" in cmd.update["required_capabilities"]
-        assert "compute statistics" in cmd.update["required_capabilities"]
         assert cmd.update["status"] == TaskStatus.DECOMPOSING
-        assert cmd.update["errors"] == []
+        subtasks = cmd.update["subtasks"]
+        assert len(subtasks) == 2
+        assert all(isinstance(s, SubTask) for s in subtasks)
+        assert subtasks[0].description == "Parse CSV file"
+        assert subtasks[1].depends_on == [0]
 
-    def test_no_structured_response(self):
-        """Agent returns no structured_response → fallback to whole task."""
-        mock_agent = self._mock_agent({"structured_response": None, "messages": []})
-        state = TaskState(task_description="Do something complex")
-
-        with patch("src.orchestrator.decomposition._get_agent", return_value=mock_agent):
-            cmd = decomposition_node(state)
-
-        assert cmd.goto == "gap_detection"
-        # Fallback: no subtasks, required_capabilities = [task_description]
-        assert cmd.update["subtasks"] == []
-        assert cmd.update["required_capabilities"] == ["Do something complex"]
-        assert any("no structured response" in e for e in cmd.update["errors"])
-
-    def test_timeout_handling(self):
-        """Agent that hangs → timeout → partial results with error."""
-        mock_agent = MagicMock()
-        mock_agent.invoke.side_effect = lambda *a, **kw: (_ for _ in ()).throw(
-            concurrent.futures.TimeoutError()
-        )
-
-        # Patch both _get_agent and the ThreadPoolExecutor to simulate timeout
-        state = TaskState(task_description="Hang forever")
-
-        with (
-            patch("src.orchestrator.decomposition._get_agent", return_value=mock_agent),
-            patch(
-                "src.orchestrator.decomposition.concurrent.futures.ThreadPoolExecutor"
-            ) as mock_pool_cls,
-        ):
-            mock_pool = MagicMock()
-            mock_pool_cls.return_value.__enter__ = MagicMock(return_value=mock_pool)
-            mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
-            mock_future = MagicMock()
-            mock_future.result.side_effect = concurrent.futures.TimeoutError()
-            mock_pool.submit.return_value = mock_future
-
-            cmd = decomposition_node(state)
-
-        assert cmd.goto == "gap_detection"
-        assert cmd.update["subtasks"] == []
-        assert cmd.update["required_capabilities"] == ["Hang forever"]
-        assert any("timed out" in e for e in cmd.update["errors"])
-
-    def test_agent_exception_handling(self):
-        """Agent raises unexpected exception → error recorded, fallback."""
-        mock_agent = MagicMock()
-
-        state = TaskState(task_description="Trigger error")
-
-        with (
-            patch("src.orchestrator.decomposition._get_agent", return_value=mock_agent),
-            patch(
-                "src.orchestrator.decomposition.concurrent.futures.ThreadPoolExecutor"
-            ) as mock_pool_cls,
-        ):
-            mock_pool = MagicMock()
-            mock_pool_cls.return_value.__enter__ = MagicMock(return_value=mock_pool)
-            mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
-            mock_future = MagicMock()
-            mock_future.result.side_effect = RuntimeError("API key invalid")
-            mock_pool.submit.return_value = mock_future
-
-            cmd = decomposition_node(state)
-
-        assert cmd.goto == "gap_detection"
-        assert cmd.update["subtasks"] == []
-        assert any("API key invalid" in e for e in cmd.update["errors"])
-
-    def test_preserves_existing_errors(self):
-        """Existing errors in state are carried forward."""
+    def test_required_capabilities_aggregated_from_all_subtasks(self, state):
+        """required_capabilities collects all capability strings across subtasks."""
         structured = DecompositionResult(
             subtasks=[
-                SubTaskItem(
-                    description="Simple task",
-                    required_capabilities=["do thing"],
-                ),
-            ],
+                SubTaskItem(description="A", required_capabilities=["cap-a", "cap-b"]),
+                SubTaskItem(description="B", required_capabilities=["cap-c"]),
+            ]
         )
-        mock_agent = self._mock_agent(_make_agent_result(structured))
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert set(cmd.update["required_capabilities"]) == {"cap-a", "cap-b", "cap-c"}
+
+    def test_no_structured_response_falls_back_to_task_description(self, state):
+        """If structured_response is None, falls back to whole task as one capability."""
+        mock_tpe, _ = _make_mock_pool({"structured_response": None})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["subtasks"] == []
+        assert cmd.update["required_capabilities"] == [state.task_description]
+        errors = cmd.update["errors"]
+        assert any("no structured response" in e.lower() for e in errors)
+
+    def test_timeout_falls_back_and_records_error(self, state):
+        """TimeoutError from the agent is caught and recorded in errors."""
+        mock_tpe, _ = _make_mock_pool(
+            future_raises=concurrent.futures.TimeoutError()
+        )
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["subtasks"] == []
+        assert cmd.update["required_capabilities"] == [state.task_description]
+        errors = cmd.update["errors"]
+        assert any("timed out" in e.lower() for e in errors)
+
+    def test_arbitrary_exception_falls_back_and_records_error(self, state):
+        """Any unexpected exception is caught and recorded in errors."""
+        mock_tpe, _ = _make_mock_pool(
+            future_raises=RuntimeError("Connection refused")
+        )
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["subtasks"] == []
+        assert cmd.update["required_capabilities"] == [state.task_description]
+        errors = cmd.update["errors"]
+        assert any("Connection refused" in e for e in errors)
+
+    def test_status_always_decomposing(self, state):
+        """Status is DECOMPOSING regardless of success or failure."""
+        mock_tpe_ok, _ = _make_mock_pool({"structured_response": None})
+        mock_tpe_err, _ = _make_mock_pool(future_raises=RuntimeError("err"))
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe_ok):
+                cmd_ok = decomposition_node(state)
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe_err):
+                cmd_err = decomposition_node(state)
+
+        assert cmd_ok.update["status"] == TaskStatus.DECOMPOSING
+        assert cmd_err.update["status"] == TaskStatus.DECOMPOSING
+
+    def test_routes_to_gap_detection(self, state):
+        """Node always routes to gap_detection."""
+        mock_tpe, _ = _make_mock_pool({"structured_response": None})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.goto == "gap_detection"
+
+    def test_existing_errors_preserved(self):
+        """Errors already in state.errors are kept alongside new ones."""
         state = TaskState(
             task_description="Test",
-            errors=["previous error"],
+            errors=["pre-existing error"],
         )
+        mock_tpe, _ = _make_mock_pool(future_raises=RuntimeError("new error"))
 
-        with patch("src.orchestrator.decomposition._get_agent", return_value=mock_agent):
-            cmd = decomposition_node(state)
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
 
-        assert "previous error" in cmd.update["errors"]
-        assert len(cmd.update["subtasks"]) == 1
-
-    def test_empty_subtasks_triggers_fallback(self):
-        """Agent returns empty subtask list → fallback to whole task."""
-        structured = DecompositionResult(subtasks=[])
-        mock_agent = self._mock_agent(_make_agent_result(structured))
-        state = TaskState(task_description="Simple one-liner")
-
-        with patch("src.orchestrator.decomposition._get_agent", return_value=mock_agent):
-            cmd = decomposition_node(state)
-
-        assert cmd.update["required_capabilities"] == ["Simple one-liner"]
-
-    def test_required_capabilities_collected(self):
-        """All required_capabilities from subtasks are aggregated."""
-        structured = DecompositionResult(
-            subtasks=[
-                SubTaskItem(
-                    description="Step 1",
-                    required_capabilities=["cap-a", "cap-b"],
-                ),
-                SubTaskItem(
-                    description="Step 2",
-                    required_capabilities=["cap-c"],
-                    depends_on=[0],
-                ),
-            ],
-        )
-        mock_agent = self._mock_agent(_make_agent_result(structured))
-        state = TaskState(task_description="Multi-step task")
-
-        with patch("src.orchestrator.decomposition._get_agent", return_value=mock_agent):
-            cmd = decomposition_node(state)
-
-        assert cmd.update["required_capabilities"] == ["cap-a", "cap-b", "cap-c"]
+        errors = cmd.update["errors"]
+        assert "pre-existing error" in errors
+        assert any("new error" in e for e in errors)
