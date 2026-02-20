@@ -244,7 +244,7 @@ Every DeepAgent invocation (`create_deep_agent()`) must respect these constraint
 
 | Constraint | Value | Notes |
 |---|---|---|
-| `recursion_limit` (decomposition) | 25 | ~12 logical steps; each tool call = 2 graph steps |
+| `recursion_limit` (decomposition) | 35 | ~17 logical steps; each tool call = 2 graph steps |
 | `recursion_limit` (adversarial probing) | 35 | Needs more exploration room |
 | `recursion_limit` (failure analysis) | 25 | Focused investigation |
 | Node-level timeout (decomposition) | 120s | Prevents pipeline hang |
@@ -354,11 +354,17 @@ If timeline pressure forces scope reduction:
 - **`src/orchestrator/generators/skill.py`** — Plain LangGraph node. Generates SKILL.md files from `ClassifiedGap`. Validates with `tools/quick_validate.py` + non-empty body check. Repair pass. Writes to `.deepagents/skills/<name>/SKILL.md`. LangFuse tracing.
 - **`src/orchestrator/generators/agent.py`** — Plain LangGraph node. Generates system prompts + LangGraph node configs. Detects DeepAgent vs. plain agent. For DeepAgent-type, generates SKILL.md content AND writes it to `.deepagents/skills/<agent-name>/SKILL.md`. Repair pass. LangFuse tracing.
 - **`src/orchestrator/tool_loader.py`** — `ToolLoader` class. Loads generated MCP tools via `importlib` dynamic import. Executes in sandboxed subprocess. `register_tool()` registers loaded tools in `SkillRegistry`. Cleanup on exit via `atexit`.
-- **Tests** — 288 passing (268 unit + 20 integration). Integration tests skip without `DEEPSEEK_API_KEY`.
+- **Tests** — 300 total (280 unit + 20 integration). 298 passing; 2 integration tests skip in CI without `DEEPSEEK_API_KEY` (decomposition recursion limit fixed to 35 — tests may pass with live API).
 
 ## Current Iteration
 
-**Iteration 2 in progress — Phases A and B complete.** Next: Phase C (pipeline wiring — gap detection node, full LangGraph graph connecting decomposition → gap detection → classification → generation → loading → registration).
+**Iteration 2 Phase C in progress.** Building the full LangGraph pipeline: decomposition → gap detection → classification → generation (sequential chaining) → loading → registration.
+
+### ✅ Decision: Generator chaining strategy → sequential (not Send fan-out)
+
+The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agent`) are chained sequentially in Phase C. Each node filters by `classified_type`, processes its gaps, and hands off to the next node via `Command(goto=...)`.
+
+**Why not Send fan-out:** Parallel fan-out requires Annotated reducers on `TaskState` list fields and refactored generator signatures accepting `GeneratorInput` instead of `TaskState`. Sequential chaining is simpler, avoids schema changes, and is sufficient for the thesis — generation latency is not a bottleneck. Send-based parallelism is documented as future work.
 
 See `docs/iteration_plan.md` for the full plan.
 

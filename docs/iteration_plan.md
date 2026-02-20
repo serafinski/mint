@@ -197,7 +197,7 @@ Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in th
    - Use `response_format` for structured output (Pydantic model with subtasks)
    - System prompt instructs the agent to plan decomposition, produce subtasks with capability annotations, and write results to files
    - Use `deepseek-chat` as the model (`deepseek-reasoner` lacks `tool_choice` support required by DeepAgents)
-   - **Operational boundaries:** `recursion_limit=25` (~12 logical steps; each tool call = 2 graph steps), timeout at node level (120s), fresh initialization per invocation
+   - **Operational boundaries:** `recursion_limit=35` (~17 logical steps; each tool call = 2 graph steps), timeout at node level (120s), fresh initialization per invocation
    - Trace with LangFuse via callback handler
 
 2. **Capability classifier** (`src/orchestrator/classifier.py`)
@@ -271,7 +271,77 @@ Require plan approval. Only approve plans that include test coverage and
 use the existing schemas from src/schemas/.
 ```
 
-*Phase C (single session):* Wire everything into the LangGraph pipeline graph. Use Command API for node routing.
+### ✅ Decision: Generator chaining strategy → sequential (not Send fan-out)
+
+The three generator nodes are chained sequentially: `generate_mcp_tool` → `generate_skill` → `generate_agent`. Each node filters by `classified_type` and hands off via `Command(goto=...)`. No `TaskState` schema changes (no Annotated reducers) are required. Send-based parallel fan-out is future work.
+
+### ✅ Decision: `DECOMPOSITION_RECURSION_LIMIT` raised to 35
+
+Integration tests confirmed `recursion_limit=25` was too low for the DeepAgent to complete real tasks. Raised to 35 (~17 logical steps). The production fallback (return partial results with error flag) remains in place.
+
+*Phase C (single session, in progress):*
+
+**Goal:** Wire all Phase A/B components into a single end-to-end LangGraph pipeline. No new LLM logic — this is plumbing work only.
+
+**Final graph topology:**
+```
+START → decomposition_node → gap_detection_node → classifier_node
+      → generate_mcp_tool → generate_skill → generate_agent
+      → loading_node → END
+```
+
+All nodes use Command API for routing. The registry and ToolLoader are injected into the graph via closures (same pattern as the Iteration 0 pipeline).
+
+**Components to build:**
+
+1. **`src/orchestrator/gap_detection.py`** (new file)
+   - Plain LangGraph node that wraps `registry.detect_gaps(state.required_capabilities)`.
+   - Signature: `gap_detection_node(state: TaskState, registry: SkillRegistry) -> Command[Literal["classifier_node"]]`
+   - Populates `state.matches` (from `detect_gaps` matches) and `state.gaps` (from `detect_gaps` gaps) using `MatchItem` and `GapItem` schemas.
+   - Sets `status = TaskStatus.DETECTING_GAPS`.
+   - Routes to `"classifier_node"` regardless of whether gaps exist (classifier handles empty gap list gracefully — already tested).
+   - `detect_gaps` return signature: `(list[tuple[CapabilityDescriptor, float, str]], list[tuple[str, str]])` — matches are `(capability, score, query)`, gaps are `(query, reason)`.
+
+2. **`src/orchestrator/loading_node.py`** (new file)
+   - Plain LangGraph node that loads and registers all `MCP_TOOL` artifacts produced by the generators.
+   - Skills and agents are already written to disk during generation — no loading needed for them.
+   - Signature: `loading_node(state: TaskState, loader: ToolLoader, registry: SkillRegistry) -> Command[Literal["__end__"]]`
+   - For each artifact in `state.generated_artifacts` where `capability_type == MCP_TOOL`:
+     - Call `loader.load_tool(artifact)` — raises on import/syntax failure; catch and record error, continue.
+     - Call `loader.execute_tool(loaded, inputs={})` with empty inputs as a smoke-test — if it fails, log a warning but still register (Tier 2 verification in Iteration 3 will do proper testing).
+     - Call `loader.register_tool(artifact, registry)` to make it discoverable.
+   - Sets `status = TaskStatus.COMPLETED` if no errors, `TaskStatus.FAILED` if all generations failed (i.e., no artifacts at all), otherwise `TaskStatus.COMPLETED` with errors recorded.
+   - Routes to `END`.
+
+3. **`src/orchestrator/pipeline.py`** (rewrite)
+   - Replace the Iteration 0 pipeline entirely.
+   - `create_pipeline(registry: SkillRegistry, loader: ToolLoader) -> StateGraph`
+   - Wire all nodes using the topology above.
+   - Inject registry and loader via closures for nodes that need them (gap_detection_node, loading_node).
+   - Full LangFuse tracing: pass a `CallbackHandler` in the config at invocation time (caller's responsibility, same as demo.py).
+   - Keep `StateGraph(TaskState)` as the state type.
+
+4. **Changes to existing nodes** (minimal edits):
+   - `src/orchestrator/classifier.py` — change `goto=END` to `goto="generate_mcp_tool"`.
+   - `src/orchestrator/generators/mcp_tool.py` — change `goto=END` to `goto="generate_skill"`.
+   - `src/orchestrator/generators/skill.py` — change `goto=END` to `goto="generate_agent"`.
+   - `src/orchestrator/generators/agent.py` — change `goto=END` to `goto="loading_node"`.
+   - Remove the `TODO Phase C` comments from all four files once the changes are made.
+
+**Tests to write:**
+
+- `tests/unit/test_gap_detection.py` — mock `SkillRegistry.detect_gaps()` for: (a) all matches, (b) all gaps, (c) mixed. Verify `state.matches`, `state.gaps`, `status`, and `goto` target.
+- `tests/unit/test_loading_node.py` — mock `ToolLoader.load_tool`, `execute_tool`, `register_tool`. Verify: (a) MCP artifacts get loaded and registered, (b) SKILL/AGENT artifacts are skipped, (c) load failure is recorded in errors but pipeline continues.
+- `tests/unit/test_pipeline.py` (update existing) — compile the new pipeline with mock registry + loader, invoke with a synthetic `TaskState`, verify the graph reaches END and state fields are populated as expected.
+- `tests/integration/test_pipeline_e2e.py` (new) — full end-to-end integration test with a real registry (seeded) and real ToolLoader. Provide a simple task description that maps to a known gap in the seeded registry, verify a `GeneratedArtifact` is produced and registered. Mark with `pytest.mark.integration` and skip without `DEEPSEEK_API_KEY`.
+
+**What not to do in Phase C:**
+- Do not add LLM logic to gap_detection_node or loading_node — they are pure Python wrappers.
+- Do not change generator signatures to accept `GeneratorInput` — that is future work.
+- Do not add verification logic — that is Iteration 3.
+- Do not modify `src/schemas/` — all required types already exist.
+
+**After Phase C completes:** Update CLAUDE.md — mark Phase C complete, update "Stable Interfaces" with the new modules, update "What's Built" section. Then run the Iteration 2 critique checkpoint before starting Iteration 3.
 
 ### Exit criteria
 - DeepAgent decomposition produces structured subtask breakdowns using `write_todos` and `response_format`
@@ -610,7 +680,7 @@ DeepAgents are powerful but expensive and unpredictable. These constraints apply
 
 | Constraint | Value | Rationale |
 |---|---|---|
-| `recursion_limit` (decomposition) | 25 | ~12 logical steps; each tool call = 2 graph steps |
+| `recursion_limit` (decomposition) | 35 | ~17 logical steps; each tool call = 2 graph steps |
 | `recursion_limit` (adversarial) | 35 | Adversarial probing needs more exploration room |
 | `recursion_limit` (failure analysis) | 25 | Failure analysis is focused investigation |
 | Node-level timeout (decomposition) | 120s | Prevents pipeline hang if agent loops |
