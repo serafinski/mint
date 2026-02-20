@@ -224,7 +224,7 @@ class TestClassifierNode:
         with patch("src.orchestrator.classifier.classify_gap", side_effect=mock_results):
             cmd = classifier_node(state)
 
-        assert cmd.goto == "__end__"
+        assert cmd.goto == "generate_mcp_tool"
         classified = cmd.update["classified_gaps"]
         assert len(classified) == 2
         assert classified[0].classified_type == CapabilityType.MCP_TOOL

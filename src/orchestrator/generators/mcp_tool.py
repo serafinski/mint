@@ -16,7 +16,6 @@ import re
 from typing import Literal
 
 from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
-from langgraph.graph import END
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -310,16 +309,12 @@ def generate_single_tool(
 
 def generate_mcp_tool(
     state: TaskState,
-    # TODO Phase C: change signature to accept GeneratorInput (single ClassifiedGap
-    # + task_context) instead of full TaskState.  The graph will use Send() to
-    # fan out each gap individually via generate_mcp_tool, generate_skill, and
-    # generate_agent nodes.  The node will then route to the verification gate
-    # rather than END.
-) -> Command[Literal["__end__"]]:
+) -> Command[Literal["generate_skill"]]:
     """Generate MCP tools for all classified gaps of type MCP_TOOL.
 
-    Routes to ``END`` for now.  In Phase C this will route to the
-    verification gate.
+    Filters ``state.classified_gaps`` to MCP_TOOL type, generates a tool for
+    each, and hands off to ``generate_skill`` for the next stage of the
+    sequential generator chain.
     """
     mcp_gaps = [
         gap
@@ -343,5 +338,5 @@ def generate_mcp_tool(
             "errors": errors,
             "status": TaskStatus.GENERATING,
         },
-        goto=END,
+        goto="generate_skill",
     )

@@ -126,7 +126,7 @@ class TestMcpToolGeneratorLive:
             f"Expected 1 artifact, errors: {cmd.update['errors']}"
         )
         assert cmd.update["errors"] == []
-        assert cmd.goto == "__end__"
+        assert cmd.goto == "generate_skill"
 
         artifact = cmd.update["generated_artifacts"][0]
         assert artifact.capability_type == CapabilityType.MCP_TOOL

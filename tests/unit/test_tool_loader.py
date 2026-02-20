@@ -367,7 +367,7 @@ class TestRegisterTool:
         self.loader.cleanup()
 
     def test_register_mcp_tool(self):
-        """register_tool calls registry.register() with a CapabilityDescriptor."""
+        """register_tool calls registry.add() with a CapabilityDescriptor."""
         artifact = GeneratedArtifact(
             capability_name="add-numbers",
             capability_type=CapabilityType.MCP_TOOL,
@@ -377,7 +377,7 @@ class TestRegisterTool:
 
         descriptor = self.loader.register_tool(artifact, mock_registry)
 
-        mock_registry.register.assert_called_once()
+        mock_registry.add.assert_called_once()
         assert isinstance(descriptor, CapabilityDescriptor)
         assert descriptor.name == "add-numbers"
         assert descriptor.capability_type == CapabilityType.MCP_TOOL
@@ -409,7 +409,7 @@ class TestRegisterTool:
         with pytest.raises(ValueError, match="MCP_TOOL"):
             self.loader.register_tool(artifact, mock_registry)
 
-        mock_registry.register.assert_not_called()
+        mock_registry.add.assert_not_called()
 
 
 class TestCleanup:

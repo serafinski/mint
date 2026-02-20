@@ -209,7 +209,7 @@ class TestGenerateSkillNode:
         assert isinstance(cmd, Command)
         assert len(cmd.update["generated_artifacts"]) == 0
         assert len(cmd.update["errors"]) == 0
-        assert cmd.goto == "__end__"
+        assert cmd.goto == "generate_agent"
 
     def test_empty_gaps_command_structure(self):
         """Empty gaps → correct Command structure with all required keys and status."""
@@ -220,7 +220,7 @@ class TestGenerateSkillNode:
         assert cmd.update["generated_artifacts"] == []
         assert cmd.update["errors"] == []
         assert cmd.update["status"] == TaskStatus.GENERATING
-        assert cmd.goto == "__end__"
+        assert cmd.goto == "generate_agent"
 
     def test_preserves_existing_artifacts(self):
         """Node preserves artifacts already in state when no SKILL gaps are present."""

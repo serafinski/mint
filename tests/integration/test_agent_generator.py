@@ -163,7 +163,7 @@ class TestAgentGeneratorLive:
             f"Expected 1 artifact, errors: {cmd.update['errors']}"
         )
         assert cmd.update["errors"] == []
-        assert cmd.goto == "__end__"
+        assert cmd.goto == "loading_node"
 
         artifact = cmd.update["generated_artifacts"][0]
         assert artifact.capability_type == CapabilityType.AGENT

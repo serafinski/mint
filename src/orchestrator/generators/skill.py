@@ -16,7 +16,6 @@ from typing import Literal
 
 import yaml
 from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
-from langgraph.graph import END
 from langgraph.types import Command
 
 from src.orchestrator.prompts.skill_generator import SKILL_GENERATOR_PROMPT, SKILL_REPAIR_PROMPT
@@ -300,17 +299,15 @@ def _generate_single_skill(
 
 def generate_skill(
     state: TaskState,
-    # TODO Phase C: change signature to accept GeneratorInput (single ClassifiedGap
-    # + task_context) instead of full TaskState.  The graph will use Send() to
-    # fan out each gap individually.  Route to verification gate instead of END.
-) -> Command[Literal["__end__"]]:
+) -> Command[Literal["generate_agent"]]:
     """Generate SKILL.md files for all gaps classified as ``SKILL``.
 
     Skips gaps whose ``classified_type`` is not ``CapabilityType.SKILL``.
     For each skill gap, calls the LLM, validates with ``quick_validate.py``,
     applies a repair pass if needed, and writes valid skills to disk.
 
-    Returns a ``Command`` updating ``generated_artifacts`` and ``errors``.
+    Returns a ``Command`` updating ``generated_artifacts`` and ``errors``,
+    then hands off to ``generate_agent`` for the next stage of the chain.
     """
     artifacts: list[GeneratedArtifact] = list(state.generated_artifacts)
     errors: list[str] = list(state.errors)
@@ -330,5 +327,5 @@ def generate_skill(
             "errors": errors,
             "status": TaskStatus.GENERATING,
         },
-        goto=END,
+        goto="generate_agent",
     )

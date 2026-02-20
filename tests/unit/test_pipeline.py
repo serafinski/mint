@@ -1,12 +1,29 @@
-"""Unit tests for the Iteration 0 LangGraph pipeline."""
+"""Unit tests for the Iteration 2 Phase C LangGraph pipeline.
+
+These tests verify:
+- The pipeline compiles without errors given a registry and loader.
+- The pipeline graph contains all expected nodes.
+- The pipeline runs end-to-end with a seeded registry whose capabilities
+  match the task (no LLM calls needed when there are no gaps — generators
+  are no-ops and the loading node has nothing to load).
+"""
+
+from __future__ import annotations
 
 import uuid
+from unittest.mock import MagicMock
 
 import pytest
 
-from src.orchestrator.pipeline import create_pipeline, gap_detection_node, intake_node
+from src.orchestrator.pipeline import create_pipeline
+from src.orchestrator.tool_loader import ToolLoader
 from src.registry.store import SkillRegistry, seed_registry
-from src.schemas.task import TaskState
+from src.schemas.task import TaskState, TaskStatus
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -20,65 +37,93 @@ def seeded_registry(registry):
     return registry
 
 
-# --- intake_node ---
+@pytest.fixture
+def mock_loader():
+    """A ToolLoader mock — no real subprocess execution."""
+    loader = MagicMock(spec=ToolLoader)
+    return loader
 
 
-def test_intake_node_sets_required_capabilities():
-    state = TaskState(task_description="compute fibonacci number")
-    result = intake_node(state)
-    assert result.update == {"required_capabilities": ["compute fibonacci number"]}
-    assert result.goto == "gap_detection"
+# ---------------------------------------------------------------------------
+# Compilation
+# ---------------------------------------------------------------------------
 
 
-# --- gap_detection_node ---
+def test_pipeline_compiles(seeded_registry, mock_loader):
+    graph = create_pipeline(seeded_registry, mock_loader).compile()
+    assert graph is not None
 
 
-def test_gap_detection_finds_match(seeded_registry):
-    state = TaskState(
-        task_description="compute fibonacci",
-        required_capabilities=["compute fibonacci number"],
+def test_pipeline_contains_expected_nodes(seeded_registry, mock_loader):
+    builder = create_pipeline(seeded_registry, mock_loader)
+    node_names = set(builder.nodes.keys())
+    expected = {
+        "decomposition_node",
+        "gap_detection",
+        "classifier_node",
+        "generate_mcp_tool",
+        "generate_skill",
+        "generate_agent",
+        "loading_node",
+    }
+    assert expected.issubset(node_names), (
+        f"Missing nodes: {expected - node_names}"
     )
-    result = gap_detection_node(state, seeded_registry)
-    matches = result.update["matches"]
-    gaps = result.update["gaps"]
-    assert len(matches) == 1
-    assert matches[0].capability.name == "fibonacci"
-    assert len(gaps) == 0
-    assert result.goto == "report"
 
 
-def test_gap_detection_finds_gap(seeded_registry):
-    state = TaskState(
-        task_description="translate to Klingon",
-        required_capabilities=["translate English to Klingon"],
-    )
-    result = gap_detection_node(state, seeded_registry)
-    gaps = result.update["gaps"]
-    matches = result.update["matches"]
-    assert len(gaps) == 1
-    assert len(matches) == 0
+# ---------------------------------------------------------------------------
+# Full-pipeline smoke: all capabilities matched (no gaps → no LLM calls)
+#
+# When every required capability is found in the registry, state.gaps is []
+# after gap_detection.  The classifier receives no gaps to classify, and all
+# three generators are no-ops.  The loading_node finds no MCP_TOOL artifacts
+# and sets status=COMPLETED.  This path exercises the full graph without any
+# LLM call, making it a deterministic unit test.
+# ---------------------------------------------------------------------------
 
 
-# --- Full pipeline ---
+def test_pipeline_no_gaps_path_completes(seeded_registry, mock_loader):
+    """Pipeline runs to completion when all capabilities are in the registry."""
+    # "compute fibonacci number" matches the seeded 'fibonacci' capability
+    graph = create_pipeline(seeded_registry, mock_loader).compile()
+
+    # decomposition_node needs the LLM — bypass it by patching
+    # _get_agent so the node falls back immediately (returns 1 subtask = task desc)
+    import src.orchestrator.decomposition as decomp_mod
+
+    original = decomp_mod._decomposition_agent
+
+    class _FakeAgent:
+        def invoke(self, *args, **kwargs):
+            return {"structured_response": None}
+
+    decomp_mod._decomposition_agent = _FakeAgent()
+    try:
+        result = graph.invoke(
+            TaskState(task_description="compute fibonacci number")
+        )
+    finally:
+        decomp_mod._decomposition_agent = original
+
+    # With the fallback, required_capabilities = [task_description].
+    # The seeded registry matches "compute fibonacci number", so gaps = [].
+    # All generators are no-ops; loading_node sees no artifacts and no gaps
+    # → status = COMPLETED.
+    assert result["status"] == TaskStatus.COMPLETED
+    assert isinstance(result["errors"], list)
 
 
-def test_pipeline_match_path(seeded_registry):
-    graph = create_pipeline(seeded_registry).compile()
-    result = graph.invoke({"task_description": "compute fibonacci number"})
-    assert len(result["matches"]) == 1
-    assert result["matches"][0].capability.name == "fibonacci"
-    assert len(result["gaps"]) == 0
 
 
-def test_pipeline_gap_path(seeded_registry):
-    graph = create_pipeline(seeded_registry).compile()
-    result = graph.invoke({"task_description": "deploy kubernetes cluster"})
-    assert len(result["gaps"]) >= 1
-    assert len(result["matches"]) == 0
+# ---------------------------------------------------------------------------
+# create_pipeline signature
+# ---------------------------------------------------------------------------
 
 
-def test_pipeline_empty_registry(registry):
-    graph = create_pipeline(registry).compile()
-    result = graph.invoke({"task_description": "anything"})
-    assert len(result["matches"]) == 0
-    assert len(result["gaps"]) == 1
+def test_create_pipeline_requires_two_args(seeded_registry, mock_loader):
+    """create_pipeline must accept (registry, loader)."""
+    import inspect
+
+    sig = inspect.signature(create_pipeline)
+    params = list(sig.parameters.keys())
+    assert params == ["registry", "loader"]

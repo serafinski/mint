@@ -14,7 +14,6 @@ import logging
 from typing import Literal
 
 from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
-from langgraph.graph import END
 from langgraph.types import Command
 
 from src.orchestrator.prompts.classifier import CLASSIFICATION_PROMPT
@@ -138,17 +137,15 @@ def classify_gap(gap: GapItem) -> ClassifiedGap:
 
 def classifier_node(
     state: TaskState,
-) -> Command[Literal["__end__"]]:
+) -> Command[Literal["generate_mcp_tool"]]:
     """Classify all gaps in the task state.
 
     Records a warning in ``state.errors`` for every gap where the LLM fell
     back to the default classification (detectable via the ``rationale`` marker
     "LLM classification failed").
 
-    Routes to ``END`` for now.  In Phase C this node will use the LangGraph
-    ``Send`` API to fan out each classified gap to its type-specific generator
-    (``generate_mcp_tool``, ``generate_skill``, ``generate_agent``).  Generator
-    nodes should accept a ``GeneratorInput`` schema as their input.
+    Routes to ``generate_mcp_tool`` which begins the sequential generator
+    chain: generate_mcp_tool → generate_skill → generate_agent → loading_node.
     """
     classified: list[ClassifiedGap] = list(state.classified_gaps)
     errors: list[str] = list(state.errors)
@@ -167,5 +164,5 @@ def classifier_node(
             "errors": errors,
             "status": TaskStatus.CLASSIFYING,
         },
-        goto=END,
+        goto="generate_mcp_tool",
     )

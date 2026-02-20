@@ -342,7 +342,7 @@ If timeline pressure forces scope reduction:
 
 ### Iteration 2 Phase A (Complete)
 
-- **`src/orchestrator/decomposition.py`** — DeepAgent (`create_deep_agent`) wrapped in a LangGraph node. Uses `deepseek-chat` (reasoner lacks `tool_choice`), `response_format=DecompositionResult`, 120s timeout via `ThreadPoolExecutor`, `recursion_limit=25`. Falls back to treating the whole task as one subtask on error.
+- **`src/orchestrator/decomposition.py`** — DeepAgent (`create_deep_agent`) wrapped in a LangGraph node. Uses `deepseek-chat` (reasoner lacks `tool_choice`), `response_format=DecompositionResult`, 120s timeout via `ThreadPoolExecutor`, `recursion_limit=35`. Falls back to treating the whole task as one subtask on error.
 - **`src/orchestrator/classifier.py`** — LLM-only classification with `temperature=0` and `with_structured_output(ClassificationResult)`. Shared LLM instance via lazy singleton. Falls back to `MCP_TOOL` with 0.3 confidence on LLM failure.
 - **`src/orchestrator/prompts/`** — Prompt package with `decomposition.py`, `classifier.py`, `mcp_tool_generator.py`, `skill_generator.py`, `agent_generator.py`. All generator prompts include complete few-shot examples.
 - **`src/schemas/task.py`** — Added `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `GeneratorInput` (18 total schema types across 4 files).
@@ -354,19 +354,30 @@ If timeline pressure forces scope reduction:
 - **`src/orchestrator/generators/skill.py`** — Plain LangGraph node. Generates SKILL.md files from `ClassifiedGap`. Validates with `tools/quick_validate.py` + non-empty body check. Repair pass. Writes to `.deepagents/skills/<name>/SKILL.md`. LangFuse tracing.
 - **`src/orchestrator/generators/agent.py`** — Plain LangGraph node. Generates system prompts + LangGraph node configs. Detects DeepAgent vs. plain agent. For DeepAgent-type, generates SKILL.md content AND writes it to `.deepagents/skills/<agent-name>/SKILL.md`. Repair pass. LangFuse tracing.
 - **`src/orchestrator/tool_loader.py`** — `ToolLoader` class. Loads generated MCP tools via `importlib` dynamic import. Executes in sandboxed subprocess. `register_tool()` registers loaded tools in `SkillRegistry`. Cleanup on exit via `atexit`.
-- **Tests** — 300 total (280 unit + 20 integration). 298 passing; 2 integration tests skip in CI without `DEEPSEEK_API_KEY` (decomposition recursion limit fixed to 35 — tests may pass with live API).
+- **Tests** — 300 total (280 unit + 20 integration). All pass with `DEEPSEEK_API_KEY` set. Integration `_node` tests for generators had stale `goto == "__end__"` assertions (fixed post Phase C: mcp_tool → "generate_skill", skill → "generate_agent", agent → "loading_node").
 
-## Current Iteration
+### Iteration 2 Phase C (Complete)
 
-**Iteration 2 Phase C in progress.** Building the full LangGraph pipeline: decomposition → gap detection → classification → generation (sequential chaining) → loading → registration.
+- **`src/orchestrator/gap_detection.py`** — Pure Python LangGraph node wrapping `registry.detect_gaps()`. Converts raw registry output to `MatchItem` / `GapItem` lists. Routes to `"classifier_node"`.
+- **`src/orchestrator/loading_node.py`** — Loads and registers `MCP_TOOL` artifacts via `ToolLoader`. Smoke-tests each tool with empty inputs (warning on failure, continues). Skills/agents already on disk — no loading needed. Sets `FAILED` if gaps existed but no artifacts were generated; `COMPLETED` otherwise.
+- **`src/orchestrator/pipeline.py`** (rewritten) — Full Iteration 2 pipeline. `create_pipeline(registry, loader)` builds: `START → decomposition_node → gap_detection → classifier_node → generate_mcp_tool → generate_skill → generate_agent → loading_node → END`. Registry and loader injected via closures.
+- **Generator `goto` updates** — All four chaining nodes updated: `classifier_node → generate_mcp_tool`, `generate_mcp_tool → generate_skill`, `generate_skill → generate_agent`, `generate_agent → loading_node`.
+- **Tests** — 296 unit tests pass, 1 skipped (full-gap path, requires LLM). 4 new integration tests in `tests/integration/test_pipeline_e2e.py` (skip without `DEEPSEEK_API_KEY`). Total: 316 tests (296 unit + 20 integration).
 
 ### ✅ Decision: Generator chaining strategy → sequential (not Send fan-out)
 
-The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agent`) are chained sequentially in Phase C. Each node filters by `classified_type`, processes its gaps, and hands off to the next node via `Command(goto=...)`.
+The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agent`) are chained sequentially. Each node filters by `classified_type`, processes its gaps, and hands off to the next node via `Command(goto=...)`.
 
 **Why not Send fan-out:** Parallel fan-out requires Annotated reducers on `TaskState` list fields and refactored generator signatures accepting `GeneratorInput` instead of `TaskState`. Sequential chaining is simpler, avoids schema changes, and is sufficient for the thesis — generation latency is not a bottleneck. Send-based parallelism is documented as future work.
 
-See `docs/iteration_plan.md` for the full plan.
+## Current Iteration
+
+**Iteration 2 complete.** Run the Iteration 2 critique checkpoint before starting Iteration 3:
+
+- Are generated capabilities good enough for verification to work with?
+- Does the pipeline reliably reach a terminal state (COMPLETED or FAILED) across diverse task descriptions?
+
+See `docs/iteration_plan.md` for the full plan and Iteration 3 spec.
 
 ## Stable Interfaces
 
@@ -376,7 +387,10 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/orchestrator/decomposition.py`** — `decomposition_node()` (DeepAgent-backed task decomposition)
 - **`src/orchestrator/classifier.py`** — `classify_gap()`, `classifier_node()` (LLM-based classification)
 - **`src/orchestrator/prompts/`** — All prompt constants for decomposition, classification, and all three generators
-- **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` (LangGraph nodes; all use `goto=END` as Phase C placeholder)
+- **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry)` (detects registry gaps, always routes to `"classifier_node"`)
+- **`src/orchestrator/loading_node.py`** — `loading_node(state, loader, registry)` (loads + registers MCP_TOOL artifacts, sets terminal status)
+- **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader)` (full 8-node Iteration 2 pipeline)
+- **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` (LangGraph nodes; chained sequentially to `loading_node`)
 - **`src/orchestrator/tool_loader.py`** — `ToolLoader` (load, execute, register_tool, cleanup), `LoadedTool`, `ToolResult`
 - **`src/registry/store.py`** — `SkillRegistry` (full CRUD + hierarchical search), `seed_registry()`
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + 4 granularity metric queries)

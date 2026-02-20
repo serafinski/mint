@@ -286,7 +286,7 @@ class ToolLoader:
         """Register a generated MCP tool in the capability registry.
 
         Builds a ``CapabilityDescriptor`` from the artifact and calls
-        ``registry.register()``.  Call this after a successful ``load_tool()``
+        ``registry.add()``.  Call this after a successful ``load_tool()``
         and ``execute_tool()`` to make the capability discoverable.
 
         Args:
@@ -318,7 +318,7 @@ class ToolLoader:
             tags=tags or [],
             metadata={"generated": "true", "source": "jit_pipeline"},
         )
-        registry.register(descriptor)
+        registry.add(descriptor)
         logger.info("Registered MCP tool %r in registry", artifact.capability_name)
         return descriptor
 

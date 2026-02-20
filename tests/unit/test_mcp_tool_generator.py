@@ -343,7 +343,7 @@ class TestGenerateMcpToolNode:
 
         assert cmd.update["generated_artifacts"] == []
         assert cmd.update["status"] == TaskStatus.GENERATING
-        assert cmd.goto == "__end__"
+        assert cmd.goto == "generate_skill"
 
     def test_mixed_success_and_failure(self):
         """Some generations succeed, some fail -> partial artifacts + errors."""
@@ -475,7 +475,7 @@ class TestGenerateMcpToolNode:
         assert "generated_artifacts" in cmd.update
         assert "errors" in cmd.update
         assert "status" in cmd.update
-        assert cmd.goto == "__end__"
+        assert cmd.goto == "generate_skill"
 
 
 # ---------------------------------------------------------------------------

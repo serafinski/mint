@@ -206,7 +206,7 @@ class TestGenerateAgentNode:
         cmd = generate_agent(state)
 
         assert isinstance(cmd, Command)
-        assert cmd.goto == "__end__"
+        assert cmd.goto == "loading_node"
         assert "generated_artifacts" in cmd.update
         assert "errors" in cmd.update
         assert cmd.update["status"] == TaskStatus.GENERATING
@@ -244,7 +244,7 @@ class TestGenerateAgentNode:
 
         assert len(cmd.update["generated_artifacts"]) == 0
         assert len(cmd.update["errors"]) == 0
-        assert cmd.goto == "__end__"
+        assert cmd.goto == "loading_node"
 
     def test_preserves_existing_artifacts(self):
         """Node preserves artifacts already in state when no AGENT gaps are present."""

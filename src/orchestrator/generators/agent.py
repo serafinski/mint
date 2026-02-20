@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Literal
 
 from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
-from langgraph.graph import END
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -306,14 +305,12 @@ def _generate_single_agent(
 
 def generate_agent(
     state: TaskState,
-    # TODO Phase C: change signature to accept GeneratorInput (single ClassifiedGap
-    # + task_context) instead of full TaskState.  The graph will use Send() to
-    # fan out each gap individually.  Route to verification gate instead of END.
-) -> Command[Literal["__end__"]]:
+) -> Command[Literal["loading_node"]]:
     """Generate agent configurations for all AGENT-typed gaps.
 
     Skips gaps that are not classified as AGENT. On LLM failure, records
-    the error and continues with the next gap.
+    the error and continues with the next gap.  Routes to ``loading_node``
+    which is the final stage of the sequential generator chain.
     """
     artifacts: list[GeneratedArtifact] = list(state.generated_artifacts)
     errors: list[str] = list(state.errors)
@@ -335,5 +332,5 @@ def generate_agent(
             "status": TaskStatus.GENERATING,
             "errors": errors,
         },
-        goto=END,
+        goto="loading_node",
     )

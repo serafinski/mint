@@ -130,11 +130,13 @@ class GapItem(BaseModel):
 
 
 class GeneratorInput(BaseModel):
-    """Input for type-specific generator nodes (dispatched via Send).
+    """Input for type-specific generator nodes.
 
-    In Phase C the classifier node uses LangGraph's ``Send`` API to fan out
-    each classified gap to its type-specific generator.  Each generator node
-    receives a ``GeneratorInput`` rather than the full ``TaskState``.
+    Reserved for future Send-based fan-out (parallel generation).  In the
+    current implementation (Iteration 2 Phase C) the three generator nodes
+    are chained sequentially and each receives the full ``TaskState`` directly.
+    ``GeneratorInput`` is defined here for schema completeness and potential
+    use in a later iteration.
     """
 
     gap: ClassifiedGap = Field(..., description="The classified gap to generate a capability for")

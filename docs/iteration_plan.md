@@ -285,7 +285,7 @@ Integration tests confirmed `recursion_limit=25` was too low for the DeepAgent t
 
 **Final graph topology:**
 ```
-START → decomposition_node → gap_detection_node → classifier_node
+START → decomposition_node → gap_detection → classifier_node
       → generate_mcp_tool → generate_skill → generate_agent
       → loading_node → END
 ```
