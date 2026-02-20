@@ -279,7 +279,7 @@ The three generator nodes are chained sequentially: `generate_mcp_tool` → `gen
 
 Integration tests confirmed `recursion_limit=25` was too low for the DeepAgent to complete real tasks. Raised to 35 (~17 logical steps). The production fallback (return partial results with error flag) remains in place.
 
-*Phase C (single session, in progress):*
+*Phase C (single session):* ✅ COMPLETE
 
 **Goal:** Wire all Phase A/B components into a single end-to-end LangGraph pipeline. No new LLM logic — this is plumbing work only.
 

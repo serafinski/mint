@@ -11,6 +11,7 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from src.orchestrator.pipeline import create_pipeline
+from src.orchestrator.tool_loader import ToolLoader
 from src.registry.store import SkillRegistry, seed_registry
 
 
@@ -35,7 +36,8 @@ async def main() -> None:
     langfuse_handler = CallbackHandler()
     registry = SkillRegistry()
     seed_registry(registry)
-    graph = create_pipeline(registry).compile()
+    loader = ToolLoader()
+    graph = create_pipeline(registry, loader).compile()
 
     # --- Path 1: Capability found ---
     print("=" * 60)
