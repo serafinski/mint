@@ -70,7 +70,12 @@ class TestDecompositionResult:
 
 
 def _make_mock_pool(future_result=None, future_raises=None):
-    """Return a (MockTPE class, future) pair for patching ThreadPoolExecutor."""
+    """Return a (MockTPE class, future) pair for patching ThreadPoolExecutor.
+
+    The executor is now used directly (not as a context manager), so the mock
+    only needs to support: ``ThreadPoolExecutor(max_workers=1)`` → pool,
+    ``pool.submit(...)`` → future, ``pool.shutdown(wait=False)``.
+    """
     mock_future = MagicMock()
     if future_raises is not None:
         mock_future.result.side_effect = future_raises
@@ -80,9 +85,7 @@ def _make_mock_pool(future_result=None, future_raises=None):
     mock_pool = MagicMock()
     mock_pool.submit.return_value = mock_future
 
-    mock_tpe_cls = MagicMock()
-    mock_tpe_cls.return_value.__enter__ = MagicMock(return_value=mock_pool)
-    mock_tpe_cls.return_value.__exit__ = MagicMock(return_value=False)
+    mock_tpe_cls = MagicMock(return_value=mock_pool)
 
     return mock_tpe_cls, mock_future
 
@@ -222,3 +225,21 @@ class TestDecompositionNode:
         errors = cmd.update["errors"]
         assert "pre-existing error" in errors
         assert any("new error" in e for e in errors)
+
+    def test_duplicate_required_capabilities_deduplicated(self, state):
+        """Shared capability names across subtasks appear only once in required_capabilities."""
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(description="A", required_capabilities=["shared-cap", "cap-a"]),
+                SubTaskItem(description="B", required_capabilities=["shared-cap", "cap-b"]),
+            ]
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        caps = cmd.update["required_capabilities"]
+        assert caps.count("shared-cap") == 1
+        assert set(caps) == {"shared-cap", "cap-a", "cap-b"}

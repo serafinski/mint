@@ -397,6 +397,34 @@ class TestRegisterTool:
 
         assert descriptor.description == "Adds two integers"
 
+    def test_register_uses_artifact_description(self):
+        """register_tool uses artifact.description when no explicit description given (Bug 1 fix)."""
+        artifact = GeneratedArtifact(
+            capability_name="csv_parser",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=VALID_TOOL_SOURCE,
+            description="Parses CSV files and returns rows as dicts",
+        )
+        mock_registry = MagicMock()
+
+        descriptor = self.loader.register_tool(artifact, mock_registry)
+
+        assert descriptor.description == "Parses CSV files and returns rows as dicts"
+
+    def test_register_falls_back_to_name_when_no_description(self):
+        """Falls back to humanised capability_name when artifact.description is None."""
+        artifact = GeneratedArtifact(
+            capability_name="add_numbers",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=VALID_TOOL_SOURCE,
+            description=None,
+        )
+        mock_registry = MagicMock()
+
+        descriptor = self.loader.register_tool(artifact, mock_registry)
+
+        assert descriptor.description == "add numbers"
+
     def test_register_rejects_non_mcp_tool(self):
         """register_tool raises ValueError for non-MCP_TOOL artifacts."""
         artifact = GeneratedArtifact(

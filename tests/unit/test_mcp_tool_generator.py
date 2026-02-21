@@ -233,6 +233,28 @@ class TestValidateCode:
         error = _validate_code(code)
         assert error is None, f"Expected valid but got: {error}"
 
+    def test_private_top_level_async_helper_accepted(self):
+        """A module-level private async helper (_prefixed) is not counted as a tool.
+
+        The tool runner skips _-prefixed names via dir() filter; _validate_code
+        must do the same so valid code with a private helper is not rejected.
+        """
+        code = (
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from typing import Annotated\n"
+            "from pydantic import Field\n"
+            "mcp = FastMCP('t')\n"
+            "async def _helper(x: int) -> int:\n"
+            "    return x * 2\n"
+            "@mcp.tool()\n"
+            "async def add(\n"
+            "    a: Annotated[int, Field(description='First number')],\n"
+            ") -> int:\n"
+            "    return await _helper(a)\n"
+        )
+        error = _validate_code(code)
+        assert error is None, f"Expected valid (private helper ignored) but got: {error}"
+
 
 # ---------------------------------------------------------------------------
 # _validate_tool_name
@@ -565,6 +587,40 @@ class TestGenerateSingleTool:
         assert artifact.capability_name == "add_numbers"
         assert artifact.capability_type == CapabilityType.MCP_TOOL
         assert artifact.source_code == VALID_TOOL_SOURCE
+
+    def test_description_preserved_in_artifact(self):
+        """The LLM-generated description is stored in the artifact (Bug 1 fix)."""
+        valid_with_desc = GeneratedToolCode(
+            tool_name="add_numbers",
+            source_code=VALID_TOOL_SOURCE,
+            description="Computes the sum of two integer inputs",
+        )
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._make_mock_llm([valid_with_desc]),
+        ):
+            artifact, error = generate_single_tool(self._gap())
+
+        assert error is None
+        assert artifact is not None
+        assert artifact.description == "Computes the sum of two integer inputs"
+
+    def test_description_preserved_after_repair(self):
+        """description from the repaired output is stored in the artifact."""
+        repaired = GeneratedToolCode(
+            tool_name="add_numbers",
+            source_code=VALID_TOOL_SOURCE,
+            description="Sum of two integers (repaired)",
+        )
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._make_mock_llm([self._INVALID_CODE, repaired]),
+        ):
+            artifact, error = generate_single_tool(self._gap())
+
+        assert error is None
+        assert artifact is not None
+        assert artifact.description == "Sum of two integers (repaired)"
 
     def test_first_llm_call_fails(self):
         """LLM error on first attempt returns (None, error) without raising."""

@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 from langgraph.types import Command
 
 from src.orchestrator.prompts.skill_generator import SKILL_GENERATOR_PROMPT, SKILL_REPAIR_PROMPT
@@ -101,19 +100,37 @@ def _strip_code_fences(text: str) -> str:
     return body.strip()
 
 
-def extract_skill_name(content: str) -> str | None:
-    """Extract the ``name`` field from SKILL.md YAML frontmatter."""
+def _parse_frontmatter(content: str) -> dict | None:
+    """Parse YAML frontmatter from SKILL.md content.  Returns None on failure."""
     match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
     if not match:
         return None
     try:
-        frontmatter = yaml.safe_load(match.group(1))
-        if isinstance(frontmatter, dict):
-            name = frontmatter.get("name")
-            if isinstance(name, str):
-                return name.strip()
+        data = yaml.safe_load(match.group(1))
+        return data if isinstance(data, dict) else None
     except yaml.YAMLError:
-        pass
+        return None
+
+
+def extract_skill_name(content: str) -> str | None:
+    """Extract the ``name`` field from SKILL.md YAML frontmatter."""
+    frontmatter = _parse_frontmatter(content)
+    if frontmatter is None:
+        return None
+    name = frontmatter.get("name")
+    if isinstance(name, str):
+        return name.strip()
+    return None
+
+
+def extract_skill_description(content: str) -> str | None:
+    """Extract the ``description`` field from SKILL.md YAML frontmatter."""
+    frontmatter = _parse_frontmatter(content)
+    if frontmatter is None:
+        return None
+    desc = frontmatter.get("description")
+    if isinstance(desc, str):
+        return desc.strip()
     return None
 
 
@@ -163,13 +180,9 @@ def _generate_single_skill(
         Tuple of (artifact, error).  Exactly one will be ``None``.
     """
     llm = _get_llm()
-    langfuse_handler = None
-    try:
-        langfuse_handler = LangFuseCallbackHandler()
-        callbacks = [langfuse_handler]
-    except Exception:  # noqa: BLE001
-        callbacks = []
-    config = {"callbacks": callbacks} if callbacks else {}
+
+    # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
+    # handler propagates automatically via LangChain's contextvar inheritance.
 
     prompt = SKILL_GENERATOR_PROMPT.format(
         description=gap.description,
@@ -179,7 +192,7 @@ def _generate_single_skill(
 
     # --- First attempt ---
     try:
-        response = llm.invoke(prompt, config=config)
+        response = llm.invoke(prompt)
         content = _strip_code_fences(response.content)
     except Exception as exc:  # noqa: BLE001
         error_msg = f"LLM call failed for skill '{gap.query}': {exc}"
@@ -207,7 +220,7 @@ def _generate_single_skill(
             content,
         )
         emit_langfuse_event(
-            langfuse_handler,
+            None,
             "skill.validation_failure",
             "WARNING",
             {"skill_name": skill_name, "error": message},
@@ -220,7 +233,7 @@ def _generate_single_skill(
             task_context=task_context,
         )
         try:
-            repair_response = llm.invoke(repair_prompt, config=config)
+            repair_response = llm.invoke(repair_prompt)
             content = _strip_code_fences(repair_response.content)
             skill_name = extract_skill_name(content) or skill_name
             is_valid, message = validate_skill_content(content, skill_name)
@@ -228,7 +241,7 @@ def _generate_single_skill(
             error_msg = f"Repair LLM call failed for skill '{skill_name}': {exc}"
             logger.warning(error_msg)
             emit_langfuse_event(
-                langfuse_handler,
+                None,
                 "skill.repair_llm_failure",
                 "ERROR",
                 {"skill_name": skill_name, "error": str(exc)},
@@ -239,7 +252,7 @@ def _generate_single_skill(
         error_msg = f"Skill '{skill_name}' failed validation after repair: {message}"
         logger.warning(error_msg)
         emit_langfuse_event(
-            langfuse_handler,
+            None,
             "skill.repair_validation_failure",
             "ERROR",
             {"skill_name": skill_name, "error": message},
@@ -261,6 +274,7 @@ def _generate_single_skill(
         capability_name=skill_name,
         capability_type=CapabilityType.SKILL,
         skill_content=content,
+        description=extract_skill_description(content),
     )
     return artifact, None
 

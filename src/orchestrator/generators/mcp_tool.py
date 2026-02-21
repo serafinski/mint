@@ -15,7 +15,6 @@ import logging
 import re
 from typing import Literal
 
-from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -113,20 +112,24 @@ def _validate_code(source_code: str) -> str | None:
     # Count async function definitions via AST (not substring search) to avoid
     # false positives from "async def" appearing in string literals or comments.
     tree = ast.parse(source_code)  # safe — syntax is already valid at this point
-    # Count only TOP-LEVEL async defs (direct children of the module node).
-    # ast.walk() traverses all nested nodes and would false-positively reject
-    # a tool that defines a helper coroutine inside the tool body — such a
-    # function never appears in dir(module) so the runner would still pick
-    # the correct top-level tool function.
+    # Count only PUBLIC top-level async defs (direct children of the module node,
+    # excluding private helpers whose names start with "_").
+    # - ast.iter_child_nodes avoids nested defs (e.g. a coroutine defined inside
+    #   the tool body) that never appear in dir(module).
+    # - The "_" filter mirrors the tool runner's dir(module) filter so that a
+    #   module-level private helper (async def _helper()) doesn't trigger a false
+    #   positive; the runner skips it alphabetically and always picks the public tool.
     async_def_count = sum(
-        1 for n in ast.iter_child_nodes(tree) if isinstance(n, ast.AsyncFunctionDef)
+        1
+        for n in ast.iter_child_nodes(tree)
+        if isinstance(n, ast.AsyncFunctionDef) and not n.name.startswith("_")
     )
     if async_def_count == 0:
         errors.append("Missing async tool function (expected: async def ...)")
     elif async_def_count > 1:
         errors.append(
-            f"Found {async_def_count} top-level async def functions; exactly 1 is required "
-            "(tool runner picks the first async function alphabetically)"
+            f"Found {async_def_count} public top-level async def functions; exactly 1 is required "
+            "(tool runner picks the first non-private async function alphabetically)"
         )
     if "Annotated" not in source_code:
         errors.append(
@@ -157,15 +160,10 @@ def generate_single_tool(
     llm = _get_llm()
     structured_llm = llm.with_structured_output(GeneratedToolCode)
 
-    # LangFuse callback
-    langfuse_handler = None
-    try:
-        langfuse_handler = LangFuseCallbackHandler()
-        callbacks = [langfuse_handler]
-    except Exception:  # noqa: BLE001
-        callbacks = []
-
-    config = {"callbacks": callbacks} if callbacks else {}
+    # No per-node CallbackHandler: this function is invoked from within a LangGraph
+    # node, so the pipeline-level CallbackHandler (when present) is automatically
+    # inherited via LangChain's contextvar-based callback propagation.  Creating an
+    # additional handler here would generate duplicate traces.
 
     user_prompt = MCP_TOOL_USER_PROMPT.format(
         description=gap.description,
@@ -180,7 +178,7 @@ def generate_single_tool(
 
     # --- First attempt ---
     try:
-        result: GeneratedToolCode = structured_llm.invoke(messages, config=config)
+        result: GeneratedToolCode = structured_llm.invoke(messages)
     except Exception as exc:  # noqa: BLE001
         error_msg = f"LLM generation failed for {gap.query!r}: {exc}"
         logger.warning(error_msg)
@@ -197,6 +195,7 @@ def generate_single_tool(
                 capability_name=result.tool_name,
                 capability_type=CapabilityType.MCP_TOOL,
                 source_code=result.source_code,
+                description=result.description,
             ),
             None,
         )
@@ -209,7 +208,7 @@ def generate_single_tool(
         result.model_dump_json(),
     )
     emit_langfuse_event(
-        langfuse_handler,
+        None,
         "mcp_tool.validation_failure",
         "WARNING",
         {"gap_query": gap.query, "error": validation_error},
@@ -231,7 +230,7 @@ def generate_single_tool(
     ]
 
     try:
-        repaired: GeneratedToolCode = structured_llm.invoke(repair_messages, config=config)
+        repaired: GeneratedToolCode = structured_llm.invoke(repair_messages)
     except Exception as exc:  # noqa: BLE001
         error_msg = (
             f"Repair pass LLM call failed for {gap.query!r}: {exc}"
@@ -239,7 +238,7 @@ def generate_single_tool(
         )
         logger.warning(error_msg)
         emit_langfuse_event(
-            langfuse_handler,
+            None,
             "mcp_tool.repair_llm_failure",
             "ERROR",
             {"gap_query": gap.query, "error": str(exc), "original_error": validation_error},
@@ -256,7 +255,7 @@ def generate_single_tool(
         )
         logger.warning(error_msg)
         emit_langfuse_event(
-            langfuse_handler,
+            None,
             "mcp_tool.repair_validation_failure",
             "ERROR",
             {
@@ -272,6 +271,7 @@ def generate_single_tool(
             capability_name=repaired.tool_name,
             capability_type=CapabilityType.MCP_TOOL,
             source_code=repaired.source_code,
+            description=repaired.description,
         ),
         None,
     )

@@ -308,6 +308,24 @@ def test_generated_artifact_roundtrip():
     assert roundtripped.skill_content == art.skill_content
 
 
+def test_generated_artifact_description_field():
+    """description field is stored and None by default (Bug 1 fix)."""
+    art_no_desc = GeneratedArtifact(
+        capability_name="add-numbers",
+        capability_type=CapabilityType.MCP_TOOL,
+        source_code="pass",
+    )
+    assert art_no_desc.description is None
+
+    art_with_desc = GeneratedArtifact(
+        capability_name="add-numbers",
+        capability_type=CapabilityType.MCP_TOOL,
+        source_code="pass",
+        description="Adds two integers",
+    )
+    assert art_with_desc.description == "Adds two integers"
+
+
 # --- Severity ---
 
 

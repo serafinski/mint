@@ -312,7 +312,7 @@ class ToolLoader:
         # source code's function signature or passed from the generator.
         descriptor = CapabilityDescriptor(
             name=artifact.capability_name,
-            description=description or artifact.capability_name.replace("-", " ").replace("_", " "),
+            description=description or artifact.description or artifact.capability_name.replace("-", " ").replace("_", " "),
             capability_type=CapabilityType.MCP_TOOL,
             domain=domain,
             tags=tags or [],

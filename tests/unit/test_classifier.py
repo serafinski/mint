@@ -138,8 +138,12 @@ class TestClassifyGap:
 
         mock_llm.with_structured_output.assert_called_once_with(ClassificationResult)
 
-    def test_langfuse_callbacks_forwarded_to_llm(self):
-        """classify_gap passes a callbacks config to structured_llm.invoke when LangFuse is up."""
+    def test_invoke_called_without_explicit_callbacks(self):
+        """classify_gap does not pass a per-node callbacks config to structured_llm.invoke.
+
+        The pipeline-level LangFuse CallbackHandler propagates automatically via
+        LangChain's contextvar inheritance — no per-node handler is needed.
+        """
         mock_response = ClassificationResult(
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.9,
@@ -147,21 +151,14 @@ class TestClassifyGap:
         )
         gap = self._gap()
         mock_llm = _make_mock_llm(mock_response)
-        mock_handler = MagicMock()
 
-        with (
-            patch("src.orchestrator.classifier._get_llm", return_value=mock_llm),
-            patch(
-                "src.orchestrator.classifier.LangFuseCallbackHandler",
-                return_value=mock_handler,
-            ),
-        ):
+        with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
             classify_gap(gap)
 
         invoke_call = mock_llm.with_structured_output.return_value.invoke
-        config_arg = invoke_call.call_args.kwargs.get("config", {})
-        assert "callbacks" in config_arg
-        assert mock_handler in config_arg["callbacks"]
+        # invoke must be called with exactly the prompt string — no config kwarg
+        args, kwargs = invoke_call.call_args
+        assert "config" not in kwargs
 
     def test_gap_fields_preserved_on_success(self):
         """description and query from the GapItem are preserved in the result."""

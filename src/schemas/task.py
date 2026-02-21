@@ -93,6 +93,10 @@ class GeneratedArtifact(BaseModel):
 
     capability_name: str = Field(..., description="Name of the generated capability")
     capability_type: CapabilityType = Field(..., description="Type of the generated capability")
+    description: str | None = Field(
+        default=None,
+        description="Human-readable description of what the capability does",
+    )
     source_code: str | None = Field(
         default=None, description="Generated source code (for MCP tools)"
     )

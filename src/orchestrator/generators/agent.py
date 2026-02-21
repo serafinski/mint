@@ -14,7 +14,6 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -165,19 +164,12 @@ def _generate_single_agent(
         task_context=task_context,
     )
 
-    # LangFuse tracing
-    langfuse_handler = None
-    try:
-        langfuse_handler = LangFuseCallbackHandler()
-        callbacks = [langfuse_handler]
-    except Exception:  # noqa: BLE001
-        callbacks = []
-
-    config = {"callbacks": callbacks} if callbacks else {}
+    # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
+    # handler propagates automatically via LangChain's contextvar inheritance.
 
     # First attempt
     try:
-        result: AgentGenerationResult = structured_llm.invoke(prompt, config=config)
+        result: AgentGenerationResult = structured_llm.invoke(prompt)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Agent generation LLM call failed for %r: %s", gap.query, exc)
         return None, f"Agent generation failed for '{gap.query}': {exc}"
@@ -195,7 +187,7 @@ def _generate_single_agent(
             result.model_dump_json(),
         )
         emit_langfuse_event(
-            langfuse_handler,
+            None,
             "agent.validation_failure",
             "WARNING",
             {"gap_query": gap.query, "errors": validation_errors},
@@ -206,11 +198,11 @@ def _generate_single_agent(
             previous_output=result.model_dump_json(indent=2),
         )
         try:
-            result = structured_llm.invoke(repair_prompt, config=config)
+            result = structured_llm.invoke(repair_prompt)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Agent generation repair failed for %r: %s", gap.query, exc)
             emit_langfuse_event(
-                langfuse_handler,
+                None,
                 "agent.repair_llm_failure",
                 "ERROR",
                 {"gap_query": gap.query, "error": str(exc)},
@@ -226,7 +218,7 @@ def _generate_single_agent(
                 error_str,
             )
             emit_langfuse_event(
-                langfuse_handler,
+                None,
                 "agent.repair_validation_failure",
                 "ERROR",
                 {"gap_query": gap.query, "errors": validation_errors},
@@ -266,6 +258,7 @@ def _generate_single_agent(
         capability_name=result.agent_name,
         capability_type=CapabilityType.AGENT,
         agent_config=agent_config,
+        description=result.description,
     )
 
     return artifact, None

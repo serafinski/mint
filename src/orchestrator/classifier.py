@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 from langgraph.types import Command
 
 from src.orchestrator.prompts.classifier import CLASSIFICATION_PROMPT
@@ -64,17 +63,11 @@ def classify_gap(gap: GapItem) -> ClassifiedGap:
         query=gap.query,
     )
 
-    langfuse_handler = None
-    try:
-        langfuse_handler = LangFuseCallbackHandler()
-        callbacks = [langfuse_handler]
-    except Exception:  # noqa: BLE001
-        callbacks = []
-
-    config = {"callbacks": callbacks} if callbacks else {}
+    # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
+    # handler propagates automatically via LangChain's contextvar inheritance.
 
     try:
-        result: ClassificationResult = structured_llm.invoke(prompt, config=config)
+        result: ClassificationResult = structured_llm.invoke(prompt)
         return ClassifiedGap(
             description=gap.description,
             query=gap.query,
@@ -85,7 +78,7 @@ def classify_gap(gap: GapItem) -> ClassifiedGap:
     except Exception as exc:  # noqa: BLE001
         logger.warning("LLM classification failed for %r: %s", gap.query, exc)
         emit_langfuse_event(
-            langfuse_handler,
+            None,
             "classifier.llm_failure",
             "ERROR",
             {"gap_query": gap.query, "error": str(exc)},

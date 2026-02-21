@@ -89,14 +89,18 @@ def decomposition_node(
     required_caps: list[str] = []
     errors: list[str] = list(state.errors)
 
+    # Use manual executor management so we can call shutdown(wait=False) on
+    # timeout — the context-manager form calls shutdown(wait=True) from __exit__,
+    # which blocks until the thread finishes even after TimeoutError is raised.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(
-                agent.invoke,
-                {"messages": [{"role": "user", "content": state.task_description}]},
-                config,
-            )
-            result = future.result(timeout=DECOMPOSITION_TIMEOUT_S)
+        future = pool.submit(
+            agent.invoke,
+            {"messages": [{"role": "user", "content": state.task_description}]},
+            config,
+        )
+        result = future.result(timeout=DECOMPOSITION_TIMEOUT_S)
+        pool.shutdown(wait=False)
 
         structured: DecompositionResult | None = result.get("structured_response")
 
@@ -121,6 +125,7 @@ def decomposition_node(
             )
 
     except concurrent.futures.TimeoutError:
+        pool.shutdown(wait=False)
         errors.append(f"Decomposition agent timed out after {DECOMPOSITION_TIMEOUT_S}s")
         logger.error("DecompositionAgent: timed out after %ds", DECOMPOSITION_TIMEOUT_S)
         emit_langfuse_event(
@@ -130,6 +135,7 @@ def decomposition_node(
             {"timeout_s": DECOMPOSITION_TIMEOUT_S},
         )
     except Exception as exc:  # noqa: BLE001
+        pool.shutdown(wait=False)
         errors.append(f"Decomposition agent error: {exc}")
         logger.exception("DecompositionAgent: unexpected error")
         emit_langfuse_event(
@@ -138,6 +144,11 @@ def decomposition_node(
             "ERROR",
             {"error": str(exc)},
         )
+
+    # Deduplicate required_caps while preserving insertion order.
+    # Multiple subtasks may reference the same capability; searching/classifying
+    # duplicates wastes tokens and can produce duplicate artifacts.
+    required_caps = list(dict.fromkeys(required_caps))
 
     # Fallback: if no subtasks were produced, treat the whole task as one subtask
     if not subtasks:
