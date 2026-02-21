@@ -13,11 +13,11 @@ from unittest.mock import patch
 from langgraph.types import Command
 
 from src.orchestrator.generators.skill import (
-    _extract_skill_name,
     _generate_single_skill,
     _strip_code_fences,
-    _validate_skill_content,
+    extract_skill_name,
     generate_skill,
+    validate_skill_content,
 )
 from src.schemas.capability import CapabilityType
 from src.schemas.task import ClassifiedGap, GeneratedArtifact, TaskState, TaskStatus
@@ -131,48 +131,48 @@ class TestStripCodeFences:
 
 class TestExtractSkillName:
     def test_valid_frontmatter(self):
-        assert _extract_skill_name(VALID_SKILL_MD) == "csv-data-loader"
+        assert extract_skill_name(VALID_SKILL_MD) == "csv-data-loader"
 
     def test_no_frontmatter(self):
-        assert _extract_skill_name("# No frontmatter") is None
+        assert extract_skill_name("# No frontmatter") is None
 
     def test_invalid_yaml(self):
-        assert _extract_skill_name("---\n: bad: yaml:\n---\ncontent") is None
+        assert extract_skill_name("---\n: bad: yaml:\n---\ncontent") is None
 
     def test_missing_name(self):
         content = "---\ndescription: test\n---\ncontent"
-        assert _extract_skill_name(content) is None
+        assert extract_skill_name(content) is None
 
 
 class TestValidateSkillContent:
     def test_valid_content(self):
-        is_valid, msg = _validate_skill_content(VALID_SKILL_MD, "csv-data-loader")
+        is_valid, msg = validate_skill_content(VALID_SKILL_MD, "csv-data-loader")
         assert is_valid, msg
 
     def test_invalid_name(self):
-        is_valid, msg = _validate_skill_content(INVALID_SKILL_MD_BAD_NAME, "CSV_Data_Loader")
+        is_valid, msg = validate_skill_content(INVALID_SKILL_MD_BAD_NAME, "CSV_Data_Loader")
         assert not is_valid
         assert "hyphen-case" in msg
 
     def test_no_frontmatter(self):
-        is_valid, msg = _validate_skill_content(INVALID_SKILL_MD_NO_FRONTMATTER, "test")
+        is_valid, msg = validate_skill_content(INVALID_SKILL_MD_NO_FRONTMATTER, "test")
         assert not is_valid
 
     def test_empty_body_rejected(self):
         """A skill with only frontmatter and no body must fail validation."""
-        is_valid, msg = _validate_skill_content(SKILL_MD_EMPTY_BODY, "csv-data-loader")
+        is_valid, msg = validate_skill_content(SKILL_MD_EMPTY_BODY, "csv-data-loader")
         assert not is_valid
         assert "non-empty" in msg
 
     def test_empty_skill_name_rejected(self):
         """Empty skill_name is rejected before reaching quick_validate."""
-        is_valid, msg = _validate_skill_content(VALID_SKILL_MD, "")
+        is_valid, msg = validate_skill_content(VALID_SKILL_MD, "")
         assert not is_valid
         assert "non-empty" in msg
 
     def test_whitespace_skill_name_rejected(self):
         """Whitespace-only skill_name is rejected before reaching quick_validate."""
-        is_valid, msg = _validate_skill_content(VALID_SKILL_MD, "   ")
+        is_valid, msg = validate_skill_content(VALID_SKILL_MD, "   ")
         assert not is_valid
         assert "non-empty" in msg
 
@@ -332,11 +332,11 @@ class TestGenerateSkillNode:
                 )(),
             ),
             patch(
-                "src.orchestrator.generators.skill._validate_skill_content",
+                "src.orchestrator.generators.skill.validate_skill_content",
                 return_value=(True, "Skill is valid!"),
             ),
             patch(
-                "src.orchestrator.generators.skill._extract_skill_name",
+                "src.orchestrator.generators.skill.extract_skill_name",
                 return_value="csv-loader",
             ),
         ):
@@ -503,7 +503,7 @@ class TestGenerateSingleSkill:
 
     def test_skill_name_derived_from_query_when_frontmatter_has_no_name(self, tmp_path):
         """When content has no name in frontmatter, skill_name is derived from gap.query."""
-        # Content without a 'name' field — _extract_skill_name returns None
+        # Content without a 'name' field — extract_skill_name returns None
         content_no_name = "---\ndescription: A skill without a name.\n---\n\n# Body\n"
         gap = ClassifiedGap(
             description="Multi-step CSV pipeline",
@@ -519,7 +519,7 @@ class TestGenerateSingleSkill:
                 return_value=self._make_mock_llm([content_no_name]),
             ),
             patch(
-                "src.orchestrator.generators.skill._validate_skill_content",
+                "src.orchestrator.generators.skill.validate_skill_content",
                 return_value=(True, "ok"),
             ),
         ):
@@ -572,7 +572,7 @@ class TestGenerateSingleSkill:
                 return_value=self._make_mock_llm([content_no_name]),
             ),
             patch(
-                "src.orchestrator.generators.skill._validate_skill_content",
+                "src.orchestrator.generators.skill.validate_skill_content",
                 return_value=(True, "ok"),
             ),
         ):

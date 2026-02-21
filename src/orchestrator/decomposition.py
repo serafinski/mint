@@ -22,41 +22,10 @@ from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 from langgraph.types import Command
 
 from src.orchestrator.prompts.decomposition import DECOMPOSITION_SYSTEM_PROMPT
+from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.task import DecompositionResult, SubTask, TaskState, TaskStatus
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# LangFuse event helper
-# ---------------------------------------------------------------------------
-
-
-def _emit_langfuse_event(
-    langfuse_handler: object | None,
-    name: str,
-    level: str,
-    metadata: dict,
-) -> None:
-    """Emit a named event to LangFuse, linked to the active trace if available.
-
-    Silently no-ops if LangFuse is unavailable.
-    """
-    try:
-        from langfuse import Langfuse
-        from langfuse.types import TraceContext
-
-        trace_id: str | None = getattr(langfuse_handler, "last_trace_id", None)
-        lf = Langfuse()
-        lf.create_event(
-            trace_context=TraceContext(trace_id=trace_id) if trace_id else None,
-            name=name,
-            level=level,  # type: ignore[arg-type]
-            metadata=metadata,
-        )
-        lf.flush()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -68,23 +37,24 @@ DECOMPOSITION_RECURSION_LIMIT = 35
 
 
 # ---------------------------------------------------------------------------
-# Agent factory (lazy initialisation to avoid import-time API key checks)
+# Agent factory — creates a fresh agent per invocation
 # ---------------------------------------------------------------------------
-
-_decomposition_agent = None
 
 
 def _get_agent():
-    """Lazily create the decomposition DeepAgent on first use."""
-    global _decomposition_agent  # noqa: PLW0603
-    if _decomposition_agent is None:
-        _decomposition_agent = create_deep_agent(
-            model="deepseek:deepseek-chat",
-            system_prompt=DECOMPOSITION_SYSTEM_PROMPT,
-            response_format=DecompositionResult,
-            name="task-decomposer",
-        )
-    return _decomposition_agent
+    """Create a fresh decomposition DeepAgent for each invocation.
+
+    A new ``CompiledStateGraph`` is returned on every call so no state is
+    carried between pipeline runs (CLAUDE.md: "Fresh every invocation —
+    No state carried between calls").  ``create_deep_agent()`` compiles a
+    LangGraph graph without making any API calls, so the overhead is minimal.
+    """
+    return create_deep_agent(
+        model="deepseek:deepseek-chat",
+        system_prompt=DECOMPOSITION_SYSTEM_PROMPT,
+        response_format=DecompositionResult,
+        name="task-decomposer",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,11 +113,17 @@ def decomposition_node(
         else:
             errors.append("Decomposition agent returned no structured response")
             logger.warning("DecompositionAgent: no structured_response in result")
+            emit_langfuse_event(
+                langfuse_handler,
+                "decomposition.no_structured_response",
+                "WARNING",
+                {"task_description": state.task_description[:200]},
+            )
 
     except concurrent.futures.TimeoutError:
         errors.append(f"Decomposition agent timed out after {DECOMPOSITION_TIMEOUT_S}s")
         logger.error("DecompositionAgent: timed out after %ds", DECOMPOSITION_TIMEOUT_S)
-        _emit_langfuse_event(
+        emit_langfuse_event(
             langfuse_handler,
             "decomposition.timeout",
             "ERROR",
@@ -156,7 +132,7 @@ def decomposition_node(
     except Exception as exc:  # noqa: BLE001
         errors.append(f"Decomposition agent error: {exc}")
         logger.exception("DecompositionAgent: unexpected error")
-        _emit_langfuse_event(
+        emit_langfuse_event(
             langfuse_handler,
             "decomposition.error",
             "ERROR",

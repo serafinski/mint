@@ -17,42 +17,11 @@ from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 from langgraph.types import Command
 
 from src.orchestrator.prompts.classifier import CLASSIFICATION_PROMPT
+from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
 from src.schemas.task import ClassificationResult, ClassifiedGap, GapItem, TaskState, TaskStatus
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# LangFuse event helper
-# ---------------------------------------------------------------------------
-
-
-def _emit_langfuse_event(
-    langfuse_handler: object | None,
-    name: str,
-    level: str,
-    metadata: dict,
-) -> None:
-    """Emit a named event to LangFuse, linked to the active trace if available.
-
-    Silently no-ops if LangFuse is unavailable.
-    """
-    try:
-        from langfuse import Langfuse
-        from langfuse.types import TraceContext
-
-        trace_id: str | None = getattr(langfuse_handler, "last_trace_id", None)
-        lf = Langfuse()
-        lf.create_event(
-            trace_context=TraceContext(trace_id=trace_id) if trace_id else None,
-            name=name,
-            level=level,  # type: ignore[arg-type]
-            metadata=metadata,
-        )
-        lf.flush()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +84,7 @@ def classify_gap(gap: GapItem) -> ClassifiedGap:
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("LLM classification failed for %r: %s", gap.query, exc)
-        _emit_langfuse_event(
+        emit_langfuse_event(
             langfuse_handler,
             "classifier.llm_failure",
             "ERROR",

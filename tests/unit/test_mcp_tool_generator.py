@@ -146,7 +146,7 @@ class TestValidateCode:
         assert "Field" in error
 
     def test_multiple_async_def_rejected(self):
-        """Code with more than one async def is rejected (runner picks wrong function)."""
+        """Two top-level async defs are rejected (runner can't tell which is the tool)."""
         code = (
             "from mcp.server.fastmcp import FastMCP\n"
             "from typing import Annotated\n"
@@ -161,6 +161,28 @@ class TestValidateCode:
         error = _validate_code(code)
         assert error is not None
         assert "async def" in error
+
+    def test_nested_async_def_not_rejected(self):
+        """A tool with a nested async def inside its body is accepted.
+
+        The runner discovers functions via ``dir(module)`` which only exposes
+        module-level names; a nested coroutine never appears there and does not
+        create ambiguity for the runner.  Using ``ast.iter_child_nodes`` (not
+        ``ast.walk``) ensures we only count top-level async defs.
+        """
+        code = (
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from typing import Annotated\n"
+            "from pydantic import Field\n"
+            "mcp = FastMCP('t')\n"
+            "@mcp.tool()\n"
+            "async def transform(n: Annotated[int, Field(description='x')]) -> int:\n"
+            "    async def _helper(x: int) -> int:\n"
+            "        return x * 2\n"
+            "    return await _helper(n)\n"
+        )
+        error = _validate_code(code)
+        assert error is None, f"Unexpected error for nested async def: {error}"
 
     def test_missing_annotated_params(self):
         code = (

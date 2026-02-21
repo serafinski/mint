@@ -19,6 +19,7 @@ from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 from langgraph.types import Command
 
 from src.orchestrator.prompts.skill_generator import SKILL_GENERATOR_PROMPT, SKILL_REPAIR_PROMPT
+from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
 from src.schemas.task import ClassifiedGap, GeneratedArtifact, TaskState, TaskStatus
 
@@ -100,7 +101,7 @@ def _strip_code_fences(text: str) -> str:
     return body.strip()
 
 
-def _extract_skill_name(content: str) -> str | None:
+def extract_skill_name(content: str) -> str | None:
     """Extract the ``name`` field from SKILL.md YAML frontmatter."""
     match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
     if not match:
@@ -116,7 +117,7 @@ def _extract_skill_name(content: str) -> str | None:
     return None
 
 
-def _validate_skill_content(content: str, skill_name: str) -> tuple[bool, str]:
+def validate_skill_content(content: str, skill_name: str) -> tuple[bool, str]:
     """Validate SKILL.md content using ``tools/quick_validate.py``.
 
     Also checks that the skill body (content after the frontmatter) is
@@ -144,34 +145,6 @@ def _validate_skill_content(content: str, skill_name: str) -> tuple[bool, str]:
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text(content)
         return validate_skill(skill_dir)
-
-
-def _emit_langfuse_event(
-    langfuse_handler: object | None,
-    name: str,
-    level: str,
-    metadata: dict,
-) -> None:
-    """Emit a named event to LangFuse, linked to the active trace if available.
-
-    Uses ``langfuse_handler.last_trace_id`` to associate the event with the
-    preceding LLM invocation span.  Silently no-ops if LangFuse is unavailable.
-    """
-    try:
-        from langfuse import Langfuse
-        from langfuse.types import TraceContext
-
-        trace_id: str | None = getattr(langfuse_handler, "last_trace_id", None)
-        lf = Langfuse()
-        lf.create_event(
-            trace_context=TraceContext(trace_id=trace_id) if trace_id else None,
-            name=name,
-            level=level,  # type: ignore[arg-type]
-            metadata=metadata,
-        )
-        lf.flush()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +186,7 @@ def _generate_single_skill(
         logger.warning(error_msg)
         return None, error_msg
 
-    skill_name = _extract_skill_name(content)
+    skill_name = extract_skill_name(content)
     if not skill_name:
         # Derive a fallback name from the query; collapse consecutive hyphens
         skill_name = re.sub(r"[^a-z0-9-]", "-", gap.query.lower().strip())
@@ -222,7 +195,7 @@ def _generate_single_skill(
         if not skill_name:
             return None, f"Cannot derive skill name from query: {gap.query!r}"
 
-    is_valid, message = _validate_skill_content(content, skill_name)
+    is_valid, message = validate_skill_content(content, skill_name)
 
     # --- Repair pass ---
     if not is_valid:
@@ -233,7 +206,7 @@ def _generate_single_skill(
             message,
             content,
         )
-        _emit_langfuse_event(
+        emit_langfuse_event(
             langfuse_handler,
             "skill.validation_failure",
             "WARNING",
@@ -249,12 +222,12 @@ def _generate_single_skill(
         try:
             repair_response = llm.invoke(repair_prompt, config=config)
             content = _strip_code_fences(repair_response.content)
-            skill_name = _extract_skill_name(content) or skill_name
-            is_valid, message = _validate_skill_content(content, skill_name)
+            skill_name = extract_skill_name(content) or skill_name
+            is_valid, message = validate_skill_content(content, skill_name)
         except Exception as exc:  # noqa: BLE001
             error_msg = f"Repair LLM call failed for skill '{skill_name}': {exc}"
             logger.warning(error_msg)
-            _emit_langfuse_event(
+            emit_langfuse_event(
                 langfuse_handler,
                 "skill.repair_llm_failure",
                 "ERROR",
@@ -265,7 +238,7 @@ def _generate_single_skill(
     if not is_valid:
         error_msg = f"Skill '{skill_name}' failed validation after repair: {message}"
         logger.warning(error_msg)
-        _emit_langfuse_event(
+        emit_langfuse_event(
             langfuse_handler,
             "skill.repair_validation_failure",
             "ERROR",

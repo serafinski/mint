@@ -24,6 +24,7 @@ from src.orchestrator.prompts.mcp_tool_generator import (
     MCP_TOOL_SYSTEM_PROMPT,
     MCP_TOOL_USER_PROMPT,
 )
+from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
 from src.schemas.task import ClassifiedGap, GeneratedArtifact, TaskState, TaskStatus
 
@@ -69,39 +70,6 @@ def _get_llm():
 _SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
-# ---------------------------------------------------------------------------
-# LangFuse event helper
-# ---------------------------------------------------------------------------
-
-
-def _emit_langfuse_event(
-    langfuse_handler: object | None,
-    name: str,
-    level: str,
-    metadata: dict,
-) -> None:
-    """Emit a named event to LangFuse, linked to the active trace if available.
-
-    Uses ``langfuse_handler.last_trace_id`` to associate the event with the
-    preceding LLM invocation span.  Silently no-ops if LangFuse is unavailable.
-    """
-    try:
-        from langfuse import Langfuse
-        from langfuse.types import TraceContext
-
-        trace_id: str | None = getattr(langfuse_handler, "last_trace_id", None)
-        lf = Langfuse()
-        lf.create_event(
-            trace_context=TraceContext(trace_id=trace_id) if trace_id else None,
-            name=name,
-            level=level,  # type: ignore[arg-type]
-            metadata=metadata,
-        )
-        lf.flush()
-    except Exception:  # noqa: BLE001
-        pass
-
-
 def _validate_tool_name(tool_name: str) -> str | None:
     """Validate the tool_name field from the LLM response.
 
@@ -145,12 +113,19 @@ def _validate_code(source_code: str) -> str | None:
     # Count async function definitions via AST (not substring search) to avoid
     # false positives from "async def" appearing in string literals or comments.
     tree = ast.parse(source_code)  # safe — syntax is already valid at this point
-    async_def_count = sum(1 for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef))
+    # Count only TOP-LEVEL async defs (direct children of the module node).
+    # ast.walk() traverses all nested nodes and would false-positively reject
+    # a tool that defines a helper coroutine inside the tool body — such a
+    # function never appears in dir(module) so the runner would still pick
+    # the correct top-level tool function.
+    async_def_count = sum(
+        1 for n in ast.iter_child_nodes(tree) if isinstance(n, ast.AsyncFunctionDef)
+    )
     if async_def_count == 0:
         errors.append("Missing async tool function (expected: async def ...)")
     elif async_def_count > 1:
         errors.append(
-            f"Found {async_def_count} async def functions; exactly 1 is required "
+            f"Found {async_def_count} top-level async def functions; exactly 1 is required "
             "(tool runner picks the first async function alphabetically)"
         )
     if "Annotated" not in source_code:
@@ -233,7 +208,7 @@ def generate_single_tool(
         validation_error,
         result.model_dump_json(),
     )
-    _emit_langfuse_event(
+    emit_langfuse_event(
         langfuse_handler,
         "mcp_tool.validation_failure",
         "WARNING",
@@ -263,7 +238,7 @@ def generate_single_tool(
             f" (original error: {validation_error})"
         )
         logger.warning(error_msg)
-        _emit_langfuse_event(
+        emit_langfuse_event(
             langfuse_handler,
             "mcp_tool.repair_llm_failure",
             "ERROR",
@@ -280,7 +255,7 @@ def generate_single_tool(
             f" (original error: {validation_error})"
         )
         logger.warning(error_msg)
-        _emit_langfuse_event(
+        emit_langfuse_event(
             langfuse_handler,
             "mcp_tool.repair_validation_failure",
             "ERROR",

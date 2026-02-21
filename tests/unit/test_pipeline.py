@@ -11,7 +11,7 @@ These tests verify:
 from __future__ import annotations
 
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -19,7 +19,6 @@ from src.orchestrator.pipeline import create_pipeline
 from src.orchestrator.tool_loader import ToolLoader
 from src.registry.store import SkillRegistry, seed_registry
 from src.schemas.task import TaskState, TaskStatus
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -87,23 +86,19 @@ def test_pipeline_no_gaps_path_completes(seeded_registry, mock_loader):
     # "compute fibonacci number" matches the seeded 'fibonacci' capability
     graph = create_pipeline(seeded_registry, mock_loader).compile()
 
-    # decomposition_node needs the LLM — bypass it by patching
-    # _get_agent so the node falls back immediately (returns 1 subtask = task desc)
-    import src.orchestrator.decomposition as decomp_mod
-
-    original = decomp_mod._decomposition_agent
-
+    # Patch _get_agent so decomposition_node falls back immediately (returns
+    # no structured_response → 1 subtask = task_description as capability).
     class _FakeAgent:
         def invoke(self, *args, **kwargs):
             return {"structured_response": None}
 
-    decomp_mod._decomposition_agent = _FakeAgent()
-    try:
+    with patch(
+        "src.orchestrator.decomposition._get_agent",
+        return_value=_FakeAgent(),
+    ):
         result = graph.invoke(
             TaskState(task_description="compute fibonacci number")
         )
-    finally:
-        decomp_mod._decomposition_agent = original
 
     # With the fallback, required_capabilities = [task_description].
     # The seeded registry matches "compute fibonacci number", so gaps = [].

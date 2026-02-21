@@ -18,8 +18,9 @@ from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from src.orchestrator.generators.skill import _extract_skill_name, _validate_skill_content
+from src.orchestrator.generators.skill import extract_skill_name, validate_skill_content
 from src.orchestrator.prompts.agent_generator import AGENT_GENERATOR_PROMPT, AGENT_REPAIR_PROMPT
+from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
 from src.schemas.task import ClassifiedGap, GeneratedArtifact, TaskState, TaskStatus
 
@@ -92,34 +93,6 @@ _SNAKE_CASE_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 # ---------------------------------------------------------------------------
 
 
-def _emit_langfuse_event(
-    langfuse_handler: object | None,
-    name: str,
-    level: str,
-    metadata: dict,
-) -> None:
-    """Emit a named event to LangFuse, linked to the active trace if available.
-
-    Uses ``langfuse_handler.last_trace_id`` to associate the event with the
-    preceding LLM invocation span.  Silently no-ops if LangFuse is unavailable.
-    """
-    try:
-        from langfuse import Langfuse
-        from langfuse.types import TraceContext
-
-        trace_id: str | None = getattr(langfuse_handler, "last_trace_id", None)
-        lf = Langfuse()
-        lf.create_event(
-            trace_context=TraceContext(trace_id=trace_id) if trace_id else None,
-            name=name,
-            level=level,  # type: ignore[arg-type]
-            metadata=metadata,
-        )
-        lf.flush()
-    except Exception:  # noqa: BLE001
-        pass
-
-
 def _validate_result(result: AgentGenerationResult) -> list[str]:
     """Return a list of validation error strings (empty if valid)."""
     errors: list[str] = []
@@ -153,12 +126,12 @@ def _validate_result(result: AgentGenerationResult) -> list[str]:
             errors.append("skill_content must start with YAML frontmatter (---)")
         else:
             # Run full quick_validate.py check (same as skill generator does)
-            is_valid, msg = _validate_skill_content(result.skill_content, result.agent_name)
+            is_valid, msg = validate_skill_content(result.skill_content, result.agent_name)
             if not is_valid:
                 errors.append(f"skill_content failed validation: {msg}")
             else:
                 # Verify the frontmatter name matches agent_name so DeepAgents can load the skill
-                content_name = _extract_skill_name(result.skill_content)
+                content_name = extract_skill_name(result.skill_content)
                 if content_name and content_name != result.agent_name:
                     errors.append(
                         f"skill_content frontmatter name '{content_name}' must match "
@@ -221,7 +194,7 @@ def _generate_single_agent(
             validation_errors,
             result.model_dump_json(),
         )
-        _emit_langfuse_event(
+        emit_langfuse_event(
             langfuse_handler,
             "agent.validation_failure",
             "WARNING",
@@ -236,7 +209,7 @@ def _generate_single_agent(
             result = structured_llm.invoke(repair_prompt, config=config)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Agent generation repair failed for %r: %s", gap.query, exc)
-            _emit_langfuse_event(
+            emit_langfuse_event(
                 langfuse_handler,
                 "agent.repair_llm_failure",
                 "ERROR",
@@ -252,7 +225,7 @@ def _generate_single_agent(
                 gap.query,
                 error_str,
             )
-            _emit_langfuse_event(
+            emit_langfuse_event(
                 langfuse_handler,
                 "agent.repair_validation_failure",
                 "ERROR",

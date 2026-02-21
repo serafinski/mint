@@ -354,7 +354,7 @@ If timeline pressure forces scope reduction:
 - **`src/orchestrator/generators/skill.py`** — Plain LangGraph node. Generates SKILL.md files from `ClassifiedGap`. Validates with `tools/quick_validate.py` + non-empty body check. Repair pass. Writes to `.deepagents/skills/<name>/SKILL.md`. LangFuse tracing.
 - **`src/orchestrator/generators/agent.py`** — Plain LangGraph node. Generates system prompts + LangGraph node configs. Detects DeepAgent vs. plain agent. For DeepAgent-type, generates SKILL.md content AND writes it to `.deepagents/skills/<agent-name>/SKILL.md`. Repair pass. LangFuse tracing.
 - **`src/orchestrator/tool_loader.py`** — `ToolLoader` class. Loads generated MCP tools via `importlib` dynamic import. Executes in sandboxed subprocess. `register_tool()` registers loaded tools in `SkillRegistry`. Cleanup on exit via `atexit`.
-- **Tests** — 300 total (280 unit + 20 integration). All pass with `DEEPSEEK_API_KEY` set. Integration `_node` tests for generators had stale `goto == "__end__"` assertions (fixed post Phase C: mcp_tool → "generate_skill", skill → "generate_agent", agent → "loading_node").
+- **Tests** — 304 total (280 unit + 24 integration). All pass with `DEEPSEEK_API_KEY` set. Integration `_node` tests for generators had stale `goto == "__end__"` assertions (fixed post Phase C: mcp_tool → "generate_skill", skill → "generate_agent", agent → "loading_node"). 24 integration tests: 5 agent-generator, 4 classifier, 3 decomposition, 2 fibonacci, 3 mcp-tool-generator, 4 pipeline-e2e, 3 skill-generator.
 
 ### Iteration 2 Phase C (Complete)
 
@@ -362,7 +362,7 @@ If timeline pressure forces scope reduction:
 - **`src/orchestrator/loading_node.py`** — Loads and registers `MCP_TOOL` artifacts via `ToolLoader`. Smoke-tests each tool with empty inputs (warning on failure, continues). Skills/agents already on disk — no loading needed. Sets `FAILED` if gaps existed but no artifacts were generated; `COMPLETED` otherwise.
 - **`src/orchestrator/pipeline.py`** (rewritten) — Full Iteration 2 pipeline. `create_pipeline(registry, loader)` builds: `START → decomposition_node → gap_detection → classifier_node → generate_mcp_tool → generate_skill → generate_agent → loading_node → END`. Registry and loader injected via closures.
 - **Generator `goto` updates** — All four chaining nodes updated: `classifier_node → generate_mcp_tool`, `generate_mcp_tool → generate_skill`, `generate_skill → generate_agent`, `generate_agent → loading_node`.
-- **Tests** — 296 unit tests pass, 1 skipped (full-gap path, requires LLM). 4 new integration tests in `tests/integration/test_pipeline_e2e.py` (skip without `DEEPSEEK_API_KEY`). Total: 316 tests (296 unit + 20 integration).
+- **Tests** — 297 unit tests pass (0 skipped). 4 integration tests in `tests/integration/test_pipeline_e2e.py` (skip without `DEEPSEEK_API_KEY`). Total: 321 tests (297 unit + 24 integration).
 
 ### ✅ Decision: Generator chaining strategy → sequential (not Send fan-out)
 
