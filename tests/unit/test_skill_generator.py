@@ -8,12 +8,15 @@ LLM mocking.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import pytest
 from langgraph.types import Command
 
+import src.orchestrator.generators.skill as _skill_module
 from src.orchestrator.generators.skill import (
     _generate_single_skill,
+    _get_validate_skill,
     _strip_code_fences,
     extract_skill_name,
     generate_skill,
@@ -581,3 +584,39 @@ class TestGenerateSingleSkill:
         assert artifact is None
         assert error is not None
         assert "Cannot derive skill name" in error
+
+
+# ---------------------------------------------------------------------------
+# Lazy-import safety: _VALIDATE_MODULE must not be cached on exec failure (Bug 2)
+# ---------------------------------------------------------------------------
+
+
+class TestGetValidateSkillLazyImport:
+    def test_module_not_cached_on_exec_failure(self):
+        """If exec_module raises, _VALIDATE_MODULE must remain None so the next
+        call retries the load rather than returning a broken module.
+
+        Regression test for Bug 2: previously _VALIDATE_MODULE was assigned
+        before exec_module ran, leaving a broken module in the cache.
+        """
+        original = _skill_module._VALIDATE_MODULE
+        try:
+            # Reset the cache so we control the first load attempt
+            _skill_module._VALIDATE_MODULE = None
+
+            with patch("importlib.util.spec_from_file_location") as mock_spec_fn:
+                mock_spec = MagicMock()
+                mock_spec.loader.exec_module.side_effect = ImportError("broken module")
+                mock_spec_fn.return_value = mock_spec
+
+                with pytest.raises(RuntimeError, match="Failed to load"):
+                    _get_validate_skill()
+
+            # After the failure, _VALIDATE_MODULE must still be None
+            assert _skill_module._VALIDATE_MODULE is None, (
+                "_VALIDATE_MODULE was set to a broken module; "
+                "next call would get AttributeError instead of retrying the load"
+            )
+        finally:
+            # Restore to original state (may be a fully-loaded module or None)
+            _skill_module._VALIDATE_MODULE = original

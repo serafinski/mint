@@ -38,10 +38,12 @@ def loading_node(
     automatically.
 
     Sets ``status`` to:
-    - ``COMPLETED`` — at least one artifact exists, or no gaps were detected
-      (all capabilities were already in the registry).
-    - ``FAILED`` — gaps were detected but no artifacts were generated at all
-      (generation failed for every gap).
+    - ``COMPLETED`` — no gaps were detected (all capabilities matched), or at
+      least one capability was successfully deployed: an MCP tool was registered
+      OR a skill/agent artifact was written to disk during generation.
+    - ``FAILED`` — gaps were detected but nothing was deployed: either no
+      artifacts were generated at all, or all MCP tool load/register attempts
+      failed and no skill/agent artifacts exist.
 
     Errors from individual tool loads/registrations are recorded in
     ``state.errors`` but do not abort the node — remaining tools continue.
@@ -82,24 +84,33 @@ def loading_node(
             logger.error(error_msg)
             errors.append(error_msg)
 
-    total_artifacts = len(state.generated_artifacts)
+    # Skills and agents are deployed by being written to disk during generation;
+    # if their artifacts appear in state.generated_artifacts the files are on disk.
+    non_mcp_artifacts = [
+        a for a in state.generated_artifacts if a.capability_type != CapabilityType.MCP_TOOL
+    ]
+    # "deployed" = MCP tools registered in registry + skills/agents written to disk.
+    deployed = registered + len(non_mcp_artifacts)
     new_errors = len(errors) - len(state.errors)
 
-    # Gaps were detected but nothing was generated → pipeline failed to produce
-    # any capabilities.  No gaps (all matched) → success even with 0 artifacts.
-    if state.gaps and total_artifacts == 0:
+    # Gaps were detected but nothing was actually deployed → pipeline failed.
+    # No gaps (all capabilities already matched) → success even with 0 artifacts.
+    if state.gaps and deployed == 0:
         status = TaskStatus.FAILED
         logger.warning(
-            "Loading complete: no artifacts generated for %d detected gaps",
+            "Loading complete: 0 capabilities deployed for %d detected gaps "
+            "(%d artifacts generated but none successfully loaded/registered)",
             len(state.gaps),
+            len(state.generated_artifacts),
         )
     else:
         status = TaskStatus.COMPLETED
         logger.info(
-            "Loading complete: %d/%d MCP tools registered, %d total artifacts, %d new errors",
+            "Loading complete: %d/%d MCP tools registered, %d skill/agent artifacts on disk, "
+            "%d new errors",
             registered,
             len(mcp_artifacts),
-            total_artifacts,
+            len(non_mcp_artifacts),
             new_errors,
         )
 

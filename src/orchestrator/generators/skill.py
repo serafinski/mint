@@ -49,11 +49,14 @@ def _get_validate_skill():
                 "This file is required for skill validation."
             )
         spec = importlib.util.spec_from_file_location("quick_validate", validate_path)
-        _VALIDATE_MODULE = importlib.util.module_from_spec(spec)
+        module = importlib.util.module_from_spec(spec)
         try:
-            spec.loader.exec_module(_VALIDATE_MODULE)
+            spec.loader.exec_module(module)
         except Exception as exc:
             raise RuntimeError(f"Failed to load tools/quick_validate.py: {exc}") from exc
+        # Only assign after successful execution so a failure doesn't leave a
+        # broken module in the cache (which would bypass the guard on next call).
+        _VALIDATE_MODULE = module
     return _VALIDATE_MODULE.validate_skill
 
 

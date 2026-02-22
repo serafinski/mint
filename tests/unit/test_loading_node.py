@@ -173,7 +173,7 @@ def test_load_failure_records_error_and_continues():
 
     assert loader.register_tool.call_count == 1  # only 'good' was registered
     assert any("bad" in e for e in cmd.update["errors"])
-    assert cmd.update["status"] == TaskStatus.COMPLETED  # total_artifacts > 0
+    assert cmd.update["status"] == TaskStatus.COMPLETED  # 'good' was registered → deployed > 0
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +242,48 @@ def test_completed_when_no_gaps_and_no_artifacts():
         generated_artifacts=[],
     )
     cmd = loading_node(state, _make_loader(), _make_registry())
+    assert cmd.update["status"] == TaskStatus.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# FAILED when gaps exist and all MCP tool loads fail (observation fix)
+# ---------------------------------------------------------------------------
+
+
+def test_failed_when_gaps_and_all_loads_fail():
+    """Gaps detected + artifacts generated but ALL load attempts fail → FAILED."""
+    from src.schemas.task import GapItem
+
+    artifacts = [_mcp_artifact("tool_a"), _mcp_artifact("tool_b")]
+    gaps = [
+        GapItem(description="tool a", query="tool a"),
+        GapItem(description="tool b", query="tool b"),
+    ]
+    state = TaskState(task_description="t", gaps=gaps, generated_artifacts=artifacts)
+
+    loader = MagicMock()
+    loader.load_tool.side_effect = RuntimeError("import error")
+
+    cmd = loading_node(state, loader, _make_registry())
+
+    assert cmd.update["status"] == TaskStatus.FAILED
+    assert len(cmd.update["errors"]) == 2  # one per failed load
+
+
+def test_completed_when_gaps_and_skill_artifact_even_if_mcp_load_fails():
+    """If an MCP load fails but a skill artifact was generated, status is COMPLETED."""
+    from src.schemas.task import GapItem
+
+    gaps = [GapItem(description="g", query="g")]
+    artifacts = [_mcp_artifact("bad_mcp"), _skill_artifact("my-skill")]
+    state = TaskState(task_description="t", gaps=gaps, generated_artifacts=artifacts)
+
+    loader = MagicMock()
+    loader.load_tool.side_effect = RuntimeError("import error")
+
+    cmd = loading_node(state, loader, _make_registry())
+
+    # Skill artifact counts as deployed → COMPLETED despite MCP failure
     assert cmd.update["status"] == TaskStatus.COMPLETED
 
 
