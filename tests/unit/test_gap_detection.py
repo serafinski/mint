@@ -158,3 +158,31 @@ def test_routes_to_classifier_when_only_gaps():
     state = TaskState(task_description="t", required_capabilities=["q"])
     cmd = gap_detection_node(state, registry)
     assert cmd.goto == "classifier_node"
+
+
+# ---------------------------------------------------------------------------
+# Error preservation
+# ---------------------------------------------------------------------------
+
+
+def test_preserves_existing_errors():
+    """Errors accumulated by earlier nodes must be carried through."""
+    registry = _make_registry(gaps=[("q", "reason")])
+    state = TaskState(
+        task_description="t",
+        required_capabilities=["q"],
+        errors=["decomposition timeout", "partial result"],
+    )
+
+    cmd = gap_detection_node(state, registry)
+
+    assert cmd.update["errors"] == ["decomposition timeout", "partial result"]
+
+
+def test_empty_errors_when_none_prior():
+    registry = _make_registry()
+    state = TaskState(task_description="t", required_capabilities=[])
+
+    cmd = gap_detection_node(state, registry)
+
+    assert cmd.update["errors"] == []

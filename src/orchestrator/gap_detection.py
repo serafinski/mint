@@ -37,6 +37,8 @@ def gap_detection_node(
     Returns:
         Command routing to ``classifier_node`` with updated matches and gaps.
     """
+    errors: list[str] = list(state.errors)
+
     matches_raw, gaps_raw = registry.detect_gaps(state.required_capabilities)
 
     matches = [
@@ -60,6 +62,7 @@ def gap_detection_node(
             "matches": matches,
             "gaps": gaps,
             "status": TaskStatus.DETECTING_GAPS,
+            "errors": errors,
         },
         goto="classifier_node",
     )
