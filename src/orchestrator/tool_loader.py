@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 from pydantic import BaseModel
 from pydantic import Field as PydanticField  # aliased; generated-tool code also imports Field
@@ -55,7 +56,7 @@ class ToolResult(BaseModel):
     """Result of executing a tool in a sandboxed subprocess."""
 
     success: bool = PydanticField(..., description="Whether the tool executed successfully")
-    result: object | None = PydanticField(default=None, description="Return value from the tool")
+    result: Any = PydanticField(default=None, description="Return value from the tool")
     error: str | None = PydanticField(default=None, description="Error message if execution failed")
     stdout: str = PydanticField(default="", description="Captured stdout")
     stderr: str = PydanticField(default="", description="Captured stderr")

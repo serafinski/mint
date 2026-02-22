@@ -270,6 +270,23 @@ def test_failed_when_gaps_and_all_loads_fail():
     assert len(cmd.update["errors"]) == 2  # one per failed load
 
 
+def test_failed_when_gaps_and_load_succeeds_but_register_fails():
+    """Gaps detected + artifact loads but registration fails → FAILED (nothing deployed)."""
+    from src.schemas.task import GapItem
+
+    gaps = [GapItem(description="tool a", query="tool a")]
+    artifact = _mcp_artifact("tool_a")
+    state = TaskState(task_description="t", gaps=gaps, generated_artifacts=[artifact])
+
+    loader = _make_loader(register_raises=RuntimeError("registry full"))
+
+    cmd = loading_node(state, loader, _make_registry())
+
+    # load succeeded, but register failed → registered=0, deployed=0, gaps non-empty → FAILED
+    assert cmd.update["status"] == TaskStatus.FAILED
+    assert any("registry full" in e for e in cmd.update["errors"])
+
+
 def test_completed_when_gaps_and_skill_artifact_even_if_mcp_load_fails():
     """If an MCP load fails but a skill artifact was generated, status is COMPLETED."""
     from src.schemas.task import GapItem

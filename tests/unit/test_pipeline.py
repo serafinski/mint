@@ -82,28 +82,37 @@ def test_pipeline_contains_expected_nodes(seeded_registry, mock_loader):
 
 
 def test_pipeline_no_gaps_path_completes(seeded_registry, mock_loader):
-    """Pipeline runs to completion when all capabilities are in the registry."""
-    # "compute fibonacci number" matches the seeded 'fibonacci' capability
+    """Pipeline runs to completion when all capabilities are in the registry.
+
+    detect_gaps is mocked to return a guaranteed match so this test does not
+    depend on ChromaDB embedding similarity scores (which would make it fragile
+    across model/library updates).
+    """
+    fibonacci_cap = seeded_registry.get("fibonacci")
+    assert fibonacci_cap is not None, "seed_registry must include 'fibonacci'"
+
     graph = create_pipeline(seeded_registry, mock_loader).compile()
 
     # Patch _get_agent so decomposition_node falls back immediately (returns
-    # no structured_response → 1 subtask = task_description as capability).
+    # no structured_response → required_capabilities = [task_description]).
     class _FakeAgent:
         def invoke(self, *args, **kwargs):
             return {"structured_response": None}
 
-    with patch(
-        "src.orchestrator.decomposition._get_agent",
-        return_value=_FakeAgent(),
-    ):
-        result = graph.invoke(
-            TaskState(task_description="compute fibonacci number")
-        )
+    # Patch detect_gaps to guarantee a match, removing the embedding-similarity
+    # dependency from this unit test.
+    guaranteed_match = [(fibonacci_cap, 0.95, "compute fibonacci number")]
+    with patch.object(seeded_registry, "detect_gaps", return_value=(guaranteed_match, [])):
+        with patch(
+            "src.orchestrator.decomposition._get_agent",
+            return_value=_FakeAgent(),
+        ):
+            result = graph.invoke(
+                TaskState(task_description="compute fibonacci number")
+            )
 
-    # With the fallback, required_capabilities = [task_description].
-    # The seeded registry matches "compute fibonacci number", so gaps = [].
-    # All generators are no-ops; loading_node sees no artifacts and no gaps
-    # → status = COMPLETED.
+    # No gaps → all generators are no-ops → loading_node sees no artifacts and
+    # no gaps → status = COMPLETED.
     assert result["status"] == TaskStatus.COMPLETED
     assert isinstance(result["errors"], list)
 

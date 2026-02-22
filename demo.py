@@ -1,4 +1,8 @@
-"""Iteration 0 demo: shows capability-found and gap-detected paths with LangFuse tracing.
+"""Iteration 2 demo: full JIT pipeline with LangFuse tracing.
+
+Shows two paths:
+  PATH 1 — capability already in registry (fibonacci match, no generation needed)
+  PATH 2 — gap detected, JIT generation triggered (Klingon translator)
 
 Usage:
     uv run python demo.py
@@ -13,6 +17,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from src.orchestrator.pipeline import create_pipeline
 from src.orchestrator.tool_loader import ToolLoader
 from src.registry.store import SkillRegistry, seed_registry
+from src.schemas.task import TaskState
 
 
 async def call_fibonacci_mcp(n: int) -> int:
@@ -44,7 +49,7 @@ async def main() -> None:
     print("PATH 1: Capability found")
     print("=" * 60)
     result = graph.invoke(
-        {"task_description": "compute fibonacci number"},
+        TaskState(task_description="compute fibonacci number"),
         config={"callbacks": [langfuse_handler]},
     )
 
@@ -65,7 +70,7 @@ async def main() -> None:
     print("PATH 2: Gap detected")
     print("=" * 60)
     result = graph.invoke(
-        {"task_description": "translate English to Klingon"},
+        TaskState(task_description="translate English to Klingon"),
         config={"callbacks": [langfuse_handler]},
     )
 
