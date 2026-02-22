@@ -131,11 +131,22 @@ def _validate_code(source_code: str) -> str | None:
             f"Found {async_def_count} public top-level async def functions; exactly 1 is required "
             "(tool runner picks the first non-private async function alphabetically)"
         )
-    if "Annotated" not in source_code:
+    # Collect all imported names via AST — substring search would match docstrings/comments
+    # and produce false positives for code that mentions but does not import these names.
+    imported_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                imported_names.add(alias.asname or alias.name)
+
+    if "Annotated" not in imported_names:
         errors.append(
             "Missing Annotated parameter types (expected: Annotated[type, Field(description=...)])"
         )
-    if "Field" not in source_code:
+    if "Field" not in imported_names:
         errors.append(
             "Missing Field from pydantic (expected: from pydantic import Field)"
         )

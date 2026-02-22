@@ -45,6 +45,12 @@ async def main() -> None:
     graph = create_pipeline(registry, loader).compile()
 
     # --- Path 1: Capability found ---
+    # NOTE: In Iteration 2 the full pipeline runs, including DeepAgent decomposition.
+    # The decomposition produces required_capabilities from the task description, and
+    # gap_detection searches for those in the seeded registry.  Whether a match is
+    # found depends on the LLM's decomposition output — this path is non-deterministic
+    # in production.  For a deterministic unit-test version see
+    # tests/unit/test_pipeline.py::test_pipeline_no_gaps_path_completes.
     print("=" * 60)
     print("PATH 1: Capability found")
     print("=" * 60)

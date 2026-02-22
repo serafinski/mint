@@ -233,6 +233,46 @@ class TestValidateCode:
         error = _validate_code(code)
         assert error is None, f"Expected valid but got: {error}"
 
+    def test_annotated_in_docstring_not_false_positive(self):
+        """'Annotated' in a docstring does not satisfy the import check.
+
+        Substring search would yield a false positive here; AST import scanning
+        correctly requires a real ``from typing import Annotated`` statement.
+        """
+        code = (
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from pydantic import Field\n"
+            "mcp = FastMCP('t')\n"
+            "@mcp.tool()\n"
+            "async def add(a: int) -> int:\n"
+            '    """Use Annotated[type, Field(description=...)] for parameters."""\n'
+            "    return a\n"
+        )
+        error = _validate_code(code)
+        # "Annotated" appears in docstring but is not imported — must still fail
+        assert error is not None
+        assert "Annotated" in error
+
+    def test_field_in_docstring_not_false_positive(self):
+        """'Field' in a docstring does not satisfy the import check.
+
+        Substring search would yield a false positive here; AST import scanning
+        correctly requires a real ``from pydantic import Field`` statement.
+        """
+        code = (
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from typing import Annotated\n"
+            "mcp = FastMCP('t')\n"
+            "@mcp.tool()\n"
+            "async def add(a: Annotated[int, 'First number']) -> int:\n"
+            '    """Field(description=...) from pydantic adds rich MCP metadata."""\n'
+            "    return a\n"
+        )
+        error = _validate_code(code)
+        # "Field" appears in docstring but is not imported — must still fail
+        assert error is not None
+        assert "Field" in error
+
     def test_private_top_level_async_helper_accepted(self):
         """A module-level private async helper (_prefixed) is not counted as a tool.
 

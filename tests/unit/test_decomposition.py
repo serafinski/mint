@@ -226,6 +226,26 @@ class TestDecompositionNode:
         assert "pre-existing error" in errors
         assert any("new error" in e for e in errors)
 
+    def test_empty_subtasks_list_falls_back_and_records_error(self, state):
+        """Agent returns DecompositionResult with 0 subtasks → fallback + error recorded.
+
+        Unlike structured_response=None (no response at all), a valid response with
+        an empty subtasks list is a distinct failure mode — the agent succeeded
+        structurally but produced no useful output.  An error must be recorded so
+        operators can observe this in state.errors and in LangFuse.
+        """
+        structured = DecompositionResult(subtasks=[], reasoning="Task seems trivial")
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["subtasks"] == []
+        assert cmd.update["required_capabilities"] == [state.task_description]
+        errors = cmd.update["errors"]
+        assert any("0 subtasks" in e for e in errors)
+
     def test_duplicate_required_capabilities_deduplicated(self, state):
         """Shared capability names across subtasks appear only once in required_capabilities."""
         structured = DecompositionResult(

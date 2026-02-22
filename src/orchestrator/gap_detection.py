@@ -45,10 +45,10 @@ def gap_detection_node(
         MatchItem(capability=cap, score=score)
         for cap, score, _query in matches_raw
     ]
-    gaps = [
-        GapItem(description=query, query=query)
-        for query, _reason in gaps_raw
-    ]
+    gaps = []
+    for query, reason in gaps_raw:
+        logger.debug("Capability gap: %r — %s", query, reason)
+        gaps.append(GapItem(description=query, query=query))
 
     logger.info(
         "Gap detection: %d matches, %d gaps from %d required capabilities",

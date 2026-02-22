@@ -114,6 +114,17 @@ def decomposition_node(
                     )
                 )
                 required_caps.extend(item.required_capabilities)
+            if not subtasks:
+                errors.append(
+                    "Decomposition agent returned 0 subtasks; treating whole task as one capability"
+                )
+                logger.warning("DecompositionAgent: structured response contained 0 subtasks")
+                emit_langfuse_event(
+                    langfuse_handler,
+                    "decomposition.empty_subtasks",
+                    "WARNING",
+                    {"task_description": state.task_description[:200]},
+                )
         else:
             errors.append("Decomposition agent returned no structured response")
             logger.warning("DecompositionAgent: no structured_response in result")
