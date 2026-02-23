@@ -398,7 +398,7 @@ class TestRegisterTool:
         assert descriptor.description == "Adds two integers"
 
     def test_register_uses_artifact_description(self):
-        """register_tool uses artifact.description when no explicit description given (Bug 1 fix)."""
+        """register_tool uses artifact.description when no explicit description given."""
         artifact = GeneratedArtifact(
             capability_name="csv_parser",
             capability_type=CapabilityType.MCP_TOOL,

@@ -99,6 +99,7 @@ def _validate_result(result: AgentGenerationResult) -> list[str]:
     if not result.system_prompt.strip():
         errors.append("system_prompt must be non-empty")
 
+    agent_name_valid = False
     if not result.agent_name.strip():
         errors.append("agent_name must be non-empty")
     elif not _HYPHEN_CASE_RE.match(result.agent_name):
@@ -108,6 +109,8 @@ def _validate_result(result: AgentGenerationResult) -> list[str]:
         )
     elif len(result.agent_name) > 64:
         errors.append(f"agent_name too long ({len(result.agent_name)} chars, max 64)")
+    else:
+        agent_name_valid = True
 
     if not result.node_name.strip():
         errors.append("node_name must be non-empty")
@@ -123,6 +126,13 @@ def _validate_result(result: AgentGenerationResult) -> list[str]:
     if result.skill_content:
         if not result.skill_content.startswith("---"):
             errors.append("skill_content must start with YAML frontmatter (---)")
+        elif not agent_name_valid:
+            # agent_name failed validation above — it may contain path-unsafe
+            # characters (e.g. "/"), which would crash validate_skill_content.
+            # Skip skill_content validation; the agent_name error already captures this.
+            errors.append(
+                "skill_content validation skipped: agent_name is invalid"
+            )
         else:
             # Run full quick_validate.py check (same as skill generator does)
             is_valid, msg = validate_skill_content(result.skill_content, result.agent_name)

@@ -311,9 +311,10 @@ class ToolLoader:
         # The Tier 2 behavioral tester (Iteration 3) will need input_schema to
         # generate test inputs; this should be populated by parsing the generated
         # source code's function signature or passed from the generator.
+        fallback_desc = artifact.capability_name.replace("-", " ").replace("_", " ")
         descriptor = CapabilityDescriptor(
             name=artifact.capability_name,
-            description=description or artifact.description or artifact.capability_name.replace("-", " ").replace("_", " "),
+            description=description or artifact.description or fallback_desc,
             capability_type=CapabilityType.MCP_TOOL,
             domain=domain,
             tags=tags or [],

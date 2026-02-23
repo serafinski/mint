@@ -86,7 +86,7 @@ async def main() -> None:
     for g in gaps:
         print(f"  - {g.description} (query: '{g.query}')")
     print()
-    print("Gap logged — in later iterations this triggers JIT capability generation.")
+    print("Gaps logged — the pipeline triggered JIT generation above (decompose → classify → generate → load).")
 
     # --- Flush traces ---
     langfuse.flush()

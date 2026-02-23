@@ -151,6 +151,15 @@ def validate_skill_content(content: str, skill_name: str) -> tuple[bool, str]:
     if not skill_name or not skill_name.strip():
         return False, "skill_name must be non-empty"
 
+    # Guard against path-unsafe names (e.g. containing "/") — Path(tmp) / "a/b"
+    # silently creates a nested path; mkdir() without parents=True then crashes
+    # with FileNotFoundError rather than returning a validation error.
+    if "/" in skill_name or "\\" in skill_name or "\x00" in skill_name:
+        return False, (
+            f"skill_name '{skill_name}' contains path-unsafe characters "
+            "(forward slash, backslash, or null byte are not allowed)"
+        )
+
     # Additional check: non-empty body after frontmatter closing ---
     # quick_validate.py only validates frontmatter; it does not check body.
     parts = re.split(r"^---\s*$", content, maxsplit=2, flags=re.MULTILINE)

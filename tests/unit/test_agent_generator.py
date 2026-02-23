@@ -181,6 +181,25 @@ class TestValidateResult:
         errors = _validate_result(result)
         assert any("agent_name" in e for e in errors)
 
+    def test_invalid_agent_name_with_skill_content_does_not_crash(self):
+        """_validate_result must not crash (FileNotFoundError) when agent_name
+        contains path-unsafe characters (e.g. '/') AND skill_content is present.
+
+        Previously, _validate_result would call validate_skill_content(skill_content,
+        'foo/bar') even after recording an agent_name error, and mkdir() without
+        parents=True would raise FileNotFoundError instead of returning an error list.
+        The guard in _validate_result skips validate_skill_content when agent_name
+        is invalid.
+        """
+        result = _valid_deep_agent_result()
+        result.agent_name = "foo/bar"  # path-unsafe: contains slash
+        # Must return a list of errors, not raise
+        errors = _validate_result(result)
+        assert any("agent_name" in e for e in errors)
+        assert any("skipped" in e for e in errors), (
+            "Expected a 'skill_content validation skipped' error when agent_name is invalid"
+        )
+
     def test_empty_node_name(self):
         result = _valid_plain_result()
         result.node_name = "  "

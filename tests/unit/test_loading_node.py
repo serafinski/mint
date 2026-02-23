@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 from src.orchestrator.loading_node import loading_node
 from src.orchestrator.tool_loader import LoadedTool, ToolResult
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact, TaskState, TaskStatus
-
 
 # ---------------------------------------------------------------------------
 # Helpers

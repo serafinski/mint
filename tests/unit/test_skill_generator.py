@@ -179,6 +179,23 @@ class TestValidateSkillContent:
         assert not is_valid
         assert "non-empty" in msg
 
+    def test_slash_in_skill_name_rejected(self):
+        """skill_name containing '/' must be rejected (not crash with FileNotFoundError).
+
+        Path(tmp) / 'foo/bar' creates a nested path; mkdir() without parents=True
+        would raise FileNotFoundError instead of returning a validation error.
+        This guard ensures we return (False, message) for path-unsafe names.
+        """
+        is_valid, msg = validate_skill_content(VALID_SKILL_MD, "foo/bar")
+        assert not is_valid
+        assert "path-unsafe" in msg
+
+    def test_absolute_path_in_skill_name_rejected(self):
+        """skill_name starting with '/' is rejected before reaching mkdir."""
+        is_valid, msg = validate_skill_content(VALID_SKILL_MD, "/absolute/path")
+        assert not is_valid
+        assert "path-unsafe" in msg
+
 
 # ---------------------------------------------------------------------------
 # Node routing tests — no LLM needed
