@@ -381,7 +381,9 @@ The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agen
 - **`src/orchestrator/generators/`** — All three generators (`mcp_tool`, `skill`, `agent`) now replace by `capability_name` instead of blindly appending. On retry cycles the generator re-runs all classified gaps; replacing by name prevents duplicate entries for the same capability.
 - **`src/orchestrator/generators/agent.py`** — `goto` changed from `"loading_node"` to `"verification_node"`.
 - **`src/orchestrator/pipeline.py`** — `verification_node` added between `generate_agent` and `loading_node`. Topology is now 9 nodes: `START → decomposition_node → gap_detection → classifier_node → generate_mcp_tool → generate_skill → generate_agent → verification_node → loading_node → END`.
-- **Tests** — 343 unit (0 skipped) + 24 integration = 367 total (integration count unchanged; `test_write_todos_is_used` task made complex enough to reliably trigger `write_todos`).
+- **`src/verification/sandbox_tool.py`** — NEW. `sandbox_execute(code, timeout=10) -> dict` runs an arbitrary Python snippet inside `docker run --rm --network none` (128 MB RAM, 0.5 CPU). Returns `{stdout, stderr, exit_code, success}`. Failures and timeouts are captured — never raises. The adversarial teammate **must import from here**; do **not** use `ToolLoader.execute_tool` (runs on host via `sys.executable`). 10 unit tests (subprocess mocked). 4 `@pytest.mark.integration` tests require the `jit-sandbox` image (`make build-sandbox`).
+- **`Makefile`** — `build-sandbox` target added (`docker build -t jit-sandbox sandbox/`).
+- **Tests** — 353 unit (0 skipped) + 24 integration = 377 total.
 
 ## Current Iteration
 
@@ -389,9 +391,10 @@ The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agen
 
 - `verification_node` stub in `src/orchestrator/verification_node.py` — replace `gate_fn` with `gate.verify` in `pipeline.py` once `src/verification/gate.py` is ready
 - `attempt_count` and retry routing already work end-to-end (tested)
-- `sandbox_execute` tool must use Docker (`--network none`) — **never `sys.executable`**
+- `sandbox_execute` is **ready** in `src/verification/sandbox_tool.py` — import from there; do **not** recreate it
 - Tier 2 behavioral tester must parse `source_code` AST for parameter schema (`input_schema` is empty in registry by design)
 - `VerificationFinding.tier` supports 0–3 (Tier 0 = structural pre-check)
+- Build the sandbox image before running integration tests: `make build-sandbox`
 
 See `docs/iteration_plan.md` for the full Iteration 3 spec.
 
