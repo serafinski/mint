@@ -354,8 +354,8 @@ All nodes use Command API for routing. The registry and ToolLoader are injected 
 - LangFuse traces full pipeline end-to-end
 - **Update CLAUDE.md**
 
-### 🔍 CRITIQUE CHECKPOINT after this iteration
-Before starting Iteration 3, assess: Are the generated capabilities good enough for verification to have something meaningful to work with? If generation quality is too low, adjust Iteration 3's expectations.
+### 🔍 CRITIQUE CHECKPOINT after this iteration ✅ PASSED
+Assessment: Generated capabilities are structurally valid and executable (344/344 tests pass). MCP tools pass syntax + FastMCP structure validation before reaching the gate. Skills pass `quick_validate.py`. Pipeline always reaches a terminal state. Iteration 3 expectations unchanged.
 
 ---
 
@@ -394,25 +394,7 @@ Before starting Iteration 3, assess: Are the generated capabilities good enough 
    - **Focused on 3 specific attack patterns:** (1) hidden demo/sample mode detection, (2) network-disconnect behavioral change, (3) ground-truth comparison where available
    - Trace with LangFuse
 
-   > ⚠️ **The `execute` tool is not yet defined.** The adversarial DeepAgent needs a tool
-   > that runs code in an isolated environment and returns stdout/stderr/exit code. This
-   > tool must be built **before Iteration 3 starts** — it is a prerequisite for the
-   > adversarial DeepAgent to function. Options:
-   >
-   > **Option A:** Hand-write `src/verification/sandbox_tool.py` — a FastMCP-style tool
-   > that runs a Python snippet in a restricted subprocess (no network, limited CPU/mem)
-   > using the existing `sandbox/Dockerfile`. Register it with the adversarial DeepAgent
-   > via `create_deep_agent(tools=[sandbox_execute])`.
-   >
-   > **Option B:** Reuse the Iteration 2 MCP tool loader (`src/orchestrator/tool_loader.py`).
-   > The loader already handles sandboxed subprocess execution — wrap it as a tool the
-   > adversarial agent can call.
-   >
-   > **Recommendation:** Option B — avoids duplication and validates that the tool loader
-   > works end-to-end before verification depends on it.
-   >
-   > **Action:** At the start of Iteration 3, before spawning the agent team, implement
-   > and test the `execute` tool interface. Add it to the `adversarial` teammate's brief.
+   > ✅ **Decision: `sandbox_execute` uses Docker (Option A, not Option B).** Build `sandbox_execute(code: str) -> dict` in `src/verification/sandbox_tool.py` using `docker run --rm --network none`. Do NOT wrap `ToolLoader.execute_tool` — that runs on the host via `sys.executable`, which is safe for smoke-testing your own generated code but not for adversarial probing. The `adversarial` teammate must use this new tool, not the tool loader. See the `verification-patterns` skill for the implementation pattern.
 
 4. **Verification gate** (`src/verification/gate.py`)
    - Combines all three tiers with tiered cost optimization:
@@ -424,8 +406,12 @@ Before starting Iteration 3, assess: Are the generated capabilities good enough 
 
 5. **Pipeline integration** — Verification node between generation and registration. Failed capabilities get feedback and can be regenerated (retry loop, max 3 attempts — "strike system"). If generation fails 3 times, fail open with "Unable to generate" rather than hallucinating success. Pass the `VerificationReport` from the previous failure into the prompt for the next attempt. Use Command API to route between generation → verification → registration with loop-back on failure.
 
-### Skills to create first
-- `.claude/skills/verification-patterns/SKILL.md`
+### Pre-work completed before agent team start
+
+- ✅ `.claude/skills/verification-patterns/SKILL.md` — created (AST patterns, behavioral testing, adversarial probing, `sandbox_execute` Docker design, retry loop)
+- ✅ `attempt_count: int = 0` added to `TaskState` (`src/schemas/task.py`, ge=0 constraint, 4 new tests)
+- ✅ `sandbox_execute` decision recorded above (Option A — Docker, not tool_loader wrapping)
+- **Note for behavioral teammate:** `CapabilityDescriptor.input_schema` is empty by design. Parse parameter schema from `source_code` AST using `ast.parse()`. See `verification-patterns` skill → Tier 2 section.
 
 ### Agent Teams usage
 **4-teammate team** (justified by thesis contribution):

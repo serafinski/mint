@@ -202,5 +202,14 @@ class TaskState(BaseModel):
         default=None,
         description="LangFuse trace ID for observability",
     )
+    attempt_count: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of generation+verification cycles attempted for the current task. "
+            "Incremented by the verification node on each retry. "
+            "Used to enforce the 3-strike limit before failing open."
+        ),
+    )
 
     model_config = {"extra": "forbid"}

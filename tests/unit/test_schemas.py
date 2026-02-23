@@ -770,6 +770,27 @@ def test_task_state_roundtrip():
     assert roundtripped.trace_id == "trace-xyz"
 
 
+def test_task_state_attempt_count_default():
+    state = TaskState(task_description="test")
+    assert state.attempt_count == 0
+
+
+def test_task_state_attempt_count_set():
+    state = TaskState(task_description="test", attempt_count=2)
+    assert state.attempt_count == 2
+
+
+def test_task_state_attempt_count_rejects_negative():
+    with pytest.raises(ValueError):
+        TaskState(task_description="test", attempt_count=-1)
+
+
+def test_task_state_attempt_count_roundtrip():
+    state = TaskState(task_description="test", attempt_count=3)
+    roundtripped = TaskState.model_validate_json(state.model_dump_json())
+    assert roundtripped.attempt_count == 3
+
+
 # --- GapItem / MatchItem ---
 
 

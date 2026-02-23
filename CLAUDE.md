@@ -116,8 +116,7 @@ The following skills are available in `.claude/skills/` and must be followed:
 - **deep-agents** — When and how to use DeepAgents vs. plain LangGraph nodes. DeepAgents are complete agent graphs invoked from within pipeline nodes.
 - **mcp-builder** — MCP server development guide (FastMCP for Python, TypeScript SDK). Covers tool design, implementation, testing, and evaluation. Has reference files for Python/TypeScript patterns and best practices. Use for both hand-written and generated MCP tools.
 
-Additional skills will be added in later iterations:
-- **verification-patterns** (Iteration 3) — AST scanning, adversarial testing, and verification gate patterns.
+- **verification-patterns** — AST scanning patterns, behavioral testing (signature-based input generation), adversarial probing (3 attack patterns), `sandbox_execute` Docker design, tiered cost gate, retry loop with `attempt_count`.
 
 ## Package Management
 
@@ -370,20 +369,28 @@ The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agen
 
 **Why not Send fan-out:** Parallel fan-out requires Annotated reducers on `TaskState` list fields and refactored generator signatures accepting `GeneratorInput` instead of `TaskState`. Sequential chaining is simpler, avoids schema changes, and is sufficient for the thesis — generation latency is not a bottleneck. Send-based parallelism is documented as future work.
 
+### Iteration 3 Pre-work (Complete)
+
+- **`src/schemas/task.py`** — Added `attempt_count: int = 0` (ge=0) to `TaskState`. Tracks generation+verification retry cycles for the 3-strike system. 4 new unit tests (324 unit total).
+- **`.claude/skills/verification-patterns/SKILL.md`** — New skill covering: 5 Tier 1 contamination categories with AST patterns, Tier 2 signature-based input extraction, `sandbox_execute` Docker design (must use Docker, never `sys.executable`), 3-strike retry loop, tiered cost gate, updated Iteration 3 pipeline topology.
+
 ## Current Iteration
 
-**Iteration 2 complete.** Run the Iteration 2 critique checkpoint before starting Iteration 3:
+**Iteration 3: Verification Layer.** Critique checkpoint passed — generated capabilities are structurally valid and executable, all 344 tests pass. Pre-work complete:
 
-- Are generated capabilities good enough for verification to work with?
-- Does the pipeline reliably reach a terminal state (COMPLETED or FAILED) across diverse task descriptions?
+- `attempt_count: int = 0` added to `TaskState` (retry loop counter, ge=0)
+- `verification-patterns` skill created (`.claude/skills/verification-patterns/SKILL.md`)
+- Iteration 3 pipeline topology: insert `verification_node` between generator chain and `loading_node`, with conditional loop-back on failure (max 3 attempts via `attempt_count`)
+- `sandbox_execute` tool must use Docker (`--network none`) — **never `sys.executable`**
+- Tier 2 behavioral tester must parse `source_code` AST for parameter schema (`input_schema` is empty in registry by design)
 
-See `docs/iteration_plan.md` for the full plan and Iteration 3 spec.
+See `docs/iteration_plan.md` for the full Iteration 3 spec.
 
 ## Stable Interfaces
 
 The following modules are implemented and tested. Import from them; avoid modifying unless explicitly required:
 
-- **`src/schemas/`** — All 18 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState`, `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact`, `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
+- **`src/schemas/`** — All 18 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState` (now includes `attempt_count: int = 0`), `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact`, `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
 - **`src/orchestrator/decomposition.py`** — `decomposition_node()` (DeepAgent-backed task decomposition)
 - **`src/orchestrator/classifier.py`** — `classify_gap()`, `classifier_node()` (LLM-based classification)
 - **`src/orchestrator/prompts/`** — All prompt constants for decomposition, classification, and all three generators
