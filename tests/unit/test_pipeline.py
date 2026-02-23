@@ -63,6 +63,7 @@ def test_pipeline_contains_expected_nodes(seeded_registry, mock_loader):
         "generate_mcp_tool",
         "generate_skill",
         "generate_agent",
+        "verification_node",
         "loading_node",
     }
     assert expected.issubset(node_names), (

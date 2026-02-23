@@ -316,6 +316,10 @@ def generate_skill(
     for gap in skill_gaps:
         artifact, error = _generate_single_skill(gap, state.task_description)
         if artifact is not None:
+            # Replace any existing artifact with the same capability_name.
+            # On retry cycles the node re-runs all classified gaps; replacing
+            # by name prevents duplicate entries for the same capability.
+            artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
         if error is not None:
             errors.append(error)

@@ -84,8 +84,10 @@ class TestDecompositionIntegration:
                     {
                         "role": "user",
                         "content": (
-                            "Parse a JSON config file and validate its schema "
-                            "against a specification."
+                            "Load customer data from a database, clean and deduplicate "
+                            "the records, train a churn prediction model, evaluate it "
+                            "against a holdout set, and generate a report with the "
+                            "predictions and model metrics."
                         ),
                     }
                 ]

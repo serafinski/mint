@@ -374,15 +374,24 @@ The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agen
 - **`src/schemas/task.py`** — Added `attempt_count: int = 0` (ge=0) to `TaskState`. Tracks generation+verification retry cycles for the 3-strike system. 4 new unit tests (324 unit total).
 - **`.claude/skills/verification-patterns/SKILL.md`** — New skill covering: 5 Tier 1 contamination categories with AST patterns, Tier 2 signature-based input extraction, `sandbox_execute` Docker design (must use Docker, never `sys.executable`), 3-strike retry loop, tiered cost gate, updated Iteration 3 pipeline topology.
 
+### Iteration 3 Foundation (Complete — pre-team start)
+
+- **`src/schemas/verification.py`** — `VerificationFinding.tier` constraint corrected to `ge=0` (was `ge=1`). Tier 0 findings (structural pre-check from `quick_validate.py`) require tier=0 to be valid.
+- **`src/orchestrator/verification_node.py`** — NEW. Stub verification node with correct retry logic: runs `gate_fn` per artifact, increments `attempt_count`, removes failed artifacts from state on retry (routes to `"generate_mcp_tool"`), fails open at `MAX_ATTEMPTS=3` (routes to `"loading_node"`). `gate_fn=None` uses `_stub_gate` (always passes) until Iteration 3 replaces it with `gate.verify`. 19 unit tests.
+- **`src/orchestrator/generators/`** — All three generators (`mcp_tool`, `skill`, `agent`) now replace by `capability_name` instead of blindly appending. On retry cycles the generator re-runs all classified gaps; replacing by name prevents duplicate entries for the same capability.
+- **`src/orchestrator/generators/agent.py`** — `goto` changed from `"loading_node"` to `"verification_node"`.
+- **`src/orchestrator/pipeline.py`** — `verification_node` added between `generate_agent` and `loading_node`. Topology is now 9 nodes: `START → decomposition_node → gap_detection → classifier_node → generate_mcp_tool → generate_skill → generate_agent → verification_node → loading_node → END`.
+- **Tests** — 343 unit (0 skipped) + 24 integration = 367 total (integration count unchanged; `test_write_todos_is_used` task made complex enough to reliably trigger `write_todos`).
+
 ## Current Iteration
 
-**Iteration 3: Verification Layer.** Critique checkpoint passed — generated capabilities are structurally valid and executable, all 344 tests pass. Pre-work complete:
+**Iteration 3: Verification Layer.** Pipeline skeleton is wired (`verification_node` stub in place). Ready to implement the real three-tier gate.
 
-- `attempt_count: int = 0` added to `TaskState` (retry loop counter, ge=0)
-- `verification-patterns` skill created (`.claude/skills/verification-patterns/SKILL.md`)
-- Iteration 3 pipeline topology: insert `verification_node` between generator chain and `loading_node`, with conditional loop-back on failure (max 3 attempts via `attempt_count`)
+- `verification_node` stub in `src/orchestrator/verification_node.py` — replace `gate_fn` with `gate.verify` in `pipeline.py` once `src/verification/gate.py` is ready
+- `attempt_count` and retry routing already work end-to-end (tested)
 - `sandbox_execute` tool must use Docker (`--network none`) — **never `sys.executable`**
 - Tier 2 behavioral tester must parse `source_code` AST for parameter schema (`input_schema` is empty in registry by design)
+- `VerificationFinding.tier` supports 0–3 (Tier 0 = structural pre-check)
 
 See `docs/iteration_plan.md` for the full Iteration 3 spec.
 
@@ -396,8 +405,9 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/orchestrator/prompts/`** — All prompt constants for decomposition, classification, and all three generators
 - **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry)` (detects registry gaps, always routes to `"classifier_node"`)
 - **`src/orchestrator/loading_node.py`** — `loading_node(state, loader, registry)` (loads + registers MCP_TOOL artifacts, sets terminal status)
-- **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader)` (full 8-node Iteration 2 pipeline)
-- **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` (LangGraph nodes; chained sequentially to `loading_node`)
+- **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader)` (9-node pipeline; verification_node stub wired between generate_agent and loading_node)
+- **`src/orchestrator/verification_node.py`** — `verification_node(state, gate_fn=None)` (retry + artifact replacement logic; stub gate until Iter 3 fills in real gate)
+- **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` (LangGraph nodes; chained sequentially to `verification_node`)
 - **`src/orchestrator/tool_loader.py`** — `ToolLoader` (load, execute, register_tool, cleanup), `LoadedTool`, `ToolResult`
 - **`src/registry/store.py`** — `SkillRegistry` (full CRUD + hierarchical search), `seed_registry()`
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + 4 granularity metric queries)

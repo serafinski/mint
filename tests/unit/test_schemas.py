@@ -369,13 +369,15 @@ def test_verification_finding_with_location():
 
 
 def test_verification_finding_tier_bounds():
-    with pytest.raises(ValueError):
-        VerificationFinding(
-            tier=0,
-            category="test",
-            severity=Severity.LOW,
-            message="test",
-        )
+    # tier=0 is valid (Tier 0 = structural pre-check for skills, runs before Tier 1)
+    f = VerificationFinding(
+        tier=0,
+        category="structural",
+        severity=Severity.CRITICAL,
+        message="quick_validate.py check failed",
+    )
+    assert f.tier == 0
+    # tier=4 is above the maximum
     with pytest.raises(ValueError):
         VerificationFinding(
             tier=4,

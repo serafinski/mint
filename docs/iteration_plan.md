@@ -411,7 +411,12 @@ Assessment: Generated capabilities are structurally valid and executable (344/34
 - ✅ `.claude/skills/verification-patterns/SKILL.md` — created (AST patterns, behavioral testing, adversarial probing, `sandbox_execute` Docker design, retry loop)
 - ✅ `attempt_count: int = 0` added to `TaskState` (`src/schemas/task.py`, ge=0 constraint, 4 new tests)
 - ✅ `sandbox_execute` decision recorded above (Option A — Docker, not tool_loader wrapping)
+- ✅ `VerificationFinding.tier` constraint corrected to `ge=0` (`src/schemas/verification.py`). Tier 0 structural findings from `quick_validate.py` require tier=0 to be a valid value.
+- ✅ `src/orchestrator/verification_node.py` — stub verification node created with correct retry + artifact-replacement logic. `gate_fn=None` uses `_stub_gate` (always passes); pipeline runs end-to-end. In Iteration 3, wire the real gate by passing `gate_fn=gate.verify` via a closure in `pipeline.py`. 19 unit tests.
+- ✅ Pipeline updated: `generate_agent` now routes to `"verification_node"` (was `"loading_node"`); `verification_node` wired in `pipeline.py` between generator chain and `loading_node`. Topology is now 9 nodes.
+- ✅ Generator replace-by-name: all three generators replace existing artifacts by `capability_name` instead of appending, preventing accumulation across retry cycles.
 - **Note for behavioral teammate:** `CapabilityDescriptor.input_schema` is empty by design. Parse parameter schema from `source_code` AST using `ast.parse()`. See `verification-patterns` skill → Tier 2 section.
+- **Note for all teammates:** `verification_node` stub is already in place — do **not** create a new one. Implement `src/verification/gate.py` with `verify(artifact, loader, registry) -> VerificationReport`, then update `pipeline.py` to pass `gate_fn=verify` via a closure.
 
 ### Agent Teams usage
 **4-teammate team** (justified by thesis contribution):

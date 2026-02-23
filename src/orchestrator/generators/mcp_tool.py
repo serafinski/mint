@@ -314,6 +314,10 @@ def generate_mcp_tool(
     for gap in mcp_gaps:
         artifact, error = generate_single_tool(gap, task_context=state.task_description)
         if artifact is not None:
+            # Replace any existing artifact with the same capability_name.
+            # On retry cycles the node re-runs all classified gaps; replacing
+            # by name prevents duplicate entries for the same capability.
+            artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
         if error is not None:
             errors.append(error)

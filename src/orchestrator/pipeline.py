@@ -9,6 +9,7 @@ Graph topology::
       → generate_mcp_tool       # LLM: MCP_TOOL gaps → source code artifacts
       → generate_skill          # LLM: SKILL gaps → SKILL.md artifacts
       → generate_agent          # LLM: AGENT gaps → agent config artifacts
+      → verification_node       # Gate: verify artifacts; retry up to 3× on failure
       → loading_node            # Pure Python: load + smoke-test + register MCP tools
       → END
 
@@ -39,6 +40,7 @@ from src.orchestrator.generators.mcp_tool import generate_mcp_tool
 from src.orchestrator.generators.skill import generate_skill
 from src.orchestrator.loading_node import loading_node
 from src.orchestrator.tool_loader import ToolLoader
+from src.orchestrator.verification_node import verification_node
 from src.registry.store import SkillRegistry
 from src.schemas.task import TaskState
 
@@ -63,6 +65,9 @@ def create_pipeline(registry: SkillRegistry, loader: ToolLoader) -> StateGraph:
     builder.add_node("generate_mcp_tool", generate_mcp_tool)
     builder.add_node("generate_skill", generate_skill)
     builder.add_node("generate_agent", generate_agent)
+    # verification_node uses the stub gate (always passes) until Iteration 3
+    # replaces it with the real gate: lambda state: verification_node(state, gate_fn=real_gate)
+    builder.add_node("verification_node", verification_node)
 
     # --- Nodes with injected dependencies (closures) ---
     builder.add_node(

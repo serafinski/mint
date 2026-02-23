@@ -281,11 +281,11 @@ def _generate_single_agent(
 
 def generate_agent(
     state: TaskState,
-) -> Command[Literal["loading_node"]]:
+) -> Command[Literal["verification_node"]]:
     """Generate agent configurations for all AGENT-typed gaps.
 
     Skips gaps that are not classified as AGENT. On LLM failure, records
-    the error and continues with the next gap.  Routes to ``loading_node``
+    the error and continues with the next gap.  Routes to ``verification_node``
     which is the final stage of the sequential generator chain.
     """
     artifacts: list[GeneratedArtifact] = list(state.generated_artifacts)
@@ -298,6 +298,10 @@ def generate_agent(
     for gap in agent_gaps:
         artifact, error = _generate_single_agent(gap, state.task_description)
         if artifact is not None:
+            # Replace any existing artifact with the same capability_name.
+            # On retry cycles the node re-runs all classified gaps; replacing
+            # by name prevents duplicate entries for the same capability.
+            artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
         if error is not None:
             errors.append(error)
@@ -308,5 +312,5 @@ def generate_agent(
             "status": TaskStatus.GENERATING,
             "errors": errors,
         },
-        goto="loading_node",
+        goto="verification_node",
     )

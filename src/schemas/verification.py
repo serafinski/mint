@@ -17,7 +17,7 @@ class Severity(StrEnum):
 class VerificationFinding(BaseModel):
     """A single finding from a verification tier."""
 
-    tier: int = Field(..., ge=1, le=3, description="Verification tier that produced this finding")
+    tier: int = Field(..., ge=0, le=3, description="Verification tier that produced this finding")
     category: str = Field(..., description="Finding category (e.g. 'security', 'correctness')")
     severity: Severity = Field(..., description="Severity level of the finding")
     message: str = Field(..., description="Human-readable description of the finding")
