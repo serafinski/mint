@@ -30,7 +30,13 @@ def emit_langfuse_event(
         from langfuse import Langfuse
         from langfuse.types import TraceContext
 
-        trace_id: str | None = getattr(langfuse_handler, "last_trace_id", None)
+        # Accept either a CallbackHandler object (exposes .last_trace_id) or a
+        # raw trace ID string (e.g. state.trace_id passed directly by nodes
+        # that don't hold a handler reference).
+        if isinstance(langfuse_handler, str):
+            trace_id: str | None = langfuse_handler
+        else:
+            trace_id = getattr(langfuse_handler, "last_trace_id", None)
         lf = Langfuse()
         lf.create_event(
             trace_context=TraceContext(trace_id=trace_id) if trace_id else None,

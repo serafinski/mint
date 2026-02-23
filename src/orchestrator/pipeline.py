@@ -85,7 +85,8 @@ def create_pipeline(registry: SkillRegistry, loader: ToolLoader) -> StateGraph:
     #   classifier_node    → "generate_mcp_tool"
     #   generate_mcp_tool  → "generate_skill"
     #   generate_skill     → "generate_agent"
-    #   generate_agent     → "loading_node"
+    #   generate_agent     → "verification_node"
+    #   verification_node  → "loading_node"  (all pass / max attempts) or "generate_mcp_tool" (retry)
     #   loading_node       → END
     builder.add_edge(START, "decomposition_node")
 
