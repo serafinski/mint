@@ -1,4 +1,8 @@
-"""Iteration 0 demo: shows capability-found and gap-detected paths with LangFuse tracing.
+"""Iteration 2 demo: full JIT pipeline with LangFuse tracing.
+
+Shows two paths:
+  PATH 1 — capability already in registry (fibonacci match, no generation needed)
+  PATH 2 — gap detected, JIT generation triggered (Klingon translator)
 
 Usage:
     uv run python demo.py
@@ -11,7 +15,9 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from src.orchestrator.pipeline import create_pipeline
+from src.orchestrator.tool_loader import ToolLoader
 from src.registry.store import SkillRegistry, seed_registry
+from src.schemas.task import TaskState
 
 
 async def call_fibonacci_mcp(n: int) -> int:
@@ -35,14 +41,21 @@ async def main() -> None:
     langfuse_handler = CallbackHandler()
     registry = SkillRegistry()
     seed_registry(registry)
-    graph = create_pipeline(registry).compile()
+    loader = ToolLoader()
+    graph = create_pipeline(registry, loader).compile()
 
     # --- Path 1: Capability found ---
+    # NOTE: In Iteration 2 the full pipeline runs, including DeepAgent decomposition.
+    # The decomposition produces required_capabilities from the task description, and
+    # gap_detection searches for those in the seeded registry.  Whether a match is
+    # found depends on the LLM's decomposition output — this path is non-deterministic
+    # in production.  For a deterministic unit-test version see
+    # tests/unit/test_pipeline.py::test_pipeline_no_gaps_path_completes.
     print("=" * 60)
     print("PATH 1: Capability found")
     print("=" * 60)
     result = graph.invoke(
-        {"task_description": "compute fibonacci number"},
+        TaskState(task_description="compute fibonacci number"),
         config={"callbacks": [langfuse_handler]},
     )
 
@@ -63,7 +76,7 @@ async def main() -> None:
     print("PATH 2: Gap detected")
     print("=" * 60)
     result = graph.invoke(
-        {"task_description": "translate English to Klingon"},
+        TaskState(task_description="translate English to Klingon"),
         config={"callbacks": [langfuse_handler]},
     )
 
@@ -73,7 +86,7 @@ async def main() -> None:
     for g in gaps:
         print(f"  - {g.description} (query: '{g.query}')")
     print()
-    print("Gap logged — in later iterations this triggers JIT capability generation.")
+    print("Gaps logged — the pipeline triggered JIT generation above (decompose → classify → generate → load).")
 
     # --- Flush traces ---
     langfuse.flush()

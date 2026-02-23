@@ -21,8 +21,8 @@ See `docs/thesis_proposal.md` for full details.
 - **LangGraph** - Multi-agent orchestration and pipeline graphs
 - **DeepAgents** (`deepagents` package) - Agent harness with built-in planning (`write_todos`), file system context management, subagent spawning, and conversation summarization. Used for task decomposition (Pillar 1) and adversarial probing (Pillar 2).
 - **LLM Provider** - DeepSeek via `langchain-deepseek` for cost efficiency. Provider-agnostic via `init_chat_model("provider:model")`.
-  - `deepseek-reasoner` (thinking mode, DeepSeek-V3.2) — for DeepAgents and complex reasoning (decomposition, adversarial probing, failure analysis)
-  - `deepseek-chat` (non-thinking mode, DeepSeek-V3.2) — for plain LangGraph nodes and single-step tasks (classification, generation, behavioral testing)
+  - `deepseek-chat` (DeepSeek-V3.2) — for all LLM tasks including DeepAgents and plain LangGraph nodes
+  - `deepseek-reasoner` (thinking mode) — **not usable with DeepAgents** due to missing `tool_choice` support; reserved for direct LLM calls without tool use
 - **Claude Code** - Code generation (development tool only, not part of the runtime system)
 - **MCP SDK** - Tool serving (Python, FastMCP pattern)
 - **ChromaDB** - Skill registry (semantic search with hierarchical embeddings)
@@ -37,15 +37,15 @@ DeepAgents (`create_deep_agent()`) return a `CompiledStateGraph` — a complete 
 
 | Component | Implementation | Model | Why |
 |---|---|---|---|
-| Task decomposition | **DeepAgent** (invoked from node) | `deepseek-reasoner` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
-| Capability classifier | Plain LangGraph node | `deepseek-chat` | Rule-based heuristics with LLM fallback — single-step |
+| Task decomposition | **DeepAgent** (invoked from node) | `deepseek-chat` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
+| Capability classifier | Plain LangGraph node | `deepseek-chat` | LLM classification with structured output (`temperature=0`) — single-step |
 | MCP tool generator | Plain LangGraph node | `deepseek-chat` | Single-pass code generation with retry on failure |
 | Skill generator | Plain LangGraph node | `deepseek-chat` | Structured text generation targeting DeepAgents skill format |
 | Agent generator | Plain LangGraph node | `deepseek-chat` | System prompt + config generation |
 | Tier 1 static scanner | Plain Python (no LLM) | — | AST + regex, deterministic |
 | Tier 2 behavioral testing | Plain LangGraph node | `deepseek-chat` | Test input generation + execution |
-| Tier 3 adversarial probing | **DeepAgent** (invoked from node) | `deepseek-reasoner` | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
-| Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | `deepseek-reasoner` | Multi-step investigation of why capabilities fail |
+| Tier 3 adversarial probing | **DeepAgent** (invoked from node) | `deepseek-chat` | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
+| Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | `deepseek-chat` | Multi-step investigation of why capabilities fail |
 | Granularity operations | Plain LangGraph node | `deepseek-chat` | Metrics-driven decisions, mostly deterministic |
 
 ### DeepAgents Skill Ecosystem
@@ -69,7 +69,7 @@ src/
 │   ├── classifier.py       # Capability classification
 │   ├── gap_detection.py    # Skill gap detection
 │   ├── pipeline.py         # Main LangGraph pipeline graph
-│   ├── server_manager.py   # Dynamic MCP server lifecycle
+│   ├── tool_loader.py      # Dynamic MCP tool loading (importlib, not subprocess servers)
 │   └── generators/         # Capability generators
 │       ├── mcp_tool.py
 │       ├── skill.py
@@ -89,8 +89,10 @@ src/
 │   └── simulation.py       # Simulation harness
 ├── schemas/            # Shared Pydantic state schemas (single source of truth)
 ├── mcp_tools/          # Generated & hand-built MCP tools
-├── skills/             # Generated SKILL.md files (runtime skills, not .claude/skills)
 └── agents/             # Agent configs & system prompts
+
+.deepagents/
+└── skills/             # Generated skills runtime location — DeepAgents loads from here automatically
 
 tools/                  # Development & validation utilities
 ├── quick_validate.py       # DeepAgents skill validator (structural checks)
@@ -114,8 +116,7 @@ The following skills are available in `.claude/skills/` and must be followed:
 - **deep-agents** — When and how to use DeepAgents vs. plain LangGraph nodes. DeepAgents are complete agent graphs invoked from within pipeline nodes.
 - **mcp-builder** — MCP server development guide (FastMCP for Python, TypeScript SDK). Covers tool design, implementation, testing, and evaluation. Has reference files for Python/TypeScript patterns and best practices. Use for both hand-written and generated MCP tools.
 
-Additional skills will be added in later iterations:
-- **verification-patterns** (Iteration 3) — AST scanning, adversarial testing, and verification gate patterns.
+- **verification-patterns** — AST scanning patterns, behavioral testing (signature-based input generation), adversarial probing (3 attack patterns), `sandbox_execute` Docker design, tiered cost gate, retry loop with `attempt_count`.
 
 ## Package Management
 
@@ -200,8 +201,8 @@ from langchain.chat_models import init_chat_model
 # For plain nodes (fast, single-step)
 llm = init_chat_model("deepseek:deepseek-chat")
 
-# For DeepAgents (complex reasoning)
-reasoning_llm = init_chat_model("deepseek:deepseek-reasoner")
+# For DeepAgents (also deepseek-chat — reasoner lacks tool_choice support)
+agent_llm = init_chat_model("deepseek:deepseek-chat")
 
 # Switch provider without changing code
 llm = init_chat_model("anthropic:claude-sonnet-4-5-20250929")
@@ -242,9 +243,9 @@ Every DeepAgent invocation (`create_deep_agent()`) must respect these constraint
 
 | Constraint | Value | Notes |
 |---|---|---|
-| `max_steps` (decomposition) | 10 | Bounded planning task |
-| `max_steps` (adversarial probing) | 15 | Needs more exploration room |
-| `max_steps` (failure analysis) | 10 | Focused investigation |
+| `recursion_limit` (decomposition) | 35 | ~17 logical steps; each tool call = 2 graph steps |
+| `recursion_limit` (adversarial probing) | 35 | Needs more exploration room |
+| `recursion_limit` (failure analysis) | 25 | Focused investigation |
 | Node-level timeout (decomposition) | 120s | Prevents pipeline hang |
 | Node-level timeout (adversarial) | 180s | Allows sandbox execution |
 | Initialization | Fresh every invocation | No state carried between calls |
@@ -252,6 +253,14 @@ Every DeepAgent invocation (`create_deep_agent()`) must respect these constraint
 | Fallback on timeout/max_steps | Return partial results with error flag | Pipeline continues degraded |
 
 If a DeepAgent exceeds its budget, the LangGraph node returns a partial result with an error flag — the pipeline does not hang.
+
+### MCP Tool Loading Strategy
+
+Generated MCP tools are loaded via `importlib` dynamic import in a sandboxed subprocess (`src/orchestrator/tool_loader.py`). **Not** persistent FastMCP server processes — no ports, no health checks, no zombie process risk. The same loader is reused by Tier 2 behavioral testing in Iteration 3. Full MCP server deployment is future work (Chapter 7).
+
+### Generated Skills Landing Path
+
+Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in the project root. DeepAgents loads project-level skills from this path automatically — no copy or symlink step needed. `src/skills/` does not exist and should not be used. User-level `~/.deepagents/<agent>/skills/` is reserved for stable, hand-curated skills only.
 
 ### Verification Gate: Tiered Cost Optimization
 
@@ -330,17 +339,76 @@ If timeline pressure forces scope reduction:
 - **`src/registry/metrics.py`** — DuckDB metrics store tracking invocations and capability lifecycle events. Computes four granularity metrics: `reuse_rate`, `success_rate`, `avg_token_cost`, `maintenance_burden`. Supports `compute_granularity_metrics()` aggregate and persistence to disk.
 - **Tests** — 115 passing: 57 schema tests, 29 registry tests, 17 metrics tests, 6 pipeline tests, 4 fibonacci tests, 2 integration tests.
 
+### Iteration 2 Phase A (Complete)
+
+- **`src/orchestrator/decomposition.py`** — DeepAgent (`create_deep_agent`) wrapped in a LangGraph node. Uses `deepseek-chat` (reasoner lacks `tool_choice`), `response_format=DecompositionResult`, 120s timeout via `ThreadPoolExecutor`, `recursion_limit=35`. Falls back to treating the whole task as one subtask on error.
+- **`src/orchestrator/classifier.py`** — LLM-only classification with `temperature=0` and `with_structured_output(ClassificationResult)`. Shared LLM instance via lazy singleton. Falls back to `MCP_TOOL` with 0.3 confidence on LLM failure.
+- **`src/orchestrator/prompts/`** — Prompt package with `decomposition.py`, `classifier.py`, `mcp_tool_generator.py`, `skill_generator.py`, `agent_generator.py`. All generator prompts include complete few-shot examples.
+- **`src/schemas/task.py`** — Added `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `GeneratorInput` (18 total schema types across 4 files).
+- **Tests** — 143 unit + 7 integration (3 decomposition, 4 classifier) = 150 passing.
+
+### Iteration 2 Phase B (Complete)
+
+- **`src/orchestrator/generators/mcp_tool.py`** — Plain LangGraph node. Generates FastMCP Python tools from `ClassifiedGap`. Validates syntax + FastMCP structure (`FastMCP`, `@mcp.tool`, `async def`). One-shot repair pass on failure. LangFuse tracing.
+- **`src/orchestrator/generators/skill.py`** — Plain LangGraph node. Generates SKILL.md files from `ClassifiedGap`. Validates with `tools/quick_validate.py` + non-empty body check. Repair pass. Writes to `.deepagents/skills/<name>/SKILL.md`. LangFuse tracing.
+- **`src/orchestrator/generators/agent.py`** — Plain LangGraph node. Generates system prompts + LangGraph node configs. Detects DeepAgent vs. plain agent. For DeepAgent-type, generates SKILL.md content AND writes it to `.deepagents/skills/<agent-name>/SKILL.md`. Repair pass. LangFuse tracing.
+- **`src/orchestrator/tool_loader.py`** — `ToolLoader` class. Loads generated MCP tools via `importlib` dynamic import. Executes in sandboxed subprocess. `register_tool()` registers loaded tools in `SkillRegistry`. Cleanup on exit via `atexit`.
+- **Tests** — 304 total (280 unit + 24 integration). All pass with `DEEPSEEK_API_KEY` set. Integration `_node` tests for generators had stale `goto == "__end__"` assertions (fixed post Phase C: mcp_tool → "generate_skill", skill → "generate_agent", agent → "loading_node"). 24 integration tests: 5 agent-generator, 4 classifier, 3 decomposition, 2 fibonacci, 3 mcp-tool-generator, 4 pipeline-e2e, 3 skill-generator.
+
+### Iteration 2 Phase C (Complete)
+
+- **`src/orchestrator/gap_detection.py`** — Pure Python LangGraph node wrapping `registry.detect_gaps()`. Converts raw registry output to `MatchItem` / `GapItem` lists. Routes to `"classifier_node"`.
+- **`src/orchestrator/loading_node.py`** — Loads and registers `MCP_TOOL` artifacts via `ToolLoader`. Smoke-tests each tool with empty inputs (warning on failure, continues). Skills/agents already on disk — no loading needed. Sets `FAILED` if gaps existed but no artifacts were generated; `COMPLETED` otherwise.
+- **`src/orchestrator/pipeline.py`** (rewritten) — Full Iteration 2 pipeline. `create_pipeline(registry, loader)` builds: `START → decomposition_node → gap_detection → classifier_node → generate_mcp_tool → generate_skill → generate_agent → loading_node → END`. Registry and loader injected via closures.
+- **Generator `goto` updates** — All four chaining nodes updated: `classifier_node → generate_mcp_tool`, `generate_mcp_tool → generate_skill`, `generate_skill → generate_agent`, `generate_agent → loading_node`.
+- **Tests** — 297 unit tests pass (0 skipped). 4 integration tests in `tests/integration/test_pipeline_e2e.py` (skip without `DEEPSEEK_API_KEY`). Total: 321 tests (297 unit + 24 integration).
+
+### ✅ Decision: Generator chaining strategy → sequential (not Send fan-out)
+
+The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agent`) are chained sequentially. Each node filters by `classified_type`, processes its gaps, and hands off to the next node via `Command(goto=...)`.
+
+**Why not Send fan-out:** Parallel fan-out requires Annotated reducers on `TaskState` list fields and refactored generator signatures accepting `GeneratorInput` instead of `TaskState`. Sequential chaining is simpler, avoids schema changes, and is sufficient for the thesis — generation latency is not a bottleneck. Send-based parallelism is documented as future work.
+
+### Iteration 3 Pre-work (Complete)
+
+- **`src/schemas/task.py`** — Added `attempt_count: int = 0` (ge=0) to `TaskState`. Tracks generation+verification retry cycles for the 3-strike system. 4 new unit tests (324 unit total).
+- **`.claude/skills/verification-patterns/SKILL.md`** — New skill covering: 5 Tier 1 contamination categories with AST patterns, Tier 2 signature-based input extraction, `sandbox_execute` Docker design (must use Docker, never `sys.executable`), 3-strike retry loop, tiered cost gate, updated Iteration 3 pipeline topology.
+
+### Iteration 3 Foundation (Complete — pre-team start)
+
+- **`src/schemas/verification.py`** — `VerificationFinding.tier` constraint corrected to `ge=0` (was `ge=1`). Tier 0 findings (structural pre-check from `quick_validate.py`) require tier=0 to be valid.
+- **`src/orchestrator/verification_node.py`** — NEW. Stub verification node with correct retry logic: runs `gate_fn` per artifact, increments `attempt_count`, removes failed artifacts from state on retry (routes to `"generate_mcp_tool"`), fails open at `MAX_ATTEMPTS=3` (routes to `"loading_node"`). `gate_fn=None` uses `_stub_gate` (always passes) until Iteration 3 replaces it with `gate.verify`. 19 unit tests.
+- **`src/orchestrator/generators/`** — All three generators (`mcp_tool`, `skill`, `agent`) now replace by `capability_name` instead of blindly appending. On retry cycles the generator re-runs all classified gaps; replacing by name prevents duplicate entries for the same capability.
+- **`src/orchestrator/generators/agent.py`** — `goto` changed from `"loading_node"` to `"verification_node"`.
+- **`src/orchestrator/pipeline.py`** — `verification_node` added between `generate_agent` and `loading_node`. Topology is now 9 nodes: `START → decomposition_node → gap_detection → classifier_node → generate_mcp_tool → generate_skill → generate_agent → verification_node → loading_node → END`.
+- **Tests** — 343 unit (0 skipped) + 24 integration = 367 total (integration count unchanged; `test_write_todos_is_used` task made complex enough to reliably trigger `write_todos`).
+
 ## Current Iteration
 
-**Iteration 1 is complete.** Next: Iteration 2 (JIT Capability Pipeline).
+**Iteration 3: Verification Layer.** Pipeline skeleton is wired (`verification_node` stub in place). Ready to implement the real three-tier gate.
 
-See `docs/iteration_plan.md` for the full plan.
+- `verification_node` stub in `src/orchestrator/verification_node.py` — replace `gate_fn` with `gate.verify` in `pipeline.py` once `src/verification/gate.py` is ready
+- `attempt_count` and retry routing already work end-to-end (tested)
+- `sandbox_execute` tool must use Docker (`--network none`) — **never `sys.executable`**
+- Tier 2 behavioral tester must parse `source_code` AST for parameter schema (`input_schema` is empty in registry by design)
+- `VerificationFinding.tier` supports 0–3 (Tier 0 = structural pre-check)
+
+See `docs/iteration_plan.md` for the full Iteration 3 spec.
 
 ## Stable Interfaces
 
 The following modules are implemented and tested. Import from them; avoid modifying unless explicitly required:
 
-- **`src/schemas/`** — All 14 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState`, `TaskStatus`, `SubTask`, `ClassifiedGap`, `GeneratedArtifact`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
+- **`src/schemas/`** — All 18 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState` (now includes `attempt_count: int = 0`), `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact`, `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
+- **`src/orchestrator/decomposition.py`** — `decomposition_node()` (DeepAgent-backed task decomposition)
+- **`src/orchestrator/classifier.py`** — `classify_gap()`, `classifier_node()` (LLM-based classification)
+- **`src/orchestrator/prompts/`** — All prompt constants for decomposition, classification, and all three generators
+- **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry)` (detects registry gaps, always routes to `"classifier_node"`)
+- **`src/orchestrator/loading_node.py`** — `loading_node(state, loader, registry)` (loads + registers MCP_TOOL artifacts, sets terminal status)
+- **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader)` (9-node pipeline; verification_node stub wired between generate_agent and loading_node)
+- **`src/orchestrator/verification_node.py`** — `verification_node(state, gate_fn=None)` (retry + artifact replacement logic; stub gate until Iter 3 fills in real gate)
+- **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` (LangGraph nodes; chained sequentially to `verification_node`)
+- **`src/orchestrator/tool_loader.py`** — `ToolLoader` (load, execute, register_tool, cleanup), `LoadedTool`, `ToolResult`
 - **`src/registry/store.py`** — `SkillRegistry` (full CRUD + hierarchical search), `seed_registry()`
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + 4 granularity metric queries)
 - **`src/mcp_tools/fibonacci.py`** — Reference MCP tool implementation
@@ -357,7 +425,7 @@ When working on this project:
 6. **DeepAgents where appropriate** — Use for task decomposition and adversarial probing; plain nodes for everything else. Remember: DeepAgents are invoked from nodes, not wired as nodes.
 7. **Generated skills must conform to DeepAgents format** — SKILL.md + optional scripts/references/assets. Validate with `tools/quick_validate.py`.
 8. **Ask before making architectural decisions** — Many design choices are still being explored
-9. **Document decisions** — Update this file or `docs/decisions/` when important choices are made
+9. **Document decisions** — Update this file or `docs/iteration_plan.md` when important choices are made (not `docs/decisions/` — all agents read CLAUDE.md and the iteration plan; separate decision files drift out of sync)
 10. **Work incrementally** — Build and test one component at a time
 11. **Tests are mandatory** — No module is done without tests (see `testing-conventions` skill)
 

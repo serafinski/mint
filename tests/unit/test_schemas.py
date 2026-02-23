@@ -3,11 +3,15 @@ import pytest
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.metrics import GranularityMetrics, InvocationRecord
 from src.schemas.task import (
+    ClassificationResult,
     ClassifiedGap,
+    DecompositionResult,
     GapItem,
     GeneratedArtifact,
+    GeneratorInput,
     MatchItem,
     SubTask,
+    SubTaskItem,
     TaskState,
     TaskStatus,
 )
@@ -304,6 +308,24 @@ def test_generated_artifact_roundtrip():
     assert roundtripped.skill_content == art.skill_content
 
 
+def test_generated_artifact_description_field():
+    """description field is stored and None by default (Bug 1 fix)."""
+    art_no_desc = GeneratedArtifact(
+        capability_name="add-numbers",
+        capability_type=CapabilityType.MCP_TOOL,
+        source_code="pass",
+    )
+    assert art_no_desc.description is None
+
+    art_with_desc = GeneratedArtifact(
+        capability_name="add-numbers",
+        capability_type=CapabilityType.MCP_TOOL,
+        source_code="pass",
+        description="Adds two integers",
+    )
+    assert art_with_desc.description == "Adds two integers"
+
+
 # --- Severity ---
 
 
@@ -347,13 +369,15 @@ def test_verification_finding_with_location():
 
 
 def test_verification_finding_tier_bounds():
-    with pytest.raises(ValueError):
-        VerificationFinding(
-            tier=0,
-            category="test",
-            severity=Severity.LOW,
-            message="test",
-        )
+    # tier=0 is valid (Tier 0 = structural pre-check for skills, runs before Tier 1)
+    f = VerificationFinding(
+        tier=0,
+        category="structural",
+        severity=Severity.CRITICAL,
+        message="quick_validate.py check failed",
+    )
+    assert f.tier == 0
+    # tier=4 is above the maximum
     with pytest.raises(ValueError):
         VerificationFinding(
             tier=4,
@@ -748,6 +772,27 @@ def test_task_state_roundtrip():
     assert roundtripped.trace_id == "trace-xyz"
 
 
+def test_task_state_attempt_count_default():
+    state = TaskState(task_description="test")
+    assert state.attempt_count == 0
+
+
+def test_task_state_attempt_count_set():
+    state = TaskState(task_description="test", attempt_count=2)
+    assert state.attempt_count == 2
+
+
+def test_task_state_attempt_count_rejects_negative():
+    with pytest.raises(ValueError):
+        TaskState(task_description="test", attempt_count=-1)
+
+
+def test_task_state_attempt_count_roundtrip():
+    state = TaskState(task_description="test", attempt_count=3)
+    roundtripped = TaskState.model_validate_json(state.model_dump_json())
+    assert roundtripped.attempt_count == 3
+
+
 # --- GapItem / MatchItem ---
 
 
@@ -759,3 +804,94 @@ def test_gap_item_rejects_extra():
 def test_match_item_requires_capability():
     with pytest.raises(ValueError):
         MatchItem(score=0.5)
+
+
+# --- SubTaskItem ---
+
+
+def test_subtask_item_rejects_extra():
+    with pytest.raises(ValueError):
+        SubTaskItem(
+            description="Do something",
+            required_capabilities=["cap-a"],
+            unknown_field="oops",
+        )
+
+
+# --- DecompositionResult ---
+
+
+def test_decomposition_result_rejects_extra():
+    with pytest.raises(ValueError):
+        DecompositionResult(
+            subtasks=[],
+            reasoning="test",
+            unknown_field="oops",
+        )
+
+
+# --- ClassificationResult ---
+
+
+def test_classification_result_rejects_extra():
+    with pytest.raises(ValueError):
+        ClassificationResult(
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="test",
+            unknown_field="oops",
+        )
+
+
+# --- GeneratorInput ---
+
+
+def test_generator_input_valid():
+    gap = ClassifiedGap(
+        description="Parse CSV",
+        query="parse CSV",
+        classified_type=CapabilityType.MCP_TOOL,
+        confidence=0.9,
+        rationale="Atomic operation",
+    )
+    gi = GeneratorInput(gap=gap, task_context="Analyse sales data")
+    assert gi.gap.classified_type == CapabilityType.MCP_TOOL
+    assert gi.task_context == "Analyse sales data"
+
+
+def test_generator_input_default_context():
+    gap = ClassifiedGap(
+        description="Sort numbers",
+        query="sort numbers",
+        classified_type=CapabilityType.MCP_TOOL,
+        confidence=0.9,
+        rationale="Deterministic",
+    )
+    gi = GeneratorInput(gap=gap)
+    assert gi.task_context == ""
+
+
+def test_generator_input_rejects_extra():
+    gap = ClassifiedGap(
+        description="Sort numbers",
+        query="sort numbers",
+        classified_type=CapabilityType.MCP_TOOL,
+        confidence=0.9,
+        rationale="Deterministic",
+    )
+    with pytest.raises(ValueError):
+        GeneratorInput(gap=gap, unknown_field="oops")
+
+
+def test_generator_input_roundtrip():
+    gap = ClassifiedGap(
+        description="Data pipeline",
+        query="data pipeline",
+        classified_type=CapabilityType.SKILL,
+        confidence=0.85,
+        rationale="Multi-step",
+    )
+    gi = GeneratorInput(gap=gap, task_context="Build analytics")
+    roundtripped = GeneratorInput.model_validate_json(gi.model_dump_json())
+    assert roundtripped.gap.classified_type == CapabilityType.SKILL
+    assert roundtripped.task_context == "Build analytics"

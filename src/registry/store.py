@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import chromadb
 
@@ -75,6 +76,13 @@ class SkillRegistry:
             "capability_type": CapabilityType(meta["capability_type"]),
             "version": meta["version"],
         }
+
+        # Restore created_at from stored ISO string; fall back to now() if missing/corrupt.
+        if "created_at" in meta:
+            try:
+                kwargs["created_at"] = datetime.fromisoformat(meta["created_at"])
+            except (ValueError, TypeError):
+                kwargs["created_at"] = datetime.now(UTC)
 
         # Conditionally add fields the schema supports
         if "domain" in model_fields and "domain" in meta:
@@ -240,17 +248,19 @@ class SkillRegistry:
 
         for query in queries:
             results = self.search(query, n_results=1)
-            if results and results[0][1] >= threshold:
+            # A deactivated capability does not fulfil the requirement — treat it as
+            # a gap so the pipeline generates a replacement.
+            if results and results[0][1] >= threshold and results[0][0].is_active:
                 cap, score = results[0]
                 matches.append((cap, score, query))
             else:
                 best_score = results[0][1] if results else 0.0
-                gaps.append(
-                    (
-                        query,
-                        f"best score {best_score:.2f} below threshold {threshold:.2f}",
-                    )
+                reason = (
+                    f"capability '{results[0][0].name}' is deactivated"
+                    if results and results[0][1] >= threshold and not results[0][0].is_active
+                    else f"best score {best_score:.2f} below threshold {threshold:.2f}"
                 )
+                gaps.append((query, reason))
 
         return matches, gaps
 

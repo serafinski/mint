@@ -444,3 +444,69 @@ def test_add_and_get_roundtrip(registry):
     assert result.description == cap.description
     assert result.capability_type == cap.capability_type
     assert result.version == cap.version
+
+
+# --- created_at round-trip (Bug 3 fix) ---
+
+
+def test_created_at_preserved_on_get(registry):
+    """created_at must survive an add → get round-trip without drift."""
+    cap = CapabilityDescriptor(
+        name="ts-tool",
+        description="A timestamped tool",
+        capability_type=CapabilityType.MCP_TOOL,
+    )
+    original_ts = cap.created_at
+    registry.add(cap)
+    fetched = registry.get("ts-tool")
+    assert fetched is not None
+    assert fetched.created_at == original_ts
+
+
+def test_created_at_preserved_on_search(registry):
+    """created_at must survive an add → search round-trip."""
+    cap = CapabilityDescriptor(
+        name="search-ts-tool",
+        description="A tool for search timestamp test",
+        capability_type=CapabilityType.MCP_TOOL,
+    )
+    original_ts = cap.created_at
+    registry.add(cap)
+    results = registry.search("search timestamp tool", n_results=1)
+    assert results and results[0][0].created_at == original_ts
+
+
+# --- detect_gaps respects is_active (Bug 1 fix) ---
+
+
+def test_detect_gaps_treats_deactivated_capability_as_gap(registry):
+    """A deactivated capability must NOT count as a match — it must be a gap."""
+    cap = CapabilityDescriptor(
+        name="legacy-tool",
+        description="Compute the nth Fibonacci number",
+        capability_type=CapabilityType.MCP_TOOL,
+    )
+    registry.add(cap)
+    registry.deactivate("legacy-tool")
+
+    matches, gaps = registry.detect_gaps(["compute fibonacci number"])
+
+    assert len(matches) == 0
+    assert len(gaps) == 1
+    assert "deactivated" in gaps[0][1]
+
+
+def test_detect_gaps_active_capability_still_matches(registry):
+    """An active capability above threshold must still be a match after the fix."""
+    cap = CapabilityDescriptor(
+        name="active-tool",
+        description="Compute the nth Fibonacci number",
+        capability_type=CapabilityType.MCP_TOOL,
+    )
+    registry.add(cap)
+
+    matches, gaps = registry.detect_gaps(["compute fibonacci number"])
+
+    assert len(matches) == 1
+    assert len(gaps) == 0
+    assert matches[0][0].name == "active-tool"
