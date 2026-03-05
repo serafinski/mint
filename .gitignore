@@ -220,3 +220,6 @@ __marimo__/
 
 # DeepAgents Skills
 .deepagents
+
+# VSCode Config
+.vscode

@@ -377,23 +377,32 @@ The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agen
 ### Iteration 3 Foundation (Complete — pre-team start)
 
 - **`src/schemas/verification.py`** — `VerificationFinding.tier` constraint corrected to `ge=0` (was `ge=1`). Tier 0 findings (structural pre-check from `quick_validate.py`) require tier=0 to be valid.
-- **`src/orchestrator/verification_node.py`** — NEW. Stub verification node with correct retry logic: runs `gate_fn` per artifact, increments `attempt_count`, removes failed artifacts from state on retry (routes to `"generate_mcp_tool"`), fails open at `MAX_ATTEMPTS=3` (routes to `"loading_node"`). `gate_fn=None` uses `_stub_gate` (always passes) until Iteration 3 replaces it with `gate.verify`. 19 unit tests.
-- **`src/orchestrator/generators/`** — All three generators (`mcp_tool`, `skill`, `agent`) now replace by `capability_name` instead of blindly appending. On retry cycles the generator re-runs all classified gaps; replacing by name prevents duplicate entries for the same capability.
-- **`src/orchestrator/generators/agent.py`** — `goto` changed from `"loading_node"` to `"verification_node"`.
-- **`src/orchestrator/pipeline.py`** — `verification_node` added between `generate_agent` and `loading_node`. Topology is now 9 nodes: `START → decomposition_node → gap_detection → classifier_node → generate_mcp_tool → generate_skill → generate_agent → verification_node → loading_node → END`.
-- **Tests** — 343 unit (0 skipped) + 24 integration = 367 total (integration count unchanged; `test_write_todos_is_used` task made complex enough to reliably trigger `write_todos`).
+- **`src/orchestrator/verification_node.py`** — Stub verification node with correct retry logic: runs `gate_fn` per artifact, increments `attempt_count`, removes failed artifacts on retry (routes to `"generate_mcp_tool"`), fails open at `MAX_ATTEMPTS=3`. 19 unit tests.
+- **`src/verification/sandbox_tool.py`** — `sandbox_execute(code, timeout=10) -> dict` runs Python inside `docker run --rm --network none`. Always returns, never raises. 13 unit tests + 4 integration.
+- **`src/orchestrator/pipeline.py`** — `verification_node` wired between generator chain and `loading_node`.
+
+### Iteration 3 (Complete)
+
+- **`src/verification/static_scanner.py`** — Tier 1 static scanner (pure Python, no LLM). Five contamination categories: hardcoded data (CRITICAL), silent exceptions (HIGH), mock/demo artifacts (CRITICAL), synthetic data indicators (HIGH), missing external calls (MEDIUM). For skills: Tier 0 `quick_validate.py` structural pre-check before Tier 1. Also exposes `scan_text_only(text, name)` for non-Python content (SKILL.md, JSON configs). `should_proceed_to_tier2(report)` cost gate. 53 unit tests.
+- **`src/verification/behavioral.py`** — Tier 2 behavioural testing node (no LLM). Parses parameter schema from source AST (`input_schema` is empty by design). Four test categories via Docker sandbox: nonexistent entity, consistency, boundary, latency. Returns `list[VerificationFinding]` with tier=2. `_build_sandbox_code` prepends `__name__ = "not_main"` before the inlined source to prevent the `if __name__ == "__main__": mcp.run()` guard from firing (generated tools always include this block; without the override, `mcp.run()` would block before `asyncio.run(_run())` executes, causing all behavioral tests to silently no-op). 28 unit tests.
+- **`src/verification/adversarial.py`** — Tier 3 adversarial probing DeepAgent. `probe(artifact) -> VerificationReport`. Runs 3 attack patterns: hidden demo/sample mode, network-disconnect behavioral change, ground-truth comparison. `deepseek-chat`, `recursion_limit=35`, timeout=180s. Pydantic `AdversarialFindings` structured output. Fails open on timeout/error. LangFuse tracing. 17 unit tests + 1 integration.
+- **`src/verification/gate.py`** — Verification gate. `verify(artifact) -> VerificationReport`. Orchestrates Tier 0→1→2→3 with fail-fast: Tier 1 CRITICAL → stop, Tier 2 CRITICAL/HIGH → stop. SKILL type: Tier 0 quick_validate + regex-only Tier 1 (no AST on YAML). AGENT type: regex-only on JSON config. `verify()` wraps `_verify_inner()` in a top-level try/except to enforce "never raises" — unexpected exceptions (e.g. filesystem errors in `_run_skill_precheck`) return a MEDIUM gate_error finding (fail open). 17 unit tests.
+- **`src/orchestrator/pipeline.py`** — Updated: `gate_fn=gate_verify` now wired into `verification_node` closure. Real three-tier gate active.
+- **`src/verification/sandbox_tool.py`** — Fixed: `except Exception` added so Docker-unavailable errors (`FileNotFoundError`, `OSError`) are captured in the return dict rather than raised. 13 unit tests.
+- **`sandbox/Dockerfile`** — Fixed: added `pip install mcp pydantic` at build time so generated MCP tools can be imported inside the sandbox. Without this, Tier 2 behavioral testing silently no-ops because `from mcp.server.fastmcp import FastMCP` raises `ModuleNotFoundError`.
+- **`src/orchestrator/generators/utils.py`** — Added `build_task_context(state)` helper. On retry (`attempt_count > 0`), appends CRITICAL/HIGH findings from failed `VerificationReport`s to `task_context` so generators know what to fix. All three generator nodes now use this instead of passing `state.task_description` directly.
+- **Tests** — 480 unit (0 skipped) + 24 integration = 504 total.
+- **Devil's advocate findings** — 18 bypasses documented in `docs/iteration_plan.md` → "Devil's Advocate Findings (Post-Implementation Review)". 6 HIGH-risk: variable-indirection hardcoding (B1.2), parameterless tool bypass (B2.1), input-independent consistency bypass (B2.3), network-fallback bypass (B3.3), 3-strike fail-open with no feedback (B4.3), "clean enough" cross-tier pattern (B5.1).
 
 ## Current Iteration
 
-**Iteration 3: Verification Layer.** Pipeline skeleton is wired (`verification_node` stub in place). Ready to implement the real three-tier gate.
+**Iteration 4: Granularity Optimizer.** Pillar 3 — evolutionary feedback loop (split, merge, prune) with type-scoped constraints.
 
-- `verification_node` stub in `src/orchestrator/verification_node.py` — replace `gate_fn` with `gate.verify` in `pipeline.py` once `src/verification/gate.py` is ready
-- `attempt_count` and retry routing already work end-to-end (tested)
-- `sandbox_execute` tool must use Docker (`--network none`) — **never `sys.executable`**
-- Tier 2 behavioral tester must parse `source_code` AST for parameter schema (`input_schema` is empty in registry by design)
-- `VerificationFinding.tier` supports 0–3 (Tier 0 = structural pre-check)
+- All three pillars are now active: JIT pipeline + three-tier verification gate (real gate, not stub)
+- Next: `src/optimizer/utility.py`, `src/optimizer/operations.py`, `src/optimizer/loop.py`, `src/optimizer/simulation.py`
+- See `docs/iteration_plan.md` → Iteration 4 for full spec
 
-See `docs/iteration_plan.md` for the full Iteration 3 spec.
+See `docs/iteration_plan.md` for the full Iteration 3 devil's advocate findings and Iteration 4 spec.
 
 ## Stable Interfaces
 
@@ -406,8 +415,13 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry)` (detects registry gaps, always routes to `"classifier_node"`)
 - **`src/orchestrator/loading_node.py`** — `loading_node(state, loader, registry)` (loads + registers MCP_TOOL artifacts, sets terminal status)
 - **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader)` (9-node pipeline; verification_node stub wired between generate_agent and loading_node)
-- **`src/orchestrator/verification_node.py`** — `verification_node(state, gate_fn=None)` (retry + artifact replacement logic; stub gate until Iter 3 fills in real gate)
+- **`src/orchestrator/verification_node.py`** — `verification_node(state, gate_fn=None)` (retry + artifact replacement logic; real gate wired in pipeline.py)
 - **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` (LangGraph nodes; chained sequentially to `verification_node`)
+- **`src/verification/static_scanner.py`** — `scan(source_code, capability_name, capability_type) -> VerificationReport`, `scan_text_only(text, name) -> VerificationReport`, `should_proceed_to_tier2(report) -> bool`
+- **`src/verification/behavioral.py`** — `run(artifact) -> list[VerificationFinding]`, `extract_parameter_schema(source_code) -> dict`
+- **`src/verification/adversarial.py`** — `probe(artifact) -> VerificationReport` (DeepAgent, never raises), `AdversarialFinding`, `AdversarialFindings`
+- **`src/verification/gate.py`** — `verify(artifact) -> VerificationReport` (tiered cost gate, wired as `gate_fn` in pipeline)
+- **`src/verification/sandbox_tool.py`** — `sandbox_execute(code, timeout=10) -> dict` (Docker isolation; use for all adversarial/behavioral probing)
 - **`src/orchestrator/tool_loader.py`** — `ToolLoader` (load, execute, register_tool, cleanup), `LoadedTool`, `ToolResult`
 - **`src/registry/store.py`** — `SkillRegistry` (full CRUD + hierarchical search), `seed_registry()`
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + 4 granularity metric queries)
@@ -444,4 +458,4 @@ When working on this project:
 
 ---
 
-**Last updated:** February 2026
+**Last updated:** March 2026

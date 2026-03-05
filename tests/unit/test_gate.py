@@ -1,0 +1,498 @@
+"""Unit tests for src/verification/gate.py.
+
+All external calls (behavioral.run, adversarial.probe) are mocked so these
+tests run without Docker or API keys.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+from src.schemas.capability import CapabilityType
+from src.schemas.task import GeneratedArtifact
+from src.schemas.verification import Severity, VerificationFinding, VerificationReport
+from src.verification.gate import verify
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_CLEAN_MCP_CODE = """\
+from mcp.server.fastmcp import FastMCP
+from pydantic import Field
+from typing import Annotated
+
+mcp = FastMCP("adder")
+
+@mcp.tool()
+async def add(
+    a: Annotated[int, Field(description="First number")],
+    b: Annotated[int, Field(description="Second number")],
+) -> int:
+    \"\"\"Add two integers.\"\"\"
+    return a + b
+"""
+
+_MOCK_MCP_CODE = """\
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("demo")
+
+@mcp.tool()
+async def get_data() -> list:
+    mock_result = [1, 2, 3]
+    return mock_result
+"""
+
+_HARDCODED_MCP_CODE = """\
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("hardcoded")
+
+@mcp.tool()
+async def get_items() -> list:
+    return ["alpha", "beta", "gamma", "delta"]
+"""
+
+_VALID_SKILL_MD = """\
+---
+name: test-skill
+description: A test skill for verification testing purposes
+---
+
+## Overview
+
+This skill does useful things.
+"""
+
+_INVALID_SKILL_MD = """\
+---
+name: this name is way too long and exceeds the sixty-four character limit set by the spec
+description: A test skill
+---
+"""
+
+_CLEAN_AGENT_CONFIG = {
+    "system_prompt": "You are a helpful assistant.",
+    "node_config": {"model": "deepseek:deepseek-chat"},
+}
+
+
+def _passing_report(name: str, tier: int) -> VerificationReport:
+    return VerificationReport(
+        capability_name=name,
+        findings=[],
+        overall_passed=True,
+        tier_reached=tier,
+    )
+
+
+def _failing_report(name: str, tier: int, severity: Severity = Severity.HIGH) -> VerificationReport:
+    return VerificationReport(
+        capability_name=name,
+        findings=[
+            VerificationFinding(
+                tier=tier,
+                category="test_failure",
+                severity=severity,
+                message="Injected test failure",
+            )
+        ],
+        overall_passed=False,
+        tier_reached=tier,
+    )
+
+
+def _make_artifact(
+    name: str = "test-cap",
+    cap_type: CapabilityType = CapabilityType.MCP_TOOL,
+    source_code: str | None = _CLEAN_MCP_CODE,
+    skill_content: str | None = None,
+    agent_config: dict | None = None,
+) -> GeneratedArtifact:
+    return GeneratedArtifact(
+        capability_name=name,
+        capability_type=cap_type,
+        source_code=source_code,
+        skill_content=skill_content,
+        agent_config=agent_config,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MCP_TOOL — clean code passes all tiers
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_mcp_clean_passes_all_tiers(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(source_code=_CLEAN_MCP_CODE)
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact)
+
+    assert report.overall_passed is True
+    assert report.tier_reached == 3
+    mock_behavioral.assert_called_once_with(artifact)
+    mock_adversarial.assert_called_once_with(artifact)
+
+
+# ---------------------------------------------------------------------------
+# MCP_TOOL — Tier 1 CRITICAL blocks immediately (Tier 2/3 not called)
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_mcp_tier1_critical_blocks_tier23(mock_behavioral, mock_adversarial):
+    # Mock artifact contains "mock" keyword → CRITICAL Tier 1 finding
+    artifact = _make_artifact(source_code=_MOCK_MCP_CODE)
+
+    report = verify(artifact)
+
+    assert report.overall_passed is False
+    assert report.tier_reached in (0, 1)
+    mock_behavioral.assert_not_called()
+    mock_adversarial.assert_not_called()
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_mcp_hardcoded_data_blocks_tier23(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(source_code=_HARDCODED_MCP_CODE)
+
+    report = verify(artifact)
+
+    assert report.overall_passed is False
+    mock_behavioral.assert_not_called()
+    mock_adversarial.assert_not_called()
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_mcp_syntax_error_blocks_tier23(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(source_code="def foo(: invalid syntax!!!")
+
+    report = verify(artifact)
+
+    assert report.overall_passed is False
+    mock_behavioral.assert_not_called()
+    mock_adversarial.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# MCP_TOOL — Tier 2 CRITICAL/HIGH blocks Tier 3
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_mcp_tier2_high_blocks_tier3(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(source_code=_CLEAN_MCP_CODE)
+    mock_behavioral.return_value = [
+        VerificationFinding(
+            tier=2,
+            category="consistency",
+            severity=Severity.HIGH,
+            message="Inconsistent results",
+        )
+    ]
+
+    report = verify(artifact)
+
+    assert report.overall_passed is False
+    assert report.tier_reached == 2
+    mock_adversarial.assert_not_called()
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_mcp_tier2_critical_blocks_tier3(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(source_code=_CLEAN_MCP_CODE)
+    mock_behavioral.return_value = [
+        VerificationFinding(
+            tier=2,
+            category="test",
+            severity=Severity.CRITICAL,
+            message="Critical behavioral issue",
+        )
+    ]
+
+    report = verify(artifact)
+
+    assert report.overall_passed is False
+    assert report.tier_reached == 2
+    mock_adversarial.assert_not_called()
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_mcp_tier2_medium_proceeds_to_tier3(mock_behavioral, mock_adversarial):
+    """MEDIUM Tier 2 findings should NOT block Tier 3."""
+    artifact = _make_artifact(source_code=_CLEAN_MCP_CODE)
+    mock_behavioral.return_value = [
+        VerificationFinding(
+            tier=2,
+            category="latency",
+            severity=Severity.MEDIUM,
+            message="Slow execution",
+        )
+    ]
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact)
+
+    assert report.tier_reached == 3
+    mock_adversarial.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# MCP_TOOL — Tier 3 CRITICAL fails overall
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_mcp_tier3_critical_fails_overall(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(source_code=_CLEAN_MCP_CODE)
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = VerificationReport(
+        capability_name="test-cap",
+        findings=[
+            VerificationFinding(
+                tier=3,
+                category="hidden_demo_mode",
+                severity=Severity.CRITICAL,
+                message="Returns canned data for 'test' inputs",
+            )
+        ],
+        overall_passed=False,
+        tier_reached=3,
+    )
+
+    report = verify(artifact)
+
+    assert report.overall_passed is False
+    assert report.tier_reached == 3
+    assert any(f.tier == 3 for f in report.findings)
+
+
+# ---------------------------------------------------------------------------
+# Findings accumulation across tiers
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_findings_accumulated_from_all_tiers(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(source_code=_CLEAN_MCP_CODE)
+    mock_behavioral.return_value = [
+        VerificationFinding(
+            tier=2, category="latency", severity=Severity.MEDIUM, message="Slow"
+        )
+    ]
+    mock_adversarial.return_value = VerificationReport(
+        capability_name="test-cap",
+        findings=[
+            VerificationFinding(
+                tier=3, category="network_disconnect", severity=Severity.LOW, message="Fine"
+            )
+        ],
+        overall_passed=True,
+        tier_reached=3,
+    )
+
+    report = verify(artifact)
+
+    tiers = {f.tier for f in report.findings}
+    assert 2 in tiers
+    assert 3 in tiers
+    assert report.overall_passed is True
+
+
+# ---------------------------------------------------------------------------
+# SKILL type — valid SKILL.md passes Tier 0
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_skill_valid_skmd_passes_tier0(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(
+        cap_type=CapabilityType.SKILL,
+        source_code=None,
+        skill_content=_VALID_SKILL_MD,
+    )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact)
+
+    # Should NOT have a tier=0 syntax rejection
+    tier0_criticals = [
+        f for f in report.findings if f.tier == 0 and f.severity == Severity.CRITICAL
+    ]
+    assert len(tier0_criticals) == 0
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_skill_invalid_skmd_rejected_at_tier0(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(
+        cap_type=CapabilityType.SKILL,
+        source_code=None,
+        skill_content=_INVALID_SKILL_MD,
+    )
+
+    report = verify(artifact)
+
+    assert report.overall_passed is False
+    assert report.tier_reached == 0
+    mock_behavioral.assert_not_called()
+    mock_adversarial.assert_not_called()
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_skill_syntax_error_not_reported_as_critical(mock_behavioral, mock_adversarial):
+    """SKILL.md is not Python — SyntaxErrors from ast.parse should be filtered out."""
+    artifact = _make_artifact(
+        cap_type=CapabilityType.SKILL,
+        source_code=None,
+        skill_content=_VALID_SKILL_MD,
+    )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact)
+
+    syntax_criticals = [
+        f for f in report.findings
+        if f.category == "syntax" and f.severity == Severity.CRITICAL
+    ]
+    assert len(syntax_criticals) == 0
+
+
+# ---------------------------------------------------------------------------
+# SKILL type — mock indicator in SKILL.md is still detected
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_skill_mock_indicator_in_content_detected(mock_behavioral, mock_adversarial):
+    contaminated_skill = """\
+---
+name: demo-skill
+description: A skill that uses mock data for demonstration
+---
+
+## Overview
+
+This skill uses mock_result to show sample data.
+"""
+    artifact = _make_artifact(
+        cap_type=CapabilityType.SKILL,
+        source_code=None,
+        skill_content=contaminated_skill,
+    )
+
+    report = verify(artifact)
+
+    assert report.overall_passed is False
+    assert any(f.category == "mock_artifact" for f in report.findings)
+    mock_behavioral.assert_not_called()
+    mock_adversarial.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# AGENT type — JSON config scanned (regex only)
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_agent_clean_config_passes(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(
+        cap_type=CapabilityType.AGENT,
+        source_code=None,
+        agent_config=_CLEAN_AGENT_CONFIG,
+    )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact)
+
+    # SyntaxError from JSON (not Python) must not appear
+    syntax_criticals = [
+        f for f in report.findings
+        if f.category == "syntax" and f.severity == Severity.CRITICAL
+    ]
+    assert len(syntax_criticals) == 0
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_agent_mock_in_config_detected(mock_behavioral, mock_adversarial):
+    artifact = _make_artifact(
+        cap_type=CapabilityType.AGENT,
+        source_code=None,
+        agent_config={"system_prompt": "You are a mock agent for testing purposes."},
+    )
+
+    report = verify(artifact)
+
+    assert report.overall_passed is False
+    assert any(f.category == "mock_artifact" for f in report.findings)
+
+
+# ---------------------------------------------------------------------------
+# Empty source code — graceful handling
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_empty_source_code_passes_tier1(mock_behavioral, mock_adversarial):
+    """Empty source should not have CRITICAL findings from Tier 1."""
+    artifact = _make_artifact(source_code="")
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact)
+
+    # No CRITICAL from Tier 1 on empty code
+    t1_criticals = [
+        f for f in report.findings
+        if f.tier == 1 and f.severity == Severity.CRITICAL
+    ]
+    assert len(t1_criticals) == 0
+
+
+# ---------------------------------------------------------------------------
+# verify() never raises — exception swallowing
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate._static_scan")
+def test_verify_never_raises_on_unexpected_exception(mock_static_scan):
+    """verify() must catch all exceptions and return a report, never raise."""
+    mock_static_scan.side_effect = OSError("Simulated filesystem failure in _run_skill_precheck")
+    artifact = _make_artifact(
+        cap_type=CapabilityType.SKILL,
+        source_code=None,
+        skill_content=_VALID_SKILL_MD,
+    )
+
+    # Must not raise even when internal scan raises
+    report = verify(artifact)
+
+    assert isinstance(report, VerificationReport)
+    assert report.capability_name == "test-cap"
+    # Fails open (MEDIUM, not CRITICAL) so the pipeline can continue
+    assert any(f.category == "gate_error" for f in report.findings)
+    gate_finding = next(f for f in report.findings if f.category == "gate_error")
+    assert gate_finding.severity == Severity.MEDIUM
+    assert report.overall_passed is True  # fail open

@@ -17,6 +17,7 @@ from typing import Literal
 import yaml
 from langgraph.types import Command
 
+from src.orchestrator.generators.utils import build_task_context
 from src.orchestrator.prompts.skill_generator import SKILL_GENERATOR_PROMPT, SKILL_REPAIR_PROMPT
 from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
@@ -313,8 +314,9 @@ def generate_skill(
 
     skill_gaps = [g for g in state.classified_gaps if g.classified_type == CapabilityType.SKILL]
 
+    task_context = build_task_context(state)
     for gap in skill_gaps:
-        artifact, error = _generate_single_skill(gap, state.task_description)
+        artifact, error = _generate_single_skill(gap, task_context)
         if artifact is not None:
             # Replace any existing artifact with the same capability_name.
             # On retry cycles the node re-runs all classified gaps; replacing
