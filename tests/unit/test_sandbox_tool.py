@@ -181,3 +181,47 @@ def test_tempfile_cleaned_up_on_timeout():
     assert len(unlinked) == 1
 
 
+# ---------------------------------------------------------------------------
+# Non-timeout exceptions (Docker unavailable, permission error, etc.)
+# ---------------------------------------------------------------------------
+
+
+def test_file_not_found_returns_error_dict():
+    """FileNotFoundError (Docker binary missing) is captured, never raised."""
+    with patch("subprocess.run", side_effect=FileNotFoundError("docker: not found")):
+        result = sandbox_execute("pass")
+
+    assert result["success"] is False
+    assert result["exit_code"] == -1
+    assert "docker" in result["stderr"].lower()
+
+
+def test_os_error_returns_error_dict():
+    """Generic OSError (daemon down, permission denied) is captured, never raised."""
+    with patch("subprocess.run", side_effect=OSError("Cannot connect to the Docker daemon")):
+        result = sandbox_execute("pass")
+
+    assert result["success"] is False
+    assert result["exit_code"] == -1
+    assert result["stdout"] == ""
+
+
+def test_tempfile_cleaned_up_on_docker_not_found():
+    """Temp file is deleted even when Docker binary is not found."""
+    unlinked: list[str] = []
+    real_unlink = Path.unlink
+
+    def tracking_unlink(self: Path, *args, **kwargs):
+        if str(self).endswith(".py"):
+            unlinked.append(str(self))
+        return real_unlink(self, *args, **kwargs)
+
+    with (
+        patch.object(Path, "unlink", tracking_unlink),
+        patch("subprocess.run", side_effect=FileNotFoundError("docker: not found")),
+    ):
+        sandbox_execute("pass")
+
+    assert len(unlinked) == 1
+
+

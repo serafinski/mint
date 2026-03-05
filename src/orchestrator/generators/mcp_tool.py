@@ -18,6 +18,7 @@ from typing import Literal
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from src.orchestrator.generators.utils import build_task_context
 from src.orchestrator.prompts.mcp_tool_generator import (
     MCP_TOOL_REPAIR_PROMPT,
     MCP_TOOL_SYSTEM_PROMPT,
@@ -311,8 +312,9 @@ def generate_mcp_tool(
     artifacts: list[GeneratedArtifact] = list(state.generated_artifacts)
     errors: list[str] = list(state.errors)
 
+    task_context = build_task_context(state)
     for gap in mcp_gaps:
-        artifact, error = generate_single_tool(gap, task_context=state.task_description)
+        artifact, error = generate_single_tool(gap, task_context=task_context)
         if artifact is not None:
             # Replace any existing artifact with the same capability_name.
             # On retry cycles the node re-runs all classified gaps; replacing

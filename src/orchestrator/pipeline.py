@@ -43,10 +43,11 @@ from src.orchestrator.tool_loader import ToolLoader
 from src.orchestrator.verification_node import verification_node
 from src.registry.store import SkillRegistry
 from src.schemas.task import TaskState
+from src.verification.gate import verify as gate_verify
 
 
 def create_pipeline(registry: SkillRegistry, loader: ToolLoader) -> StateGraph:
-    """Build the Iteration 2 JIT capability pipeline.
+    """Build the JIT capability pipeline (Iterations 2–3).
 
     Returns an *uncompiled* ``StateGraph`` — call ``.compile()`` before invoking.
 
@@ -65,9 +66,11 @@ def create_pipeline(registry: SkillRegistry, loader: ToolLoader) -> StateGraph:
     builder.add_node("generate_mcp_tool", generate_mcp_tool)
     builder.add_node("generate_skill", generate_skill)
     builder.add_node("generate_agent", generate_agent)
-    # verification_node uses the stub gate (always passes) until Iteration 3
-    # replaces it with the real gate: lambda state: verification_node(state, gate_fn=real_gate)
-    builder.add_node("verification_node", verification_node)
+    # verification_node wired with the real three-tier gate (Iteration 3).
+    builder.add_node(
+        "verification_node",
+        lambda state: verification_node(state, gate_fn=gate_verify),
+    )
 
     # --- Nodes with injected dependencies (closures) ---
     builder.add_node(

@@ -458,6 +458,225 @@ Have teammates share findings with each other. Require plan approval.
 - Devil's advocate findings documented
 - **Update CLAUDE.md**
 
+### Devil's Advocate Findings (Post-Implementation Review)
+
+This section documents ways a malicious or lazy LLM code generator could produce capabilities that pass all verification tiers while still being contaminated or fake. These are honest limitations of the verification approach and should be discussed in the thesis (Chapter 4).
+
+#### 1. Tier 1 Static Scanner Bypasses
+
+**B1.1: Hardcoded data below threshold**
+- **Attack:** Return a literal list/dict of 2 items instead of 3. The `_check_hardcoded_return` check uses `len(val.elts) >= 3`.
+- **Example:** `return ["Alice", "Bob"]` passes. A tool claiming to "fetch users" that always returns these two names is still fake.
+- **Root cause:** Arbitrary threshold at 3 items. Any fixed threshold creates a gap for data sets just below it.
+- **Suggested mitigation:** Combine with Tier 2 consistency checks (same inputs should not always produce the same canned output regardless of parameters). Also consider flagging hardcoded returns of any size in functions whose names imply dynamic data retrieval.
+- **Risk level:** HIGH for the thesis. LLMs are likely to generate 1-2 item canned responses.
+
+**B1.2: Hardcoded data via indirection**
+- **Attack:** Store canned data in a variable instead of returning it directly. `data = ["Alice", "Bob", "Charlie"]; return data` bypasses the check because `ast.Return.value` is `ast.Name`, not `ast.List`.
+- **Example:**
+  ```python
+  async def fetch_users(query: str) -> list:
+      results = ["Alice", "Bob", "Charlie"]
+      return results
+  ```
+- **Root cause:** `_check_hardcoded_return` only inspects `ast.Return` value nodes that are literal `ast.List` or `ast.Dict`. Variable assignments that hold literals are invisible.
+- **Suggested mitigation:** Track assignments to local variables and flag returns of variables whose assigned value is a large literal. A simple single-pass constant propagation would catch this.
+- **Risk level:** HIGH. This is the most natural way an LLM writes canned data.
+
+**B1.3: Mock names in non-obvious forms**
+- **Attack:** Use synonyms not in the regex: `stub`, `example_data`, `hardcoded`, `default_response`, `canned`, `synthetic`, `generated_data`, `lorem`. The regex `_MOCK_NAMES` matches `mock|fake|sample|dummy|placeholder|DEMO|TEST_DATA` but misses many common indicators.
+- **Root cause:** Finite keyword list. The LLM vocabulary for "not real" is large.
+- **Suggested mitigation:** Expand the list (especially `stub`, `example`, `hardcoded`, `default`). Note: `sample` already matches but may false-positive on legitimate uses (e.g., `random.sample`). Consider context-aware matching (only flag when used as variable names, not function calls).
+- **Risk level:** MEDIUM. The current list catches the most obvious cases.
+
+**B1.4: The `sample` false positive and the `get_` false negative**
+- **Attack (false positive):** Legitimate code using `random.sample()` or `pandas.DataFrame.sample()` gets flagged as CRITICAL, causing valid tools to fail Tier 1.
+- **Attack (false negative):** A function named `compute_metrics()` that returns hardcoded data escapes `_EXTERNAL_FN_NAMES` (which only matches `fetch|query|call|get|retrieve|search`). Functions without these prefixes are never checked for missing external calls.
+- **Root cause:** The mock regex scans all text including legitimate API calls. The external function name regex is prefix-based and incomplete.
+- **Suggested mitigation:** For `_MOCK_NAMES`, exclude matches inside function calls (e.g., `random.sample()`). For missing-external-calls, consider a broader heuristic: any tool that takes entity-like string parameters and returns structured data should have some data source.
+- **Risk level:** MEDIUM. False positives reduce trust in the gate; false negatives let fake tools through.
+
+**B1.5: Silent exceptions via specific exception types**
+- **Attack:** Use `except ValueError: pass` or `except KeyError: pass` instead of bare `except:` or `except Exception: pass`. The check only flags `is_bare` (type is None) or `is_exception` (type.id == "Exception").
+- **Root cause:** The check is scoped to only the broadest exception handlers.
+- **Suggested mitigation:** Flag any `except <Type>: pass` (with no re-raise or logging) as at least MEDIUM severity. Catching and silently discarding typed exceptions is almost always a bug in generated code.
+- **Risk level:** LOW. Specific exception swallowing is less dangerous than blanket swallowing, but still masks failures.
+
+#### 2. Tier 2 Behavioral Testing Bypasses
+
+**B2.1: Parameterless tools skip all tests**
+- **Attack:** Generate a tool with no parameters (or only `**kwargs`) that always returns canned data. `extract_parameter_schema` returns `{}`, so all four test categories are skipped with an INFO finding.
+- **Example:**
+  ```python
+  async def get_system_status() -> dict:
+      return {"status": "healthy", "uptime": 99.9}
+  ```
+- **Root cause:** Behavioral testing is entirely parameter-driven. No-parameter tools have no test surface.
+- **Suggested mitigation:** For parameterless tools, run at least a consistency check (call twice, compare outputs) and a timing check. Even without parameter variation, you can detect always-identical outputs.
+- **Risk level:** HIGH. Many plausible tool descriptions produce parameterless functions.
+
+**B2.2: Sync functions are invisible**
+- **Attack:** Define the tool function as `def fetch_data(query: str):` (sync, not async). `_extract_function_name` and `extract_parameter_schema` only look for `ast.AsyncFunctionDef`. The tool returns MEDIUM "No public async function found" and skips all behavioral tests.
+- **Root cause:** Tier 2 only searches for async functions. If the LLM generates a sync function, the entire tier is skipped.
+- **Suggested mitigation:** Also search for `ast.FunctionDef`. MCP tools should be async, but a lazy LLM may forget the `async` keyword while producing otherwise functional code.
+- **Risk level:** MEDIUM. The MCP tool generator prompt requests async, but LLMs sometimes omit it.
+
+**B2.3: Input-independent tools pass consistency trivially**
+- **Attack:** A tool that ignores its parameters and returns the same canned result passes the consistency test (same result for same input), the boundary test (no crashes), and the latency test (fast execution). The nonexistent-entity test only flags `None`/empty returns, not canned data.
+- **Example:**
+  ```python
+  async def analyze_sentiment(text: str) -> dict:
+      return {"sentiment": "positive", "confidence": 0.85}
+  ```
+- **Root cause:** Consistency checks only verify same-input-same-output. They don't verify that different inputs produce different outputs. Boundary tests only check for crashes/timeouts, not for suspiciously identical outputs across different inputs.
+- **Suggested mitigation:** Add a "variation" test: call the tool with 3+ meaningfully different inputs and check whether outputs differ. If outputs are identical across all varied inputs, flag as HIGH (tool likely ignores parameters).
+- **Risk level:** HIGH. This is the most likely contamination pattern for LLM-generated tools.
+
+**B2.4: Type annotation parsing limitations**
+- **Attack:** Use complex type annotations like `Annotated[list[dict[str, Any]], Field(...)]` or `Optional[str]` or union types. The `extract_parameter_schema` handles `Annotated[X, ...]` and simple names, but complex generics may produce unhelpful type strings, leading to the fallback empty-string input for all parameters.
+- **Root cause:** The schema extractor does basic `ast.unparse` on annotations. It doesn't recursively interpret generic types to determine the base type (e.g., `Optional[str]` unparsed is `Optional[str]`, not `str`).
+- **Suggested mitigation:** Add pattern matching for `Optional[X]`, `list[X]`, `dict[X, Y]` to extract the inner type for input generation.
+- **Risk level:** LOW. Most generated tools use simple types.
+
+#### 3. Tier 3 Adversarial Probing Bypasses
+
+**B3.1: Fail-open on timeout/error means unreliable rejection**
+- **Attack:** Generate a tool complex enough that the adversarial agent times out (180s) trying to analyze it, or that causes the agent to error. Since `_timeout_report` and `_error_report` both set `overall_passed=True`, the tool passes.
+- **Example:** A tool with 200+ lines of plausible-looking but ultimately fake logic could exhaust the agent's step budget.
+- **Root cause:** Fail-open design. The adversarial tier is designed as a best-effort improvement, not a hard gate.
+- **Suggested mitigation:** Track timeout/error rates via LangFuse. If a specific tool pattern consistently causes timeouts, add it as a Tier 1 heuristic (e.g., flag tools over N lines with no external imports). Consider fail-closed for specific high-risk scenarios.
+- **Risk level:** MEDIUM for the thesis. The fail-open design is a deliberate tradeoff documented in the architecture.
+
+**B3.2: The DeepAgent is only as smart as its LLM**
+- **Attack:** Craft a tool that subtly returns plausible but wrong results. For example, a unit conversion tool that is off by 5%. The ground-truth comparison attack pattern relies on the DeepAgent writing a reference implementation -- if the agent doesn't think to verify the specific conversion factor, it passes.
+- **Root cause:** The adversarial agent uses `deepseek-chat`, which may not catch subtle numerical errors in domains it doesn't deeply understand.
+- **Suggested mitigation:** For deterministic tools, consider a separate automated ground-truth check (outside the DeepAgent) that compares against known test vectors. The DeepAgent adds value for non-deterministic tools.
+- **Risk level:** MEDIUM. The ground-truth attack pattern is the weakest of the three because it relies entirely on the LLM's domain knowledge.
+
+**B3.3: Network-disconnect check is easy to bypass**
+- **Attack:** A tool that claims to "fetch" data but wraps the network call in a try/except and returns fallback data on `ConnectionError`. In the sandbox (`--network none`), it silently returns the fallback data. The adversarial agent may see "successful" results and flag it, but only if it reasons about the specific fallback mechanism.
+- **Example:**
+  ```python
+  async def fetch_weather(city: str) -> dict:
+      try:
+          import httpx
+          resp = await httpx.AsyncClient().get(f"https://api.weather.com/{city}")
+          return resp.json()
+      except Exception:
+          return {"city": city, "temp": 22, "condition": "sunny"}
+  ```
+- **Root cause:** The network-disconnect pattern looks for "successful results despite no network" but a tool with explicit fallback logic produces results that look like real outputs. The tool has a real `httpx` import (passing Tier 1's missing-external-calls check), and the fallback data is parameterized (includes `city`), making it harder to detect as canned.
+- **Suggested mitigation:** In Tier 1, flag `except Exception:` blocks in tools that import network libraries as HIGH. In Tier 2, add a test that checks whether the result changes when the tool's network import is present vs. absent.
+- **Risk level:** HIGH. This is a realistic pattern for LLM-generated "API wrapper" tools.
+
+**B3.4: Only CRITICAL findings from Tier 3 cause failure**
+- **Attack:** The adversarial agent flags suspicious behavior as HIGH or MEDIUM severity. Since `_findings_to_report` converts findings and `gate.verify` only checks for CRITICAL across all findings at the final stage, and Tier 3 findings often come as HIGH (the DeepAgent may hedge), many genuine concerns are logged but don't block registration.
+- **Root cause:** Tier 3 was designed to only block on high-confidence "definitely fake" verdicts. The DeepAgent's severity calibration may be conservative.
+- **Suggested mitigation:** Consider counting the number of HIGH findings from Tier 3. If 2+ attack patterns flag HIGH, escalate to CRITICAL. Also log and review Tier 3 HIGH findings in the thesis evaluation.
+- **Risk level:** MEDIUM. Conservative severity is better than false rejections, but may miss cumulative evidence.
+
+#### 4. Gate Logic Gaps
+
+**B4.1: Skills and agents have weaker Tier 1 coverage**
+- **Attack:** Skills only get `scan_text_only()` (regex, no AST) after passing Tier 0. Agents get `scan_text_only()` on JSON config only. Neither applies the hardcoded-data, silent-exception, or missing-external-calls AST checks.
+- **Root cause:** Skills are YAML/markdown (not Python) and agents are JSON configs. AST analysis doesn't apply. But this means SKILL.md bodies containing executable instructions or agent system prompts with embedded code samples are only checked for mock names and synthetic comments.
+- **Suggested mitigation:** For skills, extract any fenced code blocks from SKILL.md and run AST checks on them. For agents with `skill_content` (DeepAgent-type), parse the skill content separately.
+- **Risk level:** MEDIUM. Skills and agents are less code-centric, so contamination manifests differently. But a skill whose instructions say "return hardcoded data" passes all checks.
+
+**B4.2: Tier 2 runs on all artifact types but only works for MCP tools**
+- **Attack:** `behavioral.run(artifact)` looks for `artifact.source_code` and an async function. For SKILL and AGENT artifacts, `source_code` is typically empty (they use `skill_content` or `agent_config`). So Tier 2 returns an INFO "No source code to test" for non-MCP-tool artifacts.
+- **Root cause:** Tier 2 was designed for executable Python tools. Skills and agent configs are not directly executable.
+- **Suggested mitigation:** Document this as a known limitation. Consider generating a small test harness for skills (execute the skill's instructions against a test scenario) as future work.
+- **Risk level:** LOW for the thesis. The thesis focuses on MCP tool generation as the primary artifact type.
+
+**B4.3: The 3-strike retry loop re-runs generators from scratch** ✅ PARTIALLY FIXED
+- **Attack:** A generator that produces fake tools deterministically (same classified gap always produces the same fake output) will fail Tier 1 three times and then fail-open via the verification node (line 114-117: `all_passed or new_attempt_count >= MAX_ATTEMPTS` routes to `loading_node` with all artifacts, including failed ones).
+- **Root cause (original):** The retry loop did not pass previous `VerificationReport` findings back into the generator prompt.
+- **Fix applied (Iteration 3 post-implementation):** `src/orchestrator/generators/utils.py` introduces `build_task_context(state)` which, on retry (`attempt_count > 0`), appends CRITICAL and HIGH findings from failed `VerificationReport`s into the generator prompt with a "PREVIOUS ATTEMPT FAILED VERIFICATION" header. All three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agent`) now use this helper.
+- **Remaining risk:** Fail-open after 3 strikes is still in effect — a deterministically-bad generator that ignores feedback will still eventually load its contaminated artifact. Consider fail-closed as future work.
+- **Risk level:** MEDIUM (downgraded from HIGH). Feedback injection makes it harder for deterministic bad generators to succeed; the remaining risk is a degenerate LLM that ignores its own failure reports.
+
+#### 5. Cross-Tier Gaps
+
+**B5.1: The "clean enough" tool pattern**
+- **Attack:** Generate a tool that (a) uses no mock/demo names, (b) has no hardcoded returns over 2 items, (c) imports `httpx` (passing missing-external-calls), (d) has an async function with parameters, (e) catches `ConnectionError` specifically (not bare `except:`), (f) returns parameterized fallback data. This tool passes Tier 1 completely clean, passes Tier 2 (consistent results, handles boundaries, fast), and only Tier 3 might catch it -- if the DeepAgent happens to test the network-disconnect pattern thoroughly.
+- **Root cause:** Each tier's checks are independently bypassable. There is no cross-tier correlation (e.g., "Tier 1 found no issues AND Tier 2 found no issues for a tool that claims to fetch external data -- that itself is suspicious").
+- **Suggested mitigation:** Add a meta-check: if a tool's name/description implies external data access but all tiers find zero issues, flag it for manual review. Real network-dependent tools should fail or degrade in the sandbox.
+- **Risk level:** HIGH. This is the most complete bypass pattern. A moderately sophisticated LLM prompt could produce tools matching this template.
+
+**B5.2: Agent artifacts with embedded SKILL.md bypass all code checks**
+- **Attack:** The agent generator (for DeepAgent-type artifacts) produces `skill_content` (SKILL.md format) and writes it to disk. The gate runs `scan_text_only` on the JSON config but never scans the `skill_content` through any AST-based check. The skill content may contain instructions like "always return these example values" that are undetectable by regex.
+- **Root cause:** Agent artifacts are checked as JSON configs. The embedded skill content (which contains the actual behavioral instructions) is not independently verified through the skill verification path.
+- **Suggested mitigation:** When an agent artifact has `skill_content`, run it through the SKILL verification path (Tier 0 + `scan_text_only`) as well.
+- **Risk level:** MEDIUM. Agent generation is the least common artifact type in the thesis scope.
+
+#### Summary Table
+
+| ID | Bypass | Tier(s) Affected | Risk | Exploitable by Lazy LLM? |
+|----|--------|-------------------|------|--------------------------|
+| B1.1 | Hardcoded data below threshold (< 3 items) | Tier 1 | HIGH | Very likely |
+| B1.2 | Hardcoded data via variable indirection | Tier 1 | HIGH | Very likely |
+| B1.3 | Mock names using synonyms | Tier 1 | MEDIUM | Likely |
+| B1.4 | `sample` false positive / `get_` false negative | Tier 1 | MEDIUM | Moderate |
+| B1.5 | Silent exceptions with specific types | Tier 1 | LOW | Unlikely |
+| B2.1 | Parameterless tools skip all tests | Tier 2 | HIGH | Likely |
+| B2.2 | Sync functions invisible to Tier 2 | Tier 2 | MEDIUM | Moderate |
+| B2.3 | Input-independent tools pass consistency | Tier 2 | HIGH | Very likely |
+| B2.4 | Complex type annotation parsing | Tier 2 | LOW | Unlikely |
+| B3.1 | Fail-open on timeout/error | Tier 3 | MEDIUM | Moderate |
+| B3.2 | DeepAgent limited by LLM domain knowledge | Tier 3 | MEDIUM | Moderate |
+| B3.3 | Network fallback with parameterized data | Tier 3 | HIGH | Likely |
+| B3.4 | Only CRITICAL findings from Tier 3 block | Tier 3 | MEDIUM | N/A |
+| B4.1 | Skills/agents have weaker Tier 1 coverage | Gate | MEDIUM | Likely |
+| B4.2 | Tier 2 only works for MCP tools | Gate | LOW | N/A |
+| B4.3 | 3-strike fail-open with no feedback to generators | Gate + Retry | MEDIUM | Likely (✅ feedback injection fixed) |
+| B5.1 | "Clean enough" tool passes all tiers | Cross-tier | HIGH | Likely |
+| B5.2 | Agent embedded SKILL.md not independently verified | Cross-tier | MEDIUM | Moderate |
+
+#### Thesis Implications
+
+The findings above do not invalidate the verification approach -- they define its boundaries. For the thesis:
+
+1. **Honest limitations section (Chapter 4):** The 5 remaining HIGH-risk bypasses (B1.1, B1.2, B2.1, B2.3, B5.1) should be explicitly discussed (B4.3 downgraded to MEDIUM after feedback injection fix). They demonstrate that static + behavioral + adversarial probing forms a defense-in-depth strategy with known gaps, not an impenetrable gate.
+
+2. **Manual audit alignment (Iteration 6):** The 20-30 capability manual audit should specifically look for instances of these bypass patterns in generated tools. This provides empirical data on how often LLMs naturally produce code that falls into these gaps.
+
+3. **Future work:** Variable-indirection tracking (B1.2), input-variation testing (B2.3), and cross-tier meta-checks (B5.1) are concrete, implementable improvements that can be discussed as future work.
+
+4. **The fail-open design (B3.1, B4.3) is a thesis design choice, not a bug.** The pipeline must terminate. However, the thesis should clearly document what "fail-open" means: unverified capabilities enter the registry, relying on the granularity optimizer (Pillar 3, prune operation) to eventually remove underperforming ones. B4.3's risk has been reduced by the generator feedback injection (`build_task_context`) but the fail-open exit remains.
+
+#### Remediation Plan (Three-Bucket Strategy)
+
+Findings are triaged into three buckets. This decision is final — do not re-litigate per session.
+
+**Bucket 1 — Fix before Iteration 6 (before evaluation runs):**
+These are HIGH risk, simple enough to fix, and would contaminate evaluation data if left unfixed.
+
+| ID | Fix |
+|----|-----|
+| B2.1 | Add a smoke test for parameterless tools: if `schema == {}`, run a single no-arg execution and flag if it returns non-empty canned-looking output |
+| B2.3 | Add output-variation check: call the tool twice with *different* boundary inputs and flag if outputs are identical despite different inputs |
+| B1.2 | Extend `_check_hardcoded_return` to follow one level of variable indirection: if `ast.Return.value` is `ast.Name`, resolve it to the assignment in the same function scope |
+
+Implement these as part of Iteration 5 pre-work (before wiring evaluation harness), not a separate iteration.
+
+**Bucket 2 — Document as future work (Chapter 7):**
+HIGH/MEDIUM risk but architecturally constrained or requiring significant new machinery.
+
+- B1.1 (hardcoded data below 3-item threshold) — threshold tuning is a research problem
+- B1.3 (unrecognized mock synonyms) — finite keyword list, LLM vocabulary is unbounded
+- B3.3 (network fallback bypasses network-disconnect check) — requires semantic analysis of error handling
+- B5.1 ("clean enough" cross-tier pattern) — requires cross-tier correlation meta-check
+- B5.2 (agent embedded SKILL.md not independently verified) — requires routing agent artifacts through skill verification path
+
+**Bucket 3 — Accept as honest limitations (Chapter 4):**
+Inherent to the design; fixing would require architectural changes incompatible with the thesis scope.
+
+- B3.1 (fail-open on timeout/error) — deliberate tradeoff: pipeline must terminate
+- B3.2 (DeepAgent limited by LLM domain knowledge) — fundamental LLM limitation
+- B4.1 (skills/agents get weaker Tier 1 coverage) — YAML/JSON are not Python; AST analysis does not apply
+- B3.4 (only CRITICAL from Tier 3 blocks) — deliberate calibration: Tier 3 should only hard-reject high-confidence findings
+
 ---
 
 ## Iteration 4: Granularity Optimizer (Weeks 7–9)

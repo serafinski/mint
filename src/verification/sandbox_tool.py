@@ -54,5 +54,7 @@ def sandbox_execute(
         }
     except subprocess.TimeoutExpired:
         return {"stdout": "", "stderr": "Timeout", "exit_code": -1, "success": False}
+    except Exception as exc:  # Docker not found, daemon down, permission error, etc.
+        return {"stdout": "", "stderr": str(exc), "exit_code": -1, "success": False}
     finally:
         Path(script_path).unlink(missing_ok=True)

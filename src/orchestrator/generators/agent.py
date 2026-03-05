@@ -18,6 +18,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from src.orchestrator.generators.skill import extract_skill_name, validate_skill_content
+from src.orchestrator.generators.utils import build_task_context
 from src.orchestrator.prompts.agent_generator import AGENT_GENERATOR_PROMPT, AGENT_REPAIR_PROMPT
 from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
@@ -295,8 +296,9 @@ def generate_agent(
         g for g in state.classified_gaps if g.classified_type == CapabilityType.AGENT
     ]
 
+    task_context = build_task_context(state)
     for gap in agent_gaps:
-        artifact, error = _generate_single_agent(gap, state.task_description)
+        artifact, error = _generate_single_agent(gap, task_context)
         if artifact is not None:
             # Replace any existing artifact with the same capability_name.
             # On retry cycles the node re-runs all classified gaps; replacing
