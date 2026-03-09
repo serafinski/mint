@@ -359,7 +359,7 @@ Assessment: Generated capabilities are structurally valid and executable (344/34
 
 ---
 
-## Iteration 3: Verification Layer (Weeks 5–7)
+## Iteration 3: Verification Layer (Weeks 5–7) ✅ COMPLETE
 
 **Goal:** Build Pillar 2 — three-tier verification gate. Core thesis contribution.
 
@@ -446,7 +446,7 @@ Create an agent team with 4 teammates:
 Have teammates share findings with each other. Require plan approval.
 ```
 
-### Exit criteria
+### Exit criteria: ✅ All met
 - Static scanner catches all 5 contamination categories
 - Tier 1 Critical findings block immediately (no Tier 2/3 invocation)
 - Skill validation via `quick_validate.py` integrated into the gate
@@ -679,7 +679,7 @@ Inherent to the design; fixing would require architectural changes incompatible 
 
 ---
 
-## Iteration 4: Granularity Optimizer (Weeks 7–9)
+## Iteration 4: Granularity Optimizer (Weeks 7–9) ✅ COMPLETE
 
 **Goal:** Build Pillar 3 — evolutionary feedback loop.
 
@@ -741,12 +741,12 @@ Create an agent team with 2 teammates:
 Wait for both to finish, then wire the optimization loop into the main pipeline.
 ```
 
-### Exit criteria
+### Exit criteria: ✅ All met
 - Split, merge, prune all work correctly with type constraints enforced
 - Attempting split/merge on MCP tools is gracefully rejected (not silently skipped)
-- Simulation shows convergence over 50+ cycles
-- Utility scores improve vs. no-optimization baseline
-- If DeepAgent failure analysis is used, LangFuse traces show the reasoning
+- Simulation shows convergence over 50+ cycles (verified via simulation harness with KL divergence)
+- Utility scores improve vs. no-optimization baseline (verified via `compare_baselines()`)
+- DeepAgent failure analysis not used — plain LLM-based split/merge sufficient for thesis scope
 - **Update CLAUDE.md**
 
 ---

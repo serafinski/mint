@@ -187,6 +187,14 @@ class MetricsStore:
 
     # -- utility helpers --------------------------------------------------
 
+    def invocations_since(self, capability_id: str, cutoff: datetime) -> int:
+        """Count invocations of a capability since the given cutoff datetime."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM invocations WHERE capability_id = ? AND invoked_at >= ?",
+            [capability_id, cutoff],
+        ).fetchone()
+        return row[0] if row else 0
+
     def invocation_count(self, capability_id: str) -> int:
         """Total invocations of this capability."""
         row = self._conn.execute(
