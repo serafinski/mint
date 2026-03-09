@@ -85,14 +85,29 @@ def _run_skill_precheck(
 # ---------------------------------------------------------------------------
 
 def _check_hardcoded_return(node: ast.AST, findings: list[VerificationFinding]) -> None:
-    """Detect literal lists/dicts of >=3 items returned from a function body."""
+    """Detect literal lists/dicts of >=3 items returned from a function body.
+
+    Also follows one level of variable indirection (B1.2): if the return value
+    is a Name, resolves it to the first assignment in the function scope.
+    """
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return
+
+    # Collect variable assignments in this function scope (first assignment wins).
+    assignments: dict[str, ast.expr] = {}
+    for stmt in ast.walk(node):
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and target.id not in assignments:
+                    assignments[target.id] = stmt.value
 
     for child in ast.walk(node):
         if not isinstance(child, ast.Return) or child.value is None:
             continue
         val = child.value
+        # Follow one level of variable indirection.
+        if isinstance(val, ast.Name):
+            val = assignments.get(val.id, val)
         if isinstance(val, ast.List) and len(val.elts) >= 3:
             if all(isinstance(e, ast.Constant) for e in val.elts):
                 findings.append(

@@ -182,6 +182,88 @@ def _parse_sandbox_output(result: dict) -> dict | None:
 # Individual test categories
 # ---------------------------------------------------------------------------
 
+_TRIVIAL_RESULTS = {"None", "''", '""', "[]", "{}", "0", "False", "True"}
+
+
+def _test_parameterless_smoke(source_code: str, func_name: str) -> list[VerificationFinding]:
+    """Smoke-test a parameterless tool: flag non-empty canned-looking output.
+
+    A tool with no parameters cannot perform dynamic computation based on caller
+    inputs, so non-trivial output is a strong signal of hardcoded/canned data.
+    """
+    code = _build_sandbox_code(source_code, func_name, {})
+    result = sandbox_execute(code, timeout=15)
+    parsed = _parse_sandbox_output(result)
+
+    if parsed is None or parsed.get("error") is not None:
+        return []
+
+    result_val = parsed.get("result", "None")
+    if result_val not in _TRIVIAL_RESULTS:
+        return [
+            VerificationFinding(
+                tier=2,
+                category="parameterless_smoke",
+                severity=Severity.MEDIUM,
+                message=(
+                    f"Parameterless tool returned non-empty output: {result_val!r} — "
+                    "may be returning hardcoded/canned data"
+                ),
+            )
+        ]
+    return []
+
+
+def _test_output_variation(
+    source_code: str, func_name: str, schema: dict[str, dict]
+) -> list[VerificationFinding]:
+    """Check that different inputs produce different outputs.
+
+    Tools that ignore parameters and return canned data will produce identical
+    outputs regardless of inputs (B2.3 bypass).
+    """
+    findings: list[VerificationFinding] = []
+    if not schema:
+        return findings
+
+    inputs_a = _generate_boundary_inputs(schema)
+    inputs_b = _generate_large_inputs(schema)
+
+    # Only meaningful if the two input sets are actually different.
+    if inputs_a == inputs_b:
+        return findings
+
+    code_a = _build_sandbox_code(source_code, func_name, inputs_a)
+    code_b = _build_sandbox_code(source_code, func_name, inputs_b)
+
+    result_a = sandbox_execute(code_a, timeout=15)
+    result_b = sandbox_execute(code_b, timeout=15)
+
+    parsed_a = _parse_sandbox_output(result_a)
+    parsed_b = _parse_sandbox_output(result_b)
+
+    if (
+        parsed_a is not None
+        and parsed_b is not None
+        and parsed_a.get("error") is None
+        and parsed_b.get("error") is None
+        and parsed_a.get("result") == parsed_b.get("result")
+        and parsed_a.get("result") not in _TRIVIAL_RESULTS
+    ):
+        findings.append(
+            VerificationFinding(
+                tier=2,
+                category="output_variation",
+                severity=Severity.MEDIUM,
+                message=(
+                    f"Tool returned identical output for very different inputs: "
+                    f"{parsed_a.get('result')!r} — may be ignoring parameters"
+                ),
+            )
+        )
+
+    return findings
+
 
 def _test_nonexistent_entity(
     source_code: str, func_name: str, schema: dict[str, dict]
@@ -361,19 +443,14 @@ def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
 
     schema = extract_parameter_schema(source_code)
     if not schema:
-        return [
-            VerificationFinding(
-                tier=2,
-                category="behavioral",
-                severity=Severity.INFO,
-                message="No parameters found — skipping behavioral tests (parameterless tool)",
-            )
-        ]
+        # B2.1: run smoke test instead of silently skipping.
+        return _test_parameterless_smoke(source_code, func_name)
 
     findings: list[VerificationFinding] = []
     findings.extend(_test_nonexistent_entity(source_code, func_name, schema))
     findings.extend(_test_consistency(source_code, func_name, schema))
     findings.extend(_test_boundary(source_code, func_name, schema))
     findings.extend(_test_latency(source_code, func_name, schema))
+    findings.extend(_test_output_variation(source_code, func_name, schema))
 
     return findings

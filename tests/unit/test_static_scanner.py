@@ -99,6 +99,55 @@ def get_items(x, y, z):
         findings = [f for f in report.findings if f.category == "hardcoded_data"]
         assert len(findings) == 0
 
+    def test_hardcoded_list_via_variable_indirection(self):
+        """B1.2: data = ['a','b','c']; return data must be flagged."""
+        code = '''\
+def get_cities():
+    data = ["New York", "London", "Tokyo"]
+    return data
+'''
+        report = scan(code, "cities-tool")
+        assert not report.overall_passed
+        findings = [f for f in report.findings if f.category == "hardcoded_data"]
+        assert len(findings) >= 1
+        assert findings[0].severity == Severity.CRITICAL
+
+    def test_hardcoded_dict_via_variable_indirection(self):
+        """B1.2: config = {'a':1,'b':2,'c':3}; return config must be flagged."""
+        code = '''\
+def get_config():
+    config = {"host": "localhost", "port": "8080", "db": "test"}
+    return config
+'''
+        report = scan(code, "config-tool")
+        assert not report.overall_passed
+        findings = [f for f in report.findings if f.category == "hardcoded_data"]
+        assert len(findings) >= 1
+        assert findings[0].severity == Severity.CRITICAL
+
+    def test_small_variable_list_not_flagged(self):
+        """B1.2: small indirect lists (< 3 items) should not be flagged."""
+        code = '''\
+def get_pair():
+    data = ["a", "b"]
+    return data
+'''
+        report = scan(code, "pair-tool")
+        findings = [f for f in report.findings if f.category == "hardcoded_data"]
+        assert len(findings) == 0
+
+    def test_async_hardcoded_list_via_variable_indirection(self):
+        """B1.2 fix applies to async functions too."""
+        code = '''\
+async def get_users():
+    users = ["alice", "bob", "charlie"]
+    return users
+'''
+        report = scan(code, "users-tool")
+        assert not report.overall_passed
+        findings = [f for f in report.findings if f.category == "hardcoded_data"]
+        assert len(findings) >= 1
+
 
 # ===================================================================
 # Category 2: Silent exception handling (HIGH)
