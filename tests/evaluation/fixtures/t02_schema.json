@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "database",
+    "cache",
+    "logging"
+  ],
+  "properties": {
+    "database": {
+      "type": "object",
+      "required": [
+        "host",
+        "port",
+        "name"
+      ],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "required": [
+        "ttl",
+        "backend"
+      ],
+      "properties": {
+        "ttl": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "backend": {
+          "type": "string"
+        }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "required": [
+        "level"
+      ],
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "DEBUG",
+            "INFO",
+            "WARNING",
+            "ERROR"
+          ]
+        }
+      }
+    }
+  }
+}

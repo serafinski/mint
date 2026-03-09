@@ -1,0 +1,433 @@
+"""Testbed task definitions for Iteration 5 evaluation.
+
+Each TaskDefinition bundles:
+- metadata (id, tier, static coverage)
+- fixture paths consumed by the pipeline
+- a validator callable (output_in_range check)
+- a task_prompt fed to the JIT pipeline
+
+Validators are pure functions: (output: dict) -> bool.
+They read expected_values.json once at import time.
+
+Reuse clusters
+--------------
+CSV cluster  : T01, T04, T05, T07  (tabular ingestion variants)
+Analytics    : T08, T09             (T09 can reuse T08's cleaned output)
+
+Pilot tasks: T01 (seeded retrieval), T07 (moderate JIT), T10 (complex JIT).
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+_EV_PATH = FIXTURES_DIR / "expected_values.json"
+
+# Load expected values at import time — generate.py must have been run first.
+if not _EV_PATH.exists():
+    raise FileNotFoundError(
+        f"expected_values.json not found at {_EV_PATH}. "
+        "Run `python -m tests.evaluation.fixtures.generate` first."
+    )
+
+_EV: dict = json.loads(_EV_PATH.read_text())
+
+
+@dataclass(frozen=True)
+class TaskDefinition:
+    """Immutable definition of one testbed task."""
+
+    task_id: str
+    tier: Literal["trivial", "moderate", "complex"]
+    description: str
+    task_prompt: str
+    has_static_coverage: bool
+    static_capability_name: str | None  # seeded registry entry that serves this task
+    fixture_paths: list[Path] = field(default_factory=list)
+    # validator: (pipeline_output_dict) -> bool
+    validator: Callable[[dict], bool] = field(default=lambda _: False, compare=False)
+    is_pilot: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Validator helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_keys_present(output: dict, keys: list[str]) -> bool:
+    return all(k in output for k in keys)
+
+
+def _within_pct(value: float, reference: float, pct: float) -> bool:
+    if reference == 0:
+        return abs(value) < 1e-9
+    return abs(value - reference) / abs(reference) <= pct / 100.0
+
+
+# ---------------------------------------------------------------------------
+# T01 — Standard comma-delimited CSV
+# ---------------------------------------------------------------------------
+
+_t01_ev = _EV["T01"]
+
+
+def _validate_t01(output: dict) -> bool:
+    """row_count == expected AND column_names match."""
+    try:
+        ok_count = int(output.get("row_count", -1)) == _t01_ev["row_count"]
+        returned_cols = set(output.get("column_names", []))
+        ok_cols = returned_cols == set(_t01_ev["column_names"])
+        return ok_count and ok_cols
+    except (TypeError, ValueError):
+        return False
+
+
+T01 = TaskDefinition(
+    task_id="T01",
+    tier="trivial",
+    description="Parse a standard comma-delimited CSV, return row count and column names",
+    task_prompt=(
+        "Parse the CSV file at tests/evaluation/fixtures/t01_standard.csv. "
+        "Return a dict with keys 'row_count' (int) and 'column_names' (list of str)."
+    ),
+    has_static_coverage=True,
+    static_capability_name="csv-parser",
+    fixture_paths=[FIXTURES_DIR / "t01_standard.csv"],
+    validator=_validate_t01,
+)
+
+# ---------------------------------------------------------------------------
+# T02 — JSON config validation
+# ---------------------------------------------------------------------------
+
+_t02_ev = _EV["T02"]
+
+
+def _validate_t02(output: dict) -> bool:
+    """errors list must have exactly the right count (deterministic)."""
+    try:
+        errors = output.get("errors", [])
+        return len(errors) == _t02_ev["expected_error_count"]
+    except (TypeError, ValueError):
+        return False
+
+
+T02 = TaskDefinition(
+    task_id="T02",
+    tier="trivial",
+    description="Validate a JSON config against a JSON Schema and return the list of validation errors",
+    task_prompt=(
+        "Validate the JSON file at tests/evaluation/fixtures/t02_config.json "
+        "against the schema at tests/evaluation/fixtures/t02_schema.json. "
+        "Return a dict with key 'errors' (list of str describing each violation)."
+    ),
+    has_static_coverage=True,
+    static_capability_name="json-validator",
+    fixture_paths=[FIXTURES_DIR / "t02_config.json", FIXTURES_DIR / "t02_schema.json"],
+    validator=_validate_t02,
+)
+
+# ---------------------------------------------------------------------------
+# T03 — Text statistics
+# ---------------------------------------------------------------------------
+
+_t03_ev = _EV["T03"]
+
+
+def _validate_t03(output: dict) -> bool:
+    """word_count within ±2% AND readability_score in [0, 100]."""
+    try:
+        wc = int(output.get("word_count", -1))
+        rs = float(output.get("readability_score", -1))
+        ok_wc = _within_pct(wc, _t03_ev["word_count"], _t03_ev["word_count_tolerance_pct"])
+        ok_rs = 0 <= rs <= 100
+        return ok_wc and ok_rs
+    except (TypeError, ValueError):
+        return False
+
+
+T03 = TaskDefinition(
+    task_id="T03",
+    tier="trivial",
+    description="Compute word count and Flesch readability score for a text document",
+    task_prompt=(
+        "Compute text statistics for the document at tests/evaluation/fixtures/t03_document.txt. "
+        "Return a dict with keys 'word_count' (int) and 'readability_score' (float in 0–100)."
+    ),
+    has_static_coverage=True,
+    static_capability_name="text-statistics",
+    fixture_paths=[FIXTURES_DIR / "t03_document.txt"],
+    validator=_validate_t03,
+)
+
+# ---------------------------------------------------------------------------
+# T04 — Pipe-delimited CSV (JIT)
+# ---------------------------------------------------------------------------
+
+_t04_ev = _EV["T04"]
+
+
+def _validate_t04(output: dict) -> bool:
+    """row_count == expected AND delimiter detected as '|' AND no parse errors."""
+    try:
+        ok_count = int(output.get("row_count", -1)) == _t04_ev["row_count"]
+        ok_delim = output.get("delimiter") == "|"
+        ok_errors = not output.get("parse_errors", False)
+        return ok_count and ok_delim and ok_errors
+    except (TypeError, ValueError):
+        return False
+
+
+T04 = TaskDefinition(
+    task_id="T04",
+    tier="trivial",
+    description="Parse a pipe-delimited CSV with mixed column types",
+    task_prompt=(
+        "Parse the pipe-delimited file at tests/evaluation/fixtures/t04_pipe_delimited.csv. "
+        "Auto-detect the delimiter. "
+        "Return a dict with keys 'row_count' (int), 'delimiter' (str), "
+        "and 'parse_errors' (bool, True if any errors occurred)."
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[FIXTURES_DIR / "t04_pipe_delimited.csv"],
+    validator=_validate_t04,
+)
+
+# ---------------------------------------------------------------------------
+# T05 — Data cleaning workflow
+# ---------------------------------------------------------------------------
+
+_t05_ev = _EV["T05"]
+
+
+def _validate_t05(output: dict) -> bool:
+    """output_row_count < input_row_count AND null_count == 0."""
+    try:
+        out_count = int(output.get("output_row_count", -1))
+        null_count = int(output.get("null_count", -1))
+        ok_reduced = out_count < _t05_ev["input_row_count"]
+        ok_nulls = null_count == 0
+        return ok_reduced and ok_nulls
+    except (TypeError, ValueError):
+        return False
+
+
+T05 = TaskDefinition(
+    task_id="T05",
+    tier="moderate",
+    description="Clean a CSV with nulls and duplicates, return cleaned row count and null count",
+    task_prompt=(
+        "Clean the dataset at tests/evaluation/fixtures/t05_dirty.csv. "
+        "Remove duplicate rows and rows with any null/empty values. "
+        "Return a dict with keys 'output_row_count' (int) and 'null_count' (int)."
+    ),
+    has_static_coverage=True,
+    static_capability_name="data-cleaning-workflow",
+    fixture_paths=[FIXTURES_DIR / "t05_dirty.csv"],
+    validator=_validate_t05,
+)
+
+# ---------------------------------------------------------------------------
+# T06 — KNN imputation (JIT)
+# ---------------------------------------------------------------------------
+
+_t06_ev = _EV["T06"]
+
+
+def _validate_t06(output: dict) -> bool:
+    """null_count == 0 AND variance of each column within ±10% of original."""
+    try:
+        if int(output.get("null_count", -1)) != 0:
+            return False
+        variances = output.get("column_variances", {})
+        tol = _t06_ev["variance_tolerance_pct"]
+        for col, orig_var in _t06_ev["original_variances"].items():
+            returned = variances.get(col)
+            if returned is None:
+                return False
+            if not _within_pct(float(returned), orig_var, tol):
+                return False
+        return True
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+T06 = TaskDefinition(
+    task_id="T06",
+    tier="moderate",
+    description="KNN imputation on a dataset with ~15% missing values",
+    task_prompt=(
+        "Perform KNN imputation (k=5) on the dataset at "
+        "tests/evaluation/fixtures/t06_missing_values.csv. "
+        "Return a dict with keys 'null_count' (int, should be 0 after imputation) "
+        "and 'column_variances' (dict mapping column name to float variance)."
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[FIXTURES_DIR / "t06_missing_values.csv"],
+    validator=_validate_t06,
+    is_pilot=False,
+)
+
+# ---------------------------------------------------------------------------
+# T07 — Fuzzy join (JIT, PILOT task)
+# ---------------------------------------------------------------------------
+
+_t07_ev = _EV["T07"]
+
+
+def _validate_t07(output: dict) -> bool:
+    """len(df) == expected_join_count AND null_count_on_key == 0."""
+    try:
+        ok_count = int(output.get("row_count", -1)) == _t07_ev["expected_join_count"]
+        ok_nulls = int(output.get("null_count_on_key", -1)) == 0
+        return ok_count and ok_nulls
+    except (TypeError, ValueError):
+        return False
+
+
+T07 = TaskDefinition(
+    task_id="T07",
+    tier="moderate",
+    description="Fuzzy join two datasets on company_name (whitespace and case differences)",
+    task_prompt=(
+        "Perform a fuzzy join between "
+        "tests/evaluation/fixtures/t07_left.csv (orders) and "
+        "tests/evaluation/fixtures/t07_right.csv (companies) "
+        "on the 'company_name' column. Normalise case and strip whitespace before matching. "
+        "Return a dict with keys 'row_count' (int, matched join rows) "
+        "and 'null_count_on_key' (int, null company_name values in result)."
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[FIXTURES_DIR / "t07_left.csv", FIXTURES_DIR / "t07_right.csv"],
+    validator=_validate_t07,
+    is_pilot=True,  # pilot task
+)
+
+# ---------------------------------------------------------------------------
+# T08 — Logistic regression (JIT)
+# ---------------------------------------------------------------------------
+
+_t08_ev = _EV["T08"]
+
+
+def _validate_t08(output: dict) -> bool:
+    """accuracy > majority_class_accuracy + 0.05 AND output has required keys."""
+    try:
+        if not _check_keys_present(output, ["accuracy", "baseline_accuracy"]):
+            return False
+        accuracy = float(output["accuracy"])
+        threshold = _t08_ev["majority_class_accuracy"] + _t08_ev["accuracy_margin"]
+        return accuracy > threshold
+    except (TypeError, ValueError):
+        return False
+
+
+T08 = TaskDefinition(
+    task_id="T08",
+    tier="moderate",
+    description="Train logistic regression on pre-cleaned data, return accuracy vs majority baseline",
+    task_prompt=(
+        "Train a logistic regression classifier on "
+        "tests/evaluation/fixtures/t08_classification.csv "
+        f"(features: {_t08_ev['features']}, label: {_t08_ev['label_column']}). "
+        "Use an 80/20 train/test split. "
+        "Return a dict with keys 'accuracy' (float) and 'baseline_accuracy' "
+        "(float, majority-class baseline on the test set)."
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[FIXTURES_DIR / "t08_classification.csv"],
+    validator=_validate_t08,
+)
+
+# ---------------------------------------------------------------------------
+# T09 — Report generation
+# ---------------------------------------------------------------------------
+
+_t09_ev = _EV["T09"]
+
+
+def _validate_t09(output: dict) -> bool:
+    """output has required keys AND anomalies list has exactly 5 items."""
+    try:
+        if not _check_keys_present(output, _t09_ev["required_keys"]):
+            return False
+        return len(output.get("anomalies", [])) == _t09_ev["expected_anomaly_count"]
+    except (TypeError, ValueError):
+        return False
+
+
+T09 = TaskDefinition(
+    task_id="T09",
+    tier="complex",
+    description="Generate structured report: summary section, stats table, and top-5 anomalies",
+    task_prompt=(
+        "Generate an analytics report from the data at "
+        "tests/evaluation/fixtures/t09_report_data.json. "
+        "Identify the top 5 revenue anomalies (highest outliers). "
+        "Return a dict with keys 'summary' (str), 'stats_table' (dict or list), "
+        "and 'anomalies' (list of exactly 5 items)."
+    ),
+    has_static_coverage=True,
+    static_capability_name="report-generation",
+    fixture_paths=[FIXTURES_DIR / "t09_report_data.json"],
+    validator=_validate_t09,
+)
+
+# ---------------------------------------------------------------------------
+# T10 — Log file parsing (JIT, PILOT task)
+# ---------------------------------------------------------------------------
+
+_t10_ev = _EV["T10"]
+
+
+def _validate_t10(output: dict) -> bool:
+    """len(df) == expected AND timestamps valid AND no null severities."""
+    try:
+        ok_count = int(output.get("row_count", -1)) == _t10_ev["expected_log_lines"]
+        ok_ts = bool(output.get("timestamps_valid", False))
+        ok_sev = int(output.get("null_severity_count", -1)) == 0
+        return ok_count and ok_ts and ok_sev
+    except (TypeError, ValueError):
+        return False
+
+
+T10 = TaskDefinition(
+    task_id="T10",
+    tier="complex",
+    description="Parse an unstructured server log into a DataFrame with timestamp, severity, message",
+    task_prompt=(
+        "Parse the log file at tests/evaluation/fixtures/t10_server.log. "
+        "Each line has format: 'YYYY-MM-DD HH:MM:SS SEVERITY message'. "
+        "Return a dict with keys 'row_count' (int), 'timestamps_valid' (bool, "
+        "True if all timestamps parsed successfully), and 'null_severity_count' (int)."
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[FIXTURES_DIR / "t10_server.log"],
+    validator=_validate_t10,
+    is_pilot=True,  # pilot task
+)
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+ALL_TASKS: list[TaskDefinition] = [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10]
+
+PILOT_TASKS: list[TaskDefinition] = [T01, T07, T10]  # retrieval + moderate JIT + complex JIT
+
+_TASK_MAP: dict[str, TaskDefinition] = {t.task_id: t for t in ALL_TASKS}
+
+
+def get_task(task_id: str) -> TaskDefinition:
+    """Look up a task by ID. Raises KeyError on unknown ID."""
+    return _TASK_MAP[task_id]

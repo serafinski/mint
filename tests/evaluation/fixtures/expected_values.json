@@ -1,0 +1,96 @@
+{
+  "T01": {
+    "row_count": 50,
+    "column_names": [
+      "id",
+      "name",
+      "age",
+      "city"
+    ]
+  },
+  "T02": {
+    "expected_error_count": 3,
+    "expected_errors": [
+      "database.port: 'not-a-number' is not of type 'integer'",
+      "cache.ttl: -5 is less than the minimum of 0",
+      "logging.level: 'VERBOSE' is not one of ['DEBUG', 'INFO', 'WARNING', 'ERROR']"
+    ]
+  },
+  "T03": {
+    "word_count": 154,
+    "word_count_tolerance_pct": 2,
+    "readability_score": 0.0,
+    "readability_range": [
+      0,
+      100
+    ]
+  },
+  "T04": {
+    "row_count": 30,
+    "delimiter": "|",
+    "column_names": [
+      "id",
+      "product_name",
+      "score",
+      "active"
+    ]
+  },
+  "T05": {
+    "input_row_count": 54,
+    "expected_max_output_row_count": 40
+  },
+  "T06": {
+    "n_rows": 100,
+    "columns": [
+      "feature_a",
+      "feature_b",
+      "feature_c",
+      "feature_d"
+    ],
+    "original_variances": {
+      "feature_a": 109.114,
+      "feature_b": 90.6192,
+      "feature_c": 111.3273,
+      "feature_d": 94.2057
+    },
+    "variance_tolerance_pct": 10
+  },
+  "T07": {
+    "left_row_count": 15,
+    "right_row_count": 15,
+    "expected_join_count": 12
+  },
+  "T08": {
+    "n_rows": 200,
+    "majority_class_accuracy": 0.7,
+    "accuracy_margin": 0.05,
+    "features": [
+      "feature_x",
+      "feature_y",
+      "feature_z"
+    ],
+    "label_column": "label"
+  },
+  "T09": {
+    "required_keys": [
+      "summary",
+      "stats_table",
+      "anomalies"
+    ],
+    "expected_anomaly_count": 5
+  },
+  "T10": {
+    "expected_log_lines": 200,
+    "columns": [
+      "timestamp",
+      "severity",
+      "message"
+    ],
+    "valid_severities": [
+      "INFO",
+      "WARNING",
+      "ERROR",
+      "DEBUG"
+    ]
+  }
+}
