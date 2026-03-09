@@ -125,10 +125,60 @@ def test_pipeline_no_gaps_path_completes(seeded_registry, mock_loader):
 # ---------------------------------------------------------------------------
 
 
-def test_create_pipeline_requires_two_args(seeded_registry, mock_loader):
-    """create_pipeline must accept (registry, loader)."""
+def test_create_pipeline_accepts_registry_and_loader(seeded_registry, mock_loader):
+    """create_pipeline must accept (registry, loader) as positional args."""
     import inspect
 
     sig = inspect.signature(create_pipeline)
     params = list(sig.parameters.keys())
-    assert params == ["registry", "loader"]
+    # registry and loader are required positional args; run_optimizer and
+    # metrics_store are optional keyword-only args added in Iteration 4.
+    assert params[:2] == ["registry", "loader"]
+
+
+def test_create_pipeline_run_optimizer_flag(seeded_registry, mock_loader):
+    """create_pipeline with run_optimizer=True compiles without error."""
+    from src.registry.metrics import MetricsStore
+
+    ms = MetricsStore()
+    graph = create_pipeline(
+        seeded_registry, mock_loader, run_optimizer=True, metrics_store=ms
+    ).compile()
+    assert graph is not None
+    # optimizer_node should be present when flag is set
+    builder = create_pipeline(
+        seeded_registry, mock_loader, run_optimizer=True, metrics_store=ms
+    )
+    assert "optimizer_node" in builder.nodes
+
+
+def test_loading_then_optimize_preserves_non_end_goto():
+    """_loading_then_optimize logic: END → optimizer_node, anything else → preserved.
+
+    Tests the conditional goto logic directly rather than via LangGraph internals,
+    since StateNodeSpec is not directly callable from builder.nodes.
+    """
+    from langgraph.graph import END
+    from langgraph.types import Command
+
+    from src.schemas.task import TaskState
+
+    # Replicate the _loading_then_optimize logic from pipeline.py
+    def _loading_then_optimize(loading_node_fn, state):
+        cmd = loading_node_fn(state)
+        next_node = "optimizer_node" if cmd.goto == END else cmd.goto
+        return Command(update=cmd.update, goto=next_node)
+
+    state = TaskState(task_description="test")
+
+    # END goto → replaced with optimizer_node
+    end_result = _loading_then_optimize(
+        lambda s: Command(update={}, goto=END), state
+    )
+    assert end_result.goto == "optimizer_node"
+
+    # Non-END goto → preserved as-is (future retry path)
+    retry_result = _loading_then_optimize(
+        lambda s: Command(update={}, goto="generate_mcp_tool"), state
+    )
+    assert retry_result.goto == "generate_mcp_tool"

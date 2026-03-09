@@ -394,27 +394,43 @@ The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agen
 - **Tests** — 480 unit (0 skipped) + 24 integration = 504 total.
 - **Devil's advocate findings** — 18 bypasses documented in `docs/iteration_plan.md` → "Devil's Advocate Findings (Post-Implementation Review)". 6 HIGH-risk: variable-indirection hardcoding (B1.2), parameterless tool bypass (B2.1), input-independent consistency bypass (B2.3), network-fallback bypass (B3.3), 3-strike fail-open with no feedback (B4.3), "clean enough" cross-tier pattern (B5.1).
 
+### Iteration 4 (Complete)
+
+- **`src/optimizer/utility.py`** — Utility function U(c) = α·reuse(c)·success(c) − β·token_cost(c) − γ·maintenance(c). Pulls metrics from DuckDB via `MetricsStore`. `compute_utility()` and `compute_all_utilities()`. Configurable weights (α=1.0, β=0.1, γ=0.1).
+- **`src/optimizer/operations.py`** — Three evolutionary operations with type constraints:
+  - `prune(registry, metrics_store, window_days=30)` — deactivates zero-invocation capabilities. All types.
+  - `split(registry, metrics_store, capability_id)` — LLM-based split into 2 specialized variants. SKILL and AGENT only; raises `ValueError` for MCP_TOOL.
+  - `merge(registry, metrics_store, capability_ids)` — LLM-based merge of low-reuse instruction sets. SKILL only; raises `ValueError` for MCP_TOOL or AGENT.
+- **`src/optimizer/loop.py`** — LangGraph optimization loop: `compute_metrics → identify_candidates → apply_operations → END`. KL divergence between consecutive utility distributions (scipy). `OptimizerState` Pydantic schema. `create_optimization_loop(registry, metrics_store)`.
+- **`src/optimizer/simulation.py`** — Simulation harness: `SimConfig`/`SimResult` schemas, `generate_synthetic_registry()` (40% MCP_TOOL / 35% SKILL / 25% AGENT), `run_simulation(config, with_optimization)`, `plot_results()` (4 academic-style matplotlib plots to `docs/figures/`), `compare_baselines()`.
+- **`src/registry/metrics.py`** — Added `invocations_since(capability_id, cutoff)` method (needed by prune).
+- **`src/orchestrator/pipeline.py`** — Updated `create_pipeline(registry, loader, *, run_optimizer=False, metrics_store=None)`. When `run_optimizer=True`, appends `optimizer_node` after `loading_node` (invokes the compiled optimization loop; non-fatal on failure).
+- **Tests** — 555 unit tests passing (64 new from initial impl + 10 from post-review passes: 8 utility + 18 operations + 12 loop + 27 simulation + 2 pipeline + 6 post-review Pass 3 + others). Post-review fixes: missing try/except in merge candidate loop (loop.py), repair passes + few-shot examples + LangFuse tracing in split()/merge() (operations.py), broken test for merge loop fix corrected (was hitting compute_metrics error path, not merge loop), dead `reuse_rate_mean` field removed from SimConfig.
+- **Known architectural note**: KL divergence in `loop.py` (`_compute_kl_divergence`) treats raw utility scores as probability mass points. KL divergence in `simulation.py` (`_kl_divergence`) uses histograms of scores. Both track convergence but measure different things — thesis should clarify which is "the" convergence metric.
+
 ## Current Iteration
 
-**Iteration 4: Granularity Optimizer.** Pillar 3 — evolutionary feedback loop (split, merge, prune) with type-scoped constraints.
+**Iteration 5: Integration & End-to-End Testing.** Wire all three pillars together. Build evaluation infrastructure and baselines.
 
-- All three pillars are now active: JIT pipeline + three-tier verification gate (real gate, not stub)
-- Next: `src/optimizer/utility.py`, `src/optimizer/operations.py`, `src/optimizer/loop.py`, `src/optimizer/simulation.py`
-- See `docs/iteration_plan.md` → Iteration 4 for full spec
-
-See `docs/iteration_plan.md` for the full Iteration 3 devil's advocate findings and Iteration 4 spec.
+- All three pillars are now active: JIT pipeline + three-tier verification gate + granularity optimizer
+- Next: full pipeline wiring, testbed setup (Business Analytics Pipeline), evaluation harness, 4 baseline conditions
+- See `docs/iteration_plan.md` → Iteration 5 for full spec
 
 ## Stable Interfaces
 
 The following modules are implemented and tested. Import from them; avoid modifying unless explicitly required:
 
+- **`src/optimizer/utility.py`** — `compute_utility(capability_id, metrics_store, alpha, beta, gamma) -> float`, `compute_all_utilities(registry, metrics_store, ...) -> dict[str, float]`
+- **`src/optimizer/operations.py`** — `prune(registry, metrics_store, window_days) -> list[str]`, `split(registry, metrics_store, capability_id, llm_model) -> list[str]` (SKILL/AGENT only), `merge(registry, metrics_store, capability_ids, llm_model) -> str` (SKILL only)
+- **`src/optimizer/loop.py`** — `create_optimization_loop(registry, metrics_store, ...) -> CompiledStateGraph`, `OptimizerState`
+- **`src/optimizer/simulation.py`** — `SimConfig`, `SimResult`, `generate_synthetic_registry()`, `run_simulation(config, with_optimization) -> list[SimResult]`, `plot_results()`, `compare_baselines()`
 - **`src/schemas/`** — All 18 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState` (now includes `attempt_count: int = 0`), `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact`, `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
 - **`src/orchestrator/decomposition.py`** — `decomposition_node()` (DeepAgent-backed task decomposition)
 - **`src/orchestrator/classifier.py`** — `classify_gap()`, `classifier_node()` (LLM-based classification)
 - **`src/orchestrator/prompts/`** — All prompt constants for decomposition, classification, and all three generators
 - **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry)` (detects registry gaps, always routes to `"classifier_node"`)
 - **`src/orchestrator/loading_node.py`** — `loading_node(state, loader, registry)` (loads + registers MCP_TOOL artifacts, sets terminal status)
-- **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader)` (9-node pipeline; verification_node stub wired between generate_agent and loading_node)
+- **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader, *, run_optimizer=False, metrics_store=None)` (9-node pipeline; real three-tier gate wired via `gate_fn=gate_verify` closure; optional `optimizer_node` appended after `loading_node` when `run_optimizer=True`)
 - **`src/orchestrator/verification_node.py`** — `verification_node(state, gate_fn=None)` (retry + artifact replacement logic; real gate wired in pipeline.py)
 - **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` (LangGraph nodes; chained sequentially to `verification_node`)
 - **`src/verification/static_scanner.py`** — `scan(source_code, capability_name, capability_type) -> VerificationReport`, `scan_text_only(text, name) -> VerificationReport`, `should_proceed_to_tier2(report) -> bool`
