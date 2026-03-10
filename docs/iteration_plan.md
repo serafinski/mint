@@ -774,6 +774,34 @@ Wait for both to finish, then wire the optimization loop into the main pipeline.
 - [ ] Run 4 baseline conditions across all tasks (n_runs ≥ 5 for statistical significance)
 - [ ] Critique checkpoint (see exit criteria below)
 
+### Pilot details
+
+**Runner:** `uv run scripts/run_pilot.py`
+
+| Task | Tier | What it tests | Expected outcome |
+|---|---|---|---|
+| T01 | Trivial | Seeded retrieval (csv-parser is in registry — no JIT needed) | Succeeds in all 4 conditions; validates happy path and static baseline |
+| T07 | Moderate | Fuzzy join across two CSVs (no seeded capability — JIT required) | Succeeds in full/no_verify/no_optimize; fails in static (no static coverage) |
+| T10 | Complex | Server log analysis, 200-line log (complex JIT generation) | May fail even in full — failure modes are thesis data |
+
+**What to check after the pilot:**
+- T01 succeeds in `full` condition (gate_passed=True, output_in_range=True)
+- T07 generates an MCP_TOOL or SKILL artifact that passes verification
+- LangFuse shows complete lifecycle traces for T07/T10 (decomposition DeepAgent + generation + gate + adversarial DeepAgent)
+- No pipeline hangs (DeepAgent timeout fallbacks working)
+
+**Full evaluation commands:**
+```bash
+# Pilot (3 tasks, full condition, 1 run)
+uv run scripts/run_pilot.py
+
+# Static baseline only (fast, no LLM)
+uv run scripts/run_pilot.py --condition static --all-tasks
+
+# Full evaluation (all 4 conditions, all 10 tasks, 8 runs each)
+uv run scripts/run_pilot.py --all-conditions --all-tasks --n-runs 8
+```
+
 ### Testbed: Business Analytics Pipeline
 
 Design 10–15 tasks spanning multiple difficulty levels:
@@ -803,18 +831,23 @@ Design 10–15 tasks spanning multiple difficulty levels:
 
 6. **Error handling** — Generation failure, sandbox timeout, server crash, corrupted registry. Use Command API loop-back for recoverable errors, RetryPolicy for transient failures (see `langgraph-architect` skill error handling section).
 
-### Agent Teams usage
-**3-teammate team for baselines:**
+### ✅ Decision: No agent team — baselines are condition flags, not separate codebases
 
-```
-Create an agent team with 3 teammates:
-- "static-baseline": hand-curated skill library, wired to evaluation harness.
-- "no-verify-baseline": pipeline with Pillar 2 bypassed (no verification gate,
-  no adversarial DeepAgent). Wired to harness.
-- "no-optimize-baseline": pipeline with Pillar 3 bypassed (no granularity
-  operations). Wired to harness.
-All baselines must output metrics to the same DuckDB schema via the shared harness.
-```
+The original plan called for a 3-teammate agent team to build three separate baseline implementations. During harness design, it became clear that all four conditions share the same run loop (restore snapshot → seed registry → invoke pipeline → validate output → record to DB). The only differences are two boolean flags:
+
+- `verification_enabled=False` for the no-verification condition
+- `run_optimizer=False` for the no-optimization condition
+- `_run_static()` instead of `_run_jit()` for the static condition
+
+Building separate codebases would have duplicated the entire run loop and created three divergent harnesses that could drift apart. A single `EvaluationHarness` with a `condition` parameter is simpler, less error-prone, and ensures all conditions produce records in exactly the same schema.
+
+**Why the original plan assumed separate codebases:** The plan was written before the harness was designed. At planning time, "baselines" implied different pipelines. Once the harness abstracted the run loop, the baselines reduced to parameter choices within it.
+
+| Planned teammate | What it would have built | What we have instead |
+|---|---|---|
+| `static-baseline` | Hand-curated skill library | `_run_static` + 5 implementations in `harness.py` |
+| `no-verify-baseline` | Pipeline with gate bypassed | `verification_enabled=False` in `create_pipeline` |
+| `no-optimize-baseline` | Pipeline without optimizer | `run_optimizer=False` (already the default) |
 
 ### Exit criteria
 - Full system runs 10+ tasks end-to-end
