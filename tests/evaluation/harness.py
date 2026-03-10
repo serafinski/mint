@@ -204,12 +204,17 @@ class EvaluationHarness:
         seed_registry(registry)
         loader = ToolLoader()
 
-        # Step 3: randomise task order
+        # Step 3: create a single MetricsStore for this run (shared across tasks
+        # so the optimizer accumulates data from all tasks in the same run)
+        from src.registry.metrics import MetricsStore
+        metrics_store = MetricsStore()
+
+        # Step 4: randomise task order
         rng = random.Random(seed)
         shuffled_tasks = list(tasks)
         rng.shuffle(shuffled_tasks)
 
-        # Step 4: execute each task
+        # Step 5: execute each task
         records: list[EvaluationRecord] = []
         for task in shuffled_tasks:
             record = self._run_one_task(
@@ -218,6 +223,7 @@ class EvaluationHarness:
                 run_id=run_id,
                 registry=registry,
                 loader=loader,
+                metrics_store=metrics_store,
                 seed=seed,
                 snap_id=snap_id,
                 is_pilot=is_pilot,
@@ -235,6 +241,7 @@ class EvaluationHarness:
         run_id: str,
         registry: SkillRegistry,
         loader: ToolLoader,
+        metrics_store: Any,
         seed: int,
         snap_id: str,
         is_pilot: bool,
@@ -245,7 +252,7 @@ class EvaluationHarness:
         if condition == "static":
             result = self._run_static(task, registry)
         else:
-            result = self._run_jit(task, condition, registry, loader)
+            result = self._run_jit(task, condition, registry, loader, metrics_store)
 
         elapsed_ms = int((time.monotonic() - t_start) * 1000)
 
@@ -284,7 +291,7 @@ class EvaluationHarness:
             }
 
         # Check registry has the expected capability
-        results = registry.search(task.task_prompt, top_k=1, min_confidence=0.5)
+        results = registry.search(task.task_prompt, n_results=1, min_confidence=0.5)
         if not results:
             logger.warning("Static capability %s not found in registry", task.static_capability_name)
             return {
@@ -319,12 +326,10 @@ class EvaluationHarness:
         condition: str,
         registry: SkillRegistry,
         loader: ToolLoader,
+        metrics_store: Any,
     ) -> dict:
         """JIT conditions: invoke the pipeline, then validate output."""
         from src.orchestrator.pipeline import create_pipeline
-        from src.registry.metrics import MetricsStore
-
-        metrics_store = MetricsStore()
 
         run_optimizer = condition == "full"
         verification_enabled = condition != "no_verification"

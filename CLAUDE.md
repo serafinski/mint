@@ -412,8 +412,21 @@ The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agen
 
 **Iteration 5: Integration & End-to-End Testing.** Wire all three pillars together. Build evaluation infrastructure and baselines.
 
-- All three pillars are now active: JIT pipeline + three-tier verification gate + granularity optimizer
-- Next: full pipeline wiring, testbed setup (Business Analytics Pipeline), evaluation harness, 4 baseline conditions
+### Evaluation infrastructure (complete — 707 unit tests pass)
+
+- **`src/schemas/evaluation.py`** — `EvaluationRecord` Pydantic model (18 fields). Separate from `InvocationRecord`. `success` property = `gate_passed AND output_in_range`. 21 unit tests.
+- **`src/registry/evaluation_store.py`** — Separate DuckDB `EvaluationStore`. `evaluation_runs` table. Methods: `record_run()`, `get_runs()`, `compute_success_rate()`, `compute_gate_pass_rate()`, `run_count()`, `failure_breakdown()`. 17 unit tests.
+- **`tests/evaluation/fixtures/`** — 10 fixture files generated programmatically (seed=42) + `expected_values.json` with pre-computed validator values. `generate.py` regenerates deterministically.
+- **`tests/evaluation/tasks.py`** — `TaskDefinition` frozen dataclass. T01–T10 with validators reading `expected_values.json` at import time. Static coverage: T01 (csv-parser), T02 (json-validator), T03 (text-statistics), T05 (data-cleaning-workflow), T09 (report-generation). `ALL_TASKS`, `PILOT_TASKS=[T01,T07,T10]`, `get_task()`. 34 unit tests.
+- **`tests/evaluation/snapshots.py`** — `take_clean_snapshot()`, `restore_clean_snapshot()`, `snapshot_exists()`, `_hash_snapshot()`. Covers ChromaDB dir + `src/mcp_tools/` + `.deepagents/skills/`. SHA-256 hash (excluding `meta.json`) as snap ID. Idempotent. 19 unit tests.
+- **`tests/evaluation/harness.py`** — `HarnessConfig` dataclass, `EvaluationHarness` class. `prepare()`, `run_pilot()`, `run_condition()`, `close()`. Run loop: restore snapshot → seed registry → shuffle tasks → execute per condition → record to `EvaluationStore`. `MetricsStore` created once per run (shared across tasks so optimizer accumulates data). Static implementations for T01/T02/T03/T05/T09. `_execute_artifact()` uses `sandbox_execute` for MCP_TOOL artifacts. 22 unit tests.
+- **`src/orchestrator/pipeline.py`** — Added `verification_enabled: bool = True` parameter. `gate_fn=None` when `False` (no_verification baseline).
+
+### Still needed (actual evaluation runs)
+
+- Run pilot: T01 (seeded retrieval), T07 (moderate JIT), T10 (complex JIT)
+- Run 4 baseline conditions: `full`, `no_verification`, `no_optimization`, `static`
+- Critique checkpoint: does the evaluation design produce usable thesis data?
 - See `docs/iteration_plan.md` → Iteration 5 for full spec
 
 ## Stable Interfaces
@@ -441,7 +454,12 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/orchestrator/tool_loader.py`** — `ToolLoader` (load, execute, register_tool, cleanup), `LoadedTool`, `ToolResult`
 - **`src/registry/store.py`** — `SkillRegistry` (full CRUD + hierarchical search), `seed_registry()`
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + 4 granularity metric queries)
+- **`src/registry/evaluation_store.py`** — `EvaluationStore` (evaluation_runs DuckDB table, success rates, failure breakdown)
+- **`src/schemas/evaluation.py`** — `EvaluationRecord` (18 fields, `success` property)
 - **`src/mcp_tools/fibonacci.py`** — Reference MCP tool implementation
+- **`tests/evaluation/tasks.py`** — `TaskDefinition`, `ALL_TASKS`, `PILOT_TASKS`, `get_task()`
+- **`tests/evaluation/snapshots.py`** — `take_clean_snapshot()`, `restore_clean_snapshot()`, `snapshot_exists()`
+- **`tests/evaluation/harness.py`** — `EvaluationHarness`, `HarnessConfig`, `_run_static_implementation()`
 
 ## Notes for AI Agents
 

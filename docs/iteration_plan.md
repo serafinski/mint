@@ -751,9 +751,28 @@ Wait for both to finish, then wire the optimization loop into the main pipeline.
 
 ---
 
-## Iteration 5: Integration & End-to-End Testing (Weeks 9–11)
+## Iteration 5: Integration & End-to-End Testing (Weeks 9–11) 🔄 IN PROGRESS
 
 **Goal:** Wire all three pillars together. Build evaluation infrastructure and baselines.
+
+### Infrastructure complete (707 unit tests pass)
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/schemas/evaluation.py` | ✅ | `EvaluationRecord` (18 fields), separate from `InvocationRecord` |
+| `src/registry/evaluation_store.py` | ✅ | DuckDB `EvaluationStore`, `evaluation_runs` table |
+| `tests/evaluation/fixtures/` | ✅ | 10 fixture files, programmatic generation (seed=42), `expected_values.json` |
+| `tests/evaluation/tasks.py` | ✅ | T01–T10 `TaskDefinition` with validators |
+| `tests/evaluation/snapshots.py` | ✅ | `take_clean_snapshot` / `restore_clean_snapshot` (ChromaDB + mcp_tools + skills) |
+| `tests/evaluation/harness.py` | ✅ | Full run loop; `MetricsStore` per-run; static implementations for T01/T02/T03/T05/T09 |
+| `src/orchestrator/pipeline.py` | ✅ | Added `verification_enabled` for no_verification baseline |
+| Bucket 1 bypass fixes (B1.2, B2.1, B2.3) | ✅ | Committed pre-Iteration-5 |
+
+### Still needed
+
+- [ ] Run pilot: T01, T07, T10 through harness with real LLM
+- [ ] Run 4 baseline conditions across all tasks (n_runs ≥ 5 for statistical significance)
+- [ ] Critique checkpoint (see exit criteria below)
 
 ### Testbed: Business Analytics Pipeline
 
