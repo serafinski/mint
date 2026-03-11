@@ -375,6 +375,7 @@ def _extract_result(
     # pipeline.invoke() returns a dict, not a TaskState instance
     _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
     artifacts = _get("generated_artifacts", []) or []
+    matches = _get("matches", []) or []
     verification_results = _get("verification_results", []) or []
     attempt_count = _get("attempt_count", 0)
 
@@ -412,10 +413,30 @@ def _extract_result(
             # No verification report = gate bypassed (no_verification condition)
             gate_passed = True
             failure_reason = "none"
+    elif matches and not artifacts:
+        # Registry match path: all required capabilities were found in the
+        # registry — no generation was needed.  Seeded capabilities are
+        # pre-verified, so gate_passed=True.  The harness executes the static
+        # implementation (if available) to check output_in_range.
+        logger.info(
+            "Task %s resolved via registry match (%d match(es), 0 artifacts)",
+            task.task_id,
+            len(matches),
+        )
+        gate_passed = True
+        failure_reason = "none"
+        # Infer capability_type from the first match
+        first_match = matches[0]
+        cap = first_match.capability if hasattr(first_match, "capability") else first_match.get("capability")
+        if cap is not None:
+            _ct = cap.capability_type if hasattr(cap, "capability_type") else cap.get("capability_type")
+            capability_type = str(_ct).split(".")[-1].lower() if _ct else None
 
     # Execute the artifact against fixture data to check output_in_range
     output_in_range = False
     if gate_passed and artifacts:
+        from src.schemas.capability import CapabilityType as _CT
+        mcp_artifacts = [a for a in artifacts if a.capability_type == _CT.MCP_TOOL]
         artifact = mcp_artifacts[-1] if mcp_artifacts else artifacts[-1]
         try:
             output = _execute_artifact(artifact, task, loader)
@@ -428,6 +449,34 @@ def _extract_result(
             logger.warning(
                 "Artifact execution failed for task %s: %s", task.task_id, exc
             )
+    elif gate_passed and not artifacts and task.has_static_coverage:
+        # Registry match with static implementation available — execute it.
+        try:
+            output = _run_static_implementation(task.task_id, task.fixture_paths)
+            output_in_range = task.validator(output)
+            if not output_in_range:
+                failure_reason = "output_rejected"
+            logger.info(
+                "Registry-match static execution for %s: output_in_range=%s",
+                task.task_id,
+                output_in_range,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Static execution for registry-matched task %s failed: %s",
+                task.task_id,
+                exc,
+            )
+    elif gate_passed and not artifacts:
+        # Registry match but no static implementation and no artifact to execute.
+        # The capability was found but we can't verify output — mark as passed
+        # gate but output not validated.
+        failure_reason = "output_rejected"
+        logger.info(
+            "Task %s matched in registry but has no static implementation — "
+            "cannot validate output",
+            task.task_id,
+        )
 
     return {
         "gate_passed": gate_passed,

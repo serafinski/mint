@@ -310,10 +310,17 @@ Fix 7: parallelize generation (ThreadPoolExecutor, 4 workers)
 
 Expected result: pilot runtime from 2+ hours → ~15-25 minutes. 707 tests, zero expected breakage, ~27 new tests.
 
+### Pilot re-run results (2026-03-12, post-fix)
+
+After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% success (2/3), 100% gate pass (3/3)**. T01 registry match, T10 generated MCP_TOOL success, T07 generated MCP_TOOL passes gate but output has semantic bug (null_count_on_key=3 vs expected 0).
+
+**Semantic correctness gap:** Verification gate catches structural/deception issues but not business logic correctness. The gap between gate_pass_rate (100%) and success_rate (66.7%) quantifies this limitation. Deferred to future work — see `docs/iteration_plan.md` → "Pilot run findings (2026-03-12)" for full analysis and three proposed approaches.
+
 ### Still needed
 
-- [ ] Implement Fix 0–7 per `docs/plan.md`
-- [ ] Re-run pilot after fixes
+- [x] Implement Fix 0–7 per `docs/plan.md`
+- [x] Re-run pilot after fixes
+- [x] Classifier prompt rewrite (Single-Capability Rule)
 - [ ] Run 4 baseline conditions across all tasks (n_runs ≥ 5 for statistical significance)
 - [ ] Critique checkpoint: does the evaluation design produce usable thesis data?
 

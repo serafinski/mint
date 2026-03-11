@@ -334,3 +334,59 @@ def test_status_is_verifying():
     cmd = verification_node(state)
 
     assert cmd.update["status"] == TaskStatus.VERIFYING
+
+
+# ---------------------------------------------------------------------------
+# Fix 6: Parallel verification
+# ---------------------------------------------------------------------------
+
+
+def test_parallel_verification_processes_all_artifacts():
+    """All 4 artifacts are verified and end up in passed_artifacts."""
+    state = TaskState(
+        task_description="t",
+        generated_artifacts=[_artifact(f"tool_{i}") for i in range(4)],
+    )
+
+    cmd = verification_node(state)  # stub gate passes all
+
+    assert len(cmd.update["generated_artifacts"]) == 4
+    assert cmd.goto == "loading_node"
+
+
+def test_gate_exception_treated_as_failure_not_pass():
+    """Gate exception must result in failure, not a silent pass."""
+    def exploding_gate(artifact):
+        if artifact.capability_name == "boom":
+            raise RuntimeError("sandbox crashed")
+        return _passing_report(artifact.capability_name)
+
+    state = TaskState(
+        task_description="t",
+        generated_artifacts=[_artifact("ok"), _artifact("boom")],
+        attempt_count=0,
+    )
+    cmd = verification_node(state, gate_fn=exploding_gate)
+
+    # "boom" should be failed, "ok" should pass → retry
+    assert cmd.goto == "generate_mcp_tool"
+    names = [a.capability_name for a in cmd.update["generated_artifacts"]]
+    assert "ok" in names
+    assert "boom" not in names
+    assert any("gate_error" in e or "sandbox crashed" in e for e in cmd.update["errors"])
+
+
+def test_parallel_preserves_prior_verification_results():
+    """Prior reports in state.verification_results are not clobbered."""
+    prior = _passing_report("prior_tool")
+    state = TaskState(
+        task_description="t",
+        verification_results=[prior],
+        generated_artifacts=[_artifact("new_tool")],
+    )
+
+    cmd = verification_node(state)
+
+    results = cmd.update["verification_results"]
+    assert results[0].capability_name == "prior_tool"
+    assert any(r.capability_name == "new_tool" for r in results)

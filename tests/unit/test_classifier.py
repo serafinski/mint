@@ -160,6 +160,41 @@ class TestClassifyGap:
         args, kwargs = invoke_call.call_args
         assert "config" not in kwargs
 
+    def test_total_gaps_included_in_prompt(self):
+        """classify_gap passes total_gaps into the prompt template."""
+        mock_response = ClassificationResult(
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="Single function",
+        )
+        gap = self._gap()
+        mock_llm = _make_mock_llm(mock_response)
+
+        with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
+            classify_gap(gap, total_gaps=3)
+
+        invoke_call = mock_llm.with_structured_output.return_value.invoke
+        prompt_text = invoke_call.call_args[0][0]
+        assert "3" in prompt_text
+        assert "total capability" in prompt_text.lower() or "total_gaps" in prompt_text.lower() or "3\ntotal" in prompt_text
+
+    def test_total_gaps_defaults_to_one(self):
+        """classify_gap defaults total_gaps=1 when not specified."""
+        mock_response = ClassificationResult(
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="Single function",
+        )
+        gap = self._gap()
+        mock_llm = _make_mock_llm(mock_response)
+
+        with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
+            classify_gap(gap)
+
+        invoke_call = mock_llm.with_structured_output.return_value.invoke
+        prompt_text = invoke_call.call_args[0][0]
+        assert "1\ntotal capability" in prompt_text or "1 total" in prompt_text.lower()
+
     def test_gap_fields_preserved_on_success(self):
         """description and query from the GapItem are preserved in the result."""
         gap = GapItem(
@@ -227,6 +262,35 @@ class TestClassifierNode:
         assert classified[0].classified_type == CapabilityType.MCP_TOOL
         assert classified[1].classified_type == CapabilityType.SKILL
         assert cmd.update["status"] == TaskStatus.CLASSIFYING
+
+    def test_passes_total_gaps_to_classify_gap(self):
+        """classifier_node passes total_gaps=len(state.gaps) to classify_gap."""
+        state = TaskState(
+            task_description="Multi-gap task",
+            gaps=[
+                GapItem(description="Gap A", query="gap-a"),
+                GapItem(description="Gap B", query="gap-b"),
+                GapItem(description="Gap C", query="gap-c"),
+            ],
+        )
+
+        calls: list[dict] = []
+
+        def _mock_classify(gap, *, total_gaps=1):
+            calls.append({"query": gap.query, "total_gaps": total_gaps})
+            return ClassifiedGap(
+                description=gap.description,
+                query=gap.query,
+                classified_type=CapabilityType.MCP_TOOL,
+                confidence=0.9,
+                rationale="test",
+            )
+
+        with patch("src.orchestrator.classifier.classify_gap", side_effect=_mock_classify):
+            classifier_node(state)
+
+        assert len(calls) == 3
+        assert all(c["total_gaps"] == 3 for c in calls)
 
     def test_empty_gaps(self):
         state = TaskState(task_description="No gaps", gaps=[])

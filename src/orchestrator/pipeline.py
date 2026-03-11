@@ -102,7 +102,7 @@ def create_pipeline(
     # --- Nodes with injected dependencies (closures) ---
     builder.add_node(
         "gap_detection",
-        lambda state: gap_detection_node(state, registry),
+        lambda state: gap_detection_node(state, registry, metrics_store=metrics_store),
     )
 
     if run_optimizer and metrics_store is None:

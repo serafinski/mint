@@ -624,7 +624,9 @@ class TestGenerateSingleTool:
 
         assert error is None
         assert artifact is not None
-        assert artifact.capability_name == "add_numbers"
+        # Fix 5: name is now a deterministic slug, not the LLM-chosen name
+        from src.orchestrator.generators.utils import slugify_gap
+        assert artifact.capability_name == slugify_gap("add_numbers")
         assert artifact.capability_type == CapabilityType.MCP_TOOL
         assert artifact.source_code == VALID_TOOL_SOURCE
 
@@ -683,7 +685,9 @@ class TestGenerateSingleTool:
 
         assert error is None
         assert artifact is not None
-        assert artifact.capability_name == "add_numbers"
+        # Fix 5: name is deterministic slug, not LLM-chosen
+        from src.orchestrator.generators.utils import slugify_gap
+        assert artifact.capability_name == slugify_gap("add_numbers")
         assert artifact.capability_type == CapabilityType.MCP_TOOL
 
     def test_repair_llm_call_fails(self):
@@ -749,3 +753,283 @@ class TestGenerateSingleTool:
 
         user_msg = next(m for m in captured_messages if m["role"] == "user")
         assert "No additional context" in user_msg["content"]
+
+    def test_generate_single_tool_uses_forced_name(self):
+        """Fix 5: artifact uses slugify_gap(gap.query), not the LLM-chosen name."""
+        llm_code = GeneratedToolCode(
+            tool_name="something_else",  # LLM picks a different name
+            source_code=VALID_TOOL_SOURCE,
+            description="Adds numbers",
+        )
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._make_mock_llm([llm_code]),
+        ):
+            artifact, error = generate_single_tool(self._gap())
+
+        assert error is None
+        assert artifact is not None
+        from src.orchestrator.generators.utils import slugify_gap
+        assert artifact.capability_name == slugify_gap("add_numbers")
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: Skip already-passing gaps on retry
+# ---------------------------------------------------------------------------
+
+
+class TestSkipOnRetry:
+    """Tests for the skip-on-retry logic in generate_mcp_tool."""
+
+    def test_skip_gaps_with_existing_passing_artifact(self):
+        """Pre-existing artifact with matching gap_query skips regeneration."""
+        existing = GeneratedArtifact(
+            capability_name="fuzzy_join_abc123",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=VALID_TOOL_SOURCE,
+            gap_query="fuzzy join csvs",
+        )
+        state = TaskState(
+            task_description="Join two CSVs",
+            classified_gaps=[
+                ClassifiedGap(
+                    description="Fuzzy join",
+                    query="fuzzy join csvs",
+                    classified_type=CapabilityType.MCP_TOOL,
+                    confidence=0.9,
+                    rationale="join",
+                ),
+            ],
+            generated_artifacts=[existing],
+        )
+
+        with patch(
+            "src.orchestrator.generators.mcp_tool.generate_single_tool",
+        ) as mock_gen:
+            cmd = generate_mcp_tool(state)
+
+        mock_gen.assert_not_called()
+        assert len(cmd.update["generated_artifacts"]) == 1
+
+    def test_gap_query_set_on_generated_artifact(self):
+        """After generation, artifact.gap_query == gap.query."""
+        state = TaskState(
+            task_description="Test",
+            classified_gaps=[
+                ClassifiedGap(
+                    description="Add numbers",
+                    query="add_numbers",
+                    classified_type=CapabilityType.MCP_TOOL,
+                    confidence=0.9,
+                    rationale="Arithmetic",
+                ),
+            ],
+        )
+        mock_artifact = GeneratedArtifact(
+            capability_name="add_numbers_abc123",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=VALID_TOOL_SOURCE,
+            gap_query="add_numbers",
+        )
+        with patch(
+            "src.orchestrator.generators.mcp_tool.generate_single_tool",
+            return_value=(mock_artifact, None),
+        ):
+            cmd = generate_mcp_tool(state)
+
+        art = cmd.update["generated_artifacts"][0]
+        assert art.gap_query == "add_numbers"
+
+    def test_first_attempt_processes_all_gaps(self):
+        """On first attempt (no existing artifacts), all gaps are processed."""
+        state = TaskState(
+            task_description="Test",
+            classified_gaps=[
+                ClassifiedGap(
+                    description="A",
+                    query="gap-a",
+                    classified_type=CapabilityType.MCP_TOOL,
+                    confidence=0.9,
+                    rationale="x",
+                ),
+                ClassifiedGap(
+                    description="B",
+                    query="gap-b",
+                    classified_type=CapabilityType.MCP_TOOL,
+                    confidence=0.9,
+                    rationale="x",
+                ),
+            ],
+        )
+
+        mock_artifact = GeneratedArtifact(
+            capability_name="tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=VALID_TOOL_SOURCE,
+        )
+        with patch(
+            "src.orchestrator.generators.mcp_tool.generate_single_tool",
+            return_value=(mock_artifact, None),
+        ) as mock_gen:
+            generate_mcp_tool(state)
+
+        assert mock_gen.call_count == 2
+
+    def test_gap_query_none_does_not_crash_skip_set(self):
+        """Artifact with gap_query=None in state should not break skip set construction."""
+        existing = GeneratedArtifact(
+            capability_name="old_tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code="# old",
+            gap_query=None,
+        )
+        state = TaskState(
+            task_description="Test",
+            classified_gaps=[
+                ClassifiedGap(
+                    description="New",
+                    query="new-tool",
+                    classified_type=CapabilityType.MCP_TOOL,
+                    confidence=0.9,
+                    rationale="x",
+                ),
+            ],
+            generated_artifacts=[existing],
+        )
+        mock_artifact = GeneratedArtifact(
+            capability_name="new_tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=VALID_TOOL_SOURCE,
+        )
+        with patch(
+            "src.orchestrator.generators.mcp_tool.generate_single_tool",
+            return_value=(mock_artifact, None),
+        ) as mock_gen:
+            generate_mcp_tool(state)
+
+        mock_gen.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Fix 7: Parallel generation
+# ---------------------------------------------------------------------------
+
+
+class TestParallelGeneration:
+    """Tests for parallel generation in generate_mcp_tool."""
+
+    def test_parallel_generation_produces_all_artifacts(self):
+        """3 gaps all produce artifacts via parallel generation."""
+        gaps = [
+            ClassifiedGap(
+                description=f"Tool {i}",
+                query=f"tool-{i}",
+                classified_type=CapabilityType.MCP_TOOL,
+                confidence=0.9,
+                rationale="x",
+            )
+            for i in range(3)
+        ]
+        state = TaskState(task_description="Test", classified_gaps=gaps)
+
+        def mock_gen(gap, task_context=""):
+            return (
+                GeneratedArtifact(
+                    capability_name=f"gen_{gap.query}",
+                    capability_type=CapabilityType.MCP_TOOL,
+                    source_code=VALID_TOOL_SOURCE,
+                    gap_query=gap.query,
+                ),
+                None,
+            )
+
+        with patch(
+            "src.orchestrator.generators.mcp_tool.generate_single_tool",
+            side_effect=mock_gen,
+        ):
+            cmd = generate_mcp_tool(state)
+
+        assert len(cmd.update["generated_artifacts"]) == 3
+
+    def test_parallel_generation_exception_recorded_as_error(self):
+        """One gap raises; other artifacts still produced, error in state.errors."""
+        gaps = [
+            ClassifiedGap(
+                description=f"Tool {i}",
+                query=f"tool-{i}",
+                classified_type=CapabilityType.MCP_TOOL,
+                confidence=0.9,
+                rationale="x",
+            )
+            for i in range(2)
+        ]
+        state = TaskState(task_description="Test", classified_gaps=gaps)
+
+        call_count = 0
+
+        def mock_gen(gap, task_context=""):
+            nonlocal call_count
+            call_count += 1
+            if gap.query == "tool-0":
+                raise RuntimeError("LLM timeout")
+            return (
+                GeneratedArtifact(
+                    capability_name="gen_tool_1",
+                    capability_type=CapabilityType.MCP_TOOL,
+                    source_code=VALID_TOOL_SOURCE,
+                ),
+                None,
+            )
+
+        with patch(
+            "src.orchestrator.generators.mcp_tool.generate_single_tool",
+            side_effect=mock_gen,
+        ):
+            cmd = generate_mcp_tool(state)
+
+        assert len(cmd.update["generated_artifacts"]) == 1
+        assert any("tool-0" in e for e in cmd.update["errors"])
+
+    def test_already_passing_gaps_not_submitted_to_pool(self):
+        """Pre-existing artifact with gap_query means that gap is not submitted."""
+        existing = GeneratedArtifact(
+            capability_name="existing_tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=VALID_TOOL_SOURCE,
+            gap_query="tool-a",
+        )
+        state = TaskState(
+            task_description="Test",
+            classified_gaps=[
+                ClassifiedGap(
+                    description="Tool A",
+                    query="tool-a",
+                    classified_type=CapabilityType.MCP_TOOL,
+                    confidence=0.9,
+                    rationale="x",
+                ),
+                ClassifiedGap(
+                    description="Tool B",
+                    query="tool-b",
+                    classified_type=CapabilityType.MCP_TOOL,
+                    confidence=0.9,
+                    rationale="x",
+                ),
+            ],
+            generated_artifacts=[existing],
+        )
+        new_artifact = GeneratedArtifact(
+            capability_name="tool_b_gen",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=VALID_TOOL_SOURCE,
+        )
+
+        with patch(
+            "src.orchestrator.generators.mcp_tool.generate_single_tool",
+            return_value=(new_artifact, None),
+        ) as mock_gen:
+            cmd = generate_mcp_tool(state)
+
+        # Only tool-b should be generated
+        mock_gen.assert_called_once()
+        assert len(cmd.update["generated_artifacts"]) == 2

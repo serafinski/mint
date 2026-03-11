@@ -124,6 +124,9 @@ Gap description: "{description}"
 Search query: "{query}"
 Task context: "{task_context}"
 
+The `agent_name` field MUST be exactly `{forced_name}` (hyphen-case). \
+Do not choose a different name.
+
 Generate a complete agent configuration. Be specific in the system prompt — \
 include concrete instructions, constraints, and expected behavior. Choose tools \
 that make sense for the described capability. Set is_deep_agent to true only \

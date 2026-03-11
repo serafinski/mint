@@ -468,7 +468,9 @@ class TestGenerateSingleSkill:
 
         assert error is None
         assert artifact is not None
-        assert artifact.capability_name == "csv-data-loader"
+        # Fix 5: name is now a deterministic slug, not the LLM-chosen name
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+        assert artifact.capability_name == slugify_gap_hyphen("csv-loader")
         assert artifact.capability_type == CapabilityType.SKILL
         assert artifact.skill_content is not None
 
@@ -482,7 +484,8 @@ class TestGenerateSingleSkill:
 
         assert error is None
         assert artifact is not None
-        assert artifact.capability_name == "csv-data-loader"
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+        assert artifact.capability_name == slugify_gap_hyphen("csv-loader")
 
     def test_first_llm_call_fails(self, tmp_path):
         """LLM error on first attempt returns (None, error) without raising."""
@@ -547,8 +550,9 @@ class TestGenerateSingleSkill:
 
         assert error is None
         assert artifact is not None
-        # "CSV Data Loader" → lower → "csv data loader" → replace spaces → "csv-data-loader"
-        assert artifact.capability_name == "csv-data-loader"
+        # Fix 5: name is now a deterministic slug from gap.query
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+        assert artifact.capability_name == slugify_gap_hyphen("CSV Data Loader")
 
     def test_task_context_forwarded_to_prompt(self, tmp_path):
         """task_context passed to _generate_single_skill appears in the LLM prompt."""

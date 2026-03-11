@@ -1,9 +1,12 @@
 FROM python:3.11-slim
 
-# Install the packages that generated MCP tools are allowed to import.
-# Generator prompts restrict imports to stdlib + mcp + pydantic only.
-# Note: pip install runs at BUILD time; --network none applies at RUN time only.
-RUN pip install --no-cache-dir "mcp>=1.26.0" "pydantic>=2.12.5"
+# Install packages that generated MCP tools are allowed to import.
+# Allowed imports: stdlib, mcp, pydantic, pandas, numpy
+RUN pip install --no-cache-dir \
+    "mcp>=1.26.0" \
+    "pydantic>=2.12.5" \
+    "pandas>=2.0.0" \
+    "numpy>=1.24.0"
 
 RUN useradd --create-home --shell /bin/bash sandbox
 

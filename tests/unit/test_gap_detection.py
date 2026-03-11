@@ -186,3 +186,56 @@ def test_empty_errors_when_none_prior():
     cmd = gap_detection_node(state, registry)
 
     assert cmd.update["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# MetricsStore invocation tracking (Fix 3)
+# ---------------------------------------------------------------------------
+
+
+def test_records_match_invocations_when_metrics_store_provided():
+    """Matched capabilities should be recorded as invocations in MetricsStore."""
+    cap = _make_descriptor("csv-parser")
+    registry = _make_registry(matches=[(cap, 0.9, "parse CSV")])
+    metrics_store = MagicMock()
+    state = TaskState(
+        task_description="parse CSV file",
+        required_capabilities=["parse CSV"],
+    )
+
+    gap_detection_node(state, registry, metrics_store=metrics_store)
+
+    metrics_store.record_invocation.assert_called_once()
+    record = metrics_store.record_invocation.call_args[0][0]
+    assert record.capability_id == "csv-parser"
+    assert record.success is True
+    assert record.token_cost == 0
+    assert record.latency_ms == 0.0
+
+
+def test_no_metrics_store_does_not_crash():
+    """metrics_store=None should run without error (backwards-compat)."""
+    cap = _make_descriptor("csv-parser")
+    registry = _make_registry(matches=[(cap, 0.9, "parse CSV")])
+    state = TaskState(
+        task_description="parse CSV file",
+        required_capabilities=["parse CSV"],
+    )
+
+    # Should not raise
+    cmd = gap_detection_node(state, registry, metrics_store=None)
+    assert cmd.goto == "classifier_node"
+
+
+def test_gaps_not_recorded_as_invocations():
+    """Gaps (no registry match) must not produce invocation records."""
+    registry = _make_registry(gaps=[("train ML model", "no match")])
+    metrics_store = MagicMock()
+    state = TaskState(
+        task_description="train model",
+        required_capabilities=["train ML model"],
+    )
+
+    gap_detection_node(state, registry, metrics_store=metrics_store)
+
+    metrics_store.record_invocation.assert_not_called()

@@ -92,6 +92,51 @@ class TestPrune:
         # Cutoff should be ~7 days ago
         assert (now - cutoff).days in (6, 7)
 
+    def test_prune_skips_pinned_capability(self):
+        """Pinned capabilities are never pruned, even with zero invocations."""
+        pinned_cap = _make_cap("csv-parser")
+        pinned_cap = pinned_cap.model_copy(update={"metadata": {"pinned": "true"}})
+        registry = MagicMock()
+        registry.list_all.return_value = [pinned_cap]
+        store = MagicMock()
+        store.invocations_since.return_value = 0
+
+        result = prune(registry, store, window_days=30)
+
+        assert result == []
+        registry.deactivate.assert_not_called()
+
+    def test_prune_deactivates_unpinned_zero_invocation(self):
+        """Unpinned capabilities with zero invocations are still pruned (regression)."""
+        registry = MagicMock()
+        registry.list_all.return_value = [_make_cap("ephemeral")]
+        store = MagicMock()
+        store.invocations_since.return_value = 0
+
+        result = prune(registry, store, window_days=30)
+
+        assert result == ["ephemeral"]
+        registry.deactivate.assert_called_once_with("ephemeral")
+
+    def test_prune_mixed_registry_only_deactivates_unpinned(self):
+        """Mixed registry: pinned survives, active-with-invocations survives, idle-unpinned pruned."""
+        pinned = _make_cap("pinned-cap")
+        pinned = pinned.model_copy(update={"metadata": {"pinned": "true"}})
+        active = _make_cap("active-cap")
+        idle = _make_cap("idle-cap")
+
+        registry = MagicMock()
+        registry.list_all.return_value = [pinned, active, idle]
+        store = MagicMock()
+        # pinned is skipped before invocations_since is called
+        # active has invocations, idle has none
+        store.invocations_since.side_effect = [5, 0]
+
+        result = prune(registry, store, window_days=30)
+
+        assert result == ["idle-cap"]
+        registry.deactivate.assert_called_once_with("idle-cap")
+
 
 class TestSplit:
     def test_rejects_mcp_tool(self):

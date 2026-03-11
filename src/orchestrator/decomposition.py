@@ -35,6 +35,13 @@ logger = logging.getLogger(__name__)
 DECOMPOSITION_TIMEOUT_S = 120
 DECOMPOSITION_RECURSION_LIMIT = 50
 
+# Two-stage circuit breaker for capability count.
+# WARN: emit visibility signal but proceed intact — genuine 6-7 step tasks survive.
+# TRUNCATE: pathological 14-step decompositions are caught before they explode
+#           generation and verification time.
+WARN_CAPS = 5
+MAX_CAPS_HARD = 8
+
 
 # ---------------------------------------------------------------------------
 # Agent factory — creates a fresh agent per invocation
@@ -160,6 +167,38 @@ def decomposition_node(
     # Multiple subtasks may reference the same capability; searching/classifying
     # duplicates wastes tokens and can produce duplicate artifacts.
     required_caps = list(dict.fromkeys(required_caps))
+
+    # Two-stage circuit breaker: warn at WARN_CAPS, hard truncate at MAX_CAPS_HARD.
+    if len(required_caps) > WARN_CAPS:
+        logger.warning(
+            "Decomposition produced %d required capabilities (warn threshold %d). "
+            "Prompt constraints may not have been followed.",
+            len(required_caps), WARN_CAPS,
+        )
+        emit_langfuse_event(
+            langfuse_handler,
+            "decomposition.over_warn_limit",
+            "WARNING",
+            {"cap_count": len(required_caps), "warn_limit": WARN_CAPS, "caps": required_caps},
+        )
+
+    if len(required_caps) > MAX_CAPS_HARD:
+        logger.error(
+            "Decomposition produced %d capabilities — truncating to %d (hard limit). "
+            "This is a pathological decomposition; the prompt may not be working.",
+            len(required_caps), MAX_CAPS_HARD,
+        )
+        emit_langfuse_event(
+            langfuse_handler,
+            "decomposition.hard_truncation",
+            "CRITICAL",
+            {
+                "original_count": len(required_caps),
+                "truncated_to": MAX_CAPS_HARD,
+                "dropped": required_caps[MAX_CAPS_HARD:],
+            },
+        )
+        required_caps = required_caps[:MAX_CAPS_HARD]
 
     # Fallback: if no subtasks were produced, treat the whole task as one subtask
     if not subtasks:

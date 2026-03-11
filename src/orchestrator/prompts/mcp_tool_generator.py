@@ -73,8 +73,8 @@ if __name__ == "__main__":
 ## Rules
 
 - The tool function MUST be async (use `async def`)
-- Use only Python standard library imports plus `mcp` and `pydantic`
-- Do NOT import external packages beyond `mcp` and `pydantic`
+- Allowed imports: Python stdlib, `mcp`, `pydantic`, `pandas`, `numpy`
+- Do NOT import any other external packages (no requests, httpx, scikit-learn, etc.)
 - Parameter types must be simple: str, int, float, bool, list[str], etc.
 - Return type should be a simple type (str, int, float, bool, dict, list)
 - Tool name should be hyphen-case in FastMCP() and snake_case for the function
@@ -89,9 +89,11 @@ Description: {description}
 Search query: {query}
 Task context: {task_context}
 
+The tool function MUST be named exactly `{forced_name}` (snake_case). \
+Do not choose a different name.
+
 Generate a complete, working Python file following the FastMCP pattern shown \
-in the system prompt. The tool must be async, use Annotated parameters with \
-Field descriptions, and include a docstring.\
+in the system prompt.\
 """
 
 MCP_TOOL_REPAIR_PROMPT = """\

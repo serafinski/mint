@@ -49,11 +49,18 @@ def _get_llm():
 # ---------------------------------------------------------------------------
 
 
-def classify_gap(gap: GapItem) -> ClassifiedGap:
+def classify_gap(gap: GapItem, *, total_gaps: int = 1) -> ClassifiedGap:
     """Classify a single gap into a ``CapabilityType``.
 
     Uses a single LLM call at ``temperature=0`` with structured output.
     On LLM failure, defaults to ``MCP_TOOL`` with low confidence.
+
+    Args:
+        gap: The gap to classify.
+        total_gaps: Total number of gaps the decomposition produced for this
+            task.  Passed to the prompt so the LLM knows whether the task
+            was decomposed into a single capability (strong MCP_TOOL signal)
+            or many (more room for SKILL/AGENT).
     """
     llm = _get_llm()
     structured_llm = llm.with_structured_output(ClassificationResult)
@@ -61,6 +68,7 @@ def classify_gap(gap: GapItem) -> ClassifiedGap:
     prompt = CLASSIFICATION_PROMPT.format(
         description=gap.description,
         query=gap.query,
+        total_gaps=total_gaps,
     )
 
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
@@ -112,8 +120,9 @@ def classifier_node(
     classified: list[ClassifiedGap] = list(state.classified_gaps)
     errors: list[str] = list(state.errors)
 
+    total_gaps = len(state.gaps)
     for gap in state.gaps:
-        result = classify_gap(gap)
+        result = classify_gap(gap, total_gaps=total_gaps)
         classified.append(result)
         # Detect the LLM-failure fallback and surface it in state.errors so
         # downstream nodes and operators can observe classification failures.
