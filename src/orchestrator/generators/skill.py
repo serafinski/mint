@@ -74,7 +74,7 @@ def _get_llm():
     if _skill_llm is None:
         from langchain.chat_models import init_chat_model
 
-        _skill_llm = init_chat_model("deepseek:deepseek-chat")
+        _skill_llm = init_chat_model("deepseek:deepseek-chat", request_timeout=300)
     return _skill_llm
 
 
@@ -314,8 +314,10 @@ def generate_skill(
 
     skill_gaps = [g for g in state.classified_gaps if g.classified_type == CapabilityType.SKILL]
 
+    logger.info("generate_skill: %d gap(s) to generate", len(skill_gaps))
     task_context = build_task_context(state)
     for gap in skill_gaps:
+        logger.info("  → generating skill: %s", gap.query)
         artifact, error = _generate_single_skill(gap, task_context)
         if artifact is not None:
             # Replace any existing artifact with the same capability_name.

@@ -59,7 +59,7 @@ def _get_llm():
     if _generator_llm is None:
         from langchain.chat_models import init_chat_model
 
-        _generator_llm = init_chat_model("deepseek:deepseek-chat")
+        _generator_llm = init_chat_model("deepseek:deepseek-chat", request_timeout=300)
     return _generator_llm
 
 
@@ -312,8 +312,10 @@ def generate_mcp_tool(
     artifacts: list[GeneratedArtifact] = list(state.generated_artifacts)
     errors: list[str] = list(state.errors)
 
+    logger.info("generate_mcp_tool: %d gap(s) to generate", len(mcp_gaps))
     task_context = build_task_context(state)
     for gap in mcp_gaps:
+        logger.info("  → generating MCP tool: %s", gap.query)
         artifact, error = generate_single_tool(gap, task_context=task_context)
         if artifact is not None:
             # Replace any existing artifact with the same capability_name.

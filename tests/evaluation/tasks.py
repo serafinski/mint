@@ -300,7 +300,8 @@ T07 = TaskDefinition(
         "Perform a fuzzy join between "
         "tests/evaluation/fixtures/t07_left.csv (orders) and "
         "tests/evaluation/fixtures/t07_right.csv (companies) "
-        "on the 'company_name' column. Normalise case and strip whitespace before matching. "
+        "on the 'company_name' column. Before matching: normalise case, strip whitespace, "
+        "and strip common business suffixes (Inc, Ltd, Co, LLC). "
         "Return a dict with keys 'row_count' (int, matched join rows) "
         "and 'null_count_on_key' (int, null company_name values in result)."
     ),

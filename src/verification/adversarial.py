@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Operational boundaries
 # ---------------------------------------------------------------------------
 
-ADVERSARIAL_RECURSION_LIMIT = 35
+ADVERSARIAL_RECURSION_LIMIT = 50
 ADVERSARIAL_TIMEOUT_S = 180
 
 # ---------------------------------------------------------------------------

@@ -47,7 +47,6 @@ def gap_detection_node(
     ]
     gaps = []
     for query, reason in gaps_raw:
-        logger.debug("Capability gap: %r — %s", query, reason)
         gaps.append(GapItem(description=query, query=query))
 
     logger.info(
@@ -56,6 +55,10 @@ def gap_detection_node(
         len(gaps),
         len(state.required_capabilities),
     )
+    for m in matches:
+        logger.info("  ✓ matched: %s (score=%.2f)", m.capability.name, m.score)
+    for g in gaps:
+        logger.info("  ✗ gap: %s", g.description)
 
     return Command(
         update={

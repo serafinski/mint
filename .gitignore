@@ -219,7 +219,7 @@ __marimo__/
 .DS_Store
 
 # DeepAgents Skills
-.deepagents
+# .deepagents
 
 # VSCode Config
 .vscode

@@ -76,7 +76,7 @@ def _get_llm():
     if _agent_gen_llm is None:
         from langchain.chat_models import init_chat_model
 
-        _agent_gen_llm = init_chat_model("deepseek:deepseek-chat")
+        _agent_gen_llm = init_chat_model("deepseek:deepseek-chat", request_timeout=300)
     return _agent_gen_llm
 
 
@@ -296,8 +296,10 @@ def generate_agent(
         g for g in state.classified_gaps if g.classified_type == CapabilityType.AGENT
     ]
 
+    logger.info("generate_agent: %d gap(s) to generate", len(agent_gaps))
     task_context = build_task_context(state)
     for gap in agent_gaps:
+        logger.info("  → generating agent: %s", gap.query)
         artifact, error = _generate_single_agent(gap, task_context)
         if artifact is not None:
             # Replace any existing artifact with the same capability_name.

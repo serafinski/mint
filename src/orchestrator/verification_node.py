@@ -94,7 +94,13 @@ def verification_node(
     failed_artifacts: list[GeneratedArtifact] = []
     new_reports: list[VerificationReport] = []
 
+    logger.info(
+        "verification_node: verifying %d artifact(s) (attempt %d)",
+        len(state.generated_artifacts),
+        new_attempt_count,
+    )
     for artifact in state.generated_artifacts:
+        logger.info("  → verifying: %s (%s)", artifact.capability_name, artifact.capability_type)
         report = gate_fn(artifact)
         new_reports.append(report)
         if report.overall_passed:

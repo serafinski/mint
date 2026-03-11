@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DECOMPOSITION_TIMEOUT_S = 120
-DECOMPOSITION_RECURSION_LIMIT = 35
+DECOMPOSITION_RECURSION_LIMIT = 50
 
 
 # ---------------------------------------------------------------------------

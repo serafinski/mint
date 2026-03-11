@@ -372,9 +372,11 @@ def _extract_result(
     loader: ToolLoader,
 ) -> dict:
     """Extract EvaluationRecord fields from a completed TaskState."""
-    artifacts = getattr(state, "generated_artifacts", []) or []
-    verification_results = getattr(state, "verification_results", []) or []
-    attempt_count = getattr(state, "attempt_count", 0)
+    # pipeline.invoke() returns a dict, not a TaskState instance
+    _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
+    artifacts = _get("generated_artifacts", []) or []
+    verification_results = _get("verification_results", []) or []
+    attempt_count = _get("attempt_count", 0)
 
     # Determine verification outcome from the last VerificationReport
     gate_passed = False
@@ -383,11 +385,23 @@ def _extract_result(
     capability_type: str | None = None
 
     if artifacts:
-        artifact = artifacts[-1]
+        # Prefer an MCP_TOOL artifact (can be auto-executed) over skills/agents.
+        from src.schemas.capability import CapabilityType
+
+        mcp_artifacts = [a for a in artifacts if a.capability_type == CapabilityType.MCP_TOOL]
+        artifact = mcp_artifacts[-1] if mcp_artifacts else artifacts[-1]
         capability_type = str(artifact.capability_type).split(".")[-1].lower()
 
         if verification_results:
-            last_report = verification_results[-1]
+            # Find the report matching the selected artifact by capability_name.
+            # verification_results accumulates across retries and artifacts;
+            # the last entry is NOT necessarily for the selected artifact.
+            matched_report = None
+            for report in reversed(verification_results):
+                if report.capability_name == artifact.capability_name:
+                    matched_report = report
+                    break
+            last_report = matched_report or verification_results[-1]
             gate_passed = last_report.overall_passed
             verification_tier_reached = last_report.tier_reached
             if not gate_passed:
@@ -402,7 +416,7 @@ def _extract_result(
     # Execute the artifact against fixture data to check output_in_range
     output_in_range = False
     if gate_passed and artifacts:
-        artifact = artifacts[-1]
+        artifact = mcp_artifacts[-1] if mcp_artifacts else artifacts[-1]
         try:
             output = _execute_artifact(artifact, task, loader)
             output_in_range = task.validator(output)
@@ -449,13 +463,36 @@ def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -
     # Use sandbox_execute to run the tool with fixture-derived inputs
     from src.verification.sandbox_tool import sandbox_execute
 
-    fixture_inputs = _build_fixture_inputs(task)
-    func_name = getattr(artifact, "capability_name", "tool").replace("-", "_")
+    fixture_inputs = _build_fixture_inputs(task, source_code=source_code)
+
+    # Extract the actual async function name from source code AST
+    from src.verification.behavioral import _extract_function_name
+    func_name = _extract_function_name(source_code) or getattr(artifact, "capability_name", "tool").replace("-", "_")
+
+    # Embed fixture file content in the sandbox code since Docker doesn't
+    # mount the host filesystem.  Write each fixture to a temp path inside
+    # the container and update fixture_inputs to point there.
+    fixture_preamble = ""
+    if task.fixture_paths:
+        for i, fp in enumerate(task.fixture_paths):
+            host_path = Path(fp) if Path(fp).is_absolute() else Path.cwd() / fp
+            if host_path.exists():
+                content = host_path.read_text(encoding="utf-8", errors="replace")
+                sandbox_path = f"/tmp/fixture_{i}{host_path.suffix}"
+                fixture_preamble += (
+                    f"import pathlib as _pl\n"
+                    f"_pl.Path({sandbox_path!r}).write_text({content!r})\n"
+                )
+                # Replace the host path in fixture_inputs with the sandbox path
+                for k, v in fixture_inputs.items():
+                    if str(v) == str(fp):
+                        fixture_inputs[k] = sandbox_path
 
     # Build a sandbox invocation (same pattern as behavioral testing)
     sandbox_code = f"""
 import asyncio, json
 __name__ = "not_main"
+{fixture_preamble}
 {source_code}
 
 async def _run():
@@ -469,22 +506,115 @@ asyncio.run(_run())
 """
     result = sandbox_execute(sandbox_code, timeout=30)
     if result.get("error") or not result.get("stdout"):
+        logger.info(
+            "Sandbox execution for %s returned no output: error=%s stderr=%s",
+            func_name,
+            result.get("error"),
+            (result.get("stderr") or "")[:200],
+        )
         return {}
 
     try:
-        return json.loads(result["stdout"].strip().splitlines()[-1]).get("result", {}) or {}
+        parsed = json.loads(result["stdout"].strip().splitlines()[-1])
+        output = parsed.get("result", {}) or {}
+        logger.info("Sandbox output for %s: %s", func_name, str(output)[:300])
+        return output
     except (json.JSONDecodeError, KeyError, IndexError):
+        logger.info(
+            "Sandbox output parse failed for %s: stdout=%s",
+            func_name,
+            result["stdout"][:200],
+        )
         return {}
 
 
-def _build_fixture_inputs(task: TaskDefinition) -> dict:
-    """Build minimal keyword arguments for a task's primary fixture."""
+def _build_fixture_inputs(task: TaskDefinition, source_code: str | None = None) -> dict:
+    """Build keyword arguments matching fixture paths to the tool's parameters.
+
+    Uses AST extraction of the generated tool's parameter names to map fixture
+    files intelligently.  Falls back to ``{"file_path": <primary>}`` when the
+    tool signature cannot be parsed or has a single path-like parameter.
+    """
     if not task.fixture_paths:
         return {}
-    # Pass the primary fixture path as a string — generated tools typically
-    # accept a file_path or similar string parameter
-    primary = task.fixture_paths[0]
-    return {"file_path": str(primary)}
+
+    # --- Extract parameter names from source code ---
+    param_names: list[str] = []
+    if source_code:
+        from src.verification.behavioral import extract_parameter_schema
+        schema = extract_parameter_schema(source_code)
+        param_names = list(schema.keys())
+
+    # --- Single-fixture shortcut ---
+    if len(task.fixture_paths) == 1:
+        # Find the first path-like param, or default to "file_path"
+        path_param = "file_path"
+        for p in param_names:
+            if any(kw in p.lower() for kw in ("path", "file", "csv", "log", "json", "txt", "doc")):
+                path_param = p
+                break
+        return {path_param: str(task.fixture_paths[0])}
+
+    # --- Multi-fixture: match by keyword overlap ---
+    inputs: dict[str, str] = {}
+    # Identify path-like parameters
+    path_params = [
+        p for p in param_names
+        if any(kw in p.lower() for kw in ("path", "file", "csv", "log", "json", "txt", "doc"))
+    ]
+    unmatched_fixtures = list(task.fixture_paths)
+
+    for param in path_params:
+        best_fixture = None
+        best_score = 0
+        param_lower = param.lower()
+        for fp in unmatched_fixtures:
+            # Score by keyword overlap between param name and fixture filename
+            stem = fp.stem.lower()  # e.g. "t07_left"
+            score = sum(1 for kw in stem.split("_") if kw in param_lower)
+            # Also check common keywords like "left"/"right"/"schema"/"config"
+            if score > best_score:
+                best_score = score
+                best_fixture = fp
+        if best_fixture and best_score > 0:
+            inputs[param] = str(best_fixture)
+            unmatched_fixtures.remove(best_fixture)
+
+    # If keyword matching didn't assign all fixtures, assign remaining by order
+    remaining_path_params = [p for p in path_params if p not in inputs]
+    for param, fp in zip(remaining_path_params, unmatched_fixtures):
+        inputs[param] = str(fp)
+        # Don't remove from unmatched_fixtures in the zip — it's consumed
+
+    # If no path params were found at all, fall back to positional names
+    if not inputs:
+        if len(task.fixture_paths) == 2:
+            inputs = {
+                "left_path": str(task.fixture_paths[0]),
+                "right_path": str(task.fixture_paths[1]),
+            }
+        else:
+            for i, fp in enumerate(task.fixture_paths):
+                inputs[f"file_path_{i}"] = str(fp)
+
+    # --- Extract non-path parameters from the task prompt ---
+    # Look for column-related params and try to extract values from the prompt
+    for param in param_names:
+        if param in inputs:
+            continue
+        param_lower = param.lower()
+        if "column" in param_lower or "col" in param_lower:
+            # Extract quoted column name from task prompt
+            import re
+            col_match = re.search(r"'(\w+)'\s*column", task.task_prompt)
+            if not col_match:
+                col_match = re.search(r"column\s*['\"](\w+)['\"]", task.task_prompt)
+            if not col_match:
+                col_match = re.search(r"on\s+(?:the\s+)?'(\w+)'", task.task_prompt)
+            if col_match:
+                inputs[param] = col_match.group(1)
+
+    return inputs
 
 
 # ---------------------------------------------------------------------------
