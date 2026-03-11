@@ -20,9 +20,11 @@ See `docs/thesis_proposal.md` for full details.
 
 - **LangGraph** - Multi-agent orchestration and pipeline graphs
 - **DeepAgents** (`deepagents` package) - Agent harness with built-in planning (`write_todos`), file system context management, subagent spawning, and conversation summarization. Used for task decomposition (Pillar 1) and adversarial probing (Pillar 2).
-- **LLM Provider** - DeepSeek via `langchain-deepseek` for cost efficiency. Provider-agnostic via `init_chat_model("provider:model")`.
-  - `deepseek-chat` (DeepSeek-V3.2) — for all LLM tasks including DeepAgents and plain LangGraph nodes
+- **LLM Provider** - Provider-agnostic via `init_chat_model("provider:model")`.
+  - `deepseek-chat` (DeepSeek-V3.2) — for plain LangGraph nodes (classifiers, generators, behavioral testing)
+  - `openai:gpt-5-mini` — for DeepAgent components only (task decomposition, adversarial probing). Switched from DeepSeek during Iteration 5 pilot because DeepSeek's tool-call latency under DeepAgent's multi-step loop was prohibitive (~120s per decomposition vs ~30s with GPT-5-mini).
   - `deepseek-reasoner` (thinking mode) — **not usable with DeepAgents** due to missing `tool_choice` support; reserved for direct LLM calls without tool use
+  - **Environment:** Requires both `DEEPSEEK_API_KEY` and `OPENAI_API_KEY` in `.env`
 - **Claude Code** - Code generation (development tool only, not part of the runtime system)
 - **MCP SDK** - Tool serving (Python, FastMCP pattern)
 - **ChromaDB** - Skill registry (semantic search with hierarchical embeddings)
@@ -37,14 +39,14 @@ DeepAgents (`create_deep_agent()`) return a `CompiledStateGraph` — a complete 
 
 | Component | Implementation | Model | Why |
 |---|---|---|---|
-| Task decomposition | **DeepAgent** (invoked from node) | `deepseek-chat` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
+| Task decomposition | **DeepAgent** (invoked from node) | `openai:gpt-5-mini` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
 | Capability classifier | Plain LangGraph node | `deepseek-chat` | LLM classification with structured output (`temperature=0`) — single-step |
 | MCP tool generator | Plain LangGraph node | `deepseek-chat` | Single-pass code generation with retry on failure |
 | Skill generator | Plain LangGraph node | `deepseek-chat` | Structured text generation targeting DeepAgents skill format |
 | Agent generator | Plain LangGraph node | `deepseek-chat` | System prompt + config generation |
 | Tier 1 static scanner | Plain Python (no LLM) | — | AST + regex, deterministic |
 | Tier 2 behavioral testing | Plain LangGraph node | `deepseek-chat` | Test input generation + execution |
-| Tier 3 adversarial probing | **DeepAgent** (invoked from node) | `deepseek-chat` | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
+| Tier 3 adversarial probing | **DeepAgent** (invoked from node) | `openai:gpt-5-mini` | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
 | Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | `deepseek-chat` | Multi-step investigation of why capabilities fail |
 | Granularity operations | Plain LangGraph node | `deepseek-chat` | Metrics-driven decisions, mostly deterministic |
 
@@ -157,7 +159,7 @@ Use **Command API** for routing: `Command(update={...}, goto="next_node")`. Use 
 
 ### LLM Initialization
 
-Use `init_chat_model("deepseek:deepseek-chat")` for all nodes/agents. Never hardcode provider imports. `deepseek-reasoner` is NOT usable with DeepAgents (missing `tool_choice`).
+Use `init_chat_model("deepseek:deepseek-chat")` for plain LangGraph nodes. Use `init_chat_model("openai:gpt-5-mini")` for DeepAgent components (decomposition, adversarial probing). Never hardcode provider imports. `deepseek-reasoner` is NOT usable with DeepAgents (missing `tool_choice`).
 
 ### DeepAgents Integration
 
@@ -258,7 +260,7 @@ Full MCP server deployment is production future work (Chapter 7).
 
 All core infrastructure is built and tested. Key architectural decisions locked in:
 
-- **Iter 0**: Pipeline skeleton, sandbox Dockerfile (adds `pip install mcp pydantic`), fibonacci reference tool.
+- **Iter 0**: Pipeline skeleton, sandbox Dockerfile (adds `pip install mcp pydantic pandas numpy`), fibonacci reference tool.
 - **Iter 1**: All 18 Pydantic schemas (`src/schemas/`), ChromaDB registry (`store.py`), DuckDB metrics (`metrics.py`).
 - **Iter 2**: Full generator pipeline (`decomposition → gap_detection → classifier → generate_mcp_tool → generate_skill → generate_agent → loading_node`). Generators chained **sequentially** (not Send fan-out — simpler, no schema changes needed). All prompts include few-shot examples + repair pass.
 - **Iter 3**: Three-tier verification gate. Critical fix: `_build_sandbox_code` prepends `__name__ = "not_main"` to prevent `mcp.run()` blocking sandbox. `sandbox/Dockerfile` installs `mcp pydantic`. `build_task_context(state)` injects CRITICAL/HIGH findings on retry. 18 bypass findings documented in `docs/iteration_plan.md` (see Devil's Advocate section).
@@ -278,11 +280,42 @@ All core infrastructure is built and tested. Key architectural decisions locked 
 - **`tests/evaluation/harness.py`** — `HarnessConfig` dataclass, `EvaluationHarness` class. `prepare()`, `run_pilot()`, `run_condition()`, `close()`. Run loop: restore snapshot → seed registry → shuffle tasks → execute per condition → record to `EvaluationStore`. `MetricsStore` created once per run (shared across tasks so optimizer accumulates data). Static implementations for T01/T02/T03/T05/T09. `_execute_artifact()` uses `sandbox_execute` for MCP_TOOL artifacts. 22 unit tests.
 - **`src/orchestrator/pipeline.py`** — Added `verification_enabled: bool = True` parameter. `gate_fn=None` when `False` (no_verification baseline).
 
-### Still needed (actual evaluation runs)
+### Pilot findings (2026-03-11)
 
-- Run pilot: T01 (seeded retrieval), T07 (moderate JIT), T10 (complex JIT)
-- Run 4 baseline conditions: `full`, `no_verification`, `no_optimization`, `static`
-- Critique checkpoint: does the evaluation design produce usable thesis data?
+First pilot run (T01, T07, T10 under `full` condition) achieved 3/3 success but took **2+ hours** — unacceptable for evaluation. Root cause: six compounding architectural bottlenecks documented in `docs/investigation_pipeline_bottlenecks.md`:
+
+1. **Over-decomposition** (CRITICAL) — T07 fuzzy-join produces 14 capabilities instead of 1-2. Decomposition prompt optimizes for "smallest meaningful" granularity.
+2. **Full regeneration on retry** (CRITICAL) — When 2/10 artifacts fail verification, all 11 gaps are regenerated (not just the 2 failed ones).
+3. **Sequential verification** (HIGH) — 14 artifacts × ~2 min each = 28 min per attempt, runs in a `for` loop.
+4. **Optimizer prunes seeded capabilities** (HIGH) — `prune()` deactivates all seeded caps (csv-parser, etc.) because metrics store only tracks MCP tool invocations, not registry matches.
+5. **Sequential generation** (MEDIUM) — 11 gaps × ~25s each = 5 min per cycle, sequential.
+6. **Artifact accumulation** (MEDIUM) — LLM name non-determinism causes duplicate artifacts across retries.
+
+Additionally: sandbox missing `pandas`/`numpy` causes all data-processing tools to fail Tier 2 unconditionally.
+
+### Pipeline performance fix plan
+
+**8 fixes** documented in `docs/plan.md`. Implementation order:
+
+```
+Fix 0: sandbox/Dockerfile + generator prompt (pandas/numpy) — unblocking
+Fix 1: decomposition prompt + two-stage circuit breaker (warn@5, truncate@8)
+Fix 2: pin seeded capabilities against pruning (metadata={"pinned": "true"})
+Fix 3: track registry matches as invocations in MetricsStore
+Fix 5: deterministic capability naming with sha256 hash suffix (before Fix 4)
+Fix 4: skip already-passing gaps on retry (gap_query field on GeneratedArtifact)
+Fix 6: parallelize verification (ThreadPoolExecutor, 4 workers)
+Fix 7: parallelize generation (ThreadPoolExecutor, 4 workers)
+```
+
+Expected result: pilot runtime from 2+ hours → ~15-25 minutes. 707 tests, zero expected breakage, ~27 new tests.
+
+### Still needed
+
+- [ ] Implement Fix 0–7 per `docs/plan.md`
+- [ ] Re-run pilot after fixes
+- [ ] Run 4 baseline conditions across all tasks (n_runs ≥ 5 for statistical significance)
+- [ ] Critique checkpoint: does the evaluation design produce usable thesis data?
 
 **Runner:** `uv run scripts/run_pilot.py` (see `docs/iteration_plan.md` → Iteration 5 for full command reference)
 

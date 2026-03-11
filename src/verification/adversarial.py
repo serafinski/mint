@@ -151,7 +151,7 @@ def _create_adversarial_agent():
     from src.verification.sandbox_tool import sandbox_execute
 
     return create_deep_agent(
-        model=init_chat_model("deepseek:deepseek-chat"),
+        model=init_chat_model("openai:gpt-5-mini"),
         tools=[sandbox_execute],
         system_prompt=ADVERSARIAL_SYSTEM_PROMPT,
         response_format=AdversarialFindings,

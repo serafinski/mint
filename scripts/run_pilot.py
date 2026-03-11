@@ -77,6 +77,16 @@ def main() -> None:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    # --- LangFuse tracing (optional, enabled when env vars are set) ---
+    langfuse_handler = None
+    try:
+        from langfuse.langchain import CallbackHandler
+
+        langfuse_handler = CallbackHandler()
+        logger.info("LangFuse tracing enabled")
+    except Exception as exc:  # noqa: BLE001
+        logger.info("LangFuse tracing disabled: %s", exc)
+
     config = HarnessConfig(
         chroma_dir=CHROMA_DIR,
         mcp_tools_dir=MCP_TOOLS_DIR,
@@ -84,6 +94,7 @@ def main() -> None:
         db_path=DB_PATH,
         n_runs=args.n_runs,
         base_seed=42,
+        langfuse_handler=langfuse_handler,
     )
 
     tasks = ALL_TASKS if args.all_tasks else PILOT_TASKS
@@ -145,6 +156,17 @@ def main() -> None:
             print("Failure breakdown:")
             for reason, count in sorted(breakdown.items(), key=lambda x: -x[1]):
                 print(f"  {reason}: {count}")
+
+    # Flush LangFuse traces before exit
+    if langfuse_handler is not None:
+        try:
+            from langfuse import get_client
+
+            langfuse = get_client()
+            langfuse.flush()
+            logger.info("LangFuse traces flushed")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":

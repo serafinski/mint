@@ -50,7 +50,7 @@ def _get_agent():
     LangGraph graph without making any API calls, so the overhead is minimal.
     """
     return create_deep_agent(
-        model="deepseek:deepseek-chat",
+        model="openai:gpt-5-mini",
         system_prompt=DECOMPOSITION_SYSTEM_PROMPT,
         response_format=DecompositionResult,
         name="task-decomposer",

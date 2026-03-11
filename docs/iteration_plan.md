@@ -768,9 +768,31 @@ Wait for both to finish, then wire the optimization loop into the main pipeline.
 | `src/orchestrator/pipeline.py` | ✅ | Added `verification_enabled` for no_verification baseline |
 | Bucket 1 bypass fixes (B1.2, B2.1, B2.3) | ✅ | Committed pre-Iteration-5 |
 
+### Pilot run findings (2026-03-11)
+
+First pilot run completed (T01, T07, T10 under `full` condition). **3/3 tasks succeeded** but total runtime was **2+ hours** — unacceptable for evaluation (target: ~15-25 min).
+
+**Model change:** Switched DeepAgent components (task decomposition + adversarial probing) from `deepseek:deepseek-chat` to `openai:gpt-5-mini`. Decomposition improved from ~120s to ~30s, but model speed was a red herring — architectural issues dominated runtime. Both `.env` keys (`DEEPSEEK_API_KEY`, `OPENAI_API_KEY`) are now required.
+
+**Root cause analysis:** Six compounding architectural bottlenecks identified. Full investigation in `docs/investigation_pipeline_bottlenecks.md`:
+
+| Issue | Impact | Root cause |
+|---|---|---|
+| Over-decomposition | +60-70 min/task | Prompt says "smallest meaningful subtasks"; T07 → 14 caps instead of 1-2 |
+| Full regeneration on retry | +30-40 min/task | Generators iterate all `classified_gaps`, not just failed ones |
+| Sequential verification | +40-50 min/task | `for artifact in artifacts: gate_fn(artifact)` — no parallelism |
+| Optimizer prunes seeded caps | +20-30 min (T01, T10) | `prune()` kills all zero-invocation caps; registry matches not tracked |
+| Sequential generation | +10-15 min/task | Sequential loop over gaps, ~25s each |
+| Artifact accumulation | +5-10 min/task | LLM name non-determinism → duplicates across retries |
+| Sandbox missing pandas | Hard fail | Generated tools importing pandas fail Tier 2 unconditionally |
+
+**Fix plan:** 8 fixes documented in `docs/plan.md` (Fix 0–7). Implementation order accounts for dependencies (e.g., Fix 5 deterministic naming must precede Fix 4 skip-on-retry). Expected outcome: pilot runtime → ~15-25 min, zero test breakage, ~27 new tests.
+
 ### Still needed
 
-- [ ] Run pilot: T01, T07, T10 through harness with real LLM
+- [ ] Implement Fix 0–7 per `docs/plan.md`
+- [ ] Rebuild sandbox Docker image after Fix 0
+- [ ] Re-run pilot after fixes, verify runtime < 30 min
 - [ ] Run 4 baseline conditions across all tasks (n_runs ≥ 5 for statistical significance)
 - [ ] Critique checkpoint (see exit criteria below)
 

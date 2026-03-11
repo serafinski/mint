@@ -223,3 +223,6 @@ __marimo__/
 
 # VSCode Config
 .vscode
+
+# MCP
+.mcp.json
