@@ -254,6 +254,10 @@ For the thesis prototype, use `importlib` dynamic imports + sandbox execution ra
 
 Full MCP server deployment is production future work (Chapter 7).
 
+### Sandbox Dependency Limitation
+
+The sandbox Dockerfile hardcodes `pip install pandas numpy mcp pydantic`. This suffices for the thesis testbed but limits generated tools to these packages. Production approach: extract imports from generated source (AST), map to PyPI packages, and inject `pip install` dynamically — or build per-artifact ephemeral containers. Documented as future work (Chapter 7).
+
 ## What's Built
 
 ### Iterations 0–4 (All Complete)

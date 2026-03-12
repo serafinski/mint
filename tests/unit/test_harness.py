@@ -73,7 +73,7 @@ class TestRunStatic:
     def test_registry_miss_returns_failure(self, config):
         harness = EvaluationHarness(config)
         mock_registry = MagicMock()
-        mock_registry.search.return_value = []
+        mock_registry.get.return_value = None
         result = harness._run_static(T01, mock_registry)
         assert result["gate_passed"] is False
         assert result["failure_reason"] == "generation_failed"
@@ -83,7 +83,7 @@ class TestRunStatic:
         mock_registry = MagicMock()
         mock_cap = MagicMock()
         mock_cap.capability_type = CapabilityType.MCP_TOOL
-        mock_registry.search.return_value = [mock_cap]
+        mock_registry.get.return_value = mock_cap
 
         with patch("tests.evaluation.harness._run_static_implementation") as mock_impl:
             mock_impl.return_value = {"row_count": 50, "column_names": ["id", "name", "age", "city"]}
@@ -96,7 +96,7 @@ class TestRunStatic:
     def test_static_coverage_output_rejected(self, config):
         harness = EvaluationHarness(config)
         mock_registry = MagicMock()
-        mock_registry.search.return_value = [MagicMock()]
+        mock_registry.get.return_value = MagicMock()
 
         with patch("tests.evaluation.harness._run_static_implementation") as mock_impl:
             mock_impl.return_value = {"row_count": 999, "column_names": []}
@@ -109,7 +109,7 @@ class TestRunStatic:
     def test_static_impl_exception_returns_failure(self, config):
         harness = EvaluationHarness(config)
         mock_registry = MagicMock()
-        mock_registry.search.return_value = [MagicMock()]
+        mock_registry.get.return_value = MagicMock()
 
         with patch("tests.evaluation.harness._run_static_implementation") as mock_impl:
             mock_impl.side_effect = RuntimeError("filesystem error")
@@ -268,7 +268,7 @@ class TestRunPilot:
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
     ):
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         harness = EvaluationHarness(config)
         # run_pilot default condition is "full"; pass static explicitly for a fast no-LLM test
@@ -284,7 +284,7 @@ class TestRunPilot:
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
     ):
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         harness = EvaluationHarness(config)
         harness.run_pilot([T04])
@@ -306,7 +306,7 @@ class TestRunCondition:
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
     ):
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         config.n_runs = 3
         harness = EvaluationHarness(config)
@@ -323,7 +323,7 @@ class TestRunCondition:
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
     ):
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         config.n_runs = 2
         harness = EvaluationHarness(config)
@@ -339,7 +339,7 @@ class TestRunCondition:
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
     ):
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         harness = EvaluationHarness(config)
         records = harness.run_condition("static", [T04])
@@ -355,7 +355,7 @@ class TestRunCondition:
     ):
         """Runs use different seeds (task order is randomised per run)."""
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         config.n_runs = 2
         harness = EvaluationHarness(config)

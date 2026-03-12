@@ -663,6 +663,7 @@ Implement these as part of Iteration 5 pre-work (before wiring evaluation harnes
 **Bucket 2 — Document as future work (Chapter 7):**
 HIGH/MEDIUM risk but architecturally constrained or requiring significant new machinery.
 
+- **Dynamic sandbox dependencies** — The sandbox Dockerfile hardcodes `pip install pandas numpy mcp pydantic`. This works for the thesis testbed but breaks for generated tools that import other packages (e.g., `scikit-learn`, `requests`, `sqlalchemy`). Production approach: extract imports from generated source code (AST `import` / `import from` nodes), map module names to PyPI packages, and inject a `pip install` step into the sandbox before execution. Alternatively, build per-artifact ephemeral containers with only the required packages. The generator could also be required to output a `requirements` field on `GeneratedArtifact`.
 - B1.1 (hardcoded data below 3-item threshold) — threshold tuning is a research problem
 - B1.3 (unrecognized mock synonyms) — finite keyword list, LLM vocabulary is unbounded
 - B3.3 (network fallback bypasses network-disconnect check) — requires semantic analysis of error handling

@@ -183,7 +183,20 @@ class EvaluationHarness:
         is_pilot: bool,
     ) -> list[EvaluationRecord]:
         """Restore snapshot, randomise task order, execute each task, record."""
+        import gc
+
         cfg = self._config
+
+        # Force-release any ChromaDB PersistentClient from the previous run.
+        # Without this, SQLite WAL files may still be held open when
+        # restore_clean_snapshot does shutil.rmtree → shutil.copytree,
+        # causing corruption on the next SkillRegistry init.
+        try:
+            import chromadb
+            chromadb.api.shared_system_client.SharedSystemClient.clear_system_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        gc.collect()
 
         # Step 1: restore clean snapshot
         snap_id = restore_clean_snapshot(
@@ -290,9 +303,9 @@ class EvaluationHarness:
                 "failure_reason": "generation_failed",
             }
 
-        # Check registry has the expected capability
-        results = registry.search(task.task_prompt, n_results=1, min_confidence=0.5)
-        if not results:
+        # Check registry has the expected capability by exact name lookup
+        cap = registry.get(task.static_capability_name)
+        if cap is None:
             logger.warning("Static capability %s not found in registry", task.static_capability_name)
             return {
                 "gate_passed": False,
@@ -308,7 +321,7 @@ class EvaluationHarness:
                 "gate_passed": True,  # static implementations don't go through the gate
                 "output_in_range": in_range,
                 "failure_reason": "none" if in_range else "output_rejected",
-                "capability_type": results[0].capability_type if results else None,
+                "capability_type": cap.capability_type,
                 "attempt_count": 0,
                 "verification_tier_reached": None,  # bypassed for static
             }
