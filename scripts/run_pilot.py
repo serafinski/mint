@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Ensure project root is on sys.path when run as a script
@@ -31,10 +32,6 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-)
 logger = logging.getLogger("run_pilot")
 
 DATA_DIR = ROOT / "data"
@@ -65,17 +62,46 @@ def main() -> None:
         help="Run all 4 conditions in sequence (ignores --condition)",
     )
     parser.add_argument(
+        "--tasks",
+        type=str,
+        default=None,
+        help="Comma-separated task IDs to run (e.g., T11,T12,T13). Overrides --all-tasks.",
+    )
+    parser.add_argument(
         "--n-runs",
         type=int,
         default=1,
         help="Number of runs per condition (default: 1 for pilot; use 8 for full eval)",
     )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Path to save log output. If 'auto', generates timestamped file in data/logs/.",
+    )
     args = parser.parse_args()
 
     from tests.evaluation.harness import EvaluationHarness, HarnessConfig
-    from tests.evaluation.tasks import ALL_TASKS, PILOT_TASKS
+    from tests.evaluation.tasks import ALL_TASKS, PILOT_TASKS, get_task
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --- Set up logging (console + optional file) ---
+    log_format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+
+    if args.log_file:
+        log_dir = DATA_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if args.log_file == "auto":
+            log_path = log_dir / f"eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        else:
+            log_path = Path(args.log_file)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        handlers.append(file_handler)
+        print(f"Logging to: {log_path}")
+
+    logging.basicConfig(level=logging.INFO, format=log_format, handlers=handlers)
 
     # --- LangFuse tracing (optional, enabled when env vars are set) ---
     langfuse_handler = None
@@ -97,7 +123,12 @@ def main() -> None:
         langfuse_handler=langfuse_handler,
     )
 
-    tasks = ALL_TASKS if args.all_tasks else PILOT_TASKS
+    if args.tasks:
+        tasks = [get_task(tid.strip()) for tid in args.tasks.split(",")]
+    elif args.all_tasks:
+        tasks = ALL_TASKS
+    else:
+        tasks = PILOT_TASKS
     conditions = ALL_CONDITIONS if args.all_conditions else [args.condition]
 
     with EvaluationHarness(config) as harness:
@@ -121,23 +152,28 @@ def main() -> None:
             n_success = sum(r.success for r in records)
             n_gate = sum(r.gate_passed for r in records)
             n_output = sum(r.output_in_range for r in records)
-            print(f"\n{'='*60}")
-            print(f"Condition: {condition}")
-            print(f"  Tasks:           {len(records)}")
-            print(f"  Gate passed:     {n_gate}/{len(records)}")
-            print(f"  Output in range: {n_output}/{len(records)}")
-            print(f"  Full success:    {n_success}/{len(records)}")
-            print()
+            summary_lines = [
+                f"\n{'='*60}",
+                f"Condition: {condition}",
+                f"  Tasks:           {len(records)}",
+                f"  Gate passed:     {n_gate}/{len(records)}",
+                f"  Output in range: {n_output}/{len(records)}",
+                f"  Full success:    {n_success}/{len(records)}",
+                "",
+            ]
             for r in records:
                 status = "✓" if r.success else "✗"
-                print(
+                summary_lines.append(
                     f"  {status} {r.task_id}  gate={r.gate_passed}  "
                     f"output={r.output_in_range}  "
                     f"tier={r.verification_tier_reached}  "
                     f"reason={r.failure_reason}  "
                     f"type={r.capability_type}"
                 )
-            print()
+            summary_lines.append("")
+            summary = "\n".join(summary_lines)
+            print(summary)
+            logger.info("Condition summary:\n%s", summary)
             all_records.extend(records)
 
         logger.info("Results persisted to %s", DB_PATH)
@@ -146,16 +182,19 @@ def main() -> None:
         total = len(all_records)
         n_success = sum(r.success for r in all_records)
         n_gate = sum(r.gate_passed for r in all_records)
-        print(f"Total records: {total}")
+        final_lines = [f"Total records: {total}"]
         if total:
-            print(f"Overall success rate: {n_success/total:.1%}")
-            print(f"Overall gate pass rate: {n_gate/total:.1%}")
+            final_lines.append(f"Overall success rate: {n_success/total:.1%}")
+            final_lines.append(f"Overall gate pass rate: {n_gate/total:.1%}")
         from collections import Counter
         breakdown = Counter(r.failure_reason for r in all_records if r.failure_reason)
         if breakdown:
-            print("Failure breakdown:")
+            final_lines.append("Failure breakdown:")
             for reason, count in sorted(breakdown.items(), key=lambda x: -x[1]):
-                print(f"  {reason}: {count}")
+                final_lines.append(f"  {reason}: {count}")
+        final_summary = "\n".join(final_lines)
+        print(final_summary)
+        logger.info("Final summary:\n%s", final_summary)
 
     # Flush LangFuse traces before exit
     if langfuse_handler is not None:

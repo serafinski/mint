@@ -1,0 +1,20 @@
+{
+  "non_null_columns": [
+    "name",
+    "age",
+    "score"
+  ],
+  "range_constraints": {
+    "age": {
+      "min": 18,
+      "max": 100
+    },
+    "score": {
+      "min": 0.0,
+      "max": 100.0
+    }
+  },
+  "dedup_key_columns": [
+    "id"
+  ]
+}

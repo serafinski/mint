@@ -29,17 +29,28 @@ action required**, not the domain vocabulary.
   intermediate results, and may operate over multiple turns. Examples:
   anomaly investigation, autonomous data exploration, adaptive monitoring.
 
-## Single-Capability Rule
+## Gap Count Context
 
-The task decomposition has determined that this gap is one of {total_gaps}
-total capability(ies) needed. When the decomposition identified only 1
-capability for the entire task, it almost certainly fits in a single function.
-**Classify as mcp_tool unless the gap explicitly requires multi-tool
-orchestration (skill) or autonomous planning (agent).**
+The task decomposition produced {total_gaps} total capability gap(s) for this
+task. The gap count is contextual information, **not a routing rule**. Classify
+based on what the gap description itself requires:
 
-Even if the description mentions multiple internal steps (e.g., "parse,
-validate timestamps, count rows, and summarise"), these are implementation
-steps within one function — not separate tools that need orchestration.
+- If the description describes a single coherent computation (even with
+  multiple internal steps like parse → compute → return), classify as
+  **mcp_tool**.
+- If the description mentions integrating **multiple distinct data sources**,
+  coordinating **separate pipeline stages with intermediate outputs**, or
+  applying **a sequence of configurable rules** driven by external
+  configuration — classify as **skill**, even if there is only 1 gap.
+- If the description requires **adaptive investigation**, **planning based on
+  intermediate findings**, or **strategy adjustment** — classify as **agent**,
+  even if there is only 1 gap.
+
+A gap that says "parse a CSV and return row count" is mcp_tool regardless of
+gap count. A gap that says "join sales data with product catalog, compute
+regional revenues, then compare against targets" is skill — it orchestrates
+distinct data sources through a pipeline, even if decomposition collapsed it
+into one gap.
 
 ## Important Distinctions
 
@@ -51,6 +62,9 @@ requires **orchestrating multiple separate tools** (skill) vs. requires
 - "Fuzzy-join two CSVs with normalisation" → mcp_tool (one function)
 - "JSON data cleaning and normalization pipeline" → mcp_tool (one function)
 - "ETL pipeline: ingest from 3 APIs, transform, load into warehouse" → skill
+- "Join sales with products, compute revenues, compare against targets" → skill (multi-source integration with intermediate stages)
+- "Apply configurable quality rules from JSON config to clean a dataset" → skill (externally configured multi-stage pipeline)
+- "Investigate anomalies by profiling data and adapting strategy" → agent
 - "Autonomous agent that investigates JSON schema violations" → agent
 
 ## Examples
@@ -78,6 +92,20 @@ search strategy"
 Search query: "adaptive anomaly investigation agent"
 Answer: classified_type=agent, confidence=0.95, rationale="Requires planning, \
 adaptive reasoning, and strategy adjustment based on intermediate findings."
+
+Gap description: "Join sales data with product catalog on product_id, compute \
+per-region revenue totals, then compare against regional targets"
+Search query: "integrate-sales-products-and-compare-to-targets"
+Answer: classified_type=skill, confidence=0.9, rationale="Integrates three \
+distinct data sources (sales CSV, product catalog JSON, targets CSV) through a \
+multi-stage pipeline with intermediate join and aggregation steps."
+
+Gap description: "Profile metrics data, detect anomalies by comparing against \
+baselines, investigate clusters and correlations"
+Search query: "profile-and-detect-anomalies-against-baselines"
+Answer: classified_type=agent, confidence=0.85, rationale="Requires adaptive \
+investigation: profiling data, detecting anomalies, then investigating whether \
+they cluster or correlate — strategy adapts based on intermediate findings."
 
 ## Task
 

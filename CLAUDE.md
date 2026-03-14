@@ -320,12 +320,36 @@ After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% 
 
 **Semantic correctness gap:** Verification gate catches structural/deception issues but not business logic correctness. The gap between gate_pass_rate (100%) and success_rate (66.7%) quantifies this limitation. Deferred to future work — see `docs/iteration_plan.md` → "Pilot run findings (2026-03-12)" for full analysis and three proposed approaches.
 
+### Full evaluation results (2026-03-13, 200 records)
+
+| Condition | Success | Gate Pass |
+|---|---|---|
+| no_verification | 62.0% | 100.0% |
+| full | 58.0% | 90.0% |
+| no_optimization | 52.0% | 94.0% |
+| static | 50.0% | 50.0% |
+
+Task tiers (JIT): Always pass (T01-T03, T10 = 100%), Stochastic (T05 80%, T07 73%), Near-zero (T04, T08, T09 ~7%), Never pass (T06 0%).
+
+### SKILL/AGENT execution support (2026-03-13)
+
+Original evaluation only exercised MCP_TOOL end-to-end. Added:
+- **T11** (multi-source data integration) — targets SKILL classification
+- **T12** (configurable data quality pipeline) — targets SKILL classification
+- **T13** (autonomous anomaly investigation) — targets AGENT classification
+- **`tests/evaluation/execution.py`** — SKILL/AGENT execution via DeepAgent (same pattern as adversarial.py)
+- Harness now dispatches to `execute_skill_artifact()` / `execute_agent_artifact()` instead of returning `{}` for non-MCP_TOOL
+- Removed MCP_TOOL preference in `_extract_result` — uses whatever type the classifier chose
+- T11-T13 have no static coverage (by design — static libraries can't solve multi-step orchestration)
+
 ### Still needed
 
 - [x] Implement Fix 0–7 per `docs/plan.md`
 - [x] Re-run pilot after fixes
 - [x] Classifier prompt rewrite (Single-Capability Rule)
-- [ ] Run 4 baseline conditions across all tasks (n_runs ≥ 5 for statistical significance)
+- [x] Run 4 baseline conditions across all tasks (n_runs ≥ 5 for statistical significance)
+- [x] SKILL/AGENT execution in harness + T11-T13 tasks
+- [ ] Re-run full evaluation with 13 tasks
 - [ ] Critique checkpoint: does the evaluation design produce usable thesis data?
 
 **Runner:** `uv run scripts/run_pilot.py` (see `docs/iteration_plan.md` → Iteration 5 for full command reference)
@@ -363,6 +387,7 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`tests/evaluation/tasks.py`** — `TaskDefinition`, `ALL_TASKS`, `PILOT_TASKS`, `get_task()`
 - **`tests/evaluation/snapshots.py`** — `take_clean_snapshot()`, `restore_clean_snapshot()`, `snapshot_exists()`
 - **`tests/evaluation/harness.py`** — `EvaluationHarness`, `HarnessConfig`, `_run_static_implementation()`
+- **`tests/evaluation/execution.py`** — `execute_skill_artifact()`, `execute_agent_artifact()`, `_read_fixture_contents()` (DeepAgent-based SKILL/AGENT execution)
 - **`scripts/run_pilot.py`** — CLI runner: `uv run scripts/run_pilot.py [--condition] [--all-tasks] [--all-conditions] [--n-runs N]`
 
 ## Notes for AI Agents

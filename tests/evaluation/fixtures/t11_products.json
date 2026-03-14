@@ -1,0 +1,52 @@
+[
+  {
+    "product_id": 1,
+    "name": "Product_A",
+    "category": "Food"
+  },
+  {
+    "product_id": 2,
+    "name": "Product_B",
+    "category": "Food"
+  },
+  {
+    "product_id": 3,
+    "name": "Product_C",
+    "category": "Food"
+  },
+  {
+    "product_id": 4,
+    "name": "Product_D",
+    "category": "Food"
+  },
+  {
+    "product_id": 5,
+    "name": "Product_E",
+    "category": "Clothing"
+  },
+  {
+    "product_id": 6,
+    "name": "Product_F",
+    "category": "Food"
+  },
+  {
+    "product_id": 7,
+    "name": "Product_G",
+    "category": "Food"
+  },
+  {
+    "product_id": 8,
+    "name": "Product_H",
+    "category": "Clothing"
+  },
+  {
+    "product_id": 9,
+    "name": "Product_I",
+    "category": "Food"
+  },
+  {
+    "product_id": 10,
+    "name": "Product_J",
+    "category": "Food"
+  }
+]

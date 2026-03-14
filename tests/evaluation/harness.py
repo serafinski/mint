@@ -399,11 +399,11 @@ def _extract_result(
     capability_type: str | None = None
 
     if artifacts:
-        # Prefer an MCP_TOOL artifact (can be auto-executed) over skills/agents.
         from src.schemas.capability import CapabilityType
 
-        mcp_artifacts = [a for a in artifacts if a.capability_type == CapabilityType.MCP_TOOL]
-        artifact = mcp_artifacts[-1] if mcp_artifacts else artifacts[-1]
+        # Use the last generated artifact (pipeline produces the correct type
+        # based on classification — no need to prefer MCP_TOOL).
+        artifact = artifacts[-1]
         capability_type = str(artifact.capability_type).split(".")[-1].lower()
 
         if verification_results:
@@ -448,9 +448,7 @@ def _extract_result(
     # Execute the artifact against fixture data to check output_in_range
     output_in_range = False
     if gate_passed and artifacts:
-        from src.schemas.capability import CapabilityType as _CT
-        mcp_artifacts = [a for a in artifacts if a.capability_type == _CT.MCP_TOOL]
-        artifact = mcp_artifacts[-1] if mcp_artifacts else artifacts[-1]
+        artifact = artifacts[-1]
         try:
             output = _execute_artifact(artifact, task, loader)
             output_in_range = task.validator(output)
@@ -512,10 +510,16 @@ def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -
     from src.schemas.capability import CapabilityType
 
     cap_type = artifact.capability_type
-    if cap_type != CapabilityType.MCP_TOOL:
-        # Skills and agents cannot be automatically executed in the harness.
-        # Return empty dict — validator will return False, recorded as output_rejected.
-        logger.debug("Skipping execution for non-MCP artifact type: %s", cap_type)
+    if cap_type == CapabilityType.SKILL:
+        from tests.evaluation.execution import execute_skill_artifact, _read_fixture_contents
+        fixture_contents = _read_fixture_contents(task)
+        return execute_skill_artifact(artifact, task, fixture_contents)
+    elif cap_type == CapabilityType.AGENT:
+        from tests.evaluation.execution import execute_agent_artifact, _read_fixture_contents
+        fixture_contents = _read_fixture_contents(task)
+        return execute_agent_artifact(artifact, task, fixture_contents)
+    elif cap_type != CapabilityType.MCP_TOOL:
+        logger.debug("Unknown artifact type: %s", cap_type)
         return {}
 
     source_code = getattr(artifact, "source_code", None)
