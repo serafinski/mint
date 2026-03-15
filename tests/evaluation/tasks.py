@@ -49,6 +49,9 @@ class TaskDefinition:
     has_static_coverage: bool
     static_capability_name: str | None  # seeded registry entry that serves this task
     fixture_paths: list[Path] = field(default_factory=list)
+    # Semantic kwargs passed to the generated tool beyond fixture file paths.
+    # Covers cases where the LLM parameterizes values the task prompt specifies.
+    extra_inputs: dict = field(default_factory=dict)
     # validator: (pipeline_output_dict) -> bool
     validator: Callable[[dict], bool] = field(default=lambda _: False, compare=False)
     is_pilot: bool = False
@@ -346,6 +349,12 @@ T08 = TaskDefinition(
     has_static_coverage=False,
     static_capability_name=None,
     fixture_paths=[FIXTURES_DIR / "t08_classification.csv"],
+    extra_inputs={
+        "features": _t08_ev["features"],
+        "label_column": _t08_ev["label_column"],
+        "test_size": 0.2,
+        "random_state": 42,
+    },
     validator=_validate_t08,
 )
 

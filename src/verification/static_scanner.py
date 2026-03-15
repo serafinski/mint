@@ -25,7 +25,7 @@ from src.schemas.verification import Severity, VerificationFinding, Verification
 # ---------------------------------------------------------------------------
 
 _MOCK_NAMES = re.compile(
-    r"(mock|fake|sample|dummy|placeholder|DEMO|TEST_DATA)",
+    r"(mock|fake|dummy|placeholder|DEMO|TEST_DATA)",
     re.IGNORECASE,
 )
 

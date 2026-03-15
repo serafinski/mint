@@ -4,7 +4,7 @@ All tests mock sandbox_execute — no Docker required.
 """
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
@@ -318,7 +318,7 @@ class TestRunInconsistentTool:
     def test_inconsistent_results_produce_high_finding(self, mock_sandbox):
         call_count = 0
 
-        def side_effect(code, timeout=15):
+        def side_effect(code, timeout=15, **kwargs):
             nonlocal call_count
             call_count += 1
             # The consistency test calls sandbox twice for the same input.
@@ -359,7 +359,7 @@ class TestRunBoundaryTimeout:
     def test_timeout_on_boundary_produces_high_finding(self, mock_sandbox):
         call_count = 0
 
-        def side_effect(code, timeout=15):
+        def side_effect(code, timeout=15, **kwargs):
             nonlocal call_count
             call_count += 1
             # Make the boundary "large" test (call 6) timeout.
@@ -409,43 +409,37 @@ class TestRunNonexistentEntity:
 class TestParameterlessSmoke:
     """Unit tests for the B2.1 parameterless smoke helper."""
 
-    @patch("src.verification.behavioral.sandbox_execute")
-    def test_nonempty_output_produces_medium(self, mock_sandbox):
-        mock_sandbox.return_value = _sandbox_success('"status: ok"', elapsed=0.05)
-        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status")
+    def test_nonempty_output_produces_medium(self):
+        mock_sandbox = MagicMock(return_value=_sandbox_success('"status: ok"', elapsed=0.05))
+        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status", mock_sandbox)
         assert len(findings) == 1
         assert findings[0].severity == Severity.MEDIUM
         assert findings[0].category == "parameterless_smoke"
 
-    @patch("src.verification.behavioral.sandbox_execute")
-    def test_trivial_none_output_no_finding(self, mock_sandbox):
-        mock_sandbox.return_value = _sandbox_success("None", elapsed=0.05)
-        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status")
+    def test_trivial_none_output_no_finding(self):
+        mock_sandbox = MagicMock(return_value=_sandbox_success("None", elapsed=0.05))
+        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status", mock_sandbox)
         assert findings == []
 
-    @patch("src.verification.behavioral.sandbox_execute")
-    def test_trivial_empty_string_no_finding(self, mock_sandbox):
-        mock_sandbox.return_value = _sandbox_success("''", elapsed=0.05)
-        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status")
+    def test_trivial_empty_string_no_finding(self):
+        mock_sandbox = MagicMock(return_value=_sandbox_success("''", elapsed=0.05))
+        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status", mock_sandbox)
         assert findings == []
 
-    @patch("src.verification.behavioral.sandbox_execute")
-    def test_sandbox_failure_no_finding(self, mock_sandbox):
-        mock_sandbox.return_value = _sandbox_failure("Docker not found")
-        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status")
+    def test_sandbox_failure_no_finding(self):
+        mock_sandbox = MagicMock(return_value=_sandbox_failure("Docker not found"))
+        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status", mock_sandbox)
         assert findings == []
 
-    @patch("src.verification.behavioral.sandbox_execute")
-    def test_tool_error_no_finding(self, mock_sandbox):
-        mock_sandbox.return_value = _sandbox_success("None", elapsed=0.05, error="TypeError: bad")
-        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status")
+    def test_tool_error_no_finding(self):
+        mock_sandbox = MagicMock(return_value=_sandbox_success("None", elapsed=0.05, error="TypeError: bad"))
+        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status", mock_sandbox)
         assert findings == []
 
     def test_finding_is_tier_2(self):
-        with patch("src.verification.behavioral.sandbox_execute") as mock_sandbox:
-            mock_sandbox.return_value = _sandbox_success('"canned data"', elapsed=0.05)
-            findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status")
-            assert findings[0].tier == 2
+        mock_sandbox = MagicMock(return_value=_sandbox_success('"canned data"', elapsed=0.05))
+        findings = _test_parameterless_smoke(NO_PARAMS_TOOL, "get_status", mock_sandbox)
+        assert findings[0].tier == 2
 
 
 # ---------------------------------------------------------------------------
@@ -460,39 +454,35 @@ _SCHEMA_EMPTY: dict = {}
 class TestOutputVariation:
     """Unit tests for the B2.3 output-variation helper."""
 
-    @patch("src.verification.behavioral.sandbox_execute")
-    def test_identical_nontrivial_outputs_flagged(self, mock_sandbox):
-        mock_sandbox.return_value = _sandbox_success('"Alice"', elapsed=0.05)
-        findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}})
+    def test_identical_nontrivial_outputs_flagged(self):
+        mock_sandbox = MagicMock(return_value=_sandbox_success('"Alice"', elapsed=0.05))
+        findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}}, mock_sandbox)
         assert len(findings) == 1
         assert findings[0].severity == Severity.MEDIUM
         assert findings[0].category == "output_variation"
         assert "ignoring parameters" in findings[0].message
 
-    @patch("src.verification.behavioral.sandbox_execute")
-    def test_different_outputs_no_finding(self, mock_sandbox):
+    def test_different_outputs_no_finding(self):
         call_count = 0
 
-        def side_effect(code, timeout=15):
+        def side_effect(code, timeout=15, **kwargs):
             nonlocal call_count
             call_count += 1
             return _sandbox_success(str(call_count), elapsed=0.05)
 
-        mock_sandbox.side_effect = side_effect
-        findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}})
+        mock_sandbox = MagicMock(side_effect=side_effect)
+        findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}}, mock_sandbox)
         assert findings == []
 
-    @patch("src.verification.behavioral.sandbox_execute")
-    def test_sandbox_failure_no_finding(self, mock_sandbox):
-        mock_sandbox.return_value = _sandbox_failure("Docker not found")
-        findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}})
+    def test_sandbox_failure_no_finding(self):
+        mock_sandbox = MagicMock(return_value=_sandbox_failure("Docker not found"))
+        findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}}, mock_sandbox)
         assert findings == []
 
-    @patch("src.verification.behavioral.sandbox_execute")
-    def test_trivial_identical_outputs_not_flagged(self, mock_sandbox):
+    def test_trivial_identical_outputs_not_flagged(self):
         """Trivial values like None/0 being identical is not suspicious."""
-        mock_sandbox.return_value = _sandbox_success("None", elapsed=0.05)
-        findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}})
+        mock_sandbox = MagicMock(return_value=_sandbox_success("None", elapsed=0.05))
+        findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}}, mock_sandbox)
         assert findings == []
 
     def test_empty_schema_returns_no_findings(self):
@@ -505,7 +495,6 @@ class TestOutputVariation:
         assert findings == []
 
     def test_finding_is_tier_2(self):
-        with patch("src.verification.behavioral.sandbox_execute") as mock_sandbox:
-            mock_sandbox.return_value = _sandbox_success('"canned"', elapsed=0.05)
-            findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}})
-            assert findings[0].tier == 2
+        mock_sandbox = MagicMock(return_value=_sandbox_success('"canned"', elapsed=0.05))
+        findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}}, mock_sandbox)
+        assert findings[0].tier == 2

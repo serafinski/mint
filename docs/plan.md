@@ -1,16 +1,17 @@
-# Pipeline Performance Fix Plan — Final
+# Pipeline Performance Fix Plan
 
-**Date:** 2026-03-11  
-**Branch:** `iter/5-Integration-and-ETE-Testing`  
-**Goal:** Reduce pilot runtime from 2+ hours to ~15–25 minutes  
-**Test baseline:** 707 passing. Expected breakage: zero.
+**Date:** 2026-03-11 (original), updated 2026-03-16
+**Branch:** `fixes/iter5`
+**Goal:** Reduce pilot runtime from 2+ hours to ~15–25 minutes
+**Test baseline:** 707 passing at plan time → 787 after all fixes.
+**Status:** All fixes implemented. Targeted verification confirms T08 (100%), T11/SKILL (100%), T13/AGENT (100%). Full 13-task re-run pending.
 
 ---
 
 ## Implementation Order
 
 ```
-Fix 0   sandbox/Dockerfile + generator prompt imports update     (unblocking, do first)
+Fix 0   dynamic LLM-based import→PyPI resolution                (unblocking, do first)
 Fix 1   decomposition prompt + two-stage circuit breaker
 Fix 2   pin seeded capabilities against pruning
 Fix 3   track registry matches as invocations
@@ -24,63 +25,30 @@ Note: Fix 5 is numbered before Fix 4 intentionally — Fix 5 must be implemented
 
 ---
 
-## Fix 0: Sandbox Environment Sync
+## Fix 0: Sandbox Dependencies
 
-**Why first:** Generated tools fail behavioral testing (Tier 2) with `No module named 'pandas'`. This is a hard runtime error that causes every tool importing pandas to fail verification unconditionally, independently of correctness. Fix 0 is also the only change that requires a Docker rebuild, so doing it first means the image is ready before any verification tests run.
+**Why first:** Generated tools fail behavioral testing (Tier 2) with `No module named 'pandas'`. This is a hard runtime error that causes every tool importing pandas to fail verification unconditionally, independently of correctness.
 
-### Change 1: `sandbox/Dockerfile`
+### Original plan
 
-The current file installs only `mcp` and `pydantic`. Add `pandas` and `numpy`:
+Hardcode `pandas` and `numpy` in Dockerfile alongside `mcp` and `pydantic`. Update the generator prompt to list allowed imports. Simple, fast, but limited to a fixed set of packages.
 
-```dockerfile
-FROM python:3.11-slim
+### What was actually implemented
 
-# Install packages that generated MCP tools are allowed to import.
-# Allowed imports: stdlib, mcp, pydantic, pandas, numpy
-RUN pip install --no-cache-dir \
-    "mcp>=1.26.0" \
-    "pydantic>=2.12.5" \
-    "pandas>=2.0.0" \
-    "numpy>=1.24.0"
+The hardcoded approach was rejected during development — it doesn't emulate a real scenario where generated tools can import arbitrary packages. Instead, all hardcoded package lists were replaced with **dynamic LLM-based import→PyPI resolution**. This handles any third-party package (sklearn, scipy, requests, etc.) without maintaining a mapping.
 
-RUN useradd --create-home --shell /bin/bash sandbox
+**Changes:**
 
-WORKDIR /home/sandbox
-USER sandbox
+1. **`sandbox/Dockerfile`** — Stripped to minimal base: only `mcp` + `pydantic` (required by FastMCP tool pattern). No data-processing packages.
 
-ENTRYPOINT ["python"]
-CMD ["--help"]
-```
+2. **`src/verification/sandbox_tool.py`** — New dynamic resolution pipeline:
+   - `extract_imports(source_code)` — AST-based import extraction from generated source
+   - `resolve_extra_packages(source_code)` — Filters stdlib via `sys.stdlib_module_names` (no hardcoded list), then asks `deepseek-chat` to map remaining import names to PyPI package names (e.g., `sklearn` → `scikit-learn`). Session-level `_pip_resolution_cache` avoids repeated LLM calls. Falls back to identity mapping (import name = pip name) on LLM failure.
+   - `sandbox_execute(code, timeout, extra_packages)` — Two-phase Docker execution: Phase 1 runs `pip install` with `--network bridge` and commits to an ephemeral image; Phase 2 runs code with `--network none` against that image. Ephemeral image cleaned up after execution.
 
-After editing, rebuild with the existing Makefile target (confirmed present in `Makefile`):
-```bash
-make build-sandbox
-# expands to: docker build -t jit-sandbox sandbox/
-```
+3. **`src/verification/behavioral.py`** — All 6 `_test_*` functions gained a `_sandbox` parameter. `run()` creates a `functools.partial(sandbox_execute, extra_packages=...)` from the artifact's source code so behavioral tests install the same dependencies.
 
-The image name `jit-sandbox` is hardcoded in `src/verification/sandbox_tool.py` as `SANDBOX_IMAGE = "jit-sandbox"` — the tag must match exactly. Verify the rebuild worked before proceeding:
-```bash
-docker run --rm jit-sandbox -c "import pandas; import numpy; print('ok')"
-```
-
-### Change 2: `src/orchestrator/prompts/mcp_tool_generator.py`
-
-The current `MCP_TOOL_SYSTEM_PROMPT` says `"Use only Python standard library imports plus mcp and pydantic"` and `"Do NOT import external packages beyond mcp and pydantic"`. Update both lines to reflect the actual sandbox capabilities:
-
-```python
-# Replace these two lines in the ## Rules section:
-
-# Old:
-"- Use only Python standard library imports plus `mcp` and `pydantic`"
-"- Do NOT import external packages beyond `mcp` and `pydantic`"
-
-# New:
-"- Allowed imports: Python stdlib, `mcp`, `pydantic`, `pandas`, `numpy`"
-"- Do NOT import any other external packages (no requests, httpx, scikit-learn, etc.)"
-```
-
-**New tests:**
-- `test_sandbox_pandas_available()` in `tests/integration/test_sandbox_tool.py` — run `import pandas; import numpy; print('ok')` in sandbox, assert `success=True` and `"ok"` in stdout.
+4. **`src/orchestrator/prompts/mcp_tool_generator.py`** — Updated to allow any third-party imports (resolved dynamically), not just stdlib + mcp + pydantic.
 
 ---
 

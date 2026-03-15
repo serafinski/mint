@@ -274,11 +274,13 @@ class TestMockArtifacts:
         findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert len(findings) >= 1
 
-    def test_sample_case_insensitive(self):
+    def test_sample_not_flagged(self):
+        """'sample' was removed from mock indicators — too many false positives
+        in legitimate docstrings and Field examples (e.g. T07 fuzzy-join)."""
         code = 'Sample_Output = "hello"\n'
         report = scan(code, "sample-tool")
         findings = [f for f in report.findings if f.category == "mock_artifact"]
-        assert len(findings) >= 1
+        assert len(findings) == 0
 
 
 # ===================================================================

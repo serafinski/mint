@@ -663,7 +663,7 @@ Implement these as part of Iteration 5 pre-work (before wiring evaluation harnes
 **Bucket 2 — Document as future work (Chapter 7):**
 HIGH/MEDIUM risk but architecturally constrained or requiring significant new machinery.
 
-- **Dynamic sandbox dependencies** — The sandbox Dockerfile hardcodes `pip install pandas numpy mcp pydantic`. This works for the thesis testbed but breaks for generated tools that import other packages (e.g., `scikit-learn`, `requests`, `sqlalchemy`). Production approach: extract imports from generated source code (AST `import` / `import from` nodes), map module names to PyPI packages, and inject a `pip install` step into the sandbox before execution. Alternatively, build per-artifact ephemeral containers with only the required packages. The generator could also be required to output a `requirements` field on `GeneratedArtifact`.
+- ~~**Dynamic sandbox dependencies**~~ — **IMPLEMENTED (Iteration 5).** LLM-based import→PyPI resolution via `resolve_extra_packages()`. Two-phase Docker execution (pip install with network → run without network). Dockerfile stripped to minimal base (`mcp` + `pydantic` only).
 - B1.1 (hardcoded data below 3-item threshold) — threshold tuning is a research problem
 - B1.3 (unrecognized mock synonyms) — finite keyword list, LLM vocabulary is unbounded
 - B3.3 (network fallback bypasses network-disconnect check) — requires semantic analysis of error handling
@@ -818,7 +818,10 @@ After implementing Fix 0–7 and the classifier prompt rewrite (Single-Capabilit
 - [x] Implement Fix 0–7 per `docs/plan.md`
 - [x] Rebuild sandbox Docker image after Fix 0
 - [x] Re-run pilot after fixes (classifier fix + Single-Capability Rule)
-- [ ] Run 4 baseline conditions across all tasks (n_runs ≥ 5 for statistical significance)
+- [x] Run 4 baseline conditions across T01-T10 (n_runs=5) — results stale, need re-run post-fixes
+- [x] SKILL/AGENT execution in harness + T11-T13 tasks
+- [x] Harness execution fixes: dynamic deps, extra_inputs, error logging, registry match (2026-03-15)
+- [ ] Re-run full evaluation with 13 tasks × 4 conditions × 5 runs
 - [ ] Critique checkpoint (see exit criteria below)
 
 ### Pilot details
@@ -974,6 +977,17 @@ Create an agent team with 3 teammates:
 - "figure-check": verify all figures match raw data. Check labels, legends,
   scales. Flag anything misleading.
 ```
+
+### Future work topics for Chapter 7
+
+**Pydantic Monty for two-tier execution (sandboxed orchestration):**
+The current architecture uses Docker for all sandboxed execution (`sandbox_execute`) and DeepAgent for SKILL/AGENT orchestration. Pydantic Monty (`pydantic-monty`) — a Rust-based Python interpreter with microsecond startup — could replace the orchestration tier. Two-tier model:
+- **Monty tier**: LLM-generated coordination code (fan-out, conditionals, glue logic between pipeline stages). No Docker needed, ~4μs startup. External functions bridge to the Docker tier.
+- **Docker tier**: Generated MCP tools that need third-party libraries (pandas, numpy, sklearn). Full CPython environment, ~195ms startup.
+
+Benefits: eliminates DeepAgent overhead for SKILL execution (currently ~20-55s per invocation), enables `asyncio.gather` for parallel tool calls in one LLM round-trip (vs sequential tool-call loop), and type-checks LLM-generated orchestration code before execution. Limitation: Monty cannot run third-party libraries, so generated MCP tools still require Docker.
+
+Skill documentation available at `.claude/skills/monty/SKILL.md`.
 
 ### Exit criteria
 - Complete thesis draft

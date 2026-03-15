@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.schemas.capability import CapabilityType
-from src.schemas.task import GeneratedArtifact, TaskState
+from src.schemas.capability import CapabilityDescriptor, CapabilityType
+from src.schemas.task import GeneratedArtifact, MatchItem, TaskState
 from src.schemas.verification import VerificationReport
 from tests.evaluation.harness import EvaluationHarness, HarnessConfig, _extract_result
 from tests.evaluation.tasks import T01, T04, T07
@@ -49,13 +49,27 @@ def _make_report(passed=True, tier_reached=2):
     )
 
 
-def _make_state(artifacts=None, reports=None, attempt_count=1):
+def _make_state(artifacts=None, reports=None, attempt_count=1, matches=None):
     return TaskState(
         task_description="test",
         generated_artifacts=artifacts or [],
         verification_results=reports or [],
         attempt_count=attempt_count,
+        matches=matches or [],
     )
+
+
+def _make_match(name="fuzzy-join", source_code=None):
+    meta = {"generated": "true", "source": "jit_pipeline"}
+    if source_code:
+        meta["source_code"] = source_code
+    cap = CapabilityDescriptor(
+        name=name,
+        description="A test capability",
+        capability_type=CapabilityType.MCP_TOOL,
+        metadata=meta,
+    )
+    return MatchItem(capability=cap, score=0.85)
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +247,45 @@ class TestExtractResult:
             result = _extract_result(state, T07, loader)
         assert result["gate_passed"] is True
         assert result["output_in_range"] is False
+
+    def test_registry_match_with_source_code_executes(self):
+        """Registry match with source_code in metadata → sandbox-executed."""
+        state = _make_state(
+            artifacts=[],
+            matches=[_make_match(source_code="# tool source")],
+        )
+        loader = MagicMock()
+        fake_output = {"row_count": 12, "null_count_on_key": 0}
+        with patch("tests.evaluation.harness._execute_artifact", return_value=fake_output):
+            result = _extract_result(state, T07, loader)
+        assert result["gate_passed"] is True
+        assert result["output_in_range"] is True
+        assert result["failure_reason"] == "none"
+
+    def test_registry_match_without_source_code_cannot_validate(self):
+        """Registry match without source_code → gate passes but output not validated."""
+        state = _make_state(
+            artifacts=[],
+            matches=[_make_match(source_code=None)],
+        )
+        loader = MagicMock()
+        result = _extract_result(state, T07, loader)
+        assert result["gate_passed"] is True
+        assert result["output_in_range"] is False
+        assert result["failure_reason"] == "output_rejected"
+
+    def test_registry_match_execution_failure_does_not_raise(self):
+        """Registry match execution fails → gate passes, output not validated."""
+        state = _make_state(
+            artifacts=[],
+            matches=[_make_match(source_code="# bad tool")],
+        )
+        loader = MagicMock()
+        with patch("tests.evaluation.harness._execute_artifact", side_effect=RuntimeError("boom")):
+            result = _extract_result(state, T07, loader)
+        assert result["gate_passed"] is True
+        assert result["output_in_range"] is False
+        assert result["failure_reason"] == "output_rejected"
 
 
 # ---------------------------------------------------------------------------

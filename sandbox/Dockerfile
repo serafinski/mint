@@ -1,12 +1,12 @@
 FROM python:3.11-slim
 
-# Install packages that generated MCP tools are allowed to import.
-# Allowed imports: stdlib, mcp, pydantic, pandas, numpy
+# Minimal base image — only mcp and pydantic pre-installed because generated
+# MCP tools always import them (FastMCP pattern). All other dependencies
+# (pandas, numpy, sklearn, etc.) are resolved dynamically via LLM-based
+# import→PyPI mapping and installed at runtime in ephemeral containers.
 RUN pip install --no-cache-dir \
     "mcp>=1.26.0" \
-    "pydantic>=2.12.5" \
-    "pandas>=2.0.0" \
-    "numpy>=1.24.0"
+    "pydantic>=2.12.5"
 
 RUN useradd --create-home --shell /bin/bash sandbox
 

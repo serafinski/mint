@@ -14,11 +14,12 @@ import ast
 import json
 import textwrap
 import time
+from functools import partial
 from typing import Any
 
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import Severity, VerificationFinding
-from src.verification.sandbox_tool import sandbox_execute
+from src.verification.sandbox_tool import resolve_extra_packages, sandbox_execute
 
 LATENCY_THRESHOLD_S = 5.0
 
@@ -185,14 +186,14 @@ def _parse_sandbox_output(result: dict) -> dict | None:
 _TRIVIAL_RESULTS = {"None", "''", '""', "[]", "{}", "0", "False", "True"}
 
 
-def _test_parameterless_smoke(source_code: str, func_name: str) -> list[VerificationFinding]:
+def _test_parameterless_smoke(source_code: str, func_name: str, _sandbox=sandbox_execute) -> list[VerificationFinding]:
     """Smoke-test a parameterless tool: flag non-empty canned-looking output.
 
     A tool with no parameters cannot perform dynamic computation based on caller
     inputs, so non-trivial output is a strong signal of hardcoded/canned data.
     """
     code = _build_sandbox_code(source_code, func_name, {})
-    result = sandbox_execute(code, timeout=15)
+    result = _sandbox(code, timeout=15)
     parsed = _parse_sandbox_output(result)
 
     if parsed is None or parsed.get("error") is not None:
@@ -215,7 +216,7 @@ def _test_parameterless_smoke(source_code: str, func_name: str) -> list[Verifica
 
 
 def _test_output_variation(
-    source_code: str, func_name: str, schema: dict[str, dict]
+    source_code: str, func_name: str, schema: dict[str, dict], _sandbox=sandbox_execute
 ) -> list[VerificationFinding]:
     """Check that different inputs produce different outputs.
 
@@ -236,8 +237,8 @@ def _test_output_variation(
     code_a = _build_sandbox_code(source_code, func_name, inputs_a)
     code_b = _build_sandbox_code(source_code, func_name, inputs_b)
 
-    result_a = sandbox_execute(code_a, timeout=15)
-    result_b = sandbox_execute(code_b, timeout=15)
+    result_a = _sandbox(code_a, timeout=15)
+    result_b = _sandbox(code_b, timeout=15)
 
     parsed_a = _parse_sandbox_output(result_a)
     parsed_b = _parse_sandbox_output(result_b)
@@ -266,7 +267,7 @@ def _test_output_variation(
 
 
 def _test_nonexistent_entity(
-    source_code: str, func_name: str, schema: dict[str, dict]
+    source_code: str, func_name: str, schema: dict[str, dict], _sandbox=sandbox_execute
 ) -> list[VerificationFinding]:
     """Test with empty / nonexistent inputs. The tool should not crash silently."""
     findings: list[VerificationFinding] = []
@@ -276,7 +277,7 @@ def _test_nonexistent_entity(
     # Empty string for all params
     empty_inputs = {name: "" if info.get("type") != "int" else 0 for name, info in schema.items()}
     code = _build_sandbox_code(source_code, func_name, empty_inputs)
-    result = sandbox_execute(code, timeout=15)
+    result = _sandbox(code, timeout=15)
 
     parsed = _parse_sandbox_output(result)
     if parsed is None and not result.get("success"):
@@ -300,7 +301,7 @@ def _test_nonexistent_entity(
 
 
 def _test_consistency(
-    source_code: str, func_name: str, schema: dict[str, dict]
+    source_code: str, func_name: str, schema: dict[str, dict], _sandbox=sandbox_execute
 ) -> list[VerificationFinding]:
     """Run the same input twice and check results match."""
     findings: list[VerificationFinding] = []
@@ -310,8 +311,8 @@ def _test_consistency(
     inputs = _generate_boundary_inputs(schema)
     code = _build_sandbox_code(source_code, func_name, inputs)
 
-    result1 = sandbox_execute(code, timeout=15)
-    result2 = sandbox_execute(code, timeout=15)
+    result1 = _sandbox(code, timeout=15)
+    result2 = _sandbox(code, timeout=15)
 
     parsed1 = _parse_sandbox_output(result1)
     parsed2 = _parse_sandbox_output(result2)
@@ -347,7 +348,7 @@ def _test_consistency(
 
 
 def _test_boundary(
-    source_code: str, func_name: str, schema: dict[str, dict]
+    source_code: str, func_name: str, schema: dict[str, dict], _sandbox=sandbox_execute
 ) -> list[VerificationFinding]:
     """Test boundary values: zero, negative, large."""
     findings: list[VerificationFinding] = []
@@ -362,7 +363,7 @@ def _test_boundary(
 
     for label, inputs in test_cases:
         code = _build_sandbox_code(source_code, func_name, inputs)
-        result = sandbox_execute(code, timeout=15)
+        result = _sandbox(code, timeout=15)
 
         if not result.get("success") and "Timeout" in result.get("stderr", ""):
             findings.append(
@@ -378,7 +379,7 @@ def _test_boundary(
 
 
 def _test_latency(
-    source_code: str, func_name: str, schema: dict[str, dict]
+    source_code: str, func_name: str, schema: dict[str, dict], _sandbox=sandbox_execute
 ) -> list[VerificationFinding]:
     """Check that execution completes within a reasonable time."""
     findings: list[VerificationFinding] = []
@@ -389,7 +390,7 @@ def _test_latency(
     code = _build_sandbox_code(source_code, func_name, inputs)
 
     start = time.monotonic()
-    result = sandbox_execute(code, timeout=15)
+    result = _sandbox(code, timeout=15)
     wall_time = time.monotonic() - start
 
     parsed = _parse_sandbox_output(result)
@@ -441,16 +442,20 @@ def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
             )
         ]
 
+    # Resolve extra pip packages from imports so sandbox installs them dynamically.
+    extra_pkgs = resolve_extra_packages(source_code)
+    _sandbox = partial(sandbox_execute, extra_packages=extra_pkgs or None)
+
     schema = extract_parameter_schema(source_code)
     if not schema:
         # B2.1: run smoke test instead of silently skipping.
-        return _test_parameterless_smoke(source_code, func_name)
+        return _test_parameterless_smoke(source_code, func_name, _sandbox)
 
     findings: list[VerificationFinding] = []
-    findings.extend(_test_nonexistent_entity(source_code, func_name, schema))
-    findings.extend(_test_consistency(source_code, func_name, schema))
-    findings.extend(_test_boundary(source_code, func_name, schema))
-    findings.extend(_test_latency(source_code, func_name, schema))
-    findings.extend(_test_output_variation(source_code, func_name, schema))
+    findings.extend(_test_nonexistent_entity(source_code, func_name, schema, _sandbox))
+    findings.extend(_test_consistency(source_code, func_name, schema, _sandbox))
+    findings.extend(_test_boundary(source_code, func_name, schema, _sandbox))
+    findings.extend(_test_latency(source_code, func_name, schema, _sandbox))
+    findings.extend(_test_output_variation(source_code, func_name, schema, _sandbox))
 
     return findings

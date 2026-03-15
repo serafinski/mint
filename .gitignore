@@ -218,8 +218,11 @@ __marimo__/
 # MacOS
 .DS_Store
 
-# DeepAgents Skills
-# .deepagents
+# DeepAgents generated skills (created at runtime by evaluation/pipeline)
+.deepagents/skills/
+
+# Evaluation snapshots (created at runtime by harness)
+tests/evaluation/snapshots/
 
 # VSCode Config
 .vscode

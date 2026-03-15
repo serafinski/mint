@@ -479,15 +479,56 @@ def _extract_result(
                 exc,
             )
     elif gate_passed and not artifacts:
-        # Registry match but no static implementation and no artifact to execute.
-        # The capability was found but we can't verify output — mark as passed
-        # gate but output not validated.
-        failure_reason = "output_rejected"
-        logger.info(
-            "Task %s matched in registry but has no static implementation — "
-            "cannot validate output",
-            task.task_id,
+        # Registry match but no static implementation. Try to extract source_code
+        # from the matched capability's metadata and sandbox-execute it.
+        first_match = matches[0] if matches else None
+        cap = (
+            first_match.capability
+            if first_match and hasattr(first_match, "capability")
+            else None
         )
+        matched_source = None
+        if cap is not None:
+            meta = cap.metadata if hasattr(cap, "metadata") else {}
+            matched_source = meta.get("source_code")
+
+        if matched_source:
+            try:
+                from src.schemas.capability import CapabilityType
+                from src.schemas.task import GeneratedArtifact
+
+                proxy_artifact = GeneratedArtifact(
+                    capability_name=cap.name,
+                    capability_type=CapabilityType(cap.capability_type)
+                    if isinstance(cap.capability_type, str)
+                    else cap.capability_type,
+                    source_code=matched_source,
+                )
+                output = _execute_artifact(proxy_artifact, task, loader)
+                output_in_range = task.validator(output)
+                if not output_in_range:
+                    failure_reason = "output_rejected"
+                else:
+                    failure_reason = "none"
+                logger.info(
+                    "Registry-match sandbox execution for %s: output_in_range=%s",
+                    task.task_id,
+                    output_in_range,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Registry-match execution for task %s failed: %s",
+                    task.task_id,
+                    exc,
+                )
+                failure_reason = "output_rejected"
+        else:
+            failure_reason = "output_rejected"
+            logger.info(
+                "Task %s matched in registry but no source_code in metadata — "
+                "cannot validate output",
+                task.task_id,
+            )
 
     return {
         "gate_passed": gate_passed,
@@ -527,7 +568,7 @@ def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -
         return {}
 
     # Use sandbox_execute to run the tool with fixture-derived inputs
-    from src.verification.sandbox_tool import sandbox_execute
+    from src.verification.sandbox_tool import resolve_extra_packages, sandbox_execute
 
     fixture_inputs = _build_fixture_inputs(task, source_code=source_code)
 
@@ -554,39 +595,74 @@ def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -
                     if str(v) == str(fp):
                         fixture_inputs[k] = sandbox_path
 
-    # Build a sandbox invocation (same pattern as behavioral testing)
+    # Build a sandbox invocation (same pattern as behavioral testing).
+    # Use inspect to filter kwargs to only what the function accepts,
+    # since extra_inputs may include params the tool doesn't expose.
+    # Fuzzy-match extra_inputs keys to actual param names (e.g.
+    # "features" matches "feature_columns") to handle LLM naming variance.
     sandbox_code = f"""
-import asyncio, json
+import asyncio, json, inspect
 __name__ = "not_main"
 {fixture_preamble}
 {source_code}
 
 async def _run():
     try:
-        result = await {func_name}(**{repr(fixture_inputs)})
+        _all_inputs = {repr(fixture_inputs)}
+        _sig = inspect.signature({func_name})
+        _valid = set(_sig.parameters.keys())
+        _kwargs = {{k: v for k, v in _all_inputs.items() if k in _valid}}
+        # Fuzzy-match: for unmatched params, find extra inputs that share
+        # a root word (e.g. "features" ↔ "feature_columns").
+        _unmatched = _valid - set(_kwargs)
+        _unused = {{k: v for k, v in _all_inputs.items() if k not in _kwargs}}
+        def _words(s):
+            return set(w.rstrip("s") for w in s.lower().replace("_", " ").split() if len(w) > 2)
+        for _p in _unmatched:
+            _pw = _words(_p)
+            best, best_n = None, 0
+            for _ek, _ev in _unused.items():
+                n = len(_pw & _words(_ek))
+                if n > best_n:
+                    best, best_n = (_ek, _ev), n
+            if best_n > 0:
+                _kwargs[_p] = best[1]
+        result = await {func_name}(**_kwargs)
         print(json.dumps({{"result": result}}))
     except Exception as e:
         print(json.dumps({{"error": str(e)}}))
 
 asyncio.run(_run())
 """
-    result = sandbox_execute(sandbox_code, timeout=30)
-    if result.get("error") or not result.get("stdout"):
-        logger.info(
-            "Sandbox execution for %s returned no output: error=%s stderr=%s",
+    extra_pkgs = resolve_extra_packages(source_code)
+    # Allow more time when dynamic deps need installation (Phase 1 pip + Phase 2 exec).
+    exec_timeout = 60 if extra_pkgs else 30
+    logger.debug("Sandbox extra_packages=%s timeout=%s", extra_pkgs, exec_timeout)
+    result = sandbox_execute(sandbox_code, timeout=exec_timeout, extra_packages=extra_pkgs or None)
+    if not result.get("success") or not result.get("stdout"):
+        logger.warning(
+            "Sandbox execution for %s failed: exit_code=%s success=%s stderr=%s",
             func_name,
-            result.get("error"),
-            (result.get("stderr") or "")[:200],
+            result.get("exit_code"),
+            result.get("success"),
+            (result.get("stderr") or "")[:500],
         )
         return {}
 
     try:
         parsed = json.loads(result["stdout"].strip().splitlines()[-1])
+        if "error" in parsed:
+            logger.warning(
+                "Sandbox tool %s raised: %s",
+                func_name,
+                str(parsed["error"])[:500],
+            )
+            return {}
         output = parsed.get("result", {}) or {}
         logger.info("Sandbox output for %s: %s", func_name, str(output)[:300])
         return output
     except (json.JSONDecodeError, KeyError, IndexError):
-        logger.info(
+        logger.warning(
             "Sandbox output parse failed for %s: stdout=%s",
             func_name,
             result["stdout"][:200],
@@ -619,7 +695,13 @@ def _build_fixture_inputs(task: TaskDefinition, source_code: str | None = None) 
             if any(kw in p.lower() for kw in ("path", "file", "csv", "log", "json", "txt", "doc")):
                 path_param = p
                 break
-        return {path_param: str(task.fixture_paths[0])}
+        inputs = {path_param: str(task.fixture_paths[0])}
+        # Merge extra_inputs before returning
+        if hasattr(task, "extra_inputs") and task.extra_inputs:
+            for k, v in task.extra_inputs.items():
+                if k not in inputs:
+                    inputs[k] = v
+        return inputs
 
     # --- Multi-fixture: match by keyword overlap ---
     inputs: dict[str, str] = {}
@@ -679,6 +761,12 @@ def _build_fixture_inputs(task: TaskDefinition, source_code: str | None = None) 
                 col_match = re.search(r"on\s+(?:the\s+)?'(\w+)'", task.task_prompt)
             if col_match:
                 inputs[param] = col_match.group(1)
+
+    # --- Merge task-level extra_inputs (semantic kwargs like features, test_size) ---
+    if hasattr(task, "extra_inputs") and task.extra_inputs:
+        for k, v in task.extra_inputs.items():
+            if k not in inputs:
+                inputs[k] = v
 
     return inputs
 
