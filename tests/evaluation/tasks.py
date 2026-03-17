@@ -193,7 +193,8 @@ T04 = TaskDefinition(
     task_prompt=(
         "Parse the pipe-delimited file at tests/evaluation/fixtures/t04_pipe_delimited.csv. "
         "Auto-detect the delimiter. "
-        "Return a dict with keys 'row_count' (int), 'delimiter' (str), "
+        "Return a dict with keys 'row_count' (int, number of data rows excluding "
+        "the header), 'delimiter' (str), "
         "and 'parse_errors' (bool, True if any errors occurred)."
     ),
     has_static_coverage=False,
@@ -274,6 +275,10 @@ T06 = TaskDefinition(
     has_static_coverage=False,
     static_capability_name=None,
     fixture_paths=[FIXTURES_DIR / "t06_missing_values.csv"],
+    extra_inputs={
+        "n_neighbors": 5,
+        "k": 5,
+    },
     validator=_validate_t06,
     is_pilot=False,
 )

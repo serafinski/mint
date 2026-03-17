@@ -327,18 +327,18 @@ After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% 
 
 **Semantic correctness gap:** Verification gate catches structural/deception issues but not business logic correctness. The gap between gate_pass_rate (100%) and success_rate (66.7%) quantifies this limitation. Deferred to future work — see `docs/iteration_plan.md` → "Pilot run findings (2026-03-12)" for full analysis and three proposed approaches.
 
-### Full evaluation results (2026-03-13, 200 records — STALE, pre-fix)
+### Full evaluation results (2026-03-16/17, 260 records — FINAL)
 
 | Condition | Success | Gate Pass |
 |---|---|---|
-| no_verification | 62.0% | 100.0% |
-| full | 58.0% | 90.0% |
-| no_optimization | 52.0% | 94.0% |
-| static | 50.0% | 50.0% |
+| no_optimization | 52/65 (80.0%) | 64/65 (98.5%) |
+| no_verification | 50/65 (76.9%) | 65/65 (100%) |
+| full | 47/65 (72.3%) | 62/65 (95.4%) |
+| static | 25/65 (38.5%) | 25/65 (38.5%) |
 
-Task tiers (JIT): Always pass (T01-T03, T10 = 100%), Stochastic (T05 80%, T07 73%), Near-zero (T04, T08, T09 ~7%), Never pass (T06 0%).
+Task tiers (JIT best): Always pass (T01-T03, T08, T10, T13 = 100%), High (T04 80-100%, T07 60-80%, T11 80-100%), Stochastic (T05 60%, T12 40-100%), Low (T09 0-20%), Never pass (T06 0%).
 
-**Note:** These results are pre-fix (before dynamic sandbox deps, T08 extra_inputs, harness error logging, registry match execution). T08 went from ~7% to ~100% in targeted verification. Full re-run with 13 tasks (including T11-T13 SKILL/AGENT) pending.
+**Key findings:** (1) Optimizer hurts in single-run evaluation — needs invocation history to add value. (2) T06 0% everywhere = semantic correctness gap poster child (gate=100%, success=0%). (3) T09 5/5 static but ~0% JIT = prompt specificity tradeoff (LLM can't infer JSON structure). (4) All three capability types work end-to-end (MCP_TOOL, SKILL, AGENT). See `docs/iteration_plan.md` → "Full evaluation results (2026-03-16/17)" for detailed per-task analysis.
 
 ### SKILL/AGENT execution support (2026-03-13)
 
@@ -382,7 +382,7 @@ All three capability types confirmed working end-to-end.
 - [x] Run 4 baseline conditions across T01-T10 (n_runs ≥ 5) — results stale, need re-run
 - [x] SKILL/AGENT execution in harness + T11-T13 tasks
 - [x] Harness execution fixes (dynamic deps, extra_inputs, error logging, registry match)
-- [ ] Re-run full evaluation with 13 tasks × 4 conditions × 5 runs
+- [x] Re-run full evaluation with 13 tasks × 4 conditions × 5 runs (2026-03-16/17, 260 records)
 - [ ] Critique checkpoint: does the evaluation design produce usable thesis data?
 
 **Runner:** `uv run scripts/run_pilot.py` (see `docs/iteration_plan.md` → Iteration 5 for full command reference)
