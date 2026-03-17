@@ -109,7 +109,7 @@ def create_optimization_loop(
     split_reuse_threshold: float = 0.6,
     split_success_threshold: float = 0.7,
     merge_reuse_threshold: float = 0.05,
-    llm_model: str = "deepseek:deepseek-chat",
+    llm_model: str = "openai:gpt-5-mini",
 ) -> Any:
     """Build the LangGraph optimization loop.
 

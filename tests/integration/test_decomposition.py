@@ -72,7 +72,7 @@ class TestDecompositionIntegration:
         from deepagents import create_deep_agent
 
         agent = create_deep_agent(
-            model="deepseek:deepseek-chat",
+            model="openai:gpt-5-mini",
             system_prompt=DECOMPOSITION_SYSTEM_PROMPT,
             response_format=DecompositionResult,
             name="test-decomposer",

@@ -53,7 +53,7 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
         return {name: _pip_resolution_cache[name] for name in import_names}
 
     try:
-        llm = init_chat_model("deepseek-chat", temperature=0)
+        llm = init_chat_model("openai:gpt-5-mini", temperature=0)
         structured_llm = llm.with_structured_output(_PackageMapping)
 
         prompt = (

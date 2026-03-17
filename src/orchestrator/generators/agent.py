@@ -48,7 +48,7 @@ class AgentGenerationResult(BaseModel):
     system_prompt: str = Field(..., description="Markdown system prompt for the agent")
     node_name: str = Field(..., description="Snake_case LangGraph node function name")
     model: str = Field(
-        default="deepseek:deepseek-chat",
+        default="openai:gpt-5-mini",
         description="LLM model identifier",
     )
     tools: list[str] = Field(default_factory=list, description="Tool names the agent needs")
@@ -83,7 +83,7 @@ def _get_llm():
             if _agent_gen_llm is None:
                 from langchain.chat_models import init_chat_model
 
-                _agent_gen_llm = init_chat_model("deepseek:deepseek-chat", request_timeout=300)
+                _agent_gen_llm = init_chat_model("openai:gpt-5-mini", request_timeout=300)
     return _agent_gen_llm
 
 

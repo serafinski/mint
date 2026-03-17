@@ -21,10 +21,8 @@ See `docs/thesis_proposal.md` for full details.
 - **LangGraph** - Multi-agent orchestration and pipeline graphs
 - **DeepAgents** (`deepagents` package) - Agent harness with built-in planning (`write_todos`), file system context management, subagent spawning, and conversation summarization. Used for task decomposition (Pillar 1) and adversarial probing (Pillar 2).
 - **LLM Provider** - Provider-agnostic via `init_chat_model("provider:model")`.
-  - `deepseek-chat` (DeepSeek-V3.2) — for plain LangGraph nodes (classifiers, generators, behavioral testing)
-  - `openai:gpt-5-mini` — for DeepAgent components only (task decomposition, adversarial probing). Switched from DeepSeek during Iteration 5 pilot because DeepSeek's tool-call latency under DeepAgent's multi-step loop was prohibitive (~120s per decomposition vs ~30s with GPT-5-mini).
-  - `deepseek-reasoner` (thinking mode) — **not usable with DeepAgents** due to missing `tool_choice` support; reserved for direct LLM calls without tool use
-  - **Environment:** Requires both `DEEPSEEK_API_KEY` and `OPENAI_API_KEY` in `.env`
+  - `openai:gpt-5-mini` — unified model for all components (classifiers, generators, behavioral testing, DeepAgent components). Originally used a hybrid DeepSeek/GPT-5-mini split; unified to `openai:gpt-5-mini` in March 2026 to eliminate mixed-model confounds in evaluation.
+  - **Environment:** Requires `OPENAI_API_KEY` in `.env`
 - **Claude Code** - Code generation (development tool only, not part of the runtime system)
 - **MCP SDK** - Tool serving (Python, FastMCP pattern)
 - **ChromaDB** - Skill registry (semantic search with hierarchical embeddings)
@@ -40,15 +38,15 @@ DeepAgents (`create_deep_agent()`) return a `CompiledStateGraph` — a complete 
 | Component | Implementation | Model | Why |
 |---|---|---|---|
 | Task decomposition | **DeepAgent** (invoked from node) | `openai:gpt-5-mini` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
-| Capability classifier | Plain LangGraph node | `deepseek-chat` | LLM classification with structured output (`temperature=0`) — single-step |
-| MCP tool generator | Plain LangGraph node | `deepseek-chat` | Single-pass code generation with retry on failure |
-| Skill generator | Plain LangGraph node | `deepseek-chat` | Structured text generation targeting DeepAgents skill format |
-| Agent generator | Plain LangGraph node | `deepseek-chat` | System prompt + config generation |
+| Capability classifier | Plain LangGraph node | `openai:gpt-5-mini` | LLM classification with structured output (`temperature=0`) — single-step |
+| MCP tool generator | Plain LangGraph node | `openai:gpt-5-mini` | Single-pass code generation with retry on failure |
+| Skill generator | Plain LangGraph node | `openai:gpt-5-mini` | Structured text generation targeting DeepAgents skill format |
+| Agent generator | Plain LangGraph node | `openai:gpt-5-mini` | System prompt + config generation |
 | Tier 1 static scanner | Plain Python (no LLM) | — | AST + regex, deterministic |
-| Tier 2 behavioral testing | Plain LangGraph node | `deepseek-chat` | Test input generation + execution |
+| Tier 2 behavioral testing | Plain LangGraph node | `openai:gpt-5-mini` | Test input generation + execution |
 | Tier 3 adversarial probing | **DeepAgent** (invoked from node) | `openai:gpt-5-mini` | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
-| Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | `deepseek-chat` | Multi-step investigation of why capabilities fail |
-| Granularity operations | Plain LangGraph node | `deepseek-chat` | Metrics-driven decisions, mostly deterministic |
+| Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | `openai:gpt-5-mini` | Multi-step investigation of why capabilities fail |
+| Granularity operations | Plain LangGraph node | `openai:gpt-5-mini` | Metrics-driven decisions, mostly deterministic |
 
 ### DeepAgents Skill Ecosystem
 
@@ -159,7 +157,7 @@ Use **Command API** for routing: `Command(update={...}, goto="next_node")`. Use 
 
 ### LLM Initialization
 
-Use `init_chat_model("deepseek:deepseek-chat")` for plain LangGraph nodes. Use `init_chat_model("openai:gpt-5-mini")` for DeepAgent components (decomposition, adversarial probing). Never hardcode provider imports. `deepseek-reasoner` is NOT usable with DeepAgents (missing `tool_choice`).
+Use `init_chat_model("openai:gpt-5-mini")` for all LLM-calling components (plain LangGraph nodes and DeepAgent components alike). Never hardcode provider imports.
 
 ### DeepAgents Integration
 
@@ -260,7 +258,7 @@ The sandbox resolves dependencies dynamically at runtime — no hardcoded packag
 
 1. `extract_imports()` — AST-based import extraction from generated source
 2. `sys.stdlib_module_names` — filters out stdlib (no hardcoded list)
-3. `_resolve_imports_via_llm()` — asks `deepseek-chat` to map import names to PyPI names (e.g., `sklearn` → `scikit-learn`); results cached per session
+3. `_resolve_imports_via_llm()` — asks `openai:gpt-5-mini` to map import names to PyPI names (e.g., `sklearn` → `scikit-learn`); results cached per session
 4. Two-phase Docker execution: Phase 1 runs `pip install` with network access and commits to an ephemeral image; Phase 2 runs code with `--network none`
 
 On LLM failure, falls back to identity mapping (import name = pip name). The ephemeral image is cleaned up after execution.
@@ -280,6 +278,8 @@ All core infrastructure is built and tested. Key architectural decisions locked 
 ## Current Iteration
 
 **Iteration 5: Integration & End-to-End Testing.** Wire all three pillars together. Build evaluation infrastructure and baselines.
+
+**Model unification (2026-03-17):** Switched all LLM calls from hybrid DeepSeek/GPT-5-mini to unified `openai:gpt-5-mini` to eliminate the mixed-model confound in evaluation.
 
 ### Evaluation infrastructure (complete — 707 unit tests pass)
 
@@ -383,6 +383,10 @@ All three capability types confirmed working end-to-end.
 - [x] SKILL/AGENT execution in harness + T11-T13 tasks
 - [x] Harness execution fixes (dynamic deps, extra_inputs, error logging, registry match)
 - [x] Re-run full evaluation with 13 tasks × 4 conditions × 5 runs (2026-03-16/17, 260 records)
+- [x] Unify LLM provider (all openai:gpt-5-mini)
+- [x] T06 validator fix (post-KNN-imputation reference variance)
+- [x] T09 schema hint in task prompt
+- [ ] Re-run full evaluation (13 tasks × 4 conditions × 5 runs) with unified model + fixes
 - [ ] Critique checkpoint: does the evaluation design produce usable thesis data?
 
 **Runner:** `uv run scripts/run_pilot.py` (see `docs/iteration_plan.md` → Iteration 5 for full command reference)
@@ -445,7 +449,6 @@ When working on this project:
 - **LangGraph llms.txt**: https://docs.langchain.com/llms.txt
 - **DeepAgents docs**: https://docs.langchain.com/oss/python/deepagents/overview/
 - **DeepAgents PyPI**: https://pypi.org/project/deepagents/
-- **DeepSeek API docs**: https://api-docs.deepseek.com/
 - **DeepAgents skill spec**: See `tools/quick_validate.py` and `tools/init_skill.py` for format rules
 - **uv docs**: https://docs.astral.sh/uv/
 - **MCP specification**: https://modelcontextprotocol.io/

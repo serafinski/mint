@@ -104,7 +104,7 @@ def split(
     metrics_store: MetricsStore,
     capability_id: str,
     *,
-    llm_model: str = "deepseek:deepseek-chat",
+    llm_model: str = "openai:gpt-5-mini",
 ) -> list[str]:
     """Split a capability into specialized variants.
 
@@ -216,7 +216,7 @@ def merge(
     metrics_store: MetricsStore,
     capability_ids: list[str],
     *,
-    llm_model: str = "deepseek:deepseek-chat",
+    llm_model: str = "openai:gpt-5-mini",
 ) -> str:
     """Merge multiple capabilities into a single broader capability.
 

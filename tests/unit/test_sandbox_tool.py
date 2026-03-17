@@ -290,7 +290,7 @@ class TestResolveImportsViaLLM:
         result = _resolve_imports_via_llm(["sklearn", "cv2"])
 
         assert result == {"sklearn": "scikit-learn", "cv2": "opencv-python"}
-        mock_init.assert_called_once_with("deepseek-chat", temperature=0)
+        mock_init.assert_called_once_with("openai:gpt-5-mini", temperature=0)
         mock_structured.invoke.assert_called_once()
 
     @patch("src.verification.sandbox_tool.init_chat_model")

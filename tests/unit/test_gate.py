@@ -74,7 +74,7 @@ description: A test skill
 
 _CLEAN_AGENT_CONFIG = {
     "system_prompt": "You are a helpful assistant.",
-    "node_config": {"model": "deepseek:deepseek-chat"},
+    "node_config": {"model": "openai:gpt-5-mini"},
 }
 
 
