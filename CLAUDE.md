@@ -254,13 +254,24 @@ For the thesis prototype, use `importlib` dynamic imports + sandbox execution ra
 
 Full MCP server deployment is production future work (Chapter 7).
 
+### Dynamic Sandbox Dependencies
+
+The sandbox resolves dependencies dynamically at runtime — no hardcoded package lists. The Dockerfile installs only `mcp` and `pydantic` (required by the FastMCP tool pattern). All other packages are resolved via:
+
+1. `extract_imports()` — AST-based import extraction from generated source
+2. `sys.stdlib_module_names` — filters out stdlib (no hardcoded list)
+3. `_resolve_imports_via_llm()` — asks `deepseek-chat` to map import names to PyPI names (e.g., `sklearn` → `scikit-learn`); results cached per session
+4. Two-phase Docker execution: Phase 1 runs `pip install` with network access and commits to an ephemeral image; Phase 2 runs code with `--network none`
+
+On LLM failure, falls back to identity mapping (import name = pip name). The ephemeral image is cleaned up after execution.
+
 ## What's Built
 
 ### Iterations 0–4 (All Complete)
 
 All core infrastructure is built and tested. Key architectural decisions locked in:
 
-- **Iter 0**: Pipeline skeleton, sandbox Dockerfile (adds `pip install mcp pydantic pandas numpy`), fibonacci reference tool.
+- **Iter 0**: Pipeline skeleton, sandbox Dockerfile (minimal: `mcp` + `pydantic` only; other deps resolved dynamically), fibonacci reference tool.
 - **Iter 1**: All 18 Pydantic schemas (`src/schemas/`), ChromaDB registry (`store.py`), DuckDB metrics (`metrics.py`).
 - **Iter 2**: Full generator pipeline (`decomposition → gap_detection → classifier → generate_mcp_tool → generate_skill → generate_agent → loading_node`). Generators chained **sequentially** (not Send fan-out — simpler, no schema changes needed). All prompts include few-shot examples + repair pass.
 - **Iter 3**: Three-tier verification gate. Critical fix: `_build_sandbox_code` prepends `__name__ = "not_main"` to prevent `mcp.run()` blocking sandbox. `sandbox/Dockerfile` installs `mcp pydantic`. `build_task_context(state)` injects CRITICAL/HIGH findings on retry. 18 bypass findings documented in `docs/iteration_plan.md` (see Devil's Advocate section).
@@ -291,14 +302,14 @@ First pilot run (T01, T07, T10 under `full` condition) achieved 3/3 success but 
 5. **Sequential generation** (MEDIUM) — 11 gaps × ~25s each = 5 min per cycle, sequential.
 6. **Artifact accumulation** (MEDIUM) — LLM name non-determinism causes duplicate artifacts across retries.
 
-Additionally: sandbox missing `pandas`/`numpy` causes all data-processing tools to fail Tier 2 unconditionally.
+Additionally: sandbox base image lacked data-processing packages — resolved by dynamic LLM-based import→PyPI resolution (see "Dynamic Sandbox Dependencies" section).
 
 ### Pipeline performance fix plan
 
 **8 fixes** documented in `docs/plan.md`. Implementation order:
 
 ```
-Fix 0: sandbox/Dockerfile + generator prompt (pandas/numpy) — unblocking
+Fix 0: dynamic LLM-based import→PyPI resolution for sandbox dependencies — unblocking
 Fix 1: decomposition prompt + two-stage circuit breaker (warn@5, truncate@8)
 Fix 2: pin seeded capabilities against pruning (metadata={"pinned": "true"})
 Fix 3: track registry matches as invocations in MetricsStore
@@ -310,11 +321,68 @@ Fix 7: parallelize generation (ThreadPoolExecutor, 4 workers)
 
 Expected result: pilot runtime from 2+ hours → ~15-25 minutes. 707 tests, zero expected breakage, ~27 new tests.
 
+### Pilot re-run results (2026-03-12, post-fix)
+
+After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% success (2/3), 100% gate pass (3/3)**. T01 registry match, T10 generated MCP_TOOL success, T07 generated MCP_TOOL passes gate but output has semantic bug (null_count_on_key=3 vs expected 0).
+
+**Semantic correctness gap:** Verification gate catches structural/deception issues but not business logic correctness. The gap between gate_pass_rate (100%) and success_rate (66.7%) quantifies this limitation. Deferred to future work — see `docs/iteration_plan.md` → "Pilot run findings (2026-03-12)" for full analysis and three proposed approaches.
+
+### Full evaluation results (2026-03-16/17, 260 records — FINAL)
+
+| Condition | Success | Gate Pass |
+|---|---|---|
+| no_optimization | 52/65 (80.0%) | 64/65 (98.5%) |
+| no_verification | 50/65 (76.9%) | 65/65 (100%) |
+| full | 47/65 (72.3%) | 62/65 (95.4%) |
+| static | 25/65 (38.5%) | 25/65 (38.5%) |
+
+Task tiers (JIT best): Always pass (T01-T03, T08, T10, T13 = 100%), High (T04 80-100%, T07 60-80%, T11 80-100%), Stochastic (T05 60%, T12 40-100%), Low (T09 0-20%), Never pass (T06 0%).
+
+**Key findings:** (1) Optimizer hurts in single-run evaluation — needs invocation history to add value. (2) T06 0% everywhere = semantic correctness gap poster child (gate=100%, success=0%). (3) T09 5/5 static but ~0% JIT = prompt specificity tradeoff (LLM can't infer JSON structure). (4) All three capability types work end-to-end (MCP_TOOL, SKILL, AGENT). See `docs/iteration_plan.md` → "Full evaluation results (2026-03-16/17)" for detailed per-task analysis.
+
+### SKILL/AGENT execution support (2026-03-13)
+
+Original evaluation only exercised MCP_TOOL end-to-end. Added:
+- **T11** (multi-source data integration) — targets SKILL classification
+- **T12** (configurable data quality pipeline) — targets SKILL classification
+- **T13** (autonomous anomaly investigation) — targets AGENT classification
+- **`tests/evaluation/execution.py`** — SKILL/AGENT execution via DeepAgent (same pattern as adversarial.py)
+- Harness now dispatches to `execute_skill_artifact()` / `execute_agent_artifact()` instead of returning `{}` for non-MCP_TOOL
+- Removed MCP_TOOL preference in `_extract_result` — uses whatever type the classifier chose
+- T11-T13 have no static coverage (by design — static libraries can't solve multi-step orchestration)
+
+### Harness fixes (2026-03-15)
+
+- Dynamic LLM-based import→PyPI resolution (no hardcoded package lists in sandbox)
+- Dockerfile stripped to minimal base (`mcp` + `pydantic` only)
+- Harness sandbox error logging (was silently swallowing tool exceptions)
+- `extra_inputs` on `TaskDefinition` for semantic parameters (T08 fix: ~7% → ~100%)
+- Fuzzy parameter name matching via word-overlap stemming in sandbox code
+- Registry match execution via `source_code` stored in capability metadata
+- `sample` removed from static scanner false positives
+- Behavioral testing threads `extra_packages` via `functools.partial`
+- Snapshot directory flattened (removed unnecessary `clean/` nesting)
+- `.gitignore` updated for `.deepagents/skills/` and `tests/evaluation/snapshots/`
+
+### Targeted verification (2026-03-15)
+
+| Task | Type | Result | Notes |
+|---|---|---|---|
+| T08 | MCP_TOOL | 2/2 | Was ~7%, now 100% after extra_inputs fix |
+| T11 | SKILL | 2/2 | Classifier correctly routes to skill |
+| T13 | AGENT | 2/2 | Classifier correctly routes to agent |
+
+All three capability types confirmed working end-to-end.
+
 ### Still needed
 
-- [ ] Implement Fix 0–7 per `docs/plan.md`
-- [ ] Re-run pilot after fixes
-- [ ] Run 4 baseline conditions across all tasks (n_runs ≥ 5 for statistical significance)
+- [x] Implement Fix 0–7 per `docs/plan.md`
+- [x] Re-run pilot after fixes
+- [x] Classifier prompt rewrite (Single-Capability Rule)
+- [x] Run 4 baseline conditions across T01-T10 (n_runs ≥ 5) — results stale, need re-run
+- [x] SKILL/AGENT execution in harness + T11-T13 tasks
+- [x] Harness execution fixes (dynamic deps, extra_inputs, error logging, registry match)
+- [x] Re-run full evaluation with 13 tasks × 4 conditions × 5 runs (2026-03-16/17, 260 records)
 - [ ] Critique checkpoint: does the evaluation design produce usable thesis data?
 
 **Runner:** `uv run scripts/run_pilot.py` (see `docs/iteration_plan.md` → Iteration 5 for full command reference)
@@ -342,7 +410,7 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/verification/behavioral.py`** — `run(artifact) -> list[VerificationFinding]`, `extract_parameter_schema(source_code) -> dict`
 - **`src/verification/adversarial.py`** — `probe(artifact) -> VerificationReport` (DeepAgent, never raises), `AdversarialFinding`, `AdversarialFindings`
 - **`src/verification/gate.py`** — `verify(artifact) -> VerificationReport` (tiered cost gate, wired as `gate_fn` in pipeline)
-- **`src/verification/sandbox_tool.py`** — `sandbox_execute(code, timeout=10) -> dict` (Docker isolation; use for all adversarial/behavioral probing)
+- **`src/verification/sandbox_tool.py`** — `sandbox_execute(code, timeout=10, extra_packages=None) -> dict` (Docker isolation with dynamic dependency resolution; use for all adversarial/behavioral probing), `extract_imports(source_code) -> set[str]`, `resolve_extra_packages(source_code) -> list[str]`
 - **`src/orchestrator/tool_loader.py`** — `ToolLoader` (load, execute, register_tool, cleanup), `LoadedTool`, `ToolResult`
 - **`src/registry/store.py`** — `SkillRegistry` (full CRUD + hierarchical search), `seed_registry()`
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + 4 granularity metric queries)
@@ -352,6 +420,7 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`tests/evaluation/tasks.py`** — `TaskDefinition`, `ALL_TASKS`, `PILOT_TASKS`, `get_task()`
 - **`tests/evaluation/snapshots.py`** — `take_clean_snapshot()`, `restore_clean_snapshot()`, `snapshot_exists()`
 - **`tests/evaluation/harness.py`** — `EvaluationHarness`, `HarnessConfig`, `_run_static_implementation()`
+- **`tests/evaluation/execution.py`** — `execute_skill_artifact()`, `execute_agent_artifact()`, `_read_fixture_contents()` (DeepAgent-based SKILL/AGENT execution)
 - **`scripts/run_pilot.py`** — CLI runner: `uv run scripts/run_pilot.py [--condition] [--all-tasks] [--all-conditions] [--n-runs N]`
 
 ## Notes for AI Agents

@@ -235,7 +235,7 @@ class SkillRegistry:
         return pairs
 
     def detect_gaps(
-        self, queries: list[str], *, threshold: float = 0.3
+        self, queries: list[str], *, threshold: float = 0.5
     ) -> tuple[list[tuple[CapabilityDescriptor, float, str]], list[tuple[str, str]]]:
         """For each query, search the registry and classify as match or gap.
 
@@ -287,6 +287,7 @@ def seed_registry(registry: SkillRegistry) -> None:
             "name": name,
             "description": description,
             "capability_type": capability_type,
+            "metadata": {"pinned": "true"},  # all seeded caps are pinned
         }
         if has_domain:
             kwargs["domain"] = domain

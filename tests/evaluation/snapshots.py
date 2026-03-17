@@ -19,7 +19,6 @@ from pathlib import Path
 
 # Default snapshot storage location (within the test tree so it is gitignored)
 _SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
-_CLEAN_SNAP_NAME = "clean"
 
 
 def take_clean_snapshot(
@@ -37,15 +36,14 @@ def take_clean_snapshot(
     The snapshot ID is written to ``meta.json`` inside the snapshot so that
     ``restore_clean_snapshot`` can verify integrity.
     """
-    snap_path = snapshot_dir / _CLEAN_SNAP_NAME
-    snap_path.mkdir(parents=True, exist_ok=True)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     for src, dst_name in [
         (chroma_dir, "chroma"),
         (mcp_tools_dir, "mcp_tools"),
         (skills_dir, "skills"),
     ]:
-        dst = snap_path / dst_name
+        dst = snapshot_dir / dst_name
         if dst.exists():
             shutil.rmtree(dst)
         if src.exists():
@@ -53,8 +51,8 @@ def take_clean_snapshot(
         else:
             dst.mkdir(parents=True, exist_ok=True)
 
-    snap_id = _hash_snapshot(snap_path)
-    (snap_path / "meta.json").write_text(json.dumps({"id": snap_id}))
+    snap_id = _hash_snapshot(snapshot_dir)
+    (snapshot_dir / "meta.json").write_text(json.dumps({"id": snap_id}))
     return snap_id
 
 
@@ -72,11 +70,10 @@ def restore_clean_snapshot(
 
     Raises FileNotFoundError if take_clean_snapshot was never called.
     """
-    snap_path = snapshot_dir / _CLEAN_SNAP_NAME
-    meta_path = snap_path / "meta.json"
+    meta_path = snapshot_dir / "meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(
-            f"No clean snapshot found at {snap_path}. "
+            f"No clean snapshot found at {snapshot_dir}. "
             "Call take_clean_snapshot() before running evaluation."
         )
 
@@ -87,7 +84,7 @@ def restore_clean_snapshot(
         (mcp_tools_dir, "mcp_tools"),
         (skills_dir, "skills"),
     ]:
-        src = snap_path / src_name
+        src = snapshot_dir / src_name
         if dst.exists():
             shutil.rmtree(dst)
         if src.exists():
@@ -100,7 +97,7 @@ def restore_clean_snapshot(
 
 def get_snapshot_id(*, snapshot_dir: Path = _SNAPSHOT_DIR) -> str:
     """Return the ID of the existing clean snapshot without restoring."""
-    meta_path = snapshot_dir / _CLEAN_SNAP_NAME / "meta.json"
+    meta_path = snapshot_dir / "meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(
             "No clean snapshot found. Call take_clean_snapshot() first."
@@ -110,7 +107,7 @@ def get_snapshot_id(*, snapshot_dir: Path = _SNAPSHOT_DIR) -> str:
 
 def snapshot_exists(*, snapshot_dir: Path = _SNAPSHOT_DIR) -> bool:
     """True if a clean snapshot has been taken."""
-    return (snapshot_dir / _CLEAN_SNAP_NAME / "meta.json").exists()
+    return (snapshot_dir / "meta.json").exists()
 
 
 # ---------------------------------------------------------------------------

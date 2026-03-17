@@ -42,16 +42,16 @@ class TestTakeSnapshot:
         chroma, mcp_tools, skills = tmp_dirs
         snap_dir = tmp_path / "snapshots"
         snap_id = take_clean_snapshot(chroma, mcp_tools, skills, snapshot_dir=snap_dir)
-        meta = json.loads((snap_dir / "clean" / "meta.json").read_text())
+        meta = json.loads((snap_dir / "meta.json").read_text())
         assert meta["id"] == snap_id
 
     def test_files_copied(self, tmp_dirs, tmp_path):
         chroma, mcp_tools, skills = tmp_dirs
         snap_dir = tmp_path / "snapshots"
         take_clean_snapshot(chroma, mcp_tools, skills, snapshot_dir=snap_dir)
-        assert (snap_dir / "clean" / "chroma" / "collection.db").exists()
-        assert (snap_dir / "clean" / "mcp_tools" / "tool_a.py").exists()
-        assert (snap_dir / "clean" / "skills" / "skill_x" / "SKILL.md").exists()
+        assert (snap_dir / "chroma" / "collection.db").exists()
+        assert (snap_dir / "mcp_tools" / "tool_a.py").exists()
+        assert (snap_dir / "skills" / "skill_x" / "SKILL.md").exists()
 
     def test_idempotent(self, tmp_dirs, tmp_path):
         chroma, mcp_tools, skills = tmp_dirs

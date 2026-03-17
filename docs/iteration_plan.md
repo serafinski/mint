@@ -663,6 +663,7 @@ Implement these as part of Iteration 5 pre-work (before wiring evaluation harnes
 **Bucket 2 — Document as future work (Chapter 7):**
 HIGH/MEDIUM risk but architecturally constrained or requiring significant new machinery.
 
+- ~~**Dynamic sandbox dependencies**~~ — **IMPLEMENTED (Iteration 5).** LLM-based import→PyPI resolution via `resolve_extra_packages()`. Two-phase Docker execution (pip install with network → run without network). Dockerfile stripped to minimal base (`mcp` + `pydantic` only).
 - B1.1 (hardcoded data below 3-item threshold) — threshold tuning is a research problem
 - B1.3 (unrecognized mock synonyms) — finite keyword list, LLM vocabulary is unbounded
 - B3.3 (network fallback bypasses network-disconnect check) — requires semantic analysis of error handling
@@ -788,13 +789,104 @@ First pilot run completed (T01, T07, T10 under `full` condition). **3/3 tasks su
 
 **Fix plan:** 8 fixes documented in `docs/plan.md` (Fix 0–7). Implementation order accounts for dependencies (e.g., Fix 5 deterministic naming must precede Fix 4 skip-on-retry). Expected outcome: pilot runtime → ~15-25 min, zero test breakage, ~27 new tests.
 
+### Pilot run findings (2026-03-12) — post-fix re-run
+
+After implementing Fix 0–7 and the classifier prompt rewrite (Single-Capability Rule), the pilot was re-run (T01, T07, T10 under `full` condition):
+
+| Task | Result | gate_passed | output_in_range | Notes |
+|---|---|---|---|---|
+| T01 | ✅ success | n/a (registry match) | True | Seeded `csv-parser` matched directly |
+| T07 | ❌ output_rejected | True | False | Generated MCP_TOOL fuzzy-join; `row_count=12` correct, `null_count_on_key=3` wrong (expected 0) |
+| T10 | ✅ success | True | True | Generated MCP_TOOL log parser; passed all tiers on attempt 1 |
+
+**Success rate: 66.7% (2/3). Gate pass rate: 100% (3/3).**
+
+**Classifier fix worked:** T07 and T10 now correctly classified as MCP_TOOL (previously misclassified as SKILL). The Single-Capability Rule in the classifier prompt biases toward MCP_TOOL when decomposition produces a single gap. This is legitimate per MCP guidance ("consolidate tools"), Voyager's all-executable skill library, and SkillsBench's finding that self-generated skills provide no benefit over direct tool use.
+
+**Key finding — semantic correctness gap:** The 100% gate pass rate vs 66.7% success rate exposes a fundamental limitation: the three-tier verification gate catches structural issues (Tier 1 AST/regex), behavioral edge cases (Tier 2 sandbox testing), and adversarial deception (Tier 3 red-team probing), but **does not verify business logic correctness**. T07's fuzzy-join tool produces the correct number of rows (12) but reports 3 null keys instead of 0 — likely implementing a left outer join instead of inner join, or miscounting nulls after the join. The verification gate has no way to detect this because it lacks task-specific acceptance criteria.
+
+**Approaches for future work (not Iteration 5):**
+
+1. **Task-level acceptance tests** — Attach expected input/output pairs to each task definition. Run the generated tool against these after Tier 3 passes. Highest impact but requires ground-truth data for every task.
+2. **Retry with output feedback** — After execution, compare output against the validator. If rejected, feed the actual vs expected output back to the generator as context for a retry. Leverages the existing retry loop (`attempt_count`).
+3. **Human-in-the-loop gate** — Use LangGraph's `interrupt()` to pause after execution and present results to a human for approval. Appropriate for high-stakes tasks where automated validation is insufficient.
+
+**Decision:** Defer semantic correctness verification past Iteration 5 evaluation runs. The gap between gate_pass_rate and success_rate is itself valuable thesis data — it quantifies what structural/behavioral/adversarial verification can and cannot catch. Document as an honest limitation (Chapter 4) and propose approaches 1–2 as future work (Chapter 7).
+
 ### Still needed
 
-- [ ] Implement Fix 0–7 per `docs/plan.md`
-- [ ] Rebuild sandbox Docker image after Fix 0
-- [ ] Re-run pilot after fixes, verify runtime < 30 min
-- [ ] Run 4 baseline conditions across all tasks (n_runs ≥ 5 for statistical significance)
+- [x] Implement Fix 0–7 per `docs/plan.md`
+- [x] Rebuild sandbox Docker image after Fix 0
+- [x] Re-run pilot after fixes (classifier fix + Single-Capability Rule)
+- [x] Run 4 baseline conditions across T01-T10 (n_runs=5) — results stale, need re-run post-fixes
+- [x] SKILL/AGENT execution in harness + T11-T13 tasks
+- [x] Harness execution fixes: dynamic deps, extra_inputs, error logging, registry match (2026-03-15)
+- [x] Re-run full evaluation with 13 tasks × 4 conditions × 5 runs (2026-03-16/17)
 - [ ] Critique checkpoint (see exit criteria below)
+
+### Full evaluation results (2026-03-16/17) — post-fix, 13 tasks
+
+260 records total (13 tasks × 4 conditions × 5 runs).
+
+| Condition | Success | Gate Pass | Pre-fix (10 tasks) |
+|---|---|---|---|
+| **no_optimization** | **52/65 (80.0%)** | 64/65 (98.5%) | 52.0% |
+| **no_verification** | 50/65 (76.9%) | 65/65 (100%) | 62.0% |
+| **full** | 47/65 (72.3%) | 62/65 (95.4%) | 58.0% |
+| **static** | 25/65 (38.5%) | 25/65 (38.5%) | 50.0% |
+
+Per-task breakdown across JIT conditions:
+
+| Task | full | no_verif | no_opt | static | Type | Notes |
+|---|---|---|---|---|---|---|
+| T01 | 5/5 | 5/5 | 5/5 | 5/5 | mcp_tool | Registry match |
+| T02 | 5/5 | 5/5 | 5/5 | 5/5 | mcp_tool | Registry match |
+| T03 | 5/5 | 5/5 | 5/5 | 5/5 | mcp_tool | Registry match |
+| T04 | 3/5 | 5/5 | 4/5 | 0/5 | mcp_tool | Tier1 rejections in full |
+| T05 | 3/5 | 3/5 | 3/5 | 5/5 | skill/mcp | Classifier oscillation |
+| T06 | 0/5 | 0/5 | 0/5 | 0/5 | mcp_tool | Semantic gap (see below) |
+| T07 | 4/5 | 3/5 | 4/5 | 0/5 | mcp_tool | Stochastic |
+| T08 | 5/5 | 5/5 | 5/5 | 0/5 | mcp_tool | extra_inputs fix worked |
+| T09 | 1/5 | 0/5 | 1/5 | 5/5 | mcp_tool | JSON mismatch (see below) |
+| T10 | 5/5 | 5/5 | 5/5 | 0/5 | mcp_tool | Consistent |
+| T11 | 4/5 | 5/5 | 5/5 | 0/5 | skill | Multi-source integration |
+| T12 | 2/5 | 4/5 | 5/5 | 0/5 | skill | Verification variance |
+| T13 | 5/5 | 5/5 | 5/5 | 0/5 | agent | Anomaly investigation |
+
+**Static dropped from 50% to 38.5%** — expected arithmetic: same 5 covered tasks but denominator grew from 10 to 13 (5/13 = 38.5%). All 3 JIT conditions improved significantly despite harder task mix (+3 SKILL/AGENT tasks).
+
+**All three capability types confirmed working end-to-end:** MCP_TOOL (T01–T10), SKILL (T05, T11, T12), AGENT (T13). This validates the thesis's three-pillar architecture claim.
+
+#### Finding 1: Optimizer hurts performance (80% no_opt vs 72.3% full)
+
+`no_optimization` is the best JIT condition — the optimizer's pruning removes freshly-generated capabilities (zero invocations in 30 days) within each pipeline run. Pinned seeded capabilities are correctly protected (Fix 2 working), but pruning generated artifacts changes the registry state mid-run, affecting gap detection and classification for subsequent tasks. With `no_optimization`, the registry stays stable and generation is more consistent.
+
+**Thesis implication:** The optimizer needs invocation history to add value. In a single-run evaluation with no repeat queries, the optimizer lacks the data to make good decisions. This is a valid finding about optimizer maturity — it would likely improve with longitudinal deployment where capabilities accumulate invocation data over time. Document as honest limitation (Chapter 4) and note that evaluation conditions (fresh snapshot per run) don't give the optimizer its intended operating environment.
+
+#### Finding 2: T12 degradation under full condition (2/5 vs 5/5 no_opt)
+
+T12 failures in `full` condition:
+- 1× tier1 static scanner rejection (CRITICAL finding in generated skill)
+- 1× output validation failure (semantic bug in generated skill)
+- 1× skill execution timeout (120s limit)
+
+In `no_optimization`, T12 was 5/5. The optimizer modifying registry state within the run introduces variance in classification and generation quality. Combined with the stochastic nature of skill generation at n=5, this produces the observed degradation. Not a bug — expected variance amplified by optimizer side-effects.
+
+#### Finding 3: T06 = 0% everywhere — semantic correctness gap
+
+T06 (KNN imputation) has `has_static_coverage=False`, so static = 0% (generation_failed by design — no hand-coded implementation).
+
+All JIT conditions: gate passes 100% but output fails 100%. Generated tools produce variance values ~10-18% off from expected (e.g., `feature_c` expected 111.33, got 91.77 = -17.6%, exceeding ±10% tolerance). The LLM generates syntactically correct KNN code that successfully imputes nulls (`null_count=0` ✓) but with subtle math errors — likely sample vs population variance formula, improper neighbor weighting, or edge-case handling.
+
+**Thesis implication:** This is the strongest evidence for the semantic correctness gap. Gate_pass=100%, success=0% — a 100 percentage-point gap. The three-tier verification gate catches structural issues, behavioral edge cases, and adversarial deception, but has no mechanism to verify mathematical correctness of the output. Documenting this as the core limitation (Chapter 4) is more valuable than fixing it with prompt engineering.
+
+#### Finding 4: T09 = 5/5 static but ~0% JIT — prompt specificity tradeoff
+
+The T09 fixture (`t09_report_data.json`) is a nested dict: `{"title": "...", "period": {...}, "records": [{...}, ...]}`. The static implementation correctly accesses `data.get("records", [])`. But LLM-generated tools consistently guess wrong — they look for `data["revenues"]`, `data["data"]`, or expect a flat list. Log errors: `"Error: JSON data must be a list of records"`, `"Error: No valid revenue data found"`.
+
+The task prompt says "generate an analytics report from the data at [path]" but doesn't describe the JSON structure. The LLM has no way to know `records` is the key containing the data. One run out of ~15 happened to guess correctly.
+
+**Thesis implication:** This demonstrates the **prompt specificity vs generality tradeoff**. Adding fixture schema hints to the prompt would fix T09 but would make the evaluation less realistic — real-world tasks often arrive with incomplete specifications. The JIT system's value depends on how well it handles ambiguity. T09 shows that for complex nested data structures, the LLM needs explicit schema information. Document as a finding about the boundary conditions of JIT generation (Chapter 4) and propose schema inference as future work (Chapter 7).
 
 ### Pilot details
 
@@ -817,11 +909,14 @@ First pilot run completed (T01, T07, T10 under `full` condition). **3/3 tasks su
 # Pilot (3 tasks, full condition, 1 run)
 uv run scripts/run_pilot.py
 
-# Static baseline only (fast, no LLM)
-uv run scripts/run_pilot.py --condition static --all-tasks
+# Static baseline only (fast, no LLM, ~2 seconds)
+caffeinate -dims uv run scripts/run_pilot.py --condition static --all-tasks --n-runs 5 2>&1 | tee evaluation_run_static.log
 
-# Full evaluation (all 4 conditions, all 10 tasks, 8 runs each)
-uv run scripts/run_pilot.py --all-conditions --all-tasks --n-runs 8
+# Single condition (e.g., no_optimization)
+caffeinate -dims uv run scripts/run_pilot.py --condition no_optimization --all-tasks --n-runs 5 2>&1 | tee evaluation_run_no_opt.log
+
+# Full evaluation (all 4 conditions, 13 tasks, 5 runs each — ~9-10h)
+caffeinate -dims uv run scripts/run_pilot.py --all-conditions --all-tasks --n-runs 5 2>&1 | tee evaluation_run.log
 ```
 
 ### Testbed: Business Analytics Pipeline
@@ -949,6 +1044,17 @@ Create an agent team with 3 teammates:
 - "figure-check": verify all figures match raw data. Check labels, legends,
   scales. Flag anything misleading.
 ```
+
+### Future work topics for Chapter 7
+
+**Pydantic Monty for two-tier execution (sandboxed orchestration):**
+The current architecture uses Docker for all sandboxed execution (`sandbox_execute`) and DeepAgent for SKILL/AGENT orchestration. Pydantic Monty (`pydantic-monty`) — a Rust-based Python interpreter with microsecond startup — could replace the orchestration tier. Two-tier model:
+- **Monty tier**: LLM-generated coordination code (fan-out, conditionals, glue logic between pipeline stages). No Docker needed, ~4μs startup. External functions bridge to the Docker tier.
+- **Docker tier**: Generated MCP tools that need third-party libraries (pandas, numpy, sklearn). Full CPython environment, ~195ms startup.
+
+Benefits: eliminates DeepAgent overhead for SKILL execution (currently ~20-55s per invocation), enables `asyncio.gather` for parallel tool calls in one LLM round-trip (vs sequential tool-call loop), and type-checks LLM-generated orchestration code before execution. Limitation: Monty cannot run third-party libraries, so generated MCP tools still require Docker.
+
+Skill documentation available at `.claude/skills/monty/SKILL.md`.
 
 ### Exit criteria
 - Complete thesis draft

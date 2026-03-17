@@ -1,9 +1,12 @@
 FROM python:3.11-slim
 
-# Install the packages that generated MCP tools are allowed to import.
-# Generator prompts restrict imports to stdlib + mcp + pydantic only.
-# Note: pip install runs at BUILD time; --network none applies at RUN time only.
-RUN pip install --no-cache-dir "mcp>=1.26.0" "pydantic>=2.12.5"
+# Minimal base image — only mcp and pydantic pre-installed because generated
+# MCP tools always import them (FastMCP pattern). All other dependencies
+# (pandas, numpy, sklearn, etc.) are resolved dynamically via LLM-based
+# import→PyPI mapping and installed at runtime in ephemeral containers.
+RUN pip install --no-cache-dir \
+    "mcp>=1.26.0" \
+    "pydantic>=2.12.5"
 
 RUN useradd --create-home --shell /bin/bash sandbox
 

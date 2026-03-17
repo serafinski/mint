@@ -49,6 +49,9 @@ class TaskDefinition:
     has_static_coverage: bool
     static_capability_name: str | None  # seeded registry entry that serves this task
     fixture_paths: list[Path] = field(default_factory=list)
+    # Semantic kwargs passed to the generated tool beyond fixture file paths.
+    # Covers cases where the LLM parameterizes values the task prompt specifies.
+    extra_inputs: dict = field(default_factory=dict)
     # validator: (pipeline_output_dict) -> bool
     validator: Callable[[dict], bool] = field(default=lambda _: False, compare=False)
     is_pilot: bool = False
@@ -190,7 +193,8 @@ T04 = TaskDefinition(
     task_prompt=(
         "Parse the pipe-delimited file at tests/evaluation/fixtures/t04_pipe_delimited.csv. "
         "Auto-detect the delimiter. "
-        "Return a dict with keys 'row_count' (int), 'delimiter' (str), "
+        "Return a dict with keys 'row_count' (int, number of data rows excluding "
+        "the header), 'delimiter' (str), "
         "and 'parse_errors' (bool, True if any errors occurred)."
     ),
     has_static_coverage=False,
@@ -271,6 +275,10 @@ T06 = TaskDefinition(
     has_static_coverage=False,
     static_capability_name=None,
     fixture_paths=[FIXTURES_DIR / "t06_missing_values.csv"],
+    extra_inputs={
+        "n_neighbors": 5,
+        "k": 5,
+    },
     validator=_validate_t06,
     is_pilot=False,
 )
@@ -346,6 +354,12 @@ T08 = TaskDefinition(
     has_static_coverage=False,
     static_capability_name=None,
     fixture_paths=[FIXTURES_DIR / "t08_classification.csv"],
+    extra_inputs={
+        "features": _t08_ev["features"],
+        "label_column": _t08_ev["label_column"],
+        "test_size": 0.2,
+        "random_state": 42,
+    },
     validator=_validate_t08,
 )
 
@@ -419,10 +433,154 @@ T10 = TaskDefinition(
 )
 
 # ---------------------------------------------------------------------------
+# T11 — Multi-source data integration (targets SKILL)
+# ---------------------------------------------------------------------------
+
+_t11_ev = _EV["T11"]
+
+
+def _validate_t11(output: dict) -> bool:
+    """summary_row_count == 4 AND region revenues within ±5% AND regions_meeting_target exact."""
+    try:
+        if int(output.get("summary_row_count", -1)) != _t11_ev["summary_row_count"]:
+            return False
+        revenues = output.get("region_revenues", {})
+        tol = _t11_ev["revenue_tolerance_pct"]
+        for region, expected_rev in _t11_ev["region_revenues"].items():
+            actual = revenues.get(region)
+            if actual is None:
+                return False
+            if not _within_pct(float(actual), expected_rev, tol):
+                return False
+        ok_meeting = int(output.get("regions_meeting_target", -1)) == _t11_ev["regions_meeting_target"]
+        return ok_meeting
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+T11 = TaskDefinition(
+    task_id="T11",
+    tier="complex",
+    description="Multi-source data integration: join sales with products, compute regional revenue, compare against targets",
+    task_prompt=(
+        "Build a data integration pipeline using these three data sources:\n"
+        "1. Sales CSV at tests/evaluation/fixtures/t11_sales.csv (columns: order_id, product_id, quantity, unit_price, region)\n"
+        "2. Product catalog JSON at tests/evaluation/fixtures/t11_products.json (fields: product_id, name, category)\n"
+        "3. Regional targets CSV at tests/evaluation/fixtures/t11_targets.csv (columns: region, target_revenue)\n\n"
+        "Steps: (1) Join the sales data with the product catalog on product_id to enrich sales records with product names and categories. "
+        "(2) Compute per-region revenue totals by summing quantity * unit_price for each region. "
+        "(3) Compare each region's total revenue against its target from the targets CSV.\n\n"
+        "Return a dict with keys 'summary_row_count' (int, number of regions), "
+        "'region_revenues' (dict mapping region name to float total revenue), "
+        "and 'regions_meeting_target' (int, count of regions where revenue >= target)."
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[
+        FIXTURES_DIR / "t11_sales.csv",
+        FIXTURES_DIR / "t11_products.json",
+        FIXTURES_DIR / "t11_targets.csv",
+    ],
+    validator=_validate_t11,
+)
+
+# ---------------------------------------------------------------------------
+# T12 — Configurable data quality pipeline (targets SKILL)
+# ---------------------------------------------------------------------------
+
+_t12_ev = _EV["T12"]
+
+
+def _validate_t12(output: dict) -> bool:
+    """clean_row_count == expected AND violations_found > 0 AND rules_applied == 3."""
+    try:
+        ok_clean = int(output.get("clean_row_count", -1)) == _t12_ev["clean_row_count"]
+        ok_violations = int(output.get("violations_found", -1)) > 0
+        ok_rules = int(output.get("rules_applied", -1)) == _t12_ev["rules_applied"]
+        return ok_clean and ok_violations and ok_rules
+    except (TypeError, ValueError):
+        return False
+
+
+T12 = TaskDefinition(
+    task_id="T12",
+    tier="complex",
+    description="Configurable data quality pipeline: apply rules from JSON config to clean a dirty CSV",
+    task_prompt=(
+        "Build a data quality pipeline using these inputs:\n"
+        "1. Raw data CSV at tests/evaluation/fixtures/t12_raw_data.csv (columns: id, name, age, score, department)\n"
+        "2. Quality rules JSON at tests/evaluation/fixtures/t12_rules.json\n\n"
+        "The rules config specifies three types of quality checks to apply in sequence:\n"
+        "(1) Non-null enforcement: drop rows where any column listed in 'non_null_columns' is empty or null.\n"
+        "(2) Range constraints: drop rows where values fall outside the min/max range specified in 'range_constraints'.\n"
+        "(3) Deduplication: remove duplicate rows based on the columns listed in 'dedup_key_columns'.\n\n"
+        "Apply these rules in the order listed above. "
+        "Return a dict with keys 'clean_row_count' (int, rows remaining after all rules), "
+        "'violations_found' (int, total rows removed across all steps), "
+        "and 'rules_applied' (int, number of rule types that were applied)."
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[
+        FIXTURES_DIR / "t12_raw_data.csv",
+        FIXTURES_DIR / "t12_rules.json",
+    ],
+    validator=_validate_t12,
+)
+
+# ---------------------------------------------------------------------------
+# T13 — Autonomous anomaly investigation (targets AGENT)
+# ---------------------------------------------------------------------------
+
+_t13_ev = _EV["T13"]
+
+
+def _validate_t13(output: dict) -> bool:
+    """anomaly_count >= 3 (tolerant) AND anomalies list non-empty AND metrics_analyzed > 0."""
+    try:
+        anomaly_count = int(output.get("anomaly_count", 0))
+        anomalies = output.get("anomalies", [])
+        metrics_analyzed = int(output.get("metrics_analyzed", 0))
+        return anomaly_count >= 3 and len(anomalies) > 0 and metrics_analyzed > 0
+    except (TypeError, ValueError):
+        return False
+
+
+T13 = TaskDefinition(
+    task_id="T13",
+    tier="complex",
+    description="Autonomous anomaly investigation: profile data, detect anomalies, cross-reference with baselines",
+    task_prompt=(
+        "Investigate anomalies in the metrics dataset. You have two data sources:\n"
+        "1. Time-series metrics CSV at tests/evaluation/fixtures/t13_metrics.csv "
+        "(columns: timestamp, cpu_usage, memory_mb, request_latency_ms, error_rate)\n"
+        "2. Baselines JSON at tests/evaluation/fixtures/t13_baselines.json "
+        "(normal ranges per metric with min/max values)\n\n"
+        "Your investigation should:\n"
+        "(1) Profile the data to understand the distribution of each metric.\n"
+        "(2) Detect anomalies by comparing each metric's values against the baselines "
+        "(values outside the normal min/max range are anomalous).\n"
+        "(3) For each anomaly found, identify the timestamp, metric name, and anomalous value.\n\n"
+        "Adapt your investigation based on what you find — if one metric has many anomalies, "
+        "investigate whether they cluster in time or correlate with other metrics.\n\n"
+        "Return a dict with keys 'anomaly_count' (int, total anomalies detected), "
+        "'anomalies' (list of dicts, each with keys 'timestamp', 'metric', 'value'), "
+        "and 'metrics_analyzed' (int, number of unique metrics you examined)."
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[
+        FIXTURES_DIR / "t13_metrics.csv",
+        FIXTURES_DIR / "t13_baselines.json",
+    ],
+    validator=_validate_t13,
+)
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
-ALL_TASKS: list[TaskDefinition] = [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10]
+ALL_TASKS: list[TaskDefinition] = [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12, T13]
 
 PILOT_TASKS: list[TaskDefinition] = [T01, T07, T10]  # retrieval + moderate JIT + complex JIT
 

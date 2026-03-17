@@ -48,3 +48,13 @@ def test_docker_exit_code_nonzero_on_error():
     result = sandbox_execute("import sys; sys.exit(42)", timeout=15)
     assert result["exit_code"] == 42
     assert result["success"] is False
+
+
+@pytest.mark.integration
+def test_sandbox_pandas_available():
+    """Sandbox image must have pandas and numpy installed (Fix 0)."""
+    result = sandbox_execute(
+        "import pandas; import numpy; print('ok')", timeout=30
+    )
+    assert result["success"] is True
+    assert "ok" in result["stdout"]

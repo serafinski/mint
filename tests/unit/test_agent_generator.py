@@ -529,7 +529,9 @@ class TestGenerateSingleAgent:
 
         assert error is None
         assert artifact is not None
-        assert artifact.capability_name == "data-quality-monitor"
+        # Fix 5: name is now a deterministic slug, not the LLM-chosen name
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+        assert artifact.capability_name == slugify_gap_hyphen("data-quality-monitor")
         assert artifact.capability_type == CapabilityType.AGENT
         assert artifact.agent_config is not None
         assert artifact.agent_config["is_deep_agent"] is False
@@ -546,7 +548,8 @@ class TestGenerateSingleAgent:
 
         assert error is None
         assert artifact is not None
-        assert artifact.capability_name == "data-quality-monitor"
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+        assert artifact.capability_name == slugify_gap_hyphen("data-quality-monitor")
 
     def test_first_llm_call_fails(self, tmp_path):
         """LLM error on first attempt returns (None, error) without raising."""

@@ -84,6 +84,11 @@ def prune(
     pruned: list[str] = []
 
     for cap in active:
+        # Never prune pinned capabilities (seeded entries that should survive
+        # optimizer cycles regardless of invocation count)
+        if cap.metadata.get("pinned") == "true":
+            logger.debug("Skipping pinned capability '%s'", cap.name)
+            continue
         count = metrics_store.invocations_since(cap.name, cutoff)
         if count == 0:
             registry.deactivate(cap.name)

@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.schemas.capability import CapabilityType
-from src.schemas.task import GeneratedArtifact, TaskState
+from src.schemas.capability import CapabilityDescriptor, CapabilityType
+from src.schemas.task import GeneratedArtifact, MatchItem, TaskState
 from src.schemas.verification import VerificationReport
 from tests.evaluation.harness import EvaluationHarness, HarnessConfig, _extract_result
 from tests.evaluation.tasks import T01, T04, T07
@@ -49,13 +49,27 @@ def _make_report(passed=True, tier_reached=2):
     )
 
 
-def _make_state(artifacts=None, reports=None, attempt_count=1):
+def _make_state(artifacts=None, reports=None, attempt_count=1, matches=None):
     return TaskState(
         task_description="test",
         generated_artifacts=artifacts or [],
         verification_results=reports or [],
         attempt_count=attempt_count,
+        matches=matches or [],
     )
+
+
+def _make_match(name="fuzzy-join", source_code=None):
+    meta = {"generated": "true", "source": "jit_pipeline"}
+    if source_code:
+        meta["source_code"] = source_code
+    cap = CapabilityDescriptor(
+        name=name,
+        description="A test capability",
+        capability_type=CapabilityType.MCP_TOOL,
+        metadata=meta,
+    )
+    return MatchItem(capability=cap, score=0.85)
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +87,7 @@ class TestRunStatic:
     def test_registry_miss_returns_failure(self, config):
         harness = EvaluationHarness(config)
         mock_registry = MagicMock()
-        mock_registry.search.return_value = []
+        mock_registry.get.return_value = None
         result = harness._run_static(T01, mock_registry)
         assert result["gate_passed"] is False
         assert result["failure_reason"] == "generation_failed"
@@ -83,7 +97,7 @@ class TestRunStatic:
         mock_registry = MagicMock()
         mock_cap = MagicMock()
         mock_cap.capability_type = CapabilityType.MCP_TOOL
-        mock_registry.search.return_value = [mock_cap]
+        mock_registry.get.return_value = mock_cap
 
         with patch("tests.evaluation.harness._run_static_implementation") as mock_impl:
             mock_impl.return_value = {"row_count": 50, "column_names": ["id", "name", "age", "city"]}
@@ -96,7 +110,7 @@ class TestRunStatic:
     def test_static_coverage_output_rejected(self, config):
         harness = EvaluationHarness(config)
         mock_registry = MagicMock()
-        mock_registry.search.return_value = [MagicMock()]
+        mock_registry.get.return_value = MagicMock()
 
         with patch("tests.evaluation.harness._run_static_implementation") as mock_impl:
             mock_impl.return_value = {"row_count": 999, "column_names": []}
@@ -109,7 +123,7 @@ class TestRunStatic:
     def test_static_impl_exception_returns_failure(self, config):
         harness = EvaluationHarness(config)
         mock_registry = MagicMock()
-        mock_registry.search.return_value = [MagicMock()]
+        mock_registry.get.return_value = MagicMock()
 
         with patch("tests.evaluation.harness._run_static_implementation") as mock_impl:
             mock_impl.side_effect = RuntimeError("filesystem error")
@@ -234,6 +248,45 @@ class TestExtractResult:
         assert result["gate_passed"] is True
         assert result["output_in_range"] is False
 
+    def test_registry_match_with_source_code_executes(self):
+        """Registry match with source_code in metadata → sandbox-executed."""
+        state = _make_state(
+            artifacts=[],
+            matches=[_make_match(source_code="# tool source")],
+        )
+        loader = MagicMock()
+        fake_output = {"row_count": 12, "null_count_on_key": 0}
+        with patch("tests.evaluation.harness._execute_artifact", return_value=fake_output):
+            result = _extract_result(state, T07, loader)
+        assert result["gate_passed"] is True
+        assert result["output_in_range"] is True
+        assert result["failure_reason"] == "none"
+
+    def test_registry_match_without_source_code_cannot_validate(self):
+        """Registry match without source_code → gate passes but output not validated."""
+        state = _make_state(
+            artifacts=[],
+            matches=[_make_match(source_code=None)],
+        )
+        loader = MagicMock()
+        result = _extract_result(state, T07, loader)
+        assert result["gate_passed"] is True
+        assert result["output_in_range"] is False
+        assert result["failure_reason"] == "output_rejected"
+
+    def test_registry_match_execution_failure_does_not_raise(self):
+        """Registry match execution fails → gate passes, output not validated."""
+        state = _make_state(
+            artifacts=[],
+            matches=[_make_match(source_code="# bad tool")],
+        )
+        loader = MagicMock()
+        with patch("tests.evaluation.harness._execute_artifact", side_effect=RuntimeError("boom")):
+            result = _extract_result(state, T07, loader)
+        assert result["gate_passed"] is True
+        assert result["output_in_range"] is False
+        assert result["failure_reason"] == "output_rejected"
+
 
 # ---------------------------------------------------------------------------
 # EvaluationHarness.run_pilot
@@ -268,7 +321,7 @@ class TestRunPilot:
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
     ):
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         harness = EvaluationHarness(config)
         # run_pilot default condition is "full"; pass static explicitly for a fast no-LLM test
@@ -284,7 +337,7 @@ class TestRunPilot:
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
     ):
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         harness = EvaluationHarness(config)
         harness.run_pilot([T04])
@@ -306,7 +359,7 @@ class TestRunCondition:
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
     ):
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         config.n_runs = 3
         harness = EvaluationHarness(config)
@@ -323,7 +376,7 @@ class TestRunCondition:
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
     ):
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         config.n_runs = 2
         harness = EvaluationHarness(config)
@@ -339,7 +392,7 @@ class TestRunCondition:
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
     ):
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         harness = EvaluationHarness(config)
         records = harness.run_condition("static", [T04])
@@ -355,7 +408,7 @@ class TestRunCondition:
     ):
         """Runs use different seeds (task order is randomised per run)."""
         mock_restore.return_value = "snap_abc12345"
-        mock_registry_cls.return_value = MagicMock(search=MagicMock(return_value=[]))
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         config.n_runs = 2
         harness = EvaluationHarness(config)

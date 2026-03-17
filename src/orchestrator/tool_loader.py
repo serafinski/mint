@@ -318,7 +318,11 @@ class ToolLoader:
             capability_type=CapabilityType.MCP_TOOL,
             domain=domain,
             tags=tags or [],
-            metadata={"generated": "true", "source": "jit_pipeline"},
+            metadata={
+                "generated": "true",
+                "source": "jit_pipeline",
+                **({"source_code": artifact.source_code} if artifact.source_code else {}),
+            },
         )
         registry.add(descriptor)
         logger.info("Registered MCP tool %r in registry", artifact.capability_name)

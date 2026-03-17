@@ -92,5 +92,53 @@
       "ERROR",
       "DEBUG"
     ]
+  },
+  "T11": {
+    "summary_row_count": 4,
+    "region_revenues": {
+      "East": 18433.94,
+      "South": 16855.94,
+      "West": 9823.48,
+      "North": 19179.03
+    },
+    "regions_meeting_target": 2,
+    "revenue_tolerance_pct": 5
+  },
+  "T12": {
+    "input_row_count": 80,
+    "clean_row_count": 60,
+    "violations_found": 20,
+    "rules_applied": 3
+  },
+  "T13": {
+    "anomaly_count": 5,
+    "planted_anomalies": [
+      {
+        "timestamp": "2024-06-01 06:15:00",
+        "metric": "request_latency_ms",
+        "value": 2335.322
+      },
+      {
+        "timestamp": "2024-06-01 07:15:00",
+        "metric": "error_rate",
+        "value": 0.19
+      },
+      {
+        "timestamp": "2024-06-01 07:45:00",
+        "metric": "memory_mb",
+        "value": 19870.078
+      },
+      {
+        "timestamp": "2024-06-01 11:15:00",
+        "metric": "error_rate",
+        "value": 0.2
+      },
+      {
+        "timestamp": "2024-06-01 19:45:00",
+        "metric": "request_latency_ms",
+        "value": 2219.897
+      }
+    ],
+    "metrics_analyzed": 4
   }
 }

@@ -68,6 +68,9 @@ Return a structured error report so upstream callers can fix and retry.
 - Use `Field(ge=0)` and similar constraints for numeric bounds
 - Validate at ingestion, trust internally
 
+The SKILL.md `name` frontmatter field MUST be exactly `{forced_name}` \
+(hyphen-case). Do not choose a different name.
+
 ## Instructions
 
 Generate a SKILL.md file for the capability described above. The skill should:

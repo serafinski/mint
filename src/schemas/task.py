@@ -104,6 +104,14 @@ class GeneratedArtifact(BaseModel):
         default=None, description="Generated SKILL.md content (for skills)"
     )
     agent_config: dict | None = Field(default=None, description="Agent configuration (for agents)")
+    gap_query: str | None = Field(
+        default=None,
+        description=(
+            "The gap query string that produced this artifact. "
+            "Set at generation time to enable skip logic on retry — "
+            "gaps whose query matches an existing passing artifact are skipped."
+        ),
+    )
     generated_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="When this artifact was generated",

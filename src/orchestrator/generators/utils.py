@@ -2,7 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
+
 from src.schemas.task import TaskState
+
+
+def slugify_gap(query: str) -> str:
+    """Derive a stable, collision-free snake_case name from a gap query string.
+
+    The base is a truncated slug of the query text. A 6-character sha256
+    suffix ensures two similar queries (e.g. "parse CSV file" vs "parse CSV
+    files") never collide, while the same query always produces the same name
+    across retry attempts.
+
+    Examples:
+        "fuzzy string matching"  ->  "fuzzy_string_matching_<hash>"
+        "parse CSV file"         ->  "parse_csv_file_<hash>"
+    """
+    base = re.sub(r"[^a-z0-9]+", "_", query.lower().strip()).strip("_")[:40]
+    suffix = hashlib.sha256(query.encode()).hexdigest()[:6]
+    return f"{base}_{suffix}"
+
+
+def slugify_gap_hyphen(query: str) -> str:
+    """Like ``slugify_gap`` but returns hyphen-case (for skills and agents)."""
+    return slugify_gap(query).replace("_", "-")
 
 
 def build_task_context(state: TaskState) -> str:

@@ -32,7 +32,7 @@ FIXTURES_DIR = Path(__file__).parent
 def generate_all_fixtures(
     fixtures_dir: Path = FIXTURES_DIR, seed: int = 42
 ) -> dict:
-    """Generate all 10 task fixtures and return the expected_values dict.
+    """Generate all 13 task fixtures and return the expected_values dict.
 
     Idempotent — safe to call multiple times; files are overwritten.
     """
@@ -50,6 +50,9 @@ def generate_all_fixtures(
     expected.update(_gen_t08(fixtures_dir, rng))
     expected.update(_gen_t09(fixtures_dir, rng))
     expected.update(_gen_t10(fixtures_dir, rng))
+    expected.update(_gen_t11(fixtures_dir, rng))
+    expected.update(_gen_t12(fixtures_dir, rng))
+    expected.update(_gen_t13(fixtures_dir, rng))
 
     out_path = fixtures_dir / "expected_values.json"
     out_path.write_text(json.dumps(expected, indent=2))
@@ -550,6 +553,235 @@ def _gen_t10(fixtures_dir: Path, rng: random.Random) -> dict:
             "expected_log_lines": n_lines,
             "columns": ["timestamp", "severity", "message"],
             "valid_severities": _SEVERITIES,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T11 — Multi-source data integration (targets SKILL classification)
+# ---------------------------------------------------------------------------
+
+_T11_REGIONS = ["North", "South", "East", "West"]
+_T11_CATEGORIES = ["Electronics", "Clothing", "Food"]
+
+
+def _gen_t11(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Three data sources: sales CSV, products JSON, targets CSV."""
+    # --- Products catalog (JSON) ---
+    products = [
+        {"product_id": i + 1, "name": f"Product_{chr(65 + i)}", "category": rng.choice(_T11_CATEGORIES)}
+        for i in range(10)
+    ]
+    (fixtures_dir / "t11_products.json").write_text(json.dumps(products, indent=2))
+
+    # --- Sales data (CSV) ---
+    sales_rows = []
+    for i in range(1, 61):
+        pid = rng.choice(products)["product_id"]
+        qty = rng.randint(1, 20)
+        price = round(rng.uniform(10.0, 200.0), 2)
+        region = rng.choice(_T11_REGIONS)
+        sales_rows.append({
+            "order_id": i,
+            "product_id": pid,
+            "quantity": qty,
+            "unit_price": price,
+            "region": region,
+        })
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["order_id", "product_id", "quantity", "unit_price", "region"])
+    writer.writeheader()
+    writer.writerows(sales_rows)
+    (fixtures_dir / "t11_sales.csv").write_text(buf.getvalue())
+
+    # --- Pre-compute region revenues ---
+    region_revenues: dict[str, float] = {}
+    for row in sales_rows:
+        rev = row["quantity"] * row["unit_price"]
+        region_revenues[row["region"]] = round(
+            region_revenues.get(row["region"], 0.0) + rev, 2
+        )
+
+    # --- Regional targets (CSV) ---
+    target_rows = []
+    for region in _T11_REGIONS:
+        actual = region_revenues.get(region, 0.0)
+        # Set target so ~2-3 regions meet it
+        target = round(actual * rng.uniform(0.85, 1.15), 2)
+        target_rows.append({"region": region, "target_revenue": target})
+
+    buf_targets = io.StringIO()
+    writer = csv.DictWriter(buf_targets, fieldnames=["region", "target_revenue"])
+    writer.writeheader()
+    writer.writerows(target_rows)
+    (fixtures_dir / "t11_targets.csv").write_text(buf_targets.getvalue())
+
+    # Compute regions meeting target
+    targets_map = {r["region"]: r["target_revenue"] for r in target_rows}
+    regions_meeting = sum(
+        1 for region, rev in region_revenues.items()
+        if rev >= targets_map.get(region, float("inf"))
+    )
+
+    return {
+        "T11": {
+            "summary_row_count": len(_T11_REGIONS),
+            "region_revenues": region_revenues,
+            "regions_meeting_target": regions_meeting,
+            "revenue_tolerance_pct": 5,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T12 — Configurable data quality pipeline (targets SKILL classification)
+# ---------------------------------------------------------------------------
+
+
+def _gen_t12(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Dirty CSV + rules JSON for a multi-step quality pipeline."""
+    columns = ["id", "name", "age", "score", "department"]
+    departments = ["Engineering", "Sales", "Marketing", "Support"]
+
+    # Generate 60 clean rows
+    clean_rows = []
+    for i in range(1, 61):
+        clean_rows.append({
+            "id": i,
+            "name": rng.choice(_NAMES) + f"_{i}",
+            "age": rng.randint(22, 65),
+            "score": round(rng.uniform(0.0, 100.0), 1),
+            "department": rng.choice(departments),
+        })
+
+    # 8 rows with nulls in required columns
+    null_rows = []
+    for i in range(61, 69):
+        row = {
+            "id": i,
+            "name": "",  # null name
+            "age": rng.randint(22, 65),
+            "score": round(rng.uniform(0.0, 100.0), 1),
+            "department": rng.choice(departments),
+        }
+        null_rows.append(row)
+
+    # 6 rows with out-of-range values (age < 18 or > 100)
+    range_violation_rows = []
+    for i in range(69, 75):
+        row = {
+            "id": i,
+            "name": rng.choice(_NAMES) + f"_{i}",
+            "age": rng.choice([rng.randint(1, 17), rng.randint(101, 150)]),
+            "score": round(rng.uniform(0.0, 100.0), 1),
+            "department": rng.choice(departments),
+        }
+        range_violation_rows.append(row)
+
+    # 6 exact duplicates (rows 1-6 repeated)
+    duplicate_rows = [dict(r) for r in clean_rows[:6]]
+
+    all_rows = clean_rows + null_rows + range_violation_rows + duplicate_rows
+    rng.shuffle(all_rows)
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns)
+    writer.writeheader()
+    writer.writerows(all_rows)
+    (fixtures_dir / "t12_raw_data.csv").write_text(buf.getvalue())
+
+    # Rules config
+    rules = {
+        "non_null_columns": ["name", "age", "score"],
+        "range_constraints": {
+            "age": {"min": 18, "max": 100},
+            "score": {"min": 0.0, "max": 100.0},
+        },
+        "dedup_key_columns": ["id"],
+    }
+    (fixtures_dir / "t12_rules.json").write_text(json.dumps(rules, indent=2))
+
+    # Expected: clean_rows survive all steps
+    total_violations = len(null_rows) + len(range_violation_rows) + len(duplicate_rows)
+
+    return {
+        "T12": {
+            "input_row_count": len(all_rows),
+            "clean_row_count": len(clean_rows),
+            "violations_found": total_violations,
+            "rules_applied": 3,  # non-null, range, dedup
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T13 — Autonomous anomaly investigation (targets AGENT classification)
+# ---------------------------------------------------------------------------
+
+_T13_METRICS = ["cpu_usage", "memory_mb", "request_latency_ms", "error_rate"]
+
+
+def _gen_t13(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Time-series metrics with planted anomalies + baselines JSON."""
+    n_rows = 100
+    base_time = datetime(2024, 6, 1, 0, 0, 0)
+
+    # Normal ranges per metric
+    baselines = {
+        "cpu_usage": {"min": 10.0, "max": 80.0, "unit": "percent"},
+        "memory_mb": {"min": 512.0, "max": 4096.0, "unit": "MB"},
+        "request_latency_ms": {"min": 5.0, "max": 500.0, "unit": "ms"},
+        "error_rate": {"min": 0.0, "max": 0.05, "unit": "ratio"},
+    }
+
+    rows = []
+    anomaly_indices = set(rng.sample(range(n_rows), 5))
+    planted_anomalies = []
+
+    for i in range(n_rows):
+        ts = base_time + timedelta(minutes=i * 15)
+        row: dict = {"timestamp": ts.strftime("%Y-%m-%d %H:%M:%S")}
+
+        if i in anomaly_indices:
+            # Pick a random metric to make anomalous
+            anomaly_metric = rng.choice(_T13_METRICS)
+            for metric in _T13_METRICS:
+                bl = baselines[metric]
+                if metric == anomaly_metric:
+                    # Way outside normal range
+                    val = round(bl["max"] * rng.uniform(2.5, 5.0), 3)
+                    planted_anomalies.append({
+                        "timestamp": row["timestamp"],
+                        "metric": metric,
+                        "value": val,
+                    })
+                else:
+                    val = round(rng.uniform(bl["min"], bl["max"]), 3)
+                row[metric] = val
+        else:
+            for metric in _T13_METRICS:
+                bl = baselines[metric]
+                row[metric] = round(rng.uniform(bl["min"], bl["max"]), 3)
+
+        rows.append(row)
+
+    # Write metrics CSV
+    fieldnames = ["timestamp"] + _T13_METRICS
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    (fixtures_dir / "t13_metrics.csv").write_text(buf.getvalue())
+
+    # Write baselines JSON
+    (fixtures_dir / "t13_baselines.json").write_text(json.dumps(baselines, indent=2))
+
+    return {
+        "T13": {
+            "anomaly_count": len(planted_anomalies),
+            "planted_anomalies": planted_anomalies,
+            "metrics_analyzed": len(_T13_METRICS),
         }
     }
 

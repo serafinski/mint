@@ -17,13 +17,16 @@ from tests.evaluation.tasks import (
     T08,
     T09,
     T10,
+    T11,
+    T12,
+    T13,
     get_task,
 )
 
 
 class TestTaskRegistry:
     def test_all_tasks_count(self):
-        assert len(ALL_TASKS) == 10
+        assert len(ALL_TASKS) == 13
 
     def test_task_ids_unique(self):
         ids = [t.task_id for t in ALL_TASKS]
@@ -194,3 +197,126 @@ class TestT10Validator:
 
     def test_null_severities(self):
         assert not T10.validator({"row_count": 200, "timestamps_valid": True, "null_severity_count": 3})
+
+
+class TestT11Validator:
+    def test_valid_integration(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T11"]
+        assert T11.validator({
+            "summary_row_count": ev["summary_row_count"],
+            "region_revenues": ev["region_revenues"],
+            "regions_meeting_target": ev["regions_meeting_target"],
+        })
+
+    def test_wrong_summary_count(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T11"]
+        assert not T11.validator({
+            "summary_row_count": 999,
+            "region_revenues": ev["region_revenues"],
+            "regions_meeting_target": ev["regions_meeting_target"],
+        })
+
+    def test_revenue_way_off(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T11"]
+        bad_revenues = {k: v * 100 for k, v in ev["region_revenues"].items()}
+        assert not T11.validator({
+            "summary_row_count": ev["summary_row_count"],
+            "region_revenues": bad_revenues,
+            "regions_meeting_target": ev["regions_meeting_target"],
+        })
+
+    def test_missing_region(self):
+        assert not T11.validator({
+            "summary_row_count": 4,
+            "region_revenues": {"North": 1000.0},
+            "regions_meeting_target": 1,
+        })
+
+    def test_empty_output(self):
+        assert not T11.validator({})
+
+
+class TestT12Validator:
+    def test_valid_cleaning(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T12"]
+        assert T12.validator({
+            "clean_row_count": ev["clean_row_count"],
+            "violations_found": ev["violations_found"],
+            "rules_applied": ev["rules_applied"],
+        })
+
+    def test_wrong_clean_count(self):
+        assert not T12.validator({
+            "clean_row_count": 999,
+            "violations_found": 10,
+            "rules_applied": 3,
+        })
+
+    def test_zero_violations(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T12"]
+        assert not T12.validator({
+            "clean_row_count": ev["clean_row_count"],
+            "violations_found": 0,
+            "rules_applied": 3,
+        })
+
+    def test_wrong_rules_count(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T12"]
+        assert not T12.validator({
+            "clean_row_count": ev["clean_row_count"],
+            "violations_found": ev["violations_found"],
+            "rules_applied": 2,
+        })
+
+    def test_empty_output(self):
+        assert not T12.validator({})
+
+
+class TestT13Validator:
+    def test_valid_investigation(self):
+        anomalies = [{"timestamp": "2024-06-01", "metric": "cpu", "value": 99.0}] * 5
+        assert T13.validator({
+            "anomaly_count": 5,
+            "anomalies": anomalies,
+            "metrics_analyzed": 4,
+        })
+
+    def test_tolerant_anomaly_count(self):
+        """Agent finding 3-7 anomalies should pass (threshold is >= 3)."""
+        anomalies = [{"timestamp": "t", "metric": "m", "value": 1.0}] * 3
+        assert T13.validator({
+            "anomaly_count": 3,
+            "anomalies": anomalies,
+            "metrics_analyzed": 4,
+        })
+
+    def test_too_few_anomalies(self):
+        anomalies = [{"timestamp": "t", "metric": "m", "value": 1.0}] * 2
+        assert not T13.validator({
+            "anomaly_count": 2,
+            "anomalies": anomalies,
+            "metrics_analyzed": 4,
+        })
+
+    def test_empty_anomalies_list(self):
+        assert not T13.validator({
+            "anomaly_count": 5,
+            "anomalies": [],
+            "metrics_analyzed": 4,
+        })
+
+    def test_zero_metrics(self):
+        assert not T13.validator({
+            "anomaly_count": 5,
+            "anomalies": [{"a": 1}],
+            "metrics_analyzed": 0,
+        })
+
+    def test_empty_output(self):
+        assert not T13.validator({})
