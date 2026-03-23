@@ -1,0 +1,79 @@
+[
+  {
+    "alert_id": "ALT-0006",
+    "txn_id": 6,
+    "customer_id": 3,
+    "reason": "unusual_merchant",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0055",
+    "txn_id": 55,
+    "customer_id": 1,
+    "reason": "high_amount",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0057",
+    "txn_id": 57,
+    "customer_id": 1,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0068",
+    "txn_id": 68,
+    "customer_id": 1,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0084",
+    "txn_id": 84,
+    "customer_id": 3,
+    "reason": "high_amount",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0089",
+    "txn_id": 89,
+    "customer_id": 3,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0034",
+    "txn_id": 34,
+    "customer_id": 6,
+    "reason": "amount_threshold",
+    "severity": "low"
+  },
+  {
+    "alert_id": "ALT-0040",
+    "txn_id": 40,
+    "customer_id": 13,
+    "reason": "amount_threshold",
+    "severity": "low"
+  },
+  {
+    "alert_id": "ALT-0013",
+    "txn_id": 13,
+    "customer_id": 10,
+    "reason": "amount_threshold",
+    "severity": "low"
+  },
+  {
+    "alert_id": "ALT-0032",
+    "txn_id": 32,
+    "customer_id": 5,
+    "reason": "amount_threshold",
+    "severity": "low"
+  },
+  {
+    "alert_id": "ALT-0028",
+    "txn_id": 28,
+    "customer_id": 2,
+    "reason": "amount_threshold",
+    "severity": "low"
+  }
+]

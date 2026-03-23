@@ -53,6 +53,10 @@ def generate_all_fixtures(
     expected.update(_gen_t11(fixtures_dir, rng))
     expected.update(_gen_t12(fixtures_dir, rng))
     expected.update(_gen_t13(fixtures_dir, rng))
+    expected.update(_gen_t14(fixtures_dir, rng))
+    expected.update(_gen_t15(fixtures_dir, rng))
+    expected.update(_gen_t16(fixtures_dir, rng))
+    expected.update(_gen_t17(fixtures_dir, rng))
 
     out_path = fixtures_dir / "expected_values.json"
     out_path.write_text(json.dumps(expected, indent=2))
@@ -335,20 +339,61 @@ def _gen_t06(fixtures_dir: Path, rng: random.Random) -> dict:
     writer.writerows(rows)
     (fixtures_dir / "t06_missing_values.csv").write_text(buf.getvalue())
 
-    # Pre-compute variance of each numeric column (non-null values only)
+    # Pre-compute expected post-KNN-imputation variance (population, ddof=0).
+    #
+    # We run a reference KNN imputation (k=5, Euclidean distance on shared
+    # non-NaN features) and use the resulting full-dataset variance as the
+    # ground truth.  This accounts for the inherent variance shrinkage of
+    # KNN imputation (imputed values are neighbor means, which regress toward
+    # the population mean).  Generated tools using sklearn.impute.KNNImputer
+    # or equivalent manual implementations should produce variances within
+    # ±10% of these reference values.
+    feature_cols = columns[1:]
+    n_cols = len(feature_cols)
+
+    # Build a 2-D list (n_rows × n_cols), None for missing
+    matrix: list[list[float | None]] = []
+    for r in rows:
+        matrix.append([float(r[c]) if r[c] != "" else None for c in feature_cols])
+
+    # KNN imputation (k=5, Euclidean on shared non-None features)
+    imputed = [list(row) for row in matrix]  # deep copy
+    for i in range(n_rows):
+        for j in range(n_cols):
+            if matrix[i][j] is not None:
+                continue
+            # Collect distances to rows that have feature j
+            dists: list[tuple[float, float]] = []
+            for k in range(n_rows):
+                if k == i or matrix[k][j] is None:
+                    continue
+                # Euclidean distance on shared non-None features (excl. j)
+                shared_sq = 0.0
+                n_shared = 0
+                for f in range(n_cols):
+                    if matrix[i][f] is not None and matrix[k][f] is not None:
+                        shared_sq += (matrix[i][f] - matrix[k][f]) ** 2  # type: ignore[operator]
+                        n_shared += 1
+                if n_shared == 0:
+                    continue
+                dists.append((shared_sq ** 0.5, matrix[k][j]))  # type: ignore[arg-type]
+            dists.sort(key=lambda x: x[0])
+            neighbors = dists[:5]
+            if neighbors:
+                imputed[i][j] = sum(v for _, v in neighbors) / len(neighbors)
+
+    # Compute population variance (ddof=0) of each column after imputation
     variances: dict[str, float] = {}
-    for col in columns[1:]:
-        vals = [
-            float(r[col]) for r in rows if r[col] != ""
-        ]
+    for j, col in enumerate(feature_cols):
+        vals = [imputed[i][j] for i in range(n_rows) if imputed[i][j] is not None]
         mean = sum(vals) / len(vals)
         variances[col] = round(sum((v - mean) ** 2 for v in vals) / len(vals), 4)
 
     return {
         "T06": {
             "n_rows": n_rows,
-            "columns": columns[1:],
-            "original_variances": variances,
+            "columns": feature_cols,
+            "expected_variances": variances,
             "variance_tolerance_pct": 10,
         }
     }
@@ -782,6 +827,310 @@ def _gen_t13(fixtures_dir: Path, rng: random.Random) -> dict:
             "anomaly_count": len(planted_anomalies),
             "planted_anomalies": planted_anomalies,
             "metrics_analyzed": len(_T13_METRICS),
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T14 — Budget reconciliation pipeline (targets SKILL classification)
+# ---------------------------------------------------------------------------
+
+_T14_DEPARTMENTS = ["Engineering", "Marketing", "Sales", "Support", "HR"]
+
+
+def _gen_t14(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Three data sources: departments CSV, transactions CSV, allocation rules JSON."""
+    # --- Departments with budgets ---
+    dept_rows = [
+        {"department": dept, "annual_budget": round(rng.uniform(100000, 500000), 2)}
+        for dept in _T14_DEPARTMENTS
+    ]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["department", "annual_budget"])
+    writer.writeheader()
+    writer.writerows(dept_rows)
+    (fixtures_dir / "t14_departments.csv").write_text(buf.getvalue())
+
+    # --- Transactions (spending) ---
+    txn_rows = []
+    for i in range(1, 81):
+        dept = rng.choice(_T14_DEPARTMENTS)
+        txn_rows.append({
+            "txn_id": i,
+            "department": dept,
+            "amount": round(rng.uniform(500, 25000), 2),
+            "category": rng.choice(["salary", "equipment", "travel", "software", "training"]),
+            "date": f"2024-{rng.randint(1,12):02d}-{rng.randint(1,28):02d}",
+        })
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["txn_id", "department", "amount", "category", "date"])
+    writer.writeheader()
+    writer.writerows(txn_rows)
+    (fixtures_dir / "t14_transactions.csv").write_text(buf.getvalue())
+
+    # --- Allocation rules ---
+    rules = {
+        "max_single_transaction": 20000,
+        "category_caps": {
+            "travel": 0.15,      # max 15% of budget
+            "equipment": 0.25,   # max 25% of budget
+        },
+    }
+    (fixtures_dir / "t14_rules.json").write_text(json.dumps(rules, indent=2))
+
+    # Pre-compute expected values
+    dept_spending: dict[str, float] = {}
+    for txn in txn_rows:
+        dept_spending[txn["department"]] = round(
+            dept_spending.get(txn["department"], 0.0) + txn["amount"], 2
+        )
+    budgets = {d["department"]: d["annual_budget"] for d in dept_rows}
+    over_budget = sum(
+        1 for dept in _T14_DEPARTMENTS
+        if dept_spending.get(dept, 0.0) > budgets[dept]
+    )
+    flagged_transactions = sum(
+        1 for txn in txn_rows if txn["amount"] > rules["max_single_transaction"]
+    )
+
+    return {
+        "T14": {
+            "department_count": len(_T14_DEPARTMENTS),
+            "department_spending": dept_spending,
+            "spending_tolerance_pct": 5,
+            "over_budget_count": over_budget,
+            "flagged_transactions": flagged_transactions,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T15 — Time-series ETL with configurable aggregation (targets SKILL)
+# ---------------------------------------------------------------------------
+
+
+def _gen_t15(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Hourly metrics CSV + aggregation config JSON."""
+    # --- Hourly metrics (7 days x 24 hours = 168 rows) ---
+    base_time = datetime(2024, 3, 1, 0, 0, 0)
+    metrics_rows = []
+    for i in range(168):
+        ts = base_time + timedelta(hours=i)
+        metrics_rows.append({
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "cpu_pct": round(rng.uniform(10, 90), 1),
+            "memory_pct": round(rng.uniform(20, 85), 1),
+            "requests_per_sec": rng.randint(50, 500),
+            "error_count": rng.randint(0, 20),
+        })
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["timestamp", "cpu_pct", "memory_pct", "requests_per_sec", "error_count"])
+    writer.writeheader()
+    writer.writerows(metrics_rows)
+    (fixtures_dir / "t15_hourly_metrics.csv").write_text(buf.getvalue())
+
+    # --- Aggregation config ---
+    agg_config = {
+        "aggregation_interval": "daily",
+        "metrics": {
+            "cpu_pct": ["mean", "max"],
+            "memory_pct": ["mean", "max"],
+            "requests_per_sec": ["sum"],
+            "error_count": ["sum"],
+        },
+        "alert_thresholds": {
+            "cpu_pct_max": 85,
+            "memory_pct_max": 80,
+            "error_count_sum": 100,
+        },
+    }
+    (fixtures_dir / "t15_agg_config.json").write_text(json.dumps(agg_config, indent=2))
+
+    # Pre-compute daily aggregates
+    from collections import defaultdict
+    daily_data: dict[str, list[dict]] = defaultdict(list)
+    for row in metrics_rows:
+        day = row["timestamp"][:10]
+        daily_data[day].append(row)
+
+    n_days = len(daily_data)
+    alert_days = 0
+    for day, rows in daily_data.items():
+        cpu_max = max(float(r["cpu_pct"]) for r in rows)
+        mem_max = max(float(r["memory_pct"]) for r in rows)
+        error_sum = sum(int(r["error_count"]) for r in rows)
+        if (cpu_max > agg_config["alert_thresholds"]["cpu_pct_max"]
+                or mem_max > agg_config["alert_thresholds"]["memory_pct_max"]
+                or error_sum > agg_config["alert_thresholds"]["error_count_sum"]):
+            alert_days += 1
+
+    return {
+        "T15": {
+            "n_days": n_days,
+            "metrics_aggregated": len(agg_config["metrics"]),
+            "alert_days": alert_days,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T16 — Root cause diagnosis (targets AGENT classification)
+# ---------------------------------------------------------------------------
+
+
+def _gen_t16(fixtures_dir: Path, rng: random.Random) -> dict:
+    """System metrics with a planted cascading failure chain."""
+    n_rows = 120
+    base_time = datetime(2024, 7, 1, 0, 0, 0)
+
+    # Root cause: database connection pool exhaustion (db_connections spikes)
+    # Cascade: db_connections↑ → query_latency↑ → request_queue↑ → error_rate↑
+    root_cause_metric = "db_connections"
+    cascade_chain = ["db_connections", "query_latency_ms", "request_queue_depth", "error_rate"]
+    incident_start = 60  # row index where incident begins
+
+    rows = []
+    for i in range(n_rows):
+        ts = base_time + timedelta(minutes=i * 5)
+        row: dict = {"timestamp": ts.strftime("%Y-%m-%d %H:%M:%S")}
+
+        if i < incident_start:
+            # Normal operation
+            row["db_connections"] = rng.randint(5, 30)
+            row["query_latency_ms"] = round(rng.uniform(5, 50), 1)
+            row["request_queue_depth"] = rng.randint(0, 10)
+            row["error_rate"] = round(rng.uniform(0.0, 0.02), 4)
+            row["cpu_usage"] = round(rng.uniform(20, 60), 1)
+        else:
+            # Cascading failure with staggered onset
+            elapsed = i - incident_start
+            # Root cause: db_connections spike immediately
+            row["db_connections"] = rng.randint(80, 100) if elapsed >= 0 else rng.randint(5, 30)
+            # query_latency follows after ~5 steps
+            row["query_latency_ms"] = round(rng.uniform(500, 2000), 1) if elapsed >= 5 else round(rng.uniform(5, 50), 1)
+            # request_queue follows after ~10 steps
+            row["request_queue_depth"] = rng.randint(50, 200) if elapsed >= 10 else rng.randint(0, 10)
+            # error_rate follows after ~15 steps
+            row["error_rate"] = round(rng.uniform(0.1, 0.5), 4) if elapsed >= 15 else round(rng.uniform(0.0, 0.02), 4)
+            # cpu stays normal (red herring)
+            row["cpu_usage"] = round(rng.uniform(20, 60), 1)
+
+        rows.append(row)
+
+    fieldnames = ["timestamp", "db_connections", "query_latency_ms", "request_queue_depth", "error_rate", "cpu_usage"]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    (fixtures_dir / "t16_system_metrics.csv").write_text(buf.getvalue())
+
+    # Incident description (what the agent sees)
+    incident_report = {
+        "title": "Service degradation detected",
+        "symptoms": [
+            "Elevated error rates observed",
+            "Increased request queue depth",
+            "User-reported slow response times",
+        ],
+        "onset_time": rows[incident_start]["timestamp"],
+        "affected_service": "api-gateway",
+    }
+    (fixtures_dir / "t16_incident.json").write_text(json.dumps(incident_report, indent=2))
+
+    return {
+        "T16": {
+            "root_cause_metric": root_cause_metric,
+            "cascade_chain": cascade_chain,
+            "incident_start_row": incident_start,
+            "n_metrics": len(fieldnames) - 1,  # exclude timestamp
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T17 — Fraud investigation with cross-referencing (targets AGENT)
+# ---------------------------------------------------------------------------
+
+_T17_NAMES = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Heidi",
+              "Ivan", "Judy", "Karl", "Linda", "Mike", "Nancy", "Oscar"]
+
+
+def _gen_t17(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Transactions CSV + customers CSV + alerts JSON with planted fraud patterns."""
+    # --- Customers ---
+    customers = []
+    for i, name in enumerate(_T17_NAMES):
+        customers.append({
+            "customer_id": i + 1,
+            "name": name,
+            "account_age_days": rng.randint(30, 2000),
+            "risk_score": round(rng.uniform(0, 1), 2),
+        })
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["customer_id", "name", "account_age_days", "risk_score"])
+    writer.writeheader()
+    writer.writerows(customers)
+    (fixtures_dir / "t17_customers.csv").write_text(buf.getvalue())
+
+    # --- Transactions (some fraudulent) ---
+    fraud_customer_ids = [1, 3, 5]  # Alice, Carol, Eve
+    transactions = []
+    for i in range(1, 101):
+        cid = rng.choice(range(1, len(_T17_NAMES) + 1))
+        is_fraud = cid in fraud_customer_ids and rng.random() < 0.4
+        amount = round(rng.uniform(5000, 50000) if is_fraud else rng.uniform(10, 2000), 2)
+        transactions.append({
+            "txn_id": i,
+            "customer_id": cid,
+            "amount": amount,
+            "merchant": rng.choice(["ShopA", "ShopB", "ShopC", "OnlineX", "OnlineY"]),
+            "timestamp": f"2024-06-{rng.randint(1,30):02d} {rng.randint(0,23):02d}:{rng.randint(0,59):02d}:00",
+            "flagged": is_fraud,
+        })
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["txn_id", "customer_id", "amount", "merchant", "timestamp", "flagged"])
+    writer.writeheader()
+    writer.writerows(transactions)
+    (fixtures_dir / "t17_transactions.csv").write_text(buf.getvalue())
+
+    # --- Alerts (pre-generated, some real, some false positives) ---
+    alerts = []
+    for txn in transactions:
+        if txn["flagged"]:
+            alerts.append({
+                "alert_id": f"ALT-{txn['txn_id']:04d}",
+                "txn_id": txn["txn_id"],
+                "customer_id": txn["customer_id"],
+                "reason": rng.choice(["high_amount", "velocity_spike", "unusual_merchant"]),
+                "severity": "high",
+            })
+    # Add some false positive alerts (normal transactions flagged)
+    normal_txns = [t for t in transactions if not t["flagged"]]
+    for txn in rng.sample(normal_txns, min(5, len(normal_txns))):
+        alerts.append({
+            "alert_id": f"ALT-{txn['txn_id']:04d}",
+            "txn_id": txn["txn_id"],
+            "customer_id": txn["customer_id"],
+            "reason": "amount_threshold",
+            "severity": "low",
+        })
+
+    (fixtures_dir / "t17_alerts.json").write_text(json.dumps(alerts, indent=2))
+
+    # Pre-compute expected values
+    true_fraud_count = sum(1 for t in transactions if t["flagged"])
+    fraud_customer_names = [c["name"] for c in customers if c["customer_id"] in fraud_customer_ids]
+    total_alerts = len(alerts)
+    high_severity_alerts = sum(1 for a in alerts if a["severity"] == "high")
+
+    return {
+        "T17": {
+            "total_alerts": total_alerts,
+            "high_severity_alerts": high_severity_alerts,
+            "true_fraud_count": true_fraud_count,
+            "fraud_customer_ids": fraud_customer_ids,
+            "fraud_customer_names": fraud_customer_names,
         }
     }
 

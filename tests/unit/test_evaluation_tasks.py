@@ -26,7 +26,7 @@ from tests.evaluation.tasks import (
 
 class TestTaskRegistry:
     def test_all_tasks_count(self):
-        assert len(ALL_TASKS) == 13
+        assert len(ALL_TASKS) == 17
 
     def test_task_ids_unique(self):
         ids = [t.task_id for t in ALL_TASKS]
@@ -135,7 +135,9 @@ class TestT05Validator:
 class TestT06Validator:
     def test_valid_imputation(self):
         from tests.evaluation.tasks import _EV
-        variances = dict(_EV["T06"]["original_variances"])
+        variances = dict(
+            _EV["T06"].get("expected_variances") or _EV["T06"]["original_variances"]
+        )
         assert T06.validator({"null_count": 0, "column_variances": variances})
 
     def test_nulls_remaining(self):

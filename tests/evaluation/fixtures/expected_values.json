@@ -47,11 +47,11 @@
       "feature_c",
       "feature_d"
     ],
-    "original_variances": {
-      "feature_a": 109.114,
-      "feature_b": 90.6192,
-      "feature_c": 111.3273,
-      "feature_d": 94.2057
+    "expected_variances": {
+      "feature_a": 98.257,
+      "feature_b": 82.1563,
+      "feature_c": 91.7785,
+      "feature_d": 83.3811
     },
     "variance_tolerance_pct": 10
   },
@@ -140,5 +140,49 @@
       }
     ],
     "metrics_analyzed": 4
+  },
+  "T14": {
+    "department_count": 5,
+    "department_spending": {
+      "HR": 346208.54,
+      "Sales": 172741.47,
+      "Engineering": 154579.14,
+      "Marketing": 241610.09,
+      "Support": 159736.79
+    },
+    "spending_tolerance_pct": 5,
+    "over_budget_count": 1,
+    "flagged_transactions": 18
+  },
+  "T15": {
+    "n_days": 7,
+    "metrics_aggregated": 4,
+    "alert_days": 7
+  },
+  "T16": {
+    "root_cause_metric": "db_connections",
+    "cascade_chain": [
+      "db_connections",
+      "query_latency_ms",
+      "request_queue_depth",
+      "error_rate"
+    ],
+    "incident_start_row": 60,
+    "n_metrics": 5
+  },
+  "T17": {
+    "total_alerts": 11,
+    "high_severity_alerts": 6,
+    "true_fraud_count": 6,
+    "fraud_customer_ids": [
+      1,
+      3,
+      5
+    ],
+    "fraud_customer_names": [
+      "Alice",
+      "Carol",
+      "Eve"
+    ]
   }
 }

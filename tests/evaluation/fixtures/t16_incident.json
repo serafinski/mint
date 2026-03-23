@@ -1,0 +1,10 @@
+{
+  "title": "Service degradation detected",
+  "symptoms": [
+    "Elevated error rates observed",
+    "Increased request queue depth",
+    "User-reported slow response times"
+  ],
+  "onset_time": "2024-07-01 05:00:00",
+  "affected_service": "api-gateway"
+}

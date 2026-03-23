@@ -1,0 +1,7 @@
+{
+  "max_single_transaction": 20000,
+  "category_caps": {
+    "travel": 0.15,
+    "equipment": 0.25
+  }
+}

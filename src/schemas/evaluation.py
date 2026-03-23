@@ -14,12 +14,13 @@ from pydantic import BaseModel, Field
 
 
 class BaselineCondition(StrEnum):
-    """The four evaluation conditions compared in the thesis."""
+    """The evaluation conditions compared in the thesis."""
 
     FULL = "full"
     NO_VERIFICATION = "no_verification"
     NO_OPTIMIZATION = "no_optimization"
     STATIC = "static"
+    LONGITUDINAL = "longitudinal"
 
 
 class TaskTier(StrEnum):
@@ -57,7 +58,7 @@ class EvaluationRecord(BaseModel):
 
     # --- Experimental identifiers ---
     run_id: str = Field(..., description="Groups all tasks in one experimental run")
-    condition: Literal["full", "no_verification", "no_optimization", "static"] = Field(
+    condition: Literal["full", "no_verification", "no_optimization", "static", "longitudinal"] = Field(
         ..., description="Baseline condition"
     )
     task_id: str = Field(..., description="Testbed task identifier (e.g. 'T01')")

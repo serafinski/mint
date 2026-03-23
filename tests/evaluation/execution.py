@@ -52,6 +52,31 @@ class T13Result(BaseModel):
     metrics_analyzed: int
 
 
+class T14Result(BaseModel):
+    department_count: int
+    department_spending: dict[str, float]
+    over_budget_count: int
+    flagged_transactions: int
+
+
+class T15Result(BaseModel):
+    n_days: int
+    metrics_aggregated: int
+    alert_days: int
+
+
+class T16Result(BaseModel):
+    root_cause_metric: str
+    cascade_chain: list[str]
+    n_metrics_investigated: int
+
+
+class T17Result(BaseModel):
+    total_alerts: int
+    high_severity_alerts: int
+    fraud_customer_ids: list
+
+
 class GenericResult(BaseModel):
     """Fallback for tasks without a dedicated response model."""
     result: dict = {}
@@ -61,6 +86,10 @@ TASK_RESULT_MODELS: dict[str, type[BaseModel]] = {
     "T11": T11Result,
     "T12": T12Result,
     "T13": T13Result,
+    "T14": T14Result,
+    "T15": T15Result,
+    "T16": T16Result,
+    "T17": T17Result,
 }
 
 
