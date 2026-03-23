@@ -286,7 +286,7 @@ All core infrastructure is built and tested. Key architectural decisions locked 
 - **`src/schemas/evaluation.py`** — `EvaluationRecord` Pydantic model (18 fields). Separate from `InvocationRecord`. `success` property = `gate_passed AND output_in_range`. 21 unit tests.
 - **`src/registry/evaluation_store.py`** — Separate DuckDB `EvaluationStore`. `evaluation_runs` table. Methods: `record_run()`, `get_runs()`, `compute_success_rate()`, `compute_gate_pass_rate()`, `run_count()`, `failure_breakdown()`. 17 unit tests.
 - **`tests/evaluation/fixtures/`** — 10 fixture files generated programmatically (seed=42) + `expected_values.json` with pre-computed validator values. `generate.py` regenerates deterministically.
-- **`tests/evaluation/tasks.py`** — `TaskDefinition` frozen dataclass. T01–T10 with validators reading `expected_values.json` at import time. Static coverage: T01 (csv-parser), T02 (json-validator), T03 (text-statistics), T05 (data-cleaning-workflow), T09 (report-generation). `ALL_TASKS`, `PILOT_TASKS=[T01,T07,T10]`, `get_task()`. 34 unit tests.
+- **`tests/evaluation/tasks.py`** — `TaskDefinition` frozen dataclass. T01–T17 with validators reading `expected_values.json` at import time. Static coverage: T01 (csv-parser), T02 (json-validator), T03 (text-statistics), T05 (data-cleaning-workflow), T09 (report-generation). `ALL_TASKS`, `PILOT_TASKS=[T01,T07,T10]`, `get_task()`. 34 unit tests.
 - **`tests/evaluation/snapshots.py`** — `take_clean_snapshot()`, `restore_clean_snapshot()`, `snapshot_exists()`, `_hash_snapshot()`. Covers ChromaDB dir + `src/mcp_tools/` + `.deepagents/skills/`. SHA-256 hash (excluding `meta.json`) as snap ID. Idempotent. 19 unit tests.
 - **`tests/evaluation/harness.py`** — `HarnessConfig` dataclass, `EvaluationHarness` class. `prepare()`, `run_pilot()`, `run_condition()`, `close()`. Run loop: restore snapshot → seed registry → shuffle tasks → execute per condition → record to `EvaluationStore`. `MetricsStore` created once per run (shared across tasks so optimizer accumulates data). Static implementations for T01/T02/T03/T05/T09. `_execute_artifact()` uses `sandbox_execute` for MCP_TOOL artifacts. 22 unit tests.
 - **`src/orchestrator/pipeline.py`** — Added `verification_enabled: bool = True` parameter. `gate_fn=None` when `False` (no_verification baseline).
@@ -327,18 +327,18 @@ After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% 
 
 **Semantic correctness gap:** Verification gate catches structural/deception issues but not business logic correctness. The gap between gate_pass_rate (100%) and success_rate (66.7%) quantifies this limitation. Deferred to future work — see `docs/iteration_plan.md` → "Pilot run findings (2026-03-12)" for full analysis and three proposed approaches.
 
-### Full evaluation results (2026-03-16/17, 260 records — FINAL)
+### Full evaluation results (2026-03-18 + 2026-03-20, 340 records — FINAL)
 
 | Condition | Success | Gate Pass |
 |---|---|---|
-| no_optimization | 52/65 (80.0%) | 64/65 (98.5%) |
-| no_verification | 50/65 (76.9%) | 65/65 (100%) |
-| full | 47/65 (72.3%) | 62/65 (95.4%) |
-| static | 25/65 (38.5%) | 25/65 (38.5%) |
+| full | 61/85 (71.8%) | 81/85 (95.3%) |
+| no_optimization | 66/85 (77.6%) | 85/85 (100%) |
+| no_verification | 72/85 (84.7%) | 84/85 (98.8%) |
+| static | 25/85 (29.4%) | 25/85 (29.4%) |
 
-Task tiers (JIT best): Always pass (T01-T03, T08, T10, T13 = 100%), High (T04 80-100%, T07 60-80%, T11 80-100%), Stochastic (T05 60%, T12 40-100%), Low (T09 0-20%), Never pass (T06 0%).
+Task tiers (JIT best): Always pass (T01-T03, T08, T10, T13 = 100%), High (T04 80-100%, T07 60-80%, T11 80-100%, T14 80-100%), Stochastic (T05 60%, T12 40-100%, T15 40-80%, T16 40-60%), Low (T09 0-20%, T17 variable), Never pass (T06 0%).
 
-**Key findings:** (1) Optimizer hurts in single-run evaluation — needs invocation history to add value. (2) T06 0% everywhere = semantic correctness gap poster child (gate=100%, success=0%). (3) T09 5/5 static but ~0% JIT = prompt specificity tradeoff (LLM can't infer JSON structure). (4) All three capability types work end-to-end (MCP_TOOL, SKILL, AGENT). See `docs/iteration_plan.md` → "Full evaluation results (2026-03-16/17)" for detailed per-task analysis.
+**Key findings:** (1) Pooled JIT vs Static: 73.3% vs 14.3%, p<0.001. (2) JIT cluster (synthesis): 65.7%–81.4%. (3) Optimizer hurts in single-run evaluation — needs invocation history to add value. (4) T06 0% everywhere = semantic correctness gap poster child (gate=100%, success=0%). (5) T09 5/5 static but ~0% JIT = prompt specificity tradeoff. (6) All three capability types work end-to-end (MCP_TOOL, SKILL, AGENT) — T14 SKILL 13/15, T16 AGENT 6/15, T17 AGENT 4/4 when correctly classified vs SKILL 1/11 (type selection matters). See `docs/iteration_plan.md` for detailed per-task analysis.
 
 ### SKILL/AGENT execution support (2026-03-13)
 
@@ -346,10 +346,15 @@ Original evaluation only exercised MCP_TOOL end-to-end. Added:
 - **T11** (multi-source data integration) — targets SKILL classification
 - **T12** (configurable data quality pipeline) — targets SKILL classification
 - **T13** (autonomous anomaly investigation) — targets AGENT classification
+- **T14** (hierarchical data aggregation) — targets SKILL classification
+- **T15** (time-series forecasting pipeline) — targets SKILL classification
+- **T16** (root cause analysis agent) — targets AGENT classification
+- **T17** (adaptive ETL orchestration) — targets AGENT classification
 - **`tests/evaluation/execution.py`** — SKILL/AGENT execution via DeepAgent (same pattern as adversarial.py)
 - Harness now dispatches to `execute_skill_artifact()` / `execute_agent_artifact()` instead of returning `{}` for non-MCP_TOOL
 - Removed MCP_TOOL preference in `_extract_result` — uses whatever type the classifier chose
 - T11-T13 have no static coverage (by design — static libraries can't solve multi-step orchestration)
+- **T14-T17** added (2026-03-20) — additional SKILL/AGENT tasks for broader type coverage
 
 ### Harness fixes (2026-03-15)
 
@@ -386,10 +391,14 @@ All three capability types confirmed working end-to-end.
 - [x] Unify LLM provider (all openai:gpt-5-mini)
 - [x] T06 validator fix (post-KNN-imputation reference variance)
 - [x] T09 schema hint in task prompt
-- [ ] Re-run full evaluation (13 tasks × 4 conditions × 5 runs) with unified model + fixes
-- [ ] Critique checkpoint: does the evaluation design produce usable thesis data?
+- [x] Re-run full evaluation (13 tasks × 4 conditions × 5 runs) with unified model + fixes (2026-03-18, 260 records)
+- [x] Add T14-T17 tasks (SKILL/AGENT coverage) and run evaluation (2026-03-20, 340 total records)
+- [x] Critique checkpoint: does the evaluation design produce usable thesis data? — Yes, see `docs/critique_checkpoint_review.md`
+- [x] Longitudinal optimizer test (40 sequential tasks, no snapshot reset) — `scripts/run_longitudinal.py` (2026-03-19, 35/40 success=87.5%, first cycle 69.2% → last cycle 100%, prune only — split/merge thresholds not reached)
+- [x] Level 1 CLI runner — `scripts/run_task.py` (2026-03-22); supports `--file`, `--param`, `--dry-run`, `--list`, `--skip-verification`, `--enable-optimizer`, `--output-format json|human`
 
 **Runner:** `uv run scripts/run_pilot.py` (see `docs/iteration_plan.md` → Iteration 5 for full command reference)
+**CLI:** `uv run scripts/run_task.py "task description" --file data.csv` (see `docs/plan_cli_runner.md`)
 
 **Agent team:** Not needed — all 3 baseline conditions are condition flags on the shared harness, not separate codebases.
 
@@ -425,7 +434,8 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`tests/evaluation/snapshots.py`** — `take_clean_snapshot()`, `restore_clean_snapshot()`, `snapshot_exists()`
 - **`tests/evaluation/harness.py`** — `EvaluationHarness`, `HarnessConfig`, `_run_static_implementation()`
 - **`tests/evaluation/execution.py`** — `execute_skill_artifact()`, `execute_agent_artifact()`, `_read_fixture_contents()` (DeepAgent-based SKILL/AGENT execution)
-- **`scripts/run_pilot.py`** — CLI runner: `uv run scripts/run_pilot.py [--condition] [--all-tasks] [--all-conditions] [--n-runs N]`
+- **`scripts/run_pilot.py`** — Evaluation runner: `uv run scripts/run_pilot.py [--condition] [--all-tasks] [--all-conditions] [--n-runs N]`
+- **`scripts/run_task.py`** — User-facing CLI: `uv run scripts/run_task.py "task" [--file PATH] [--param K=V] [--dry-run] [--list] [--skip-verification] [--enable-optimizer] [--output-format json|human]`
 
 ## Notes for AI Agents
 
