@@ -154,23 +154,26 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
         output_tokens = usage.get("output", 0) or 0
         total_tokens = usage.get("total", 0) or 0
 
-        # Extract reasoning tokens from usageDetails or completionTokensDetails
+        # Extract reasoning tokens from usageDetails.
+        # LangFuse REST API returns flat keys: "output_reasoning" and
+        # "input_cache_read" (not nested under output_token_details).
         reasoning_tokens = 0
-        if "output_token_details" in usage_details:
-            reasoning_tokens = usage_details["output_token_details"].get("reasoning", 0) or 0
-        elif "outputTokenDetails" in usage_details:
-            reasoning_tokens = usage_details["outputTokenDetails"].get("reasoning", 0) or 0
-        # Also try the completionTokensDetails path
-        completion_details = obs.get("completionTokensDetails") or {}
-        if not reasoning_tokens and completion_details:
+        reasoning_tokens = usage_details.get("output_reasoning", 0) or 0
+        if not reasoning_tokens:
+            # Fallback: nested format (some SDK versions)
+            otd = usage_details.get("output_token_details") or usage_details.get("outputTokenDetails") or {}
+            reasoning_tokens = otd.get("reasoning", 0) or 0
+        if not reasoning_tokens:
+            completion_details = obs.get("completionTokensDetails") or {}
             reasoning_tokens = completion_details.get("reasoning_tokens", 0) or 0
 
         # Cache tokens (tokens reused from previous context)
         cache_read = 0
-        if "input_token_details" in usage_details:
-            cache_read = usage_details["input_token_details"].get("cache_read", 0) or 0
-        elif "inputTokenDetails" in usage_details:
-            cache_read = usage_details["inputTokenDetails"].get("cache_read", 0) or 0
+        cache_read = usage_details.get("input_cache_read", 0) or 0
+        if not cache_read:
+            # Fallback: nested format
+            itd = usage_details.get("input_token_details") or usage_details.get("inputTokenDetails") or {}
+            cache_read = itd.get("cache_read", 0) or 0
 
         steps.append({
             "obs_id": obs.get("id", ""),

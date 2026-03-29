@@ -753,6 +753,24 @@ def main() -> int:
                 )
 
     # ------------------------------------------------------------------
+    # Record invocation in MetricsStore for optimizer visibility
+    # ------------------------------------------------------------------
+    if artifact is not None:
+        try:
+            from src.schemas.metrics import InvocationRecord
+
+            record = InvocationRecord(
+                capability_id=getattr(artifact, "capability_name", "unknown"),
+                task_id=task_prompt[:64],  # truncate for storage
+                success=output is not None and bool(output),
+                token_cost=0,  # not tracked inline
+                latency_ms=float(elapsed_ms),
+            )
+            metrics_store.record_invocation(record)
+        except Exception:  # noqa: BLE001
+            pass  # best-effort, don't fail the CLI
+
+    # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
     if args.output_format == "json":

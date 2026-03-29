@@ -282,12 +282,16 @@ def seed_registry(registry: SkillRegistry) -> None:
         capability_type: CapabilityType,
         domain: str = "general",
         tags: list[str] | None = None,
+        source_code: str | None = None,
     ) -> CapabilityDescriptor:
+        metadata: dict = {"pinned": "true"}  # all seeded caps are pinned
+        if source_code is not None:
+            metadata["source_code"] = source_code
         kwargs: dict = {
             "name": name,
             "description": description,
             "capability_type": capability_type,
-            "metadata": {"pinned": "true"},  # all seeded caps are pinned
+            "metadata": metadata,
         }
         if has_domain:
             kwargs["domain"] = domain
@@ -310,6 +314,21 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.MCP_TOOL,
             domain="data-processing",
             tags=["csv", "parsing", "data-ingestion"],
+            source_code=(
+                'from typing import Annotated\n'
+                'from mcp.server.fastmcp import FastMCP\n'
+                'mcp = FastMCP("csv-parser")\n'
+                '@mcp.tool()\n'
+                'async def csv_parser(file_path: Annotated[str, "Path to the CSV file"]) -> dict:\n'
+                '    """Parse a CSV file and return row_count and column_names."""\n'
+                '    import csv\n'
+                '    with open(file_path) as f:\n'
+                '        reader = csv.DictReader(f)\n'
+                '        rows = list(reader)\n'
+                '        return {"row_count": len(rows), "column_names": list(reader.fieldnames or [])}\n'
+                'if __name__ == "__main__":\n'
+                '    mcp.run()\n'
+            ),
         ),
         _cap(
             "date-formatter",
@@ -327,6 +346,25 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.MCP_TOOL,
             domain="data-processing",
             tags=["json", "validation", "schema"],
+            source_code=(
+                "from typing import Annotated\n"
+                "from mcp.server.fastmcp import FastMCP\n"
+                'mcp = FastMCP("json-validator")\n'
+                "@mcp.tool()\n"
+                "async def json_validator(\n"
+                '    config_path: Annotated[str, "Path to JSON config"],\n'
+                '    schema_path: Annotated[str, "Path to JSON Schema"],\n'
+                ") -> dict:\n"
+                '    """Validate JSON data against a JSON Schema and return errors."""\n'
+                "    import json, jsonschema\n"
+                "    config = json.loads(open(config_path).read())\n"
+                "    schema = json.loads(open(schema_path).read())\n"
+                "    validator = jsonschema.Draft7Validator(schema)\n"
+                "    errors = [e.message for e in validator.iter_errors(config)]\n"
+                '    return {"errors": errors}\n'
+                'if __name__ == "__main__":\n'
+                "    mcp.run()\n"
+            ),
         ),
         _cap(
             "text-statistics",
@@ -337,6 +375,27 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.MCP_TOOL,
             domain="text-analysis",
             tags=["text", "statistics", "nlp", "readability"],
+            source_code=(
+                'from typing import Annotated\n'
+                'from mcp.server.fastmcp import FastMCP\n'
+                'import re\n'
+                'mcp = FastMCP("text-statistics")\n'
+                '@mcp.tool()\n'
+                'async def text_statistics(file_path: Annotated[str, "Path to text file"]) -> dict:\n'
+                '    """Compute word count and Flesch readability score."""\n'
+                '    text = open(file_path).read()\n'
+                '    words = re.findall(r"\\b\\w+\\b", text)\n'
+                '    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]\n'
+                '    def syllables(w):\n'
+                '        return max(len(re.findall(r"[aeiouAEIOU]+", w)), 1)\n'
+                '    n_w = len(words)\n'
+                '    n_s = max(len(sentences), 1)\n'
+                '    n_syl = sum(syllables(w) for w in words)\n'
+                '    score = round(max(0.0, min(100.0, 206.835 - 1.015*(n_w/n_s) - 84.6*(n_syl/max(n_w,1)))), 2)\n'
+                '    return {"word_count": n_w, "readability_score": score}\n'
+                'if __name__ == "__main__":\n'
+                '    mcp.run()\n'
+            ),
         ),
         # SKILL type
         _cap(
