@@ -340,6 +340,266 @@ def test_merge(verbose: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Full optimization loop test
+# ---------------------------------------------------------------------------
+
+
+def test_full_loop(verbose: bool = False) -> bool:
+    """Test the full optimization loop (compute_metrics → identify → apply).
+
+    Seeds a registry with capabilities that will trigger all three operations
+    in a single loop pass:
+
+    - **Prune target**: "unused-formatter" — has zero invocations in the window
+    - **Split target**: "broad-data-processor" (SKILL) — high reuse (80%), low success (50%)
+    - **Merge targets**: "csv-row-cleaner" + "tsv-row-cleaner" (SKILLs) — low reuse, semantically similar
+    - **Pinned (should survive)**: "core-tool" — has metadata={"pinned": "true"}
+
+    Runs the full LangGraph optimization loop via create_optimization_loop().
+    """
+    from src.optimizer.loop import create_optimization_loop
+    from src.optimizer.utility import compute_all_utilities
+
+    print("\n" + "=" * 70)
+    print("  FULL OPTIMIZATION LOOP TEST")
+    print("=" * 70)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        registry = _create_fresh_registry(tmp_dir)
+        metrics = MetricsStore()  # in-memory
+
+        # --- Register capabilities ---
+
+        # 1. Prune target: zero invocations, not pinned
+        prune_cap = CapabilityDescriptor(
+            name="unused-formatter",
+            description="Format dates between different calendar systems",
+            capability_type=CapabilityType.MCP_TOOL,
+            domain="utility",
+            tags=["formatting"],
+        )
+        registry.add(prune_cap)
+
+        # 2. Pinned capability: zero invocations but should NOT be pruned
+        pinned_cap = CapabilityDescriptor(
+            name="core-tool",
+            description="Core utility tool that must always be available",
+            capability_type=CapabilityType.MCP_TOOL,
+            domain="core",
+            tags=["core"],
+            metadata={"pinned": "true"},
+        )
+        registry.add(pinned_cap)
+
+        # 3. Split target: SKILL with high reuse, low success
+        split_cap = CapabilityDescriptor(
+            name="broad-data-processor",
+            description=(
+                "Process and transform any structured data file including CSV, "
+                "JSON, XML, and YAML formats with validation and cleaning"
+            ),
+            capability_type=CapabilityType.SKILL,
+            domain="data-processing",
+            tags=["data", "parsing", "transformation"],
+        )
+        registry.add(split_cap)
+
+        # 4. Merge targets: two similar low-reuse SKILLs
+        merge_a = CapabilityDescriptor(
+            name="csv-row-cleaner",
+            description=(
+                "Clean and validate rows in CSV data files by removing nulls, "
+                "deduplicating records, and normalizing column types"
+            ),
+            capability_type=CapabilityType.SKILL,
+            domain="data-processing",
+            tags=["csv", "cleaning"],
+        )
+        merge_b = CapabilityDescriptor(
+            name="tsv-row-cleaner",
+            description=(
+                "Clean and validate rows in TSV data files by removing nulls, "
+                "deduplicating records, and normalizing column types"
+            ),
+            capability_type=CapabilityType.SKILL,
+            domain="data-processing",
+            tags=["tsv", "cleaning"],
+        )
+        registry.add(merge_a)
+        registry.add(merge_b)
+
+        # 5. Filler tool to create a large task pool for reuse_rate denominators
+        filler = CapabilityDescriptor(
+            name="filler-tool",
+            description="A filler tool for task diversity",
+            capability_type=CapabilityType.MCP_TOOL,
+        )
+        registry.add(filler)
+
+        all_caps = registry.list_all()
+        print(f"\n  Registered {len(all_caps)} capabilities:")
+        for c in all_caps:
+            pinned = " [PINNED]" if c.metadata.get("pinned") == "true" else ""
+            print(f"    {c.name} ({c.capability_type.value}){pinned}")
+
+        # --- Seed invocations ---
+
+        # Create 25 unique tasks (large pool for reuse_rate denominators)
+        all_task_ids = [f"TASK_{i:02d}" for i in range(25)]
+
+        # Filler: invoked across all tasks (so the task pool is large)
+        _seed_invocations(metrics, "filler-tool", all_task_ids, success_rate=1.0, n_per_task=1)
+
+        # Prune target: NO invocations (will be pruned)
+        # unused-formatter has 0 invocations — prune triggers
+
+        # Pinned: also no invocations, but pinned metadata protects it
+        # core-tool has 0 invocations — should NOT be pruned
+
+        # Split target: high reuse (80%), low success (50%)
+        split_tasks = all_task_ids[:20]  # 20/25 = 80% reuse
+        _seed_invocations(metrics, "broad-data-processor", split_tasks, success_rate=0.5, n_per_task=5)
+
+        # Merge targets: low reuse (1 task each out of 25 = 4%)
+        _seed_invocations(metrics, "csv-row-cleaner", ["TASK_00"], success_rate=0.8, n_per_task=3)
+        _seed_invocations(metrics, "tsv-row-cleaner", ["TASK_01"], success_rate=0.8, n_per_task=3)
+
+        # Verify metrics
+        print("\n  Seeded metrics:")
+        for cap_name in ["unused-formatter", "core-tool", "broad-data-processor",
+                         "csv-row-cleaner", "tsv-row-cleaner"]:
+            rr = metrics.reuse_rate(cap_name)
+            sr = metrics.success_rate(cap_name)
+            ic = metrics.invocation_count(cap_name)
+            print(f"    {cap_name}: invocations={ic}, reuse={rr:.2f}, success={sr:.2f}")
+
+        # Check similarity between merge candidates
+        results = registry.search("csv-row-cleaner", n_results=5)
+        similarity = None
+        for cap_desc, score in results:
+            if cap_desc.name == "tsv-row-cleaner":
+                similarity = score
+                break
+        print(f"    csv↔tsv similarity: {similarity:.3f}" if similarity else "    csv↔tsv similarity: NOT FOUND")
+
+        # --- Compute utility scores (pre-loop) ---
+        pre_scores = compute_all_utilities(registry, metrics)
+        print("\n  Pre-loop utility scores:")
+        for cap_id, score in sorted(pre_scores.items()):
+            print(f"    {cap_id}: {score:.4f}")
+
+        # --- Run the full optimization loop ---
+        print("\n  Running create_optimization_loop()...", flush=True)
+        try:
+            loop = create_optimization_loop(
+                registry, metrics,
+                prune_window_days=30,
+                split_reuse_threshold=0.6,
+                split_success_threshold=0.7,
+                merge_reuse_threshold=0.05,
+            )
+            result = loop.invoke({})
+        except Exception as exc:
+            print(f"\n  FAIL: Optimization loop raised: {exc}")
+            return False
+
+        # --- Verify results ---
+        print(f"\n  Results:")
+
+        # Prune
+        pruned = result.get("pruned", [])
+        print(f"\n  Pruned ({len(pruned)}): {pruned}")
+        if "unused-formatter" not in pruned:
+            print("  FAIL: 'unused-formatter' should have been pruned (zero invocations)")
+            return False
+        if "core-tool" in pruned:
+            print("  FAIL: 'core-tool' should NOT be pruned (pinned)")
+            return False
+        print("  OK: unused-formatter pruned, core-tool survived (pinned)")
+
+        # Split
+        split_results = result.get("split_results", {})
+        print(f"\n  Split results: {split_results}")
+        if "broad-data-processor" not in split_results:
+            print("  FAIL: 'broad-data-processor' should have been split (reuse=0.80, success=0.50)")
+            return False
+        variants = split_results["broad-data-processor"]
+        if len(variants) < 2:
+            print(f"  FAIL: Expected >= 2 split variants, got {len(variants)}")
+            return False
+        # Verify parent deactivated
+        parent = registry.get("broad-data-processor")
+        if parent and parent.is_active:
+            print("  FAIL: 'broad-data-processor' should be deactivated after split")
+            return False
+        # Verify variants exist and are active
+        for vid in variants:
+            v = registry.get(vid)
+            if v is None:
+                print(f"  FAIL: Split variant '{vid}' not found in registry")
+                return False
+            print(f"    Variant: {vid} — {v.description[:60]}...")
+        print("  OK: broad-data-processor split into", variants)
+
+        # Merge
+        merge_results = result.get("merge_results", {})
+        print(f"\n  Merge results: {merge_results}")
+        if not merge_results:
+            print("  FAIL: Expected at least one merge (csv-row-cleaner + tsv-row-cleaner)")
+            return False
+        merged_id = list(merge_results.values())[0]
+        merged = registry.get(merged_id)
+        if merged is None:
+            print(f"  FAIL: Merged capability '{merged_id}' not found")
+            return False
+        # Verify parents deactivated
+        for parent_name in ["csv-row-cleaner", "tsv-row-cleaner"]:
+            p = registry.get(parent_name)
+            if p and p.is_active:
+                print(f"  FAIL: '{parent_name}' should be deactivated after merge")
+                return False
+        print(f"  OK: merged into '{merged_id}' — {merged.description[:60]}...")
+
+        # KL divergence
+        kl = result.get("kl_divergence")
+        print(f"\n  KL divergence: {kl}")
+
+        # Utility scores
+        scores = result.get("utility_scores", {})
+        print(f"  Utility scores ({len(scores)} capabilities):")
+        for cap_id, score in sorted(scores.items()):
+            print(f"    {cap_id}: {score:.4f}")
+
+        # Errors
+        errors = result.get("errors", [])
+        if errors:
+            print(f"\n  Errors ({len(errors)}):")
+            for e in errors:
+                print(f"    {e}")
+
+        # Events in MetricsStore
+        events = metrics._conn.execute(
+            "SELECT capability_id, event_type, details FROM capability_events "
+            "ORDER BY occurred_at"
+        ).fetchall()
+        print(f"\n  Events recorded: {len(events)}")
+        for eid, etype, details in events:
+            print(f"    {eid}: {etype} — {details}")
+
+        # Final registry state
+        active = [c for c in registry.list_all() if c.is_active]
+        inactive = [c for c in registry.list_all() if not c.is_active]
+        print(f"\n  Final registry: {len(active)} active, {len(inactive)} inactive")
+        for c in active:
+            print(f"    [ACTIVE] {c.name} ({c.capability_type.value})")
+        for c in inactive:
+            print(f"    [INACTIVE] {c.name} ({c.capability_type.value})")
+
+        print("\n  PASS: Full optimization loop completed — prune + split + merge all triggered")
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -350,6 +610,7 @@ def main() -> int:
     )
     parser.add_argument("--split-only", action="store_true", help="Run only split test")
     parser.add_argument("--merge-only", action="store_true", help="Run only merge test")
+    parser.add_argument("--loop-only", action="store_true", help="Run only full loop test")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -360,8 +621,10 @@ def main() -> int:
         stream=sys.stderr,
     )
 
-    run_split = not args.merge_only
-    run_merge = not args.split_only
+    only_one = args.split_only or args.merge_only or args.loop_only
+    run_split = args.split_only or not only_one
+    run_merge = args.merge_only or not only_one
+    run_loop = args.loop_only or not only_one
 
     results = {}
 
@@ -370,6 +633,9 @@ def main() -> int:
 
     if run_merge:
         results["merge"] = test_merge(verbose=args.verbose)
+
+    if run_loop:
+        results["full_loop"] = test_full_loop(verbose=args.verbose)
 
     # Summary
     print("\n" + "=" * 70)
