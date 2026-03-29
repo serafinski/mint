@@ -94,11 +94,45 @@ class EvaluationHarness:
     # -- public API ----------------------------------------------------------
 
     def prepare(self) -> str:
-        """Take the clean snapshot. Must be called before any run_* method.
+        """Ensure a clean state and take the snapshot.
 
-        Returns the snapshot ID.
+        Wipes generated artifacts (skills, chroma) and rebuilds a fresh
+        seeded registry so the snapshot captures only the baseline state,
+        not leftover artifacts from previous runs or CLI usage.
+
+        Must be called before any run_* method.  Returns the snapshot ID.
         """
+        import gc
+        import shutil
+
         cfg = self._config
+
+        # 1. Wipe generated skills (keep the directory itself)
+        if cfg.skills_dir.exists():
+            shutil.rmtree(cfg.skills_dir)
+        cfg.skills_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Cleaned skills directory: %s", cfg.skills_dir)
+
+        # 2. Wipe and rebuild ChromaDB with fresh seeded registry
+        try:
+            import chromadb
+            chromadb.api.shared_system_client.SharedSystemClient.clear_system_cache()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ChromaDB cache clear failed (non-critical): %s", exc)
+        gc.collect()
+
+        if cfg.chroma_dir.exists():
+            shutil.rmtree(cfg.chroma_dir)
+        cfg.chroma_dir.mkdir(parents=True, exist_ok=True)
+
+        registry = SkillRegistry(
+            persist_directory=str(cfg.chroma_dir),
+            collection_name=cfg.chroma_collection,
+        )
+        seed_registry(registry)
+        logger.info("Rebuilt clean registry with %d seeded capabilities", len(registry.list_all()))
+
+        # 3. Take snapshot of the clean state
         self._snap_id = take_clean_snapshot(
             cfg.chroma_dir, cfg.mcp_tools_dir, cfg.skills_dir
         )
@@ -194,8 +228,8 @@ class EvaluationHarness:
         try:
             import chromadb
             chromadb.api.shared_system_client.SharedSystemClient.clear_system_cache()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ChromaDB cache clear failed (non-critical): %s", exc)
         gc.collect()
 
         # Step 1: restore clean snapshot

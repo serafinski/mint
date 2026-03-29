@@ -84,7 +84,8 @@ def decomposition_node(
     try:
         langfuse_handler = LangFuseCallbackHandler()
         callbacks = [langfuse_handler]
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
         callbacks = []
 
     config = {

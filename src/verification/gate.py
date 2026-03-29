@@ -93,7 +93,11 @@ def verify(artifact: GeneratedArtifact) -> VerificationReport:
     try:
         return _verify_inner(artifact, name, all_findings)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in verify() for %s: %s", name, exc)
+        logger.warning(
+            "Verification gate error for '%s': %s — PASSING (fail-open policy). "
+            "Artifact was NOT verified; it passed by default due to a gate error.",
+            name, exc,
+        )
         return VerificationReport(
             capability_name=name,
             findings=[

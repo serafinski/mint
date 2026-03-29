@@ -73,7 +73,11 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
             _pip_resolution_cache[name] = pip_name
 
     except Exception as exc:
-        logger.warning("LLM package resolution failed (%s), falling back to identity mapping", exc)
+        logger.warning(
+            "LLM package resolution failed for imports %s: %s. "
+            "Falling back to identity mapping (import name = pip name).",
+            list(uncached), exc,
+        )
         for name in uncached:
             _pip_resolution_cache[name] = name
 

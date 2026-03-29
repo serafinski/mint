@@ -185,8 +185,8 @@ def _execute_skill_inner(
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
         config["callbacks"] = [LangFuseCallbackHandler()]
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
@@ -291,8 +291,8 @@ def _execute_agent_inner(
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
         config["callbacks"] = [LangFuseCallbackHandler()]
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:

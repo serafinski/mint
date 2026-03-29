@@ -356,12 +356,20 @@ def generate_skill(
                 gap = futures[future]
                 raw_results.append((None, f"Generation failed for skill {gap.query!r}: {exc}"))
 
+    failed_queries: list[str] = []
     for artifact, error in raw_results:
         if artifact is not None:
             artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
         if error is not None:
             errors.append(error)
+            failed_queries.append(error[:80])
+
+    if failed_queries:
+        logger.warning(
+            "generate_skill: %d/%d gaps failed generation: %s",
+            len(failed_queries), len(gaps_to_generate), failed_queries,
+        )
 
     return Command(
         update={

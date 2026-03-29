@@ -357,12 +357,22 @@ def generate_mcp_tool(
                 raw_results.append((None, f"Generation failed for {gap.query!r}: {exc}"))
 
     # Merge after pool closes — sequential, no concurrent mutation
+    n_succeeded = 0
+    failed_queries: list[str] = []
     for artifact, error in raw_results:
         if artifact is not None:
             artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
+            n_succeeded += 1
         if error is not None:
             errors.append(error)
+            failed_queries.append(error[:80])
+
+    if failed_queries:
+        logger.warning(
+            "generate_mcp_tool: %d/%d gaps failed generation: %s",
+            len(failed_queries), len(gaps_to_generate), failed_queries,
+        )
 
     return Command(
         update={
