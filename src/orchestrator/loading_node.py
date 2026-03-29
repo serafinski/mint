@@ -55,26 +55,33 @@ def loading_node(
     ]
 
     registered = 0
+    host_loadable = 0
     for artifact in mcp_artifacts:
-        # --- Load ---
+        # --- Load (host importlib) ---
+        loaded = None
         try:
             loaded = loader.load_tool(artifact)
+            host_loadable += 1
         except Exception as exc:  # noqa: BLE001
-            error_msg = f"Failed to load tool '{artifact.capability_name}': {exc}"
-            logger.error(error_msg)
-            errors.append(error_msg)
-            continue
-
-        # --- Smoke-test ---
-        smoke = loader.execute_tool(loaded, inputs={})
-        if not smoke.success:
+            # Host import failed (e.g., missing pandas/numpy). The tool can
+            # still be executed in the Docker sandbox which installs deps
+            # dynamically. Register it with source_code so it's reusable.
             logger.warning(
-                "Smoke-test failed for tool '%s' (will still register): %s",
-                artifact.capability_name,
-                smoke.error,
+                "Host import failed for '%s': %s (registering with source_code only)",
+                artifact.capability_name, exc,
             )
 
-        # --- Register ---
+        # --- Smoke-test (only if host-loadable) ---
+        if loaded is not None:
+            smoke = loader.execute_tool(loaded, inputs={})
+            if not smoke.success:
+                logger.warning(
+                    "Smoke-test failed for tool '%s' (will still register): %s",
+                    artifact.capability_name,
+                    smoke.error,
+                )
+
+        # --- Register (always, regardless of host loadability) ---
         try:
             loader.register_tool(artifact, registry)
             registered += 1
@@ -106,10 +113,11 @@ def loading_node(
     else:
         status = TaskStatus.COMPLETED
         logger.info(
-            "Loading complete: %d/%d MCP tools registered, %d skill/agent artifacts on disk, "
-            "%d new errors",
+            "Loading complete: %d/%d MCP tools registered (%d host-loadable), "
+            "%d skill/agent artifacts on disk, %d new errors",
             registered,
             len(mcp_artifacts),
+            host_loadable,
             len(non_mcp_artifacts),
             new_errors,
         )

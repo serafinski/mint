@@ -156,21 +156,21 @@ def test_mixed_artifacts_only_mcp_tools_loaded():
 # ---------------------------------------------------------------------------
 
 
-def test_load_failure_records_error_and_continues():
+def test_load_failure_still_registers_with_source_code():
     artifacts = [_mcp_artifact("bad"), _mcp_artifact("good")]
     state = TaskState(task_description="t", generated_artifacts=artifacts)
 
     loader = MagicMock()
     loaded = MagicMock(spec=LoadedTool)
-    # First call raises, second succeeds
+    # First call raises (host import fails), second succeeds
     loader.load_tool.side_effect = [RuntimeError("import error"), loaded]
     loader.execute_tool.return_value = ToolResult(success=True)
 
     cmd = loading_node(state, loader, _make_registry())
 
-    assert loader.register_tool.call_count == 1  # only 'good' was registered
-    assert any("bad" in e for e in cmd.update["errors"])
-    assert cmd.update["status"] == TaskStatus.COMPLETED  # 'good' was registered → deployed > 0
+    # Both tools registered — 'bad' with source_code only, 'good' with full load
+    assert loader.register_tool.call_count == 2
+    assert cmd.update["status"] == TaskStatus.COMPLETED
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +247,12 @@ def test_completed_when_no_gaps_and_no_artifacts():
 # ---------------------------------------------------------------------------
 
 
-def test_failed_when_gaps_and_all_loads_fail():
-    """Gaps detected + artifacts generated but ALL load attempts fail → FAILED."""
+def test_host_load_fails_but_registration_succeeds():
+    """Gaps detected + host import fails but registration succeeds → COMPLETED.
+
+    Tools with external deps (pandas, numpy) fail importlib on the host but
+    still get registered with source_code for sandbox execution.
+    """
     from src.schemas.task import GapItem
 
     artifacts = [_mcp_artifact("tool_a"), _mcp_artifact("tool_b")]
@@ -263,8 +267,30 @@ def test_failed_when_gaps_and_all_loads_fail():
 
     cmd = loading_node(state, loader, _make_registry())
 
+    # Both registered despite host load failure
+    assert loader.register_tool.call_count == 2
+    assert cmd.update["status"] == TaskStatus.COMPLETED
+
+
+def test_failed_when_gaps_and_all_registrations_fail():
+    """Gaps detected + both host load AND registration fail → FAILED."""
+    from src.schemas.task import GapItem
+
+    artifacts = [_mcp_artifact("tool_a"), _mcp_artifact("tool_b")]
+    gaps = [
+        GapItem(description="tool a", query="tool a"),
+        GapItem(description="tool b", query="tool b"),
+    ]
+    state = TaskState(task_description="t", gaps=gaps, generated_artifacts=artifacts)
+
+    loader = MagicMock()
+    loader.load_tool.side_effect = RuntimeError("import error")
+    loader.register_tool.side_effect = RuntimeError("registry error")
+
+    cmd = loading_node(state, loader, _make_registry())
+
     assert cmd.update["status"] == TaskStatus.FAILED
-    assert len(cmd.update["errors"]) == 2  # one per failed load
+    assert len(cmd.update["errors"]) == 2  # one per failed registration
 
 
 def test_failed_when_gaps_and_load_succeeds_but_register_fails():
