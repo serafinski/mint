@@ -2,7 +2,7 @@
   {
     "product_id": 1,
     "name": "Product_A",
-    "category": "Food"
+    "category": "Clothing"
   },
   {
     "product_id": 2,
@@ -22,31 +22,31 @@
   {
     "product_id": 5,
     "name": "Product_E",
-    "category": "Clothing"
+    "category": "Food"
   },
   {
     "product_id": 6,
     "name": "Product_F",
-    "category": "Food"
+    "category": "Electronics"
   },
   {
     "product_id": 7,
     "name": "Product_G",
-    "category": "Food"
+    "category": "Clothing"
   },
   {
     "product_id": 8,
     "name": "Product_H",
-    "category": "Clothing"
+    "category": "Electronics"
   },
   {
     "product_id": 9,
     "name": "Product_I",
-    "category": "Food"
+    "category": "Clothing"
   },
   {
     "product_id": 10,
     "name": "Product_J",
-    "category": "Food"
+    "category": "Electronics"
   }
 ]

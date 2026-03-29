@@ -8,86 +8,86 @@
     {
       "region": "North",
       "product": "Widget",
-      "revenue": 907893.13,
-      "units": 1931,
-      "returns": 15
+      "revenue": 572095.78,
+      "units": 309,
+      "returns": 5
     },
     {
       "region": "North",
       "product": "Gadget",
-      "revenue": 865758.74,
-      "units": 1320,
-      "returns": 17
+      "revenue": 910345.37,
+      "units": 3139,
+      "returns": 35
     },
     {
       "region": "North",
       "product": "Doohickey",
-      "revenue": 659451.85,
-      "units": 974,
-      "returns": 2
+      "revenue": 910451.19,
+      "units": 127,
+      "returns": 44
     },
     {
       "region": "South",
       "product": "Widget",
-      "revenue": 798958.84,
-      "units": 3484,
-      "returns": 39
+      "revenue": 964437.47,
+      "units": 4144,
+      "returns": 27
     },
     {
       "region": "South",
       "product": "Gadget",
-      "revenue": 836265.95,
-      "units": 178,
-      "returns": 15
+      "revenue": 649638.44,
+      "units": 2763,
+      "returns": 36
     },
     {
       "region": "South",
       "product": "Doohickey",
-      "revenue": 49155.51,
-      "units": 876,
-      "returns": 38
+      "revenue": 195692.55,
+      "units": 831,
+      "returns": 33
     },
     {
       "region": "East",
       "product": "Widget",
-      "revenue": 16379.49,
-      "units": 4947,
+      "revenue": 184638.92,
+      "units": 1932,
+      "returns": 13
+    },
+    {
+      "region": "East",
+      "product": "Gadget",
+      "revenue": 181241.86,
+      "units": 4693,
+      "returns": 30
+    },
+    {
+      "region": "East",
+      "product": "Doohickey",
+      "revenue": 61508.06,
+      "units": 659,
       "returns": 43
     },
     {
-      "region": "East",
-      "product": "Gadget",
-      "revenue": 143624.39,
-      "units": 448,
-      "returns": 15
-    },
-    {
-      "region": "East",
-      "product": "Doohickey",
-      "revenue": 150702.8,
-      "units": 3345,
-      "returns": 28
-    },
-    {
       "region": "West",
       "product": "Widget",
-      "revenue": 54524.46,
-      "units": 1829,
-      "returns": 48
+      "revenue": 185861.11,
+      "units": 4498,
+      "returns": 36
     },
     {
       "region": "West",
       "product": "Gadget",
-      "revenue": 174108.75,
-      "units": 512,
-      "returns": 8
+      "revenue": 135040.76,
+      "units": 1519,
+      "returns": 20
     },
     {
       "region": "West",
       "product": "Doohickey",
-      "revenue": 105740.21,
-      "units": 2419,
-      "returns": 14
+      "revenue": 12975.04,
+      "units": 1747,
+      "returns": 37
     }
   ]
 }

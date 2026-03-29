@@ -34,6 +34,26 @@ _RECURSION_LIMIT = 50
 # ---------------------------------------------------------------------------
 
 
+class T04Result(BaseModel):
+    product_count: int
+    items_below_threshold: int
+    total_reorder_cost: float
+
+
+class T08Result(BaseModel):
+    n_rows: int
+    n_columns: int
+    quality_issues_found: int
+    issue_categories: list[str] = []
+
+
+class T10Result(BaseModel):
+    n_weeks: int
+    trend_direction: str
+    has_seasonality: bool = False
+    forecast: list[float] = []
+
+
 class T11Result(BaseModel):
     summary_row_count: int
     region_revenues: dict[str, float]
@@ -83,6 +103,9 @@ class GenericResult(BaseModel):
 
 
 TASK_RESULT_MODELS: dict[str, type[BaseModel]] = {
+    "T04": T04Result,
+    "T08": T08Result,
+    "T10": T10Result,
     "T11": T11Result,
     "T12": T12Result,
     "T13": T13Result,

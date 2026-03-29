@@ -34,7 +34,7 @@ class TestTaskRegistry:
 
     def test_pilot_tasks(self):
         ids = {t.task_id for t in PILOT_TASKS}
-        assert ids == {"T01", "T07", "T10"}
+        assert ids == {"T01", "T07", "T05"}
 
     def test_get_task_returns_correct(self):
         assert get_task("T01") is T01
@@ -110,13 +110,29 @@ class TestT03Validator:
 
 class TestT04Validator:
     def test_valid(self):
-        assert T04.validator({"row_count": 30, "delimiter": "|", "parse_errors": False})
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T04"]
+        assert T04.validator({
+            "product_count": ev["product_count"],
+            "items_below_threshold": ev["items_below_threshold"],
+            "total_reorder_cost": ev["total_reorder_cost"],
+        })
 
-    def test_wrong_delimiter(self):
-        assert not T04.validator({"row_count": 30, "delimiter": ",", "parse_errors": False})
+    def test_wrong_product_count(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T04"]
+        assert not T04.validator({
+            "product_count": 999,
+            "items_below_threshold": ev["items_below_threshold"],
+            "total_reorder_cost": ev["total_reorder_cost"],
+        })
 
-    def test_parse_errors_flag(self):
-        assert not T04.validator({"row_count": 30, "delimiter": "|", "parse_errors": True})
+    def test_cost_too_far_off(self):
+        assert not T04.validator({
+            "product_count": 10,
+            "items_below_threshold": 7,
+            "total_reorder_cost": 0.0,
+        })
 
 
 class TestT05Validator:
@@ -162,17 +178,27 @@ class TestT07Validator:
 
 
 class TestT08Validator:
-    def test_above_threshold(self):
-        from tests.evaluation.tasks import _EV
-        ev = _EV["T08"]
-        threshold = ev["majority_class_accuracy"] + ev["accuracy_margin"]
-        assert T08.validator({"accuracy": threshold + 0.01, "baseline_accuracy": 0.70})
+    def test_valid(self):
+        assert T08.validator({
+            "n_rows": 100,
+            "n_columns": 6,
+            "quality_issues_found": 25,
+            "issue_categories": ["null_ages", "salary_outliers"],
+        })
 
-    def test_below_threshold(self):
-        assert not T08.validator({"accuracy": 0.50, "baseline_accuracy": 0.70})
+    def test_no_issues_found(self):
+        assert not T08.validator({
+            "n_rows": 100,
+            "n_columns": 6,
+            "quality_issues_found": 0,
+        })
 
-    def test_missing_keys(self):
-        assert not T08.validator({"accuracy": 0.90})
+    def test_wrong_row_count(self):
+        assert not T08.validator({
+            "n_rows": 999,
+            "n_columns": 6,
+            "quality_issues_found": 25,
+        })
 
 
 class TestT09Validator:
@@ -188,17 +214,33 @@ class TestT09Validator:
 
 
 class TestT10Validator:
-    def test_valid_parse(self):
-        assert T10.validator({"row_count": 200, "timestamps_valid": True, "null_severity_count": 0})
+    def test_valid(self):
+        assert T10.validator({
+            "n_weeks": 52,
+            "trend_direction": "upward",
+            "has_seasonality": True,
+            "forecast": [1900.0, 1920.0, 1940.0, 1960.0],
+        })
 
-    def test_wrong_line_count(self):
-        assert not T10.validator({"row_count": 150, "timestamps_valid": True, "null_severity_count": 0})
+    def test_wrong_trend(self):
+        assert not T10.validator({
+            "n_weeks": 52,
+            "trend_direction": "downward",
+            "forecast": [1900.0, 1920.0, 1940.0, 1960.0],
+        })
 
-    def test_invalid_timestamps(self):
-        assert not T10.validator({"row_count": 200, "timestamps_valid": False, "null_severity_count": 0})
+    def test_no_forecast(self):
+        assert not T10.validator({
+            "n_weeks": 52,
+            "trend_direction": "upward",
+        })
 
-    def test_null_severities(self):
-        assert not T10.validator({"row_count": 200, "timestamps_valid": True, "null_severity_count": 3})
+    def test_wrong_weeks(self):
+        assert not T10.validator({
+            "n_weeks": 10,
+            "trend_direction": "upward",
+            "forecast": [100.0, 200.0, 300.0, 400.0],
+        })
 
 
 class TestT11Validator:

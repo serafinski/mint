@@ -1,0 +1,11 @@
+product_id,product_name,current_stock,daily_usage,unit_cost,warehouse
+1,Widget-A,45,7.4,95.61,WH-South
+2,Widget-B,133,11.7,53.23,WH-North
+3,Gadget-X,165,5.2,65.7,WH-North
+4,Gadget-Y,44,6.2,20.35,WH-North
+5,Sensor-1,158,5.5,6.85,WH-South
+6,Sensor-2,83,4.4,27.88,WH-North
+7,Module-P,26,11.2,82.52,WH-North
+8,Module-Q,37,10.2,94.95,WH-North
+9,Cable-S,72,8.4,62.63,WH-North
+10,Cable-T,143,11.6,70.54,WH-South

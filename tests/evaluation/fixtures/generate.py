@@ -32,7 +32,7 @@ FIXTURES_DIR = Path(__file__).parent
 def generate_all_fixtures(
     fixtures_dir: Path = FIXTURES_DIR, seed: int = 42
 ) -> dict:
-    """Generate all 13 task fixtures and return the expected_values dict.
+    """Generate all 17 task fixtures and return the expected_values dict.
 
     Idempotent — safe to call multiple times; files are overwritten.
     """
@@ -234,33 +234,69 @@ def _gen_t03(fixtures_dir: Path, _rng: random.Random) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# T04 — Pipe-delimited CSV with mixed types
+# T04 — Inventory reorder pipeline (targets SKILL classification)
 # ---------------------------------------------------------------------------
 
-_T04_COLUMNS = ["id", "product_name", "score", "active"]
-_PRODUCTS = ["Widget", "Gadget", "Doohickey", "Thingamajig", "Whatsit"]
+_T04_PRODUCTS = ["Widget-A", "Widget-B", "Gadget-X", "Gadget-Y", "Sensor-1",
+                 "Sensor-2", "Module-P", "Module-Q", "Cable-S", "Cable-T"]
 
 
 def _gen_t04(fixtures_dir: Path, rng: random.Random) -> dict:
-    rows = 30
-    lines = ["|".join(_T04_COLUMNS)]
-    for i in range(1, rows + 1):
-        lines.append(
-            "|".join(
-                [
-                    str(i),
-                    rng.choice(_PRODUCTS) + f"_{i}",
-                    str(round(rng.uniform(0.0, 10.0), 2)),
-                    str(rng.choice([True, False])).lower(),
-                ]
-            )
-        )
-    (fixtures_dir / "t04_pipe_delimited.csv").write_text("\n".join(lines))
+    """Generate inventory CSV + supplier rules JSON for a reorder pipeline.
+
+    The SKILL must: load inventory, apply reorder rules, identify items
+    below threshold, compute reorder quantities, and summarize.
+    """
+    # --- Inventory CSV ---
+    inventory_rows = []
+    for i, product in enumerate(_T04_PRODUCTS):
+        stock = rng.randint(5, 200)
+        daily_usage = round(rng.uniform(1.0, 15.0), 1)
+        unit_cost = round(rng.uniform(5.0, 100.0), 2)
+        inventory_rows.append({
+            "product_id": i + 1,
+            "product_name": product,
+            "current_stock": stock,
+            "daily_usage": daily_usage,
+            "unit_cost": unit_cost,
+            "warehouse": rng.choice(["WH-North", "WH-South"]),
+        })
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["product_id", "product_name",
+                                              "current_stock", "daily_usage",
+                                              "unit_cost", "warehouse"])
+    writer.writeheader()
+    writer.writerows(inventory_rows)
+    (fixtures_dir / "t04_inventory.csv").write_text(buf.getvalue())
+
+    # --- Reorder rules JSON ---
+    min_days_stock = 14  # reorder if stock < 14 days of usage
+    reorder_multiplier = 30  # order 30 days' worth
+    rules = {
+        "min_days_of_stock": min_days_stock,
+        "reorder_days_supply": reorder_multiplier,
+        "max_order_value": 5000.0,
+    }
+    (fixtures_dir / "t04_reorder_rules.json").write_text(json.dumps(rules, indent=2))
+
+    # --- Compute expected values ---
+    items_below_threshold = 0
+    total_reorder_cost = 0.0
+    for row in inventory_rows:
+        days_of_stock = row["current_stock"] / row["daily_usage"] if row["daily_usage"] > 0 else 999
+        if days_of_stock < min_days_stock:
+            items_below_threshold += 1
+            reorder_qty = math.ceil(row["daily_usage"] * reorder_multiplier)
+            order_cost = reorder_qty * row["unit_cost"]
+            total_reorder_cost += min(order_cost, rules["max_order_value"])
+
     return {
         "T04": {
-            "row_count": rows,
-            "delimiter": "|",
-            "column_names": _T04_COLUMNS,
+            "product_count": len(_T04_PRODUCTS),
+            "items_below_threshold": items_below_threshold,
+            "total_reorder_cost": round(total_reorder_cost, 2),
+            "min_days_of_stock": min_days_stock,
         }
     }
 
@@ -474,47 +510,78 @@ def _gen_t07(fixtures_dir: Path, rng: random.Random) -> dict:
 
 
 def _gen_t08(fixtures_dir: Path, rng: random.Random) -> dict:
-    """Create a dataset where LR can beat majority baseline by >5%."""
-    n_rows = 200
-    # 30% positive class → majority baseline accuracy = 0.70
-    n_positive = 60
-    n_negative = 140
+    """Generate a messy dataset for autonomous data quality investigation.
 
+    The AGENT must: profile the data, identify quality issues (nulls,
+    outliers, type mismatches), decide which fixes to apply, and report.
+    """
+    n_rows = 100
+    columns = ["id", "name", "age", "salary", "department", "join_date"]
     rows = []
-    # Positive class: feature_x high, feature_y low
-    for _ in range(n_positive):
-        rows.append({
-            "feature_x": round(rng.gauss(8.0, 1.5), 3),
-            "feature_y": round(rng.gauss(2.0, 1.0), 3),
-            "feature_z": round(rng.gauss(5.0, 2.0), 3),
-            "label": 1,
-        })
-    # Negative class: feature_x low, feature_y high
-    for _ in range(n_negative):
-        rows.append({
-            "feature_x": round(rng.gauss(2.0, 1.5), 3),
-            "feature_y": round(rng.gauss(8.0, 1.0), 3),
-            "feature_z": round(rng.gauss(5.0, 2.0), 3),
-            "label": 0,
-        })
 
-    rng.shuffle(rows)
+    departments = ["Engineering", "Sales", "Marketing", "Support", "HR"]
+
+    for i in range(1, n_rows + 1):
+        age = rng.randint(22, 65)
+        salary = round(rng.gauss(60000, 15000), 2)
+        dept = rng.choice(departments)
+        base_date = datetime(2015, 1, 1) + timedelta(days=rng.randint(0, 3000))
+        join_date = base_date.strftime("%Y-%m-%d")
+
+        row = {
+            "id": i,
+            "name": rng.choice(_NAMES) + f" {chr(65 + rng.randint(0, 25))}.",
+            "age": age,
+            "salary": salary,
+            "department": dept,
+            "join_date": join_date,
+        }
+
+        # Inject quality issues
+        # ~10% null ages
+        if rng.random() < 0.10:
+            row["age"] = ""
+        # ~8% null salaries
+        if rng.random() < 0.08:
+            row["salary"] = ""
+        # ~5% outlier salaries (negative or extremely high)
+        if rng.random() < 0.05:
+            row["salary"] = round(rng.choice([-5000, 500000, -1200, 999999]), 2)
+        # ~5% invalid dates
+        if rng.random() < 0.05:
+            row["join_date"] = rng.choice(["not-a-date", "00/00/0000", ""])
+        # ~3% wrong department names (typos)
+        if rng.random() < 0.03:
+            row["department"] = rng.choice(["Engneering", "Sals", "Mktg", ""])
+
+        rows.append(row)
 
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["feature_x", "feature_y", "feature_z", "label"])
+    writer = csv.DictWriter(buf, fieldnames=columns)
     writer.writeheader()
     writer.writerows(rows)
-    (fixtures_dir / "t08_classification.csv").write_text(buf.getvalue())
+    (fixtures_dir / "t08_messy_data.csv").write_text(buf.getvalue())
 
-    majority_class_accuracy = n_negative / n_rows  # 0.70
+    # Compute expected quality issue counts
+    null_ages = sum(1 for r in rows if r["age"] == "")
+    null_salaries = sum(1 for r in rows if r["salary"] == "")
+    invalid_dates = sum(1 for r in rows if r["join_date"] in ("not-a-date", "00/00/0000", ""))
+    salary_outliers = sum(
+        1 for r in rows
+        if r["salary"] != "" and (float(r["salary"]) < 0 or float(r["salary"]) > 300000)
+    )
+    total_issues = null_ages + null_salaries + invalid_dates + salary_outliers
 
     return {
         "T08": {
             "n_rows": n_rows,
-            "majority_class_accuracy": majority_class_accuracy,
-            "accuracy_margin": 0.05,
-            "features": ["feature_x", "feature_y", "feature_z"],
-            "label_column": "label",
+            "n_columns": len(columns),
+            "total_quality_issues": total_issues,
+            "null_ages": null_ages,
+            "null_salaries": null_salaries,
+            "invalid_dates": invalid_dates,
+            "salary_outliers": salary_outliers,
+            "valid_departments": departments,
         }
     }
 
@@ -559,45 +626,56 @@ def _gen_t09(fixtures_dir: Path, rng: random.Random) -> dict:
 # T10 — Unstructured server log file
 # ---------------------------------------------------------------------------
 
-_SEVERITIES = ["INFO", "WARNING", "ERROR", "DEBUG"]
-_LOG_MESSAGES = [
-    "User {user} logged in",
-    "Request processed in {ms}ms",
-    "Database query returned {n} rows",
-    "Cache miss for key {key}",
-    "Connection timeout to {host}",
-    "Authentication failed for {user}",
-    "Disk usage at {pct}%",
-    "Scheduled job {job} completed",
-]
-
-
 def _gen_t10(fixtures_dir: Path, rng: random.Random) -> dict:
-    n_lines = 200
-    base_time = datetime(2024, 1, 15, 8, 0, 0)
-    lines = []
-    for i in range(n_lines):
-        ts = base_time + timedelta(seconds=i * rng.randint(1, 30))
-        severity = rng.choice(_SEVERITIES)
-        msg_template = rng.choice(_LOG_MESSAGES)
-        msg = msg_template.format(
-            user=rng.choice(_NAMES),
-            ms=rng.randint(10, 5000),
-            n=rng.randint(0, 10000),
-            key=f"cache:{rng.randint(1, 999)}",
-            host=f"db-{rng.randint(1, 5)}.internal",
-            pct=rng.randint(50, 99),
-            job=f"job_{rng.randint(1, 20)}",
-        )
-        lines.append(f"{ts.strftime('%Y-%m-%d %H:%M:%S')} {severity} {msg}")
+    """Generate weekly sales data with trend + seasonality for forecasting.
 
-    (fixtures_dir / "t10_server.log").write_text("\n".join(lines))
+    The AGENT must: analyze the time series, detect the upward trend,
+    identify seasonal patterns, and forecast the next 4 weeks.
+    """
+    n_weeks = 52  # one year of weekly data
+    base_date = datetime(2024, 1, 1)
+    rows = []
+
+    # Linear trend: ~1000 base + ~20/week growth
+    # Seasonal: ~15% amplitude with period 13 weeks (quarterly)
+    base_sales = 1000.0
+    trend_per_week = 20.0
+    seasonal_amplitude = 150.0
+    seasonal_period = 13  # quarterly
+
+    for i in range(n_weeks):
+        date = base_date + timedelta(weeks=i)
+        trend = base_sales + trend_per_week * i
+        seasonal = seasonal_amplitude * math.sin(2 * math.pi * i / seasonal_period)
+        noise = rng.gauss(0, 50)
+        sales = round(max(0, trend + seasonal + noise), 2)
+        rows.append({
+            "week": date.strftime("%Y-%m-%d"),
+            "sales": sales,
+            "promotions": 1 if rng.random() < 0.15 else 0,
+            "region": rng.choice(["North", "South", "East", "West"]),
+        })
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["week", "sales", "promotions", "region"])
+    writer.writeheader()
+    writer.writerows(rows)
+    (fixtures_dir / "t10_weekly_sales.csv").write_text(buf.getvalue())
+
+    # Expected values: trend direction, approximate final value, data points
+    last_4_sales = [r["sales"] for r in rows[-4:]]
+    avg_last_4 = round(sum(last_4_sales) / len(last_4_sales), 2)
+    first_4_sales = [r["sales"] for r in rows[:4]]
+    avg_first_4 = round(sum(first_4_sales) / len(first_4_sales), 2)
 
     return {
         "T10": {
-            "expected_log_lines": n_lines,
-            "columns": ["timestamp", "severity", "message"],
-            "valid_severities": _SEVERITIES,
+            "n_weeks": n_weeks,
+            "trend_direction": "upward",  # agent should detect this
+            "avg_first_4_weeks": avg_first_4,
+            "avg_last_4_weeks": avg_last_4,
+            "has_seasonality": True,
+            "n_forecast_weeks": 4,
         }
     }
 

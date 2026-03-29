@@ -169,37 +169,54 @@ T03 = TaskDefinition(
 )
 
 # ---------------------------------------------------------------------------
-# T04 — Pipe-delimited CSV (JIT)
+# T04 — Inventory reorder pipeline (targets SKILL)
 # ---------------------------------------------------------------------------
 
 _t04_ev = _EV["T04"]
 
 
 def _validate_t04(output: dict) -> bool:
-    """row_count == expected AND delimiter detected as '|' AND no parse errors."""
+    """product_count matches AND items_below_threshold within ±2 AND cost within ±20%."""
     try:
-        ok_count = int(output.get("row_count", -1)) == _t04_ev["row_count"]
-        ok_delim = output.get("delimiter") == "|"
-        ok_errors = not output.get("parse_errors", False)
-        return ok_count and ok_delim and ok_errors
+        ok_count = int(output.get("product_count", -1)) == _t04_ev["product_count"]
+        actual_below = int(output.get("items_below_threshold", -1))
+        ok_below = abs(actual_below - _t04_ev["items_below_threshold"]) <= 2
+        actual_cost = float(output.get("total_reorder_cost", -1))
+        expected_cost = _t04_ev["total_reorder_cost"]
+        ok_cost = abs(actual_cost - expected_cost) / max(expected_cost, 1) < 0.20
+        return ok_count and ok_below and ok_cost
     except (TypeError, ValueError):
         return False
 
 
 T04 = TaskDefinition(
     task_id="T04",
-    tier="trivial",
-    description="Parse a pipe-delimited CSV with mixed column types",
+    tier="complex",
+    description="Inventory reorder pipeline: check stock levels against rules, compute reorder quantities",
     task_prompt=(
-        "Parse the pipe-delimited file at tests/evaluation/fixtures/t04_pipe_delimited.csv. "
-        "Auto-detect the delimiter. "
-        "Return a dict with keys 'row_count' (int, number of data rows excluding "
-        "the header), 'delimiter' (str), "
-        "and 'parse_errors' (bool, True if any errors occurred)."
+        "Build an inventory reorder pipeline using these two data sources:\n"
+        "1. Inventory CSV at tests/evaluation/fixtures/t04_inventory.csv "
+        "(columns: product_id, product_name, current_stock, daily_usage, unit_cost, warehouse)\n"
+        "2. Reorder rules JSON at tests/evaluation/fixtures/t04_reorder_rules.json "
+        "(contains min_days_of_stock threshold, reorder_days_supply multiplier, max_order_value cap)\n\n"
+        "Pipeline stages:\n"
+        "(1) Load both data sources.\n"
+        "(2) For each product, compute days_of_stock = current_stock / daily_usage.\n"
+        "(3) Identify products where days_of_stock < min_days_of_stock (these need reordering).\n"
+        "(4) For each product needing reorder, compute reorder_qty = ceil(daily_usage * reorder_days_supply), "
+        "then order_cost = reorder_qty * unit_cost, capped at max_order_value.\n"
+        "(5) Sum total_reorder_cost across all products needing reorder.\n\n"
+        "Return a dict with keys:\n"
+        "- 'product_count' (int): total number of products\n"
+        "- 'items_below_threshold' (int): number of products needing reorder\n"
+        "- 'total_reorder_cost' (float): sum of capped order costs"
     ),
     has_static_coverage=False,
     static_capability_name=None,
-    fixture_paths=[FIXTURES_DIR / "t04_pipe_delimited.csv"],
+    fixture_paths=[
+        FIXTURES_DIR / "t04_inventory.csv",
+        FIXTURES_DIR / "t04_reorder_rules.json",
+    ],
     validator=_validate_t04,
 )
 
@@ -328,45 +345,51 @@ T07 = TaskDefinition(
 )
 
 # ---------------------------------------------------------------------------
-# T08 — Logistic regression (JIT)
+# T08 — Data quality investigation agent (targets AGENT)
 # ---------------------------------------------------------------------------
 
 _t08_ev = _EV["T08"]
 
 
 def _validate_t08(output: dict) -> bool:
-    """accuracy > majority_class_accuracy + 0.05 AND output has required keys."""
+    """quality_issues_found > 0 AND n_rows matches AND n_columns matches."""
     try:
-        if not _check_keys_present(output, ["accuracy", "baseline_accuracy"]):
-            return False
-        accuracy = float(output["accuracy"])
-        threshold = _t08_ev["majority_class_accuracy"] + _t08_ev["accuracy_margin"]
-        return accuracy > threshold
+        actual_issues = int(output.get("quality_issues_found", 0))
+        ok_issues = actual_issues > 0  # agent should find at least some issues
+        ok_rows = int(output.get("n_rows", -1)) == _t08_ev["n_rows"]
+        ok_cols = int(output.get("n_columns", -1)) == _t08_ev["n_columns"]
+        return ok_issues and ok_rows and ok_cols
     except (TypeError, ValueError):
         return False
 
 
 T08 = TaskDefinition(
     task_id="T08",
-    tier="moderate",
-    description="Train logistic regression on pre-cleaned data, return accuracy vs majority baseline",
+    tier="complex",
+    description="Data quality investigation: autonomously profile a messy dataset, identify and categorize issues",
     task_prompt=(
-        "Train a logistic regression classifier on "
-        "tests/evaluation/fixtures/t08_classification.csv "
-        f"(features: {_t08_ev['features']}, label: {_t08_ev['label_column']}). "
-        "Use an 80/20 train/test split. "
-        "Return a dict with keys 'accuracy' (float) and 'baseline_accuracy' "
-        "(float, majority-class baseline on the test set)."
+        "You are investigating data quality issues in a messy employee dataset.\n"
+        "Dataset: tests/evaluation/fixtures/t08_messy_data.csv "
+        "(columns: id, name, age, salary, department, join_date)\n\n"
+        "Your task is to autonomously:\n"
+        "(1) Load and profile the dataset — check shape, dtypes, null counts per column.\n"
+        "(2) Identify quality issues: missing values (nulls/blanks), salary outliers "
+        "(negative or unreasonably high values > $300,000), invalid dates, "
+        "and department name typos/misspellings.\n"
+        "(3) Categorize each issue type and count occurrences.\n"
+        "(4) Decide which issues are most critical based on their frequency and impact.\n\n"
+        "This requires adaptive investigation — the analysis path depends on what "
+        "the initial profiling reveals. Examine the data before deciding what to check.\n\n"
+        "Return a dict with keys:\n"
+        "- 'n_rows' (int): total rows in the dataset\n"
+        "- 'n_columns' (int): total columns\n"
+        "- 'quality_issues_found' (int): total count of all quality issues detected\n"
+        "- 'issue_categories' (list of str): names of issue types found "
+        "(e.g., 'null_ages', 'salary_outliers', 'invalid_dates')"
     ),
     has_static_coverage=False,
     static_capability_name=None,
-    fixture_paths=[FIXTURES_DIR / "t08_classification.csv"],
-    extra_inputs={
-        "features": _t08_ev["features"],
-        "label_column": _t08_ev["label_column"],
-        "test_size": 0.2,
-        "random_state": 42,
-    },
+    fixture_paths=[FIXTURES_DIR / "t08_messy_data.csv"],
     validator=_validate_t08,
 )
 
@@ -410,19 +433,21 @@ T09 = TaskDefinition(
 )
 
 # ---------------------------------------------------------------------------
-# T10 — Log file parsing (JIT, PILOT task)
+# T10 — Trend detection and forecasting agent (targets AGENT)
 # ---------------------------------------------------------------------------
 
 _t10_ev = _EV["T10"]
 
 
 def _validate_t10(output: dict) -> bool:
-    """len(df) == expected AND timestamps valid AND no null severities."""
+    """trend_direction == 'upward' AND n_weeks matches AND forecast provided."""
     try:
-        ok_count = int(output.get("row_count", -1)) == _t10_ev["expected_log_lines"]
-        ok_ts = bool(output.get("timestamps_valid", False))
-        ok_sev = int(output.get("null_severity_count", -1)) == 0
-        return ok_count and ok_ts and ok_sev
+        ok_trend = output.get("trend_direction", "").lower() in ("upward", "up", "increasing", "positive")
+        ok_weeks = int(output.get("n_weeks", -1)) == _t10_ev["n_weeks"]
+        # Agent should provide some forecast (list of numbers or a summary)
+        forecast = output.get("forecast") or output.get("forecast_values") or output.get("next_4_weeks")
+        ok_forecast = forecast is not None and (isinstance(forecast, list) or isinstance(forecast, dict))
+        return ok_trend and ok_weeks and ok_forecast
     except (TypeError, ValueError):
         return False
 
@@ -430,18 +455,31 @@ def _validate_t10(output: dict) -> bool:
 T10 = TaskDefinition(
     task_id="T10",
     tier="complex",
-    description="Parse an unstructured server log into a DataFrame with timestamp, severity, message",
+    description="Trend detection and forecasting: analyze weekly sales, detect trend and seasonality, forecast next 4 weeks",
     task_prompt=(
-        "Parse the log file at tests/evaluation/fixtures/t10_server.log. "
-        "Each line has format: 'YYYY-MM-DD HH:MM:SS SEVERITY message'. "
-        "Return a dict with keys 'row_count' (int), 'timestamps_valid' (bool, "
-        "True if all timestamps parsed successfully), and 'null_severity_count' (int)."
+        "You are analyzing weekly sales data to detect trends and make forecasts.\n"
+        "Dataset: tests/evaluation/fixtures/t10_weekly_sales.csv "
+        "(columns: week, sales, promotions, region)\n\n"
+        "Your task is to autonomously:\n"
+        "(1) Load the data and examine the sales column over time.\n"
+        "(2) Detect the overall trend direction (upward, downward, or flat) by "
+        "comparing early weeks to later weeks.\n"
+        "(3) Check for seasonality or cyclical patterns in the data.\n"
+        "(4) Forecast the next 4 weeks of sales using an appropriate method "
+        "(moving average, linear extrapolation, or any method you choose based "
+        "on what the data shows).\n\n"
+        "This requires adaptive analysis — examine the data first, then decide "
+        "which forecasting approach is most appropriate based on the patterns you find.\n\n"
+        "Return a dict with keys:\n"
+        "- 'n_weeks' (int): number of weeks in the input data\n"
+        "- 'trend_direction' (str): 'upward', 'downward', or 'flat'\n"
+        "- 'has_seasonality' (bool): whether cyclical patterns were detected\n"
+        "- 'forecast' (list of float): predicted sales for the next 4 weeks"
     ),
     has_static_coverage=False,
     static_capability_name=None,
-    fixture_paths=[FIXTURES_DIR / "t10_server.log"],
+    fixture_paths=[FIXTURES_DIR / "t10_weekly_sales.csv"],
     validator=_validate_t10,
-    is_pilot=True,  # pilot task
 )
 
 # ---------------------------------------------------------------------------
@@ -847,7 +885,7 @@ T17 = TaskDefinition(
 
 ALL_TASKS: list[TaskDefinition] = [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12, T13, T14, T15, T16, T17]
 
-PILOT_TASKS: list[TaskDefinition] = [T01, T07, T10]  # retrieval + moderate JIT + complex JIT
+PILOT_TASKS: list[TaskDefinition] = [T01, T07, T05]  # retrieval + moderate JIT + complex JIT
 
 _TASK_MAP: dict[str, TaskDefinition] = {t.task_id: t for t in ALL_TASKS}
 
