@@ -90,7 +90,7 @@ parser.add_argument("--enable-optimizer", action="store_true")
 parser.add_argument("--output-format", choices=["json", "human"], default="human")
 parser.add_argument("--dry-run", action="store_true", help="Decompose only, don't generate")
 parser.add_argument("--list", action="store_true", help="List registry capabilities")
-parser.add_argument("--timeout", type=int, default=None, help="SKILL/AGENT execution timeout (default: 120s/180s)")
+parser.add_argument("--timeout", type=int, default=None, help="SKILL/AGENT execution timeout (default: 240s/300s)")
 parser.add_argument("--verbose", action="store_true")
 ```
 
@@ -225,13 +225,13 @@ def execute_skill(artifact, file_paths):
     return execute_skill_artifact(artifact, task_context, fixture_contents)
 ```
 
-**Key detail:** `execute_skill_artifact` creates a fresh DeepAgent per invocation, passes the skill content as the system prompt, and gives the agent access to `sandbox_execute` as a tool. The agent reads the fixture contents from the user message, plans its work via `write_todos`, and returns structured output. Timeout: 120s.
+**Key detail:** `execute_skill_artifact` creates a fresh DeepAgent per invocation, passes the skill content as the system prompt, and gives the agent access to `sandbox_execute` as a tool. The agent reads the fixture contents from the user message, plans its work via `write_todos`, and returns structured output. Timeout: 240s.
 
 **Key detail:** The current `execute_skill_artifact` expects a task-specific Pydantic response model (e.g., `T11Result`, `T12Result`). For the CLI, we need a generic response model since we don't know what the skill will return. Use a flexible model like `class GenericResult(BaseModel): result: dict`.
 
 #### AGENT Execution
 
-Same as SKILL but with `execute_agent_artifact` and 180s timeout:
+Same as SKILL but with `execute_agent_artifact` and 300s timeout:
 
 ```python
 def execute_agent(artifact, file_paths):

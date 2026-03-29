@@ -499,7 +499,7 @@ def main() -> int:
         type=int,
         default=None,
         metavar="SECONDS",
-        help="Execution timeout for SKILL/AGENT tasks (default: 120s SKILL, 180s AGENT)",
+        help="Execution timeout for SKILL/AGENT tasks (default: 240s SKILL, 300s AGENT)",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()

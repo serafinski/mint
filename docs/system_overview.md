@@ -70,8 +70,20 @@ Over time, a capability registry accumulates entries that may be too specific (r
 
 **Operations:**
 - **Prune**: Deactivate capabilities with zero invocations in the last 30 days (all types). Seeded capabilities are protected with `metadata={"pinned": "true"}`.
-- **Split**: Break a high-reuse but low-success capability into specialized variants (Skills and Agents only -- MCP tool code refactoring is deferred to future work).
+- **Split**: Break a high-reuse but low-success capability into specialized variants (Skills and Agents only).
 - **Merge**: Combine low-reuse, semantically similar capabilities into a single broader one (Skills only).
+
+**Why operations are type-scoped:** Split and merge operate on **metadata** (names and descriptions), not on generated code. When the optimizer splits "data-file-processor" into "csv-cleaner" and "json-validator", it asks the LLM to produce two new `CapabilityDescriptor` entries with narrower descriptions. The original is deactivated. The next time a CSV task arrives, the pipeline finds "csv-cleaner" via registry search and generates fresh code for it.
+
+This is why MCP_TOOL split/merge is deferred to future work: splitting a Python function into two working functions requires **code refactoring** (understanding the implementation, separating concerns, producing two compilable outputs). That's a harder LLM task than splitting a description into two narrower descriptions. For Skills, the SKILL.md is an instruction document -- the LLM can narrow or broaden instructions reliably. For Agents, the system prompt serves the same role.
+
+Merge is restricted to Skills (not Agents) because merging two autonomous agents into one with a broader mandate risks creating an unfocused agent that does neither task well. Skills are instruction sets that can be combined without this risk.
+
+| Operation | MCP_TOOL | SKILL | AGENT | Operates on |
+|---|---|---|---|---|
+| Prune | Yes | Yes | Yes | Registry entry (type-agnostic) |
+| Split | No | Yes | Yes | Description → 2+ narrower descriptions |
+| Merge | No | Yes | No | 2 descriptions → 1 broader description |
 
 **Convergence:** The optimizer tracks KL divergence between successive utility score distributions. When the distribution stabilizes (divergence < threshold), it stops iterating.
 
@@ -404,7 +416,7 @@ uv run scripts/run_task.py --list
 uv run scripts/run_task.py "Count words in this document" \
   --file report.txt --output-format json --skip-verification --verbose
 
-# Override SKILL/AGENT execution timeout (default: 120s SKILL, 180s AGENT)
+# Override SKILL/AGENT execution timeout (default: 240s SKILL, 300s AGENT)
 uv run scripts/run_task.py "Investigate anomalies in this data" \
   --file metrics.csv --timeout 300
 
@@ -440,3 +452,36 @@ The optimizer's cold-start problem in standard evaluation and its resolution in 
 The expanded 17-task evaluation (adding T14-T17) strengthened the evidence for capability type diversity. T17 (adaptive ETL orchestration) demonstrates that type selection is not merely cosmetic: AGENT classification yields 100% success while SKILL classification yields 9%. This validates the three-type taxonomy as more than a theoretical distinction -- the execution model (function call vs. instruction following vs. autonomous planning) has measurable impact on task success for complex, adaptive tasks.
 
 Together, these findings provide empirical grounding for the three tensions in the research question: autonomy vs. correctness (the verification tradeoff), specificity vs. generality (the optimizer's split/merge operations), and context economy (token costs per capability type).
+
+---
+
+## 10. Future Work and Demo Notes
+
+### MCP Server Deployment (Chapter 7)
+
+The current prototype uses `importlib` dynamic import for tool execution — no running servers. However, every generated MCP tool is **server-ready by construction**. The generated code already contains the full FastMCP structure:
+
+```python
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("csv-parser")
+
+@mcp.tool()
+async def csv_parser(file_path: str) -> dict:
+    ...
+
+if __name__ == "__main__":
+    mcp.run()  # starts a stdio MCP server
+```
+
+The sandbox uses `__name__ = "not_main"` to prevent `mcp.run()` from starting. Remove that one line and the generated tool becomes a live MCP server that any MCP client (Claude Desktop, IDE extensions, other agents) can connect to.
+
+**For thesis defense demo:** Save `artifact.source_code` to a file, run it with `uv run python generated_tool.py`, and connect from Claude Desktop. Takes ~20 lines of glue code, no architectural changes.
+
+**For production (future work):** Needs process lifecycle management (start/stop, port allocation, health checks, zombie process cleanup), multi-tool server consolidation (bundle related tools into one server), and persistent deployment (Docker/K8s). Documented as Chapter 7 future work.
+
+### Other Future Work
+
+- **Per-task token attribution** — implemented in harness (LangFuse trace tagging), pending re-run for data collection
+- **Semantic correctness testing** — the gate catches structural defects but not business logic errors; LLM-as-judge or property-based testing could close this gap
+- **Classifier tuning for AGENT tasks** — T16/T17 frequently misclassified as SKILL; prompt engineering or fine-tuning could improve routing
+- **Larger testbed for organic split/merge** — current 17 tasks don't produce overlapping capabilities; 50+ diverse tasks would test evolutionary operations in practice

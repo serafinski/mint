@@ -194,11 +194,11 @@ Every DeepAgent invocation (`create_deep_agent()`) must respect these constraint
 
 | Constraint | Value | Notes |
 |---|---|---|
-| `recursion_limit` (decomposition) | 50 | ~25 logical steps; 35 hit limit in practice under slow DeepSeek |
-| `recursion_limit` (adversarial probing) | 50 | Needs more exploration room; 35 hit limit in practice |
+| `recursion_limit` (decomposition) | 50 | ~25 logical steps; typical usage is 2-3 steps |
+| `recursion_limit` (adversarial probing) | 50 | Typical usage is 3-5 steps; timeout (300s) is the binding constraint, not step count |
 | `recursion_limit` (failure analysis) | 25 | Focused investigation |
 | Node-level timeout (decomposition) | 120s | Prevents pipeline hang |
-| Node-level timeout (adversarial) | 180s | Allows sandbox execution |
+| Node-level timeout (adversarial) | 300s | Allows sandbox execution |
 | Initialization | Fresh every invocation | No state carried between calls |
 | Output contract | `response_format=PydanticModel` | Structured output, not free-text |
 | Fallback on timeout/max_steps | Return partial results with error flag | Pipeline continues degraded |
