@@ -238,12 +238,16 @@ def compute_run_costs(
             by_model[model]["cost"] += g["calculated_total_cost"]
             by_model[model]["count"] += 1
 
-        n_jit_tasks = rw["n_distinct_tasks"] - len(
-            RETRIEVAL_TASKS & set()  # We don't know which tasks, estimate
-        )
-        # Rough: subtract 3 for T01-T03 if this is a full-13-task run
-        if rw["n_distinct_tasks"] >= 13:
-            n_jit_tasks = 10
+        # For longitudinal runs, all tasks use the pipeline (including T01-T03)
+        if rw["condition"] == "longitudinal":
+            n_jit_tasks = rw["n_distinct_tasks"]
+        else:
+            n_jit_tasks = rw["n_distinct_tasks"] - len(
+                RETRIEVAL_TASKS & set()  # We don't know which tasks, estimate
+            )
+            # Rough: subtract 3 for T01-T03 if this is a full-task run
+            if rw["n_distinct_tasks"] >= 13:
+                n_jit_tasks = rw["n_distinct_tasks"] - 3
 
         summaries[rid] = {
             "condition": rw["condition"],
@@ -271,8 +275,12 @@ def compute_backfill_values(
 
     Strategy:
     - static records: 0 tokens
-    - T01-T03 (registry match): 0 tokens (no generation/verification)
-    - JIT tasks: run_total_tokens / n_jit_tasks (equal distribution within run)
+    - longitudinal records: run_total_tokens / n_tasks (all tasks use the
+      pipeline, including T01-T03 which call the decomposition DeepAgent)
+    - Evaluation JIT records for T01-T03 (registry match): 0 tokens (negligible
+      cost compared to generation/verification — attributing to JIT tasks only
+      gives a more meaningful per-task estimate)
+    - Other JIT tasks: run_total_tokens / n_jit_tasks (equal distribution)
     """
     updates: list[tuple[str, int]] = []
 
@@ -281,11 +289,22 @@ def compute_backfill_values(
             updates.append((rec["id"], 0))
             continue
 
+        summary = run_summaries.get(rec["run_id"])
+
+        # Longitudinal: every task runs the full pipeline, distribute evenly
+        if rec["condition"] == "longitudinal":
+            if summary and summary["n_tasks"] > 0:
+                per_task = summary["total_tokens"] // summary["n_tasks"]
+                updates.append((rec["id"], per_task))
+            else:
+                updates.append((rec["id"], 0))
+            continue
+
+        # Evaluation: retrieval tasks get 0 (negligible decomposition cost)
         if rec["task_id"] in RETRIEVAL_TASKS:
             updates.append((rec["id"], 0))
             continue
 
-        summary = run_summaries.get(rec["run_id"])
         if summary and summary["n_jit_tasks"] > 0:
             per_task = summary["total_tokens"] // summary["n_jit_tasks"]
             updates.append((rec["id"], per_task))
