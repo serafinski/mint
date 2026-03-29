@@ -411,6 +411,139 @@ def print_per_run_detail(run_summaries: dict[str, dict]) -> None:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
+def fetch_traces_by_session(
+    base_url: str, auth: httpx.Auth, session_id: str
+) -> list[dict]:
+    """Fetch all traces for a given session_id (= run_id) via REST API."""
+    traces = []
+    page = 1
+    with httpx.Client(base_url=base_url, auth=auth, timeout=30.0) as client:
+        while True:
+            resp = client.get(
+                "/api/public/traces",
+                params={"sessionId": session_id, "limit": 100, "page": page},
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            if not data:
+                break
+
+            for t in data:
+                tags = t.get("tags") or []
+                metadata = t.get("metadata") or {}
+                total_cost = t.get("totalCost", 0) or 0
+                traces.append({
+                    "id": t["id"],
+                    "name": t.get("name", ""),
+                    "tags": tags,
+                    "metadata": metadata,
+                    "total_cost": total_cost,
+                    "task_id": metadata.get("task_id"),
+                    "condition": metadata.get("condition"),
+                })
+
+            if len(data) < 100:
+                break
+            page += 1
+            if page > 200:
+                break
+    return traces
+
+
+def fetch_observations_for_trace(
+    base_url: str, auth: httpx.Auth, trace_id: str
+) -> int:
+    """Fetch total tokens for all observations in a trace."""
+    total_tokens = 0
+    page = 1
+    with httpx.Client(base_url=base_url, auth=auth, timeout=30.0) as client:
+        while True:
+            resp = client.get(
+                "/api/public/observations",
+                params={"traceId": trace_id, "type": "GENERATION", "limit": 100, "page": page},
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            if not data:
+                break
+
+            for obs in data:
+                usage = obs.get("usage") or {}
+                total_tokens += usage.get("total", 0) or 0
+
+            if len(data) < 100:
+                break
+            page += 1
+    return total_tokens
+
+
+def compute_per_task_costs(
+    base_url: str,
+    auth: httpx.Auth,
+    records: list[dict],
+    run_windows: list[dict],
+) -> list[tuple[str, int]] | None:
+    """Try per-task attribution via tagged LangFuse traces.
+
+    Returns (record_id, token_cost) pairs if tagged traces are found,
+    or None if no tagged data exists (fall back to run-level averaging).
+    """
+    # Group records by run_id
+    runs_by_id = {rw["run_id"]: rw for rw in run_windows}
+
+    # Try the first non-static run to see if it has tagged traces
+    test_run = None
+    for rw in run_windows:
+        if rw["condition"] != "static":
+            test_run = rw
+            break
+    if test_run is None:
+        return None
+
+    test_traces = fetch_traces_by_session(base_url, auth, test_run["run_id"])
+    has_tags = any(t.get("task_id") for t in test_traces)
+    if not has_tags:
+        return None  # No tagged data — fall back to run-level mode
+
+    print("  Per-task trace tags detected — using per-task attribution mode.")
+
+    # Build a mapping: (run_id, task_id) → total_tokens
+    run_task_tokens: dict[tuple[str, str], int] = {}
+
+    # Get unique non-static run_ids from records
+    run_ids = {r["run_id"] for r in records if r["condition"] != "static"}
+    for i, rid in enumerate(sorted(run_ids)):
+        if (i + 1) % 5 == 0 or i == len(run_ids) - 1:
+            print(f"    Fetching traces for run {i + 1}/{len(run_ids)}...", flush=True)
+
+        traces = fetch_traces_by_session(base_url, auth, rid)
+        # Group traces by task_id, sum tokens via observations
+        task_traces: dict[str, list[dict]] = defaultdict(list)
+        for t in traces:
+            tid = t.get("task_id")
+            if tid:
+                task_traces[tid].append(t)
+
+        for task_id, t_list in task_traces.items():
+            total = 0
+            for t in t_list:
+                total += fetch_observations_for_trace(base_url, auth, t["id"])
+            run_task_tokens[(rid, task_id)] = total
+
+    # Build updates
+    updates: list[tuple[str, int]] = []
+    for rec in records:
+        if rec["condition"] == "static":
+            updates.append((rec["id"], 0))
+            continue
+
+        key = (rec["run_id"], rec["task_id"])
+        tokens = run_task_tokens.get(key, 0)
+        updates.append((rec["id"], tokens))
+
+    return updates
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backfill token costs from LangFuse")
     parser.add_argument("--db", default=DB_PATH)
@@ -468,9 +601,17 @@ def main() -> None:
     print_summary(run_summaries)
     print_per_run_detail(run_summaries)
 
-    # Compute backfill values
+    # Compute backfill values — try per-task attribution first, then run-level
     records = get_per_record_info(conn)
-    updates = compute_backfill_values(records, run_summaries)
+
+    print("\nChecking for per-task trace tags...")
+    per_task_updates = compute_per_task_costs(base_url, auth, records, run_windows)
+    if per_task_updates is not None:
+        updates = per_task_updates
+        print("  Using per-task attribution (traces tagged with task_id).")
+    else:
+        updates = compute_backfill_values(records, run_summaries)
+        print("  No per-task tags found — using run-level averaging (legacy mode).")
 
     non_zero = sum(1 for _, v in updates if v > 0)
     print(f"\n  Backfill: {non_zero}/{len(updates)} records would get non-zero token costs")

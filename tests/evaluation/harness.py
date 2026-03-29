@@ -265,7 +265,9 @@ class EvaluationHarness:
         if condition == "static":
             result = self._run_static(task, registry)
         else:
-            result = self._run_jit(task, condition, registry, loader, metrics_store)
+            result = self._run_jit(
+                task, condition, registry, loader, metrics_store, run_id=run_id,
+            )
 
         elapsed_ms = int((time.monotonic() - t_start) * 1000)
 
@@ -340,6 +342,8 @@ class EvaluationHarness:
         registry: SkillRegistry,
         loader: ToolLoader,
         metrics_store: Any,
+        *,
+        run_id: str = "",
     ) -> dict:
         """JIT conditions: invoke the pipeline, then validate output."""
         from src.orchestrator.pipeline import create_pipeline
@@ -355,9 +359,20 @@ class EvaluationHarness:
             verification_enabled=verification_enabled,
         ).compile()
 
+        # Per-task LangFuse tracing: pass task_id and condition via config
+        # metadata so each pipeline invocation gets its own tagged trace.
+        # LangFuse's LangChain integration reads langfuse_* keys from
+        # config["metadata"] to set session_id, tags, etc. on the trace.
         invoke_config: dict = {}
         if self._config.langfuse_handler is not None:
             invoke_config["callbacks"] = [self._config.langfuse_handler]
+            invoke_config["metadata"] = {
+                "langfuse_session_id": run_id,
+                "langfuse_tags": [condition, task.task_id],
+                "task_id": task.task_id,
+                "condition": condition,
+                "run_id": run_id,
+            }
 
         initial_state = TaskState(task_description=task.task_prompt)
         try:
