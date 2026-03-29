@@ -370,7 +370,7 @@ No separate test file needed for the thesis. Verify manually with:
 uv run scripts/run_task.py "Parse this CSV" --file tests/evaluation/fixtures/t01_standard.csv
 
 # Test 2: JIT generation (no existing capability)
-uv run scripts/run_task.py "Parse this pipe-delimited file" --file tests/evaluation/fixtures/t04_pipe_delimited.csv
+uv run scripts/run_task.py "Clean this CSV and remove duplicates" --file tests/evaluation/fixtures/t05_dirty.csv
 
 # Test 3: SKILL task
 uv run scripts/run_task.py \

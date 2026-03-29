@@ -286,7 +286,7 @@ All core infrastructure is built and tested. Key architectural decisions locked 
 - **`src/schemas/evaluation.py`** — `EvaluationRecord` Pydantic model (18 fields). Separate from `InvocationRecord`. `success` property = `gate_passed AND output_in_range`. 21 unit tests.
 - **`src/registry/evaluation_store.py`** — Separate DuckDB `EvaluationStore`. `evaluation_runs` table. Methods: `record_run()`, `get_runs()`, `compute_success_rate()`, `compute_gate_pass_rate()`, `run_count()`, `failure_breakdown()`. 17 unit tests.
 - **`tests/evaluation/fixtures/`** — 10 fixture files generated programmatically (seed=42) + `expected_values.json` with pre-computed validator values. `generate.py` regenerates deterministically.
-- **`tests/evaluation/tasks.py`** — `TaskDefinition` frozen dataclass. T01–T17 with validators reading `expected_values.json` at import time. Static coverage: T01 (csv-parser), T02 (json-validator), T03 (text-statistics), T05 (data-cleaning-workflow), T09 (report-generation). `ALL_TASKS`, `PILOT_TASKS=[T01,T07,T10]`, `get_task()`. 34 unit tests.
+- **`tests/evaluation/tasks.py`** — `TaskDefinition` frozen dataclass. T01–T17 with validators reading `expected_values.json` at import time. Static coverage: T01 (csv-parser), T02 (json-validator), T03 (text-statistics), T05 (data-cleaning-workflow), T09 (report-generation). Task type distribution: 7 MCP_TOOL (3 retrieval + 4 synthesis), 5 SKILL, 5 AGENT. `ALL_TASKS`, `PILOT_TASKS=[T01,T07,T05]`, `get_task()`.
 - **`tests/evaluation/snapshots.py`** — `take_clean_snapshot()`, `restore_clean_snapshot()`, `snapshot_exists()`, `_hash_snapshot()`. Covers ChromaDB dir + `src/mcp_tools/` + `.deepagents/skills/`. SHA-256 hash (excluding `meta.json`) as snap ID. Idempotent. 19 unit tests.
 - **`tests/evaluation/harness.py`** — `HarnessConfig` dataclass, `EvaluationHarness` class. `prepare()`, `run_pilot()`, `run_condition()`, `close()`. Run loop: restore snapshot → seed registry → shuffle tasks → execute per condition → record to `EvaluationStore`. `MetricsStore` created once per run (shared across tasks so optimizer accumulates data). Static implementations for T01/T02/T03/T05/T09. `_execute_artifact()` uses `sandbox_execute` for MCP_TOOL artifacts. 22 unit tests.
 - **`src/orchestrator/pipeline.py`** — Added `verification_enabled: bool = True` parameter. `gate_fn=None` when `False` (no_verification baseline).
@@ -329,7 +329,7 @@ After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% 
 
 ### Full evaluation results (2026-03-18 + 2026-03-20, 340 records — PENDING RE-RUN)
 
-<!-- TODO: UPDATE AFTER RE-RUN — new run with deepagents 0.4.12, timeouts (adversarial 300s, SKILL 240s, AGENT 300s), per-task LangFuse tagging. Replace table and per-task notes below. -->
+<!-- TODO: UPDATE AFTER RE-RUN — new run with deepagents 0.4.12, timeouts (adversarial 300s, SKILL 240s, AGENT 300s), per-task LangFuse tagging. Task set restructured: T04 (was pipe-delimited MCP → inventory reorder SKILL), T08 (was logistic regression MCP → data quality investigation AGENT), T10 (was server log MCP → trend detection AGENT). Distribution now 7 MCP / 5 SKILL / 5 AGENT. Replace table and per-task notes below. -->
 
 | Condition | Success | Gate Pass |
 |---|---|---|

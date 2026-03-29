@@ -86,6 +86,38 @@ BAD_MCP_TOOL = GeneratedArtifact(
     ),
 )
 
+GOOD_AGENT = GeneratedArtifact(
+    capability_name="anomaly-investigator",
+    capability_type=CapabilityType.AGENT,
+    description="Autonomous agent that investigates anomalies in metrics data",
+    agent_config={
+        "system_prompt": (
+            "You are an autonomous data analysis agent. You receive metrics "
+            "data and must investigate anomalies by computing baselines, "
+            "identifying outliers, and producing a structured findings report. "
+            "Use sandbox_execute to run Python code for any computation."
+        ),
+        "is_deep_agent": True,
+        "model": "openai:gpt-5-mini",
+    },
+)
+
+BAD_SKILL = GeneratedArtifact(
+    capability_name="bad--skill--name",
+    capability_type=CapabilityType.SKILL,
+    description="A skill with invalid naming",
+    skill_content=(
+        '---\n'
+        'name: bad--skill--name\n'
+        'description: "This skill has consecutive hyphens in the name"\n'
+        '---\n'
+        '\n'
+        '# Bad Skill\n'
+        '\n'
+        'This skill has an invalid name with consecutive hyphens.\n'
+    ),
+)
+
 GOOD_SKILL = GeneratedArtifact(
     capability_name="data-cleaning-steps",
     capability_type=CapabilityType.SKILL,
@@ -227,6 +259,61 @@ def test_good_skill() -> bool:
     return True
 
 
+def test_bad_skill() -> bool:
+    """Test: a SKILL with invalid name (consecutive hyphens) should be rejected at Tier 0."""
+    from src.verification.gate import verify
+
+    print("\n" + "=" * 70)
+    print("  TEST: Bad SKILL (consecutive hyphens in name)")
+    print("  Expected: FAIL at Tier 0 (structural pre-check)")
+    print("=" * 70)
+
+    report = verify(BAD_SKILL)
+
+    print(f"\n  Result: {'PASSED' if report.overall_passed else 'FAILED'}")
+    print(f"  Tier reached: {report.tier_reached}")
+    print(f"  Findings ({len(report.findings)}):")
+    for line in _format_findings(report):
+        print(line)
+
+    if report.overall_passed:
+        print("\n  FAIL: Bad skill should NOT pass verification")
+        return False
+
+    has_structural = any(f.tier == 0 for f in report.findings)
+    if not has_structural:
+        print("\n  FAIL: Expected Tier 0 structural finding")
+        return False
+
+    print("\n  PASS: Bad skill correctly rejected at Tier 0")
+    return True
+
+
+def test_good_agent() -> bool:
+    """Test: a well-formed AGENT config should pass verification."""
+    from src.verification.gate import verify
+
+    print("\n" + "=" * 70)
+    print("  TEST: Good AGENT (anomaly-investigator)")
+    print("  Expected: PASS (regex-only scan on serialised config)")
+    print("=" * 70)
+
+    report = verify(GOOD_AGENT)
+
+    print(f"\n  Result: {'PASSED' if report.overall_passed else 'FAILED'}")
+    print(f"  Tier reached: {report.tier_reached}")
+    print(f"  Findings ({len(report.findings)}):")
+    for line in _format_findings(report):
+        print(line)
+
+    if not report.overall_passed:
+        print("\n  FAIL: Well-formed agent should pass verification")
+        return False
+
+    print("\n  PASS: Agent config passed verification")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -238,7 +325,8 @@ def main() -> int:
     )
     parser.add_argument("--good-only", action="store_true", help="Run only good MCP tool test")
     parser.add_argument("--bad-only", action="store_true", help="Run only bad MCP tool test")
-    parser.add_argument("--skill-only", action="store_true", help="Run only skill test")
+    parser.add_argument("--skill-only", action="store_true", help="Run only skill tests")
+    parser.add_argument("--agent-only", action="store_true", help="Run only agent test")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -249,20 +337,24 @@ def main() -> int:
         stream=sys.stderr,
     )
 
-    only_one = args.good_only or args.bad_only or args.skill_only
+    only_one = args.good_only or args.bad_only or args.skill_only or args.agent_only
     run_good = args.good_only or not only_one
     run_bad = args.bad_only or not only_one
     run_skill = args.skill_only or not only_one
+    run_agent = args.agent_only or not only_one
 
     results = {}
 
     if run_bad:
-        # Run bad first — it's fast (Tier 1 rejection, no Docker/LLM)
+        # Fast tests first — no Docker/LLM
         results["bad_mcp_tool"] = test_bad_mcp_tool()
 
     if run_skill:
-        # Skill test — also fast (Tier 0 + Tier 1 only, no Docker)
+        results["bad_skill"] = test_bad_skill()
         results["good_skill"] = test_good_skill()
+
+    if run_agent:
+        results["good_agent"] = test_good_agent()
 
     if run_good:
         # Good tool — slowest (runs all 3 tiers including adversarial DeepAgent)

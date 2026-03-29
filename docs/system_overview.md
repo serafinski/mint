@@ -122,13 +122,13 @@ The evaluation uses a **business analytics pipeline** testbed -- 17 tasks spanni
 | T01 | Parse standard CSV | MCP_TOOL | Trivial |
 | T02 | Validate JSON against schema | MCP_TOOL | Trivial |
 | T03 | Compute text statistics | MCP_TOOL | Trivial |
-| T04 | Parse pipe-delimited CSV (auto-detect delimiter) | MCP_TOOL | Trivial |
+| T04 | Inventory reorder pipeline (stock levels vs rules) | SKILL | Complex |
 | T05 | Clean dirty CSV (nulls + duplicates) | MCP_TOOL | Moderate |
 | T06 | KNN imputation (k=5) on dataset with ~15% missing values | MCP_TOOL | Moderate |
 | T07 | Fuzzy join on mismatched company names | MCP_TOOL | Moderate |
-| T08 | Train logistic regression, beat majority baseline by >5% | MCP_TOOL | Moderate |
+| T08 | Data quality investigation (autonomous profiling of messy dataset) | AGENT | Complex |
 | T09 | Generate analytics report with top-5 anomalies | MCP_TOOL | Complex |
-| T10 | Parse unstructured server logs | MCP_TOOL | Complex |
+| T10 | Trend detection and forecasting (weekly sales analysis) | AGENT | Complex |
 | T11 | Multi-source data integration (3 sources, revenue summary) | SKILL | Complex |
 | T12 | Configurable data quality pipeline (rules-based cleaning) | SKILL | Complex |
 | T13 | Autonomous anomaly investigation (baselines + metrics) | AGENT | Complex |
@@ -137,7 +137,7 @@ The evaluation uses a **business analytics pipeline** testbed -- 17 tasks spanni
 | T16 | Root cause analysis agent (metric degradation diagnosis) | AGENT | Complex |
 | T17 | Adaptive ETL orchestration (schema drift handling) | AGENT | Complex |
 
-T01-T03 have matching seeded capabilities in the registry (testing retrieval). T04-T17 require the system to generate new capabilities (testing synthesis). T11-T17 target non-MCP-tool types (SKILLs and AGENTs).
+T01-T03 have matching seeded capabilities in the registry (testing retrieval). T04-T17 require the system to generate new capabilities (testing synthesis). The testbed is balanced across capability types: 7 MCP_TOOL (3 retrieval + 4 synthesis), 5 SKILL, 5 AGENT.
 
 **4 Baseline Conditions (additive ablation):**
 
@@ -301,7 +301,7 @@ The classifier exhibits an MCP_TOOL bias, though the addition of T14-T17 (which 
 
 All three types were generated and executed successfully: MCP Tools (T04-T10), Skills (T11-T12, T14-T15), and Agents (T13, T16-T17). The expanded task set reveals that **type selection matters more than previously observed**: T17 (adaptive ETL orchestration) achieves 4/4 success (100%) when classified as AGENT but only 1/11 (9%) when classified as SKILL. T14 (hierarchical data aggregation) achieves 13/15 success as SKILL, confirming the classifier routes correctly for tasks with clear multi-step structure.
 
-This finding refines the earlier observation about type selection. For most tasks (T04-T10), the simpler MCP_TOOL execution model is sufficient regardless of the "ideal" type. But for tasks requiring adaptive planning (T16, T17), correct type classification becomes critical to success. The three types represent genuinely different execution models, and the classifier's routing accuracy has measurable impact on complex tasks.
+This finding refines the earlier observation about type selection. For simple data processing tasks (T05-T07, T09), the MCP_TOOL execution model is sufficient regardless of the "ideal" type. But for tasks requiring multi-step workflows (T04, T11, T12, T14, T15) or adaptive planning (T08, T10, T13, T16, T17), correct type classification becomes critical to success. The three types represent genuinely different execution models, and the classifier's routing accuracy has measurable impact on complex tasks.
 
 ---
 
@@ -368,7 +368,9 @@ scripts/
   backfill_token_costs.py # LangFuse -> DuckDB token cost extraction
   run_longitudinal.py   # Longitudinal optimizer test (40+ sequential tasks)
   analyze_context_utilization.py  # Context window utilization from LangFuse traces
-  test_split_merge.py   # Integration test for optimizer split/merge operations
+  test_pipeline.py      # Integration test: full 9-node pipeline end-to-end (Pillar 1)
+  test_verification.py  # Integration test: three-tier verification gate (Pillar 2)
+  test_split_merge.py   # Integration test: optimizer prune/split/merge + full loop (Pillar 3)
 ```
 
 ---
@@ -395,8 +397,8 @@ uv run scripts/run_task.py "Parse this CSV and compute summary statistics" \
   --file tests/evaluation/fixtures/t01_standard.csv
 
 # Generate a new capability on demand
-uv run scripts/run_task.py "Parse this pipe-delimited file" \
-  --file tests/evaluation/fixtures/t04_pipe_delimited.csv
+uv run scripts/run_task.py "Clean this CSV and remove duplicates" \
+  --file tests/evaluation/fixtures/t05_dirty.csv
 
 # Multi-file SKILL task
 uv run scripts/run_task.py \
