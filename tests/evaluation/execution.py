@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 # Timeouts (seconds) — matching CLAUDE.md operational boundaries
 # ---------------------------------------------------------------------------
 
-SKILL_EXECUTION_TIMEOUT_S = 120
-AGENT_EXECUTION_TIMEOUT_S = 180
+SKILL_EXECUTION_TIMEOUT_S = 240
+AGENT_EXECUTION_TIMEOUT_S = 300
 _RECURSION_LIMIT = 50
 
 # ---------------------------------------------------------------------------

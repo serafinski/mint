@@ -10,7 +10,7 @@ and ``response_format=AdversarialFindings`` for structured output.
 
 Operational boundaries (from CLAUDE.md):
 - ``recursion_limit=35``
-- Node-level timeout: 180 s
+- Node-level timeout: 300 s
 - Fresh agent per invocation
 - On timeout / error: return partial report with error flag, never raise
 """
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ADVERSARIAL_RECURSION_LIMIT = 50
-ADVERSARIAL_TIMEOUT_S = 180
+ADVERSARIAL_TIMEOUT_S = 300
 
 # ---------------------------------------------------------------------------
 # Pydantic models for structured DeepAgent output
