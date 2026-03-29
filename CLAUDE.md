@@ -327,7 +327,9 @@ After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% 
 
 **Semantic correctness gap:** Verification gate catches structural/deception issues but not business logic correctness. The gap between gate_pass_rate (100%) and success_rate (66.7%) quantifies this limitation. Deferred to future work — see `docs/iteration_plan.md` → "Pilot run findings (2026-03-12)" for full analysis and three proposed approaches.
 
-### Full evaluation results (2026-03-18 + 2026-03-20, 340 records — FINAL)
+### Full evaluation results (2026-03-18 + 2026-03-20, 340 records — PENDING RE-RUN)
+
+<!-- TODO: UPDATE AFTER RE-RUN — new run with deepagents 0.4.12, timeouts (adversarial 300s, SKILL 240s, AGENT 300s), per-task LangFuse tagging. Replace table and per-task notes below. -->
 
 | Condition | Success | Gate Pass |
 |---|---|---|

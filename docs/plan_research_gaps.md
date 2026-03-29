@@ -22,7 +22,7 @@
 
 ---
 
-## Gap 1: Per-Task Token Attribution
+## Gap 1: Per-Task Token Attribution — CODE DONE, awaiting eval re-run
 
 **Problem:** Token costs are run-level averages, not per-task measurements. Every task in a run gets the same number (e.g., 119,280 tokens). We cannot compare the cost of generating an MCP_TOOL vs a SKILL vs an AGENT.
 
@@ -133,7 +133,7 @@ From existing traces we can already see:
    agent-executor          15       5.8       24,000       18.8%         31.0%
    ```
 
-3. This can also extract `output_token_details.reasoning_tokens` to quantify how much of GPT-5-mini's output is chain-of-thought reasoning vs actual content.
+3. This can also extract reasoning tokens to quantify how much of GPT-5-mini's output is chain-of-thought reasoning vs actual content. Note: LangFuse REST API returns reasoning tokens as `usageDetails.output_reasoning` (flat key), not nested under `output_token_details`. The script handles both formats.
 
 **Effort:** ~1-2 hours (script only). Read-only against LangFuse — no LLM calls, no pipeline runs, no evaluation re-run needed.
 
@@ -168,7 +168,7 @@ Key findings:
 |---|---|---|---|---|
 | Gap 3: Context utilization | 1-2h | No | High — directly answers context economy | **DONE** |
 | Gap 2: Split/merge validation | 2h | No | High — strengthens specificity vs generality | **DONE** |
-| Gap 1: Per-task token attribution | 1h + re-run | Yes (~14h, ~$5) | Medium — improves cost precision | PLANNED |
+| Gap 1: Per-task token attribution | 1h + re-run | Yes (~14h, ~$5) | Medium — improves cost precision | **CODE DONE** (needs re-run) |
 
 Recommended order: Gap 3 -> Gap 2 -> Gap 1 (if time permits for re-run).
 Gap 3 and Gap 2 completed on 2026-03-29.

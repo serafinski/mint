@@ -142,6 +142,8 @@ Each condition runs 5 times (randomized task order, different seeds) for 340 tot
 
 ### Results (340 records, 2026-03-18 + 2026-03-20)
 
+> **TODO: UPDATE AFTER RE-RUN** — A new evaluation is pending (deepagents 0.4.12, increased timeouts: adversarial 300s, SKILL 240s, AGENT 300s, per-task LangFuse tagging). Numbers below are from the pre-upgrade run. Update headline table, per-task breakdown, verification tradeoff, token costs, and capability type distribution after the new run completes.
+
 #### Headline Numbers
 
 | Condition | All Tasks | Synthesis Only (T04-T17) | 95% CI (Synthesis) |
@@ -198,11 +200,11 @@ The gate detects structural defects (syntax errors, hardcoded data, silent excep
 
 #### The Optimizer Cold-Start Problem
 
-The optimizer consistently reduces success rate in the standard evaluation: full (74.0%) < no_optimization (84.0%). This is expected and was predicted before the evaluation. The optimizer's prune operation deactivates capabilities with zero invocation history -- but in a fresh evaluation run, *all* newly generated capabilities have zero history. The optimizer essentially prunes capabilities before they get a chance to be used.
+The optimizer consistently reduces success rate in the standard evaluation: full (71.8%) < no_optimization (77.6%). This is expected and was predicted before the evaluation. The optimizer's prune operation deactivates capabilities with zero invocation history -- but in a fresh evaluation run, *all* newly generated capabilities have zero history. The optimizer essentially prunes capabilities before they get a chance to be used.
 
 #### Longitudinal Optimizer Test (40 tasks, no snapshot reset)
 
-To test whether the optimizer adds value with accumulated history, a separate longitudinal evaluation ran 40 sequential tasks (~3 full cycles through all 13 tasks) without resetting the registry or metrics store between tasks.
+To test whether the optimizer adds value with accumulated history, a separate longitudinal evaluation ran 40 sequential tasks (~3 full cycles through the original 13 tasks, T01-T13) without resetting the registry or metrics store between tasks.
 
 | Window | Success | Rate |
 |---|---|---|
@@ -217,7 +219,7 @@ The gate pass rate was 100% across all 40 tasks -- zero false positives when the
 
 The active capability count stabilized at 8 throughout the run. The optimizer used prune exclusively -- deactivating unused capabilities after early cycles, allowing the registry to converge on a stable set of working capabilities.
 
-**Split and merge were not triggered.** Split requires a capability with reuse_rate > 0.6 (used by 60%+ of task types), but the testbed produces task-specific capabilities that each serve 1-2 task types. Merge requires semantically similar low-reuse Skills, but T11 (data integration) and T12 (quality pipeline) generate distinct skills. Both operations are validated through unit tests (19 tests) and synthetic simulation, which demonstrates convergence. Empirical validation requires a task ecosystem with overlapping capability requirements -- a larger, more diverse workload where general-purpose capabilities emerge naturally. This is documented as future work.
+**Split and merge were not triggered in the longitudinal test.** Split requires a capability with reuse_rate > 0.6 (used by 60%+ of task types), but the testbed produces task-specific capabilities that each serve 1-2 task types. Merge requires semantically similar low-reuse Skills, but T11 (data integration) and T12 (quality pipeline) generate distinct skills. Both operations are validated through unit tests and synthetic simulation, and were verified end-to-end via an integration test (`scripts/test_split_merge.py`) that seeds synthetic invocation data to trigger the thresholds and runs split/merge with real GPT-5-mini calls. Split produced 2 specialized variants from a broad SKILL; merge combined 2 similar SKILLs into one. Triggering these operations organically requires a task ecosystem with overlapping capability requirements -- a larger, more diverse workload where general-purpose capabilities emerge naturally.
 
 #### Token Costs
 
@@ -230,7 +232,7 @@ The active capability count stabilized at 8 throughout the run. The optimizer us
 
 100% of LLM calls use GPT-5-mini. The entire 340-record evaluation cost ~$4.65. The longitudinal optimizer test (40 tasks) cost ~$0.56.
 
-**Token cost methodology:** Per-task token costs are estimated via post-hoc backfill from LangFuse traces, not tracked inline during pipeline execution. The backfill script (`scripts/backfill_token_costs.py`) fetches all GENERATION observations from LangFuse within each run's time window, sums the total tokens per run, and distributes them evenly across tasks in that run. This means per-task costs are *run-level averages*, not exact per-task measurements -- a simple registry-match task (T01) and a complex agent task (T13) receive the same token cost within the same run. Run-level totals and condition-level averages are accurate; per-task figures should be interpreted as estimates. Exact per-task attribution would require tagging each LLM call with its task ID in the LangFuse callback, which is documented as future work.
+**Token cost methodology:** Per-task token costs are estimated via post-hoc backfill from LangFuse traces, not tracked inline during pipeline execution. The backfill script (`scripts/backfill_token_costs.py`) fetches all GENERATION observations from LangFuse within each run's time window, sums the total tokens per run, and distributes them evenly across tasks in that run. This means per-task costs are *run-level averages*, not exact per-task measurements -- a simple registry-match task (T01) and a complex agent task (T13) receive the same token cost within the same run. Run-level totals and condition-level averages are accurate; per-task figures should be interpreted as estimates. Per-task trace tagging was implemented in the evaluation harness (`langfuse_session_id`, `langfuse_tags` with task_id and condition in `invoke_config["metadata"]`) and the backfill script auto-detects tagged traces for exact per-task attribution. The 340-record dataset uses run-level averages (pre-tagging); future re-runs will produce per-task costs automatically.
 
 For the evaluation conditions, retrieval tasks (T01-T03) are assigned zero tokens because their cost (decomposition only, no generation/verification) is negligible relative to JIT tasks. For the longitudinal test, all tasks are assigned equal shares since every task runs the full pipeline.
 
@@ -344,7 +346,7 @@ src/
     evaluation_store.py # EvaluationStore (experiment records)
   schemas/              # 18+ Pydantic models (single source of truth)
 tests/
-  unit/                 # 787 tests, no I/O
+  unit/                 # 787+ tests, no I/O
   integration/          # Docker, ChromaDB, DuckDB
   evaluation/           # Harness, tasks, snapshots, fixtures
 scripts/
@@ -353,6 +355,8 @@ scripts/
   analyze_results.py    # Statistical analysis (CIs, Fisher's exact)
   backfill_token_costs.py # LangFuse -> DuckDB token cost extraction
   run_longitudinal.py   # Longitudinal optimizer test (40+ sequential tasks)
+  analyze_context_utilization.py  # Context window utilization from LangFuse traces
+  test_split_merge.py   # Integration test for optimizer split/merge operations
 ```
 
 ---
@@ -429,7 +433,7 @@ The conventional approach to multi-agent capabilities is **pre-built**: you writ
 
 This system inverts that: capabilities are generated on demand, verified automatically, and evolved over time. The verification layer is the core contribution -- it defines a concrete, measurable boundary between what automated testing can and cannot catch. The 95-100% gate pass rate with 66-81% success rate (depending on condition) quantifies this boundary precisely.
 
-The false-positive finding is equally important. Verification does not just miss bad code (false negatives) -- it also rejects good code (false positives). The cost is quantified: ~2.3x more tokens, ~16x more latency, and ~9pp lower success rate. This gives practitioners a framework for deciding when verification is worth its cost.
+The false-positive finding is equally important. Verification does not just miss bad code (false negatives) -- it also rejects good code (false positives). The cost is quantified: adding verification increases tokens by ~2.3x (33k to 76k per task), and the full pipeline with adversarial probing adds ~18x more latency (13.3s to 236.5s median). The net effect is ~9pp lower success rate than unverified generation. This gives practitioners a framework for deciding when verification is worth its cost.
 
 The optimizer's cold-start problem in standard evaluation and its resolution in the longitudinal test demonstrate an important architectural constraint: evolutionary optimization requires accumulated history. The standard evaluation (snapshot reset between runs) cannot provide this, but the longitudinal test (40 tasks, no reset) shows the optimizer converging to 100% success after ~18 tasks. The prune operation drives this improvement; split and merge require workloads with overlapping capability requirements that the current testbed does not produce.
 
