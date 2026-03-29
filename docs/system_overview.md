@@ -228,7 +228,11 @@ The active capability count stabilized at 8 throughout the run. The optimizer us
 | JIT only | ~2,310,000 | $0.75 | ~33,000 |
 | Static | 0 | $0.00 | 0 |
 
-100% of LLM calls use GPT-5-mini. The entire 340-record evaluation cost ~$4.65.
+100% of LLM calls use GPT-5-mini. The entire 340-record evaluation cost ~$4.65. The longitudinal optimizer test (40 tasks) cost ~$0.56.
+
+**Token cost methodology:** Per-task token costs are estimated via post-hoc backfill from LangFuse traces, not tracked inline during pipeline execution. The backfill script (`scripts/backfill_token_costs.py`) fetches all GENERATION observations from LangFuse within each run's time window, sums the total tokens per run, and distributes them evenly across tasks in that run. This means per-task costs are *run-level averages*, not exact per-task measurements -- a simple registry-match task (T01) and a complex agent task (T13) receive the same token cost within the same run. Run-level totals and condition-level averages are accurate; per-task figures should be interpreted as estimates. Exact per-task attribution would require tagging each LLM call with its task ID in the LangFuse callback, which is documented as future work.
+
+For the evaluation conditions, retrieval tasks (T01-T03) are assigned zero tokens because their cost (decomposition only, no generation/verification) is negligible relative to JIT tasks. For the longitudinal test, all tasks are assigned equal shares since every task runs the full pipeline.
 
 ---
 
@@ -395,6 +399,10 @@ uv run scripts/run_task.py --list
 # JSON output, skip verification, verbose logging
 uv run scripts/run_task.py "Count words in this document" \
   --file report.txt --output-format json --skip-verification --verbose
+
+# Override SKILL/AGENT execution timeout (default: 120s SKILL, 180s AGENT)
+uv run scripts/run_task.py "Investigate anomalies in this data" \
+  --file metrics.csv --timeout 300
 
 # --- Evaluation runners ---
 
