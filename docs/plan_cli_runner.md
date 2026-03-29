@@ -90,6 +90,7 @@ parser.add_argument("--enable-optimizer", action="store_true")
 parser.add_argument("--output-format", choices=["json", "human"], default="human")
 parser.add_argument("--dry-run", action="store_true", help="Decompose only, don't generate")
 parser.add_argument("--list", action="store_true", help="List registry capabilities")
+parser.add_argument("--timeout", type=int, default=None, help="SKILL/AGENT execution timeout (default: 120s/180s)")
 parser.add_argument("--verbose", action="store_true")
 ```
 
