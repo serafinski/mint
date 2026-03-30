@@ -20,13 +20,14 @@ from tests.evaluation.tasks import (
     T11,
     T12,
     T13,
+    T18,
     get_task,
 )
 
 
 class TestTaskRegistry:
     def test_all_tasks_count(self):
-        assert len(ALL_TASKS) == 17
+        assert len(ALL_TASKS) == 18
 
     def test_task_ids_unique(self):
         ids = [t.task_id for t in ALL_TASKS]
@@ -364,3 +365,29 @@ class TestT13Validator:
 
     def test_empty_output(self):
         assert not T13.validator({})
+
+
+class TestT18Validator:
+    def test_valid(self):
+        assert T18.validator({
+            "total_rows": 67,
+            "unique_count": 50,
+            "duplicate_count": 17,
+        })
+
+    def test_wrong_unique(self):
+        assert not T18.validator({
+            "total_rows": 67,
+            "unique_count": 60,
+            "duplicate_count": 7,
+        })
+
+    def test_wrong_total(self):
+        assert not T18.validator({
+            "total_rows": 100,
+            "unique_count": 50,
+            "duplicate_count": 17,
+        })
+
+    def test_empty_output(self):
+        assert not T18.validator({})

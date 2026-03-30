@@ -57,6 +57,7 @@ def generate_all_fixtures(
     expected.update(_gen_t15(fixtures_dir, rng))
     expected.update(_gen_t16(fixtures_dir, rng))
     expected.update(_gen_t17(fixtures_dir, rng))
+    expected.update(_gen_t18(fixtures_dir, rng))
 
     out_path = fixtures_dir / "expected_values.json"
     out_path.write_text(json.dumps(expected, indent=2))
@@ -1209,6 +1210,57 @@ def _gen_t17(fixtures_dir: Path, rng: random.Random) -> dict:
             "true_fraud_count": true_fraud_count,
             "fraud_customer_ids": fraud_customer_ids,
             "fraud_customer_names": fraud_customer_names,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T18 — Record deduplication via hashing (targets MCP_TOOL classification)
+# ---------------------------------------------------------------------------
+
+
+def _gen_t18(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Generate a CSV with exact and near-duplicate records for hash-based dedup.
+
+    The MCP_TOOL must: compute a hash per row (on key columns), identify
+    exact duplicates by hash, return unique count + duplicate count.
+    """
+    columns = ["order_id", "customer", "product", "quantity", "price"]
+    base_rows = []
+    for i in range(1, 51):  # 50 unique orders
+        base_rows.append({
+            "order_id": i,
+            "customer": rng.choice(_NAMES) + f"_{rng.randint(1, 99)}",
+            "product": rng.choice(["Widget", "Gadget", "Sensor", "Module", "Cable"]),
+            "quantity": rng.randint(1, 20),
+            "price": round(rng.uniform(10.0, 500.0), 2),
+        })
+
+    # Add exact duplicates (repeat rows 1-12)
+    duplicate_rows = [dict(r) for r in base_rows[:12]]
+    # Add a second copy of rows 1-5 (triple duplicates)
+    triple_rows = [dict(r) for r in base_rows[:5]]
+
+    all_rows = base_rows + duplicate_rows + triple_rows
+    rng.shuffle(all_rows)
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns)
+    writer.writeheader()
+    writer.writerows(all_rows)
+    (fixtures_dir / "t18_orders_with_dupes.csv").write_text(buf.getvalue())
+
+    # Expected: 50 unique, 17 duplicate rows (12 + 5)
+    unique_count = len(base_rows)  # 50
+    total_rows = len(all_rows)  # 67
+    duplicate_count = total_rows - unique_count  # 17
+
+    return {
+        "T18": {
+            "total_rows": total_rows,
+            "unique_count": unique_count,
+            "duplicate_count": duplicate_count,
+            "key_columns": columns,
         }
     }
 

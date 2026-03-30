@@ -880,10 +880,48 @@ T17 = TaskDefinition(
 )
 
 # ---------------------------------------------------------------------------
+# T18 — Record deduplication via hashing (MCP_TOOL)
+# ---------------------------------------------------------------------------
+
+_t18_ev = _EV["T18"]
+
+
+def _validate_t18(output: dict) -> bool:
+    """unique_count == 50 AND duplicate_count == 17 AND total_rows == 67."""
+    try:
+        ok_unique = int(output.get("unique_count", -1)) == _t18_ev["unique_count"]
+        ok_dupes = int(output.get("duplicate_count", -1)) == _t18_ev["duplicate_count"]
+        ok_total = int(output.get("total_rows", -1)) == _t18_ev["total_rows"]
+        return ok_unique and ok_dupes and ok_total
+    except (TypeError, ValueError):
+        return False
+
+
+T18 = TaskDefinition(
+    task_id="T18",
+    tier="moderate",
+    description="Deduplicate records by hashing: compute hash per row, identify exact duplicates, return counts",
+    task_prompt=(
+        "Deduplicate the orders CSV at tests/evaluation/fixtures/t18_orders_with_dupes.csv. "
+        "The file contains exact duplicate rows (same values in all columns). "
+        "Compute a hash of each row (using all columns: order_id, customer, product, "
+        "quantity, price), identify rows with identical hashes, and keep only unique rows.\n\n"
+        "Return a dict with keys:\n"
+        "- 'total_rows' (int): total rows in the input (excluding header)\n"
+        "- 'unique_count' (int): number of unique rows after deduplication\n"
+        "- 'duplicate_count' (int): number of duplicate rows removed"
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[FIXTURES_DIR / "t18_orders_with_dupes.csv"],
+    validator=_validate_t18,
+)
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
-ALL_TASKS: list[TaskDefinition] = [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12, T13, T14, T15, T16, T17]
+ALL_TASKS: list[TaskDefinition] = [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12, T13, T14, T15, T16, T17, T18]
 
 PILOT_TASKS: list[TaskDefinition] = [T01, T07, T05]  # retrieval + moderate JIT + complex JIT
 

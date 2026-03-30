@@ -136,8 +136,9 @@ The evaluation uses a **business analytics pipeline** testbed -- 17 tasks spanni
 | T15 | Time-series forecasting pipeline (trend + seasonality) | SKILL | Complex |
 | T16 | Root cause analysis agent (metric degradation diagnosis) | AGENT | Complex |
 | T17 | Adaptive ETL orchestration (schema drift handling) | AGENT | Complex |
+| T18 | Record deduplication via row hashing | MCP_TOOL | Moderate |
 
-T01-T03 have matching seeded capabilities in the registry (testing retrieval). T04-T17 require the system to generate new capabilities (testing synthesis). The testbed is balanced across capability types: 7 MCP_TOOL (3 retrieval + 4 synthesis), 5 SKILL, 5 AGENT.
+T01-T03 have matching seeded capabilities in the registry (testing retrieval). T04-T18 require the system to generate new capabilities (testing synthesis). The testbed is balanced across capability types: 8 MCP_TOOL (3 retrieval + 5 synthesis), 5 SKILL, 5 AGENT.
 
 **4 Baseline Conditions (additive ablation):**
 

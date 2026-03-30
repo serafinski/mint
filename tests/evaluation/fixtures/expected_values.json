@@ -179,5 +179,17 @@
       "Carol",
       "Eve"
     ]
+  },
+  "T18": {
+    "total_rows": 67,
+    "unique_count": 50,
+    "duplicate_count": 17,
+    "key_columns": [
+      "order_id",
+      "customer",
+      "product",
+      "quantity",
+      "price"
+    ]
   }
 }
