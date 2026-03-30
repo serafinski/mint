@@ -397,7 +397,7 @@ All three capability types confirmed working end-to-end.
 - [x] Add T14-T17 tasks (SKILL/AGENT coverage) and run evaluation (2026-03-20, 340 total records)
 - [x] Critique checkpoint: does the evaluation design produce usable thesis data? — Yes, see `docs/critique_checkpoint_review.md`
 - [x] Longitudinal optimizer test (40 sequential tasks, no snapshot reset) — `scripts/run_longitudinal.py` (2026-03-19, 35/40 success=87.5%, first cycle 69.2% → last cycle 100%, prune only — split/merge thresholds not reached)
-- [x] Level 1 CLI runner — `scripts/run_task.py` (2026-03-23); supports `--file`, `--param`, `--dry-run`, `--list`, `--skip-verification`, `--enable-optimizer`, `--timeout`, `--output-format json|human`. Persists metrics to `data/cli_metrics.duckdb`.
+- [x] Level 1 CLI runner — `scripts/run_task.py` (2026-03-23); supports `--file`, `--param`, `--dry-run`, `--list`, `--skip-verification`, `--enable-optimizer`, `--no-optimizer`, `--timeout`, `--output-format json|human`. Optimizer auto-enables after 20+ invocations. Persists metrics to `data/cli_metrics.duckdb`.
 
 **Runner:** `uv run scripts/run_pilot.py` (see `docs/iteration_plan.md` → Iteration 5 for full command reference)
 **CLI:** `uv run scripts/run_task.py "task description" --file data.csv` (see `docs/plan_cli_runner.md`)
@@ -437,7 +437,7 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`tests/evaluation/harness.py`** — `EvaluationHarness`, `HarnessConfig`, `_run_static_implementation()`
 - **`tests/evaluation/execution.py`** — `execute_skill_artifact()`, `execute_agent_artifact()`, `_read_fixture_contents()` (DeepAgent-based SKILL/AGENT execution)
 - **`scripts/run_pilot.py`** — Evaluation runner: `uv run scripts/run_pilot.py [--condition] [--all-tasks] [--all-conditions] [--n-runs N]`
-- **`scripts/run_task.py`** — User-facing CLI: `uv run scripts/run_task.py "task" [--file PATH] [--param K=V] [--dry-run] [--list] [--skip-verification] [--enable-optimizer] [--timeout SECONDS] [--output-format json|human]`. Persists capabilities (ChromaDB) and invocation metrics (`data/cli_metrics.duckdb`) across runs.
+- **`scripts/run_task.py`** — User-facing CLI: `uv run scripts/run_task.py "task" [--file PATH] [--param K=V] [--dry-run] [--list] [--skip-verification] [--enable-optimizer] [--no-optimizer] [--timeout SECONDS] [--output-format json|human]`. Optimizer auto-enables after 20+ invocations. Persists capabilities (ChromaDB) and invocation metrics (`data/cli_metrics.duckdb`) across runs.
 
 ## Notes for AI Agents
 

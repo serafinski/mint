@@ -86,7 +86,8 @@ parser.add_argument("task", type=str, help="Task description")
 parser.add_argument("--file", action="append", dest="files", help="Input file(s)")
 parser.add_argument("--param", action="append", dest="params", help="key=value parameters")
 parser.add_argument("--skip-verification", action="store_true")
-parser.add_argument("--enable-optimizer", action="store_true")
+parser.add_argument("--enable-optimizer", action="store_true")  # force on; auto-enables after 20+ invocations
+parser.add_argument("--no-optimizer", action="store_true")       # force off
 parser.add_argument("--output-format", choices=["json", "human"], default="human")
 parser.add_argument("--dry-run", action="store_true", help="Decompose only, don't generate")
 parser.add_argument("--list", action="store_true", help="List registry capabilities")

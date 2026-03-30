@@ -132,7 +132,7 @@ except Exception as exc:
 
 **Problem:** When a generator retries (LLM call + repair pass) and gives up, each failure is logged individually, but there's no summary like "Gave up generating 'csv-parser' after 2 attempts (initial + repair)."
 
-**Impact:** Low — each attempt is logged. But in a run with 17 tasks, scrolling through individual warnings to figure out which gaps were abandoned is tedious.
+**Impact:** Low — each attempt is logged. But in a run with 18 tasks, scrolling through individual warnings to figure out which gaps were abandoned is tedious.
 
 **Fix:** Add a summary log after the generation loop:
 

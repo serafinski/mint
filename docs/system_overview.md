@@ -113,7 +113,7 @@ The system was originally hybrid (DeepSeek for plain nodes, GPT-5-mini for DeepA
 
 ### Design
 
-The evaluation uses a **business analytics pipeline** testbed -- 17 tasks spanning data ingestion, transformation, ML training, and report generation. Tasks were chosen to naturally produce diverse capability types and range from trivial (CSV parsing) to complex (autonomous anomaly investigation).
+The evaluation uses a **business analytics pipeline** testbed -- 18 tasks spanning data ingestion, transformation, quality investigation, and report generation. Tasks were chosen to naturally produce diverse capability types and range from trivial (CSV parsing) to complex (autonomous anomaly investigation).
 
 **17 Tasks:**
 
@@ -153,13 +153,13 @@ Each condition runs 5 times (randomized task order, different seeds) for 340 tot
 
 **Validators:** Each task has a ground-truth validator that compares output against pre-computed expected values (from deterministic fixtures with seed=42). Success = gate_passed AND output_in_range.
 
-### Results (340 records, 2026-03-18 + 2026-03-20)
+### Results (pre-upgrade, 340 records from 2026-03-18 + 2026-03-20; re-run pending with 360 records)
 
 > **TODO: UPDATE AFTER RE-RUN** — A new evaluation is pending (deepagents 0.4.12, increased timeouts: adversarial 300s, SKILL 240s, AGENT 300s, per-task LangFuse tagging). Numbers below are from the pre-upgrade run. Update headline table, per-task breakdown, verification tradeoff, token costs, and capability type distribution after the new run completes.
 
 #### Headline Numbers
 
-| Condition | All Tasks | Synthesis Only (T04-T17) | 95% CI (Synthesis) |
+| Condition | All Tasks | Synthesis Only (T04-T18) | 95% CI (Synthesis) |
 |---|---|---|---|
 | **JIT only** | 84.7% (72/85) | **81.4%** (57/70) | [70.3%, 89.7%] |
 | **JIT + Verification** | 77.6% (66/85) | 72.9% (51/70) | [60.9%, 82.8%] |
@@ -257,12 +257,14 @@ For the evaluation conditions, retrieval tasks (T01-T03) are assigned zero token
 
 The system is designed to never hang or crash:
 
-- `verify()` wraps `_verify_inner()` in try/except -- returns a MEDIUM finding and passes the capability on gate bugs
+- `verify()` wraps `_verify_inner()` in try/except -- returns a MEDIUM finding and passes the capability on gate bugs. The log explicitly says "PASSING (fail-open policy)" so the behavior is traceable.
 - `sandbox_execute()` always returns a dict, never raises
 - `adversarial.probe()` always returns a VerificationReport, never raises
 - `decomposition_node` returns partial results on timeout (120s) with an error flag
 - After 3 failed verification attempts, the pipeline "fails open" and loads whatever it has
 - The optimizer node catches all exceptions and continues to END with a warning
+- `loading_node` registers MCP tools in ChromaDB even when host `importlib` fails (e.g., tool imports pandas which isn't in the project venv). The tool's `source_code` is stored in metadata, allowing sandbox execution and cross-task reuse. Log distinguishes "registered" from "host-loadable".
+- `harness.prepare()` automatically wipes `.deepagents/skills/` and rebuilds ChromaDB from scratch before taking the baseline snapshot, preventing leftover artifacts from contaminating evaluation runs.
 
 ### Dynamic Dependency Resolution
 
@@ -286,11 +288,30 @@ When verification rejects a capability, the retry loop:
 
 LLM-generated capability names are non-deterministic across runs. To prevent duplicate artifacts, the pipeline overrides LLM name choices with deterministic slugs derived from the gap query + a SHA-256 hash suffix. This ensures that retrying the same gap always targets the same artifact name.
 
+### Seeded Capabilities with Source Code
+
+The three seeded MCP tools that correspond to retrieval tasks (csv-parser, json-validator, text-statistics) include executable `source_code` in their ChromaDB metadata. This allows the CLI to execute registry matches directly via `sandbox_execute()` without JIT generation. Other seeded capabilities (date-formatter, fibonacci, data-cleaning-workflow, report-generation, data-analysis-agent) are descriptors without source code -- they serve as registry match targets but cannot be executed without generation.
+
+---
+
+### Context Window Utilization
+
+Analysis of 1,255 LangFuse traces across all evaluation runs shows the system never approaches the GPT-5-mini context window limit:
+
+| Agent Type | Traces | Avg Steps | Avg Peak Context | Max Utilization |
+|---|---|---|---|---|
+| Decomposition | 709 | 2.2 | 6,313 tokens | 7.4% |
+| Adversarial Probing | 353 | 5.2 | 13,352 tokens | 28.8% |
+| SKILL Execution | 147 | 3.5 | 15,352 tokens | 27.6% |
+| AGENT Execution | 46 | 1.4 | 10,441 tokens | 10.8% |
+
+The system is **cost-bound, not context-bound**. Context grows ~2,500 tokens per DeepAgent step. At the observed growth rate, the system would need ~40 steps to reach 50% of the 128K window -- well beyond the `recursion_limit=50` safety bound. The binding constraint is LLM response latency (5-15s per call), not context window size. Reducing token spend (fewer verification tiers, smarter prompts) is more impactful than increasing context windows.
+
 ---
 
 #### Capability Type Distribution and Classifier Behavior
 
-Across 255 JIT records (3 conditions x 17 tasks x 5 runs), the classifier routed:
+Across JIT records (3 conditions x 18 tasks x 5 runs), the classifier routed:
 
 | Type | Records | % | Tasks where dominant |
 |---|---|---|---|
@@ -359,7 +380,7 @@ src/
     evaluation_store.py # EvaluationStore (experiment records)
   schemas/              # 18+ Pydantic models (single source of truth)
 tests/
-  unit/                 # 787+ tests, no I/O
+  unit/                 # 792+ tests, no I/O
   integration/          # Docker, ChromaDB, DuckDB
   evaluation/           # Harness, tasks, snapshots, fixtures
 scripts/
@@ -372,6 +393,7 @@ scripts/
   test_pipeline.py      # Integration test: full 9-node pipeline end-to-end (Pillar 1)
   test_verification.py  # Integration test: three-tier verification gate (Pillar 2)
   test_split_merge.py   # Integration test: optimizer prune/split/merge + full loop (Pillar 3)
+  test_auto_optimizer.py # Integration test: auto-enable optimizer via pipeline (all 3 operations)
 ```
 
 ---
@@ -392,6 +414,13 @@ export LANGFUSE_HOST="http://localhost:3000"  # optional
 uv run pytest tests/unit/ -q
 
 # --- Interactive CLI (Level 1 runner) ---
+#
+# The CLI persists capabilities (ChromaDB) and invocation metrics (DuckDB)
+# across runs. The granularity optimizer auto-enables after 20+ invocations
+# have been recorded — no flag needed. It prunes unused capabilities, splits
+# high-reuse/low-success ones into specialized variants, and merges similar
+# low-reuse SKILLs. Use --no-optimizer to disable, --enable-optimizer to
+# force on early.
 
 # Parse a CSV file (will find seeded csv-parser in registry)
 uv run scripts/run_task.py "Parse this CSV and compute summary statistics" \
@@ -425,7 +454,7 @@ uv run scripts/run_task.py "Investigate anomalies in this data" \
 
 # --- Evaluation runners ---
 
-# Run full evaluation (17 tasks x 4 conditions x 5 runs, ~14h, ~$5)
+# Run full evaluation (18 tasks x 4 conditions x 5 runs, ~14h, ~$5)
 caffeinate -dims uv run scripts/run_pilot.py \
   --all-tasks --all-conditions --n-runs 5 --log-file auto
 
@@ -487,4 +516,4 @@ The sandbox uses `__name__ = "not_main"` to prevent `mcp.run()` from starting. R
 - **Per-task token attribution** — implemented in harness (LangFuse trace tagging), pending re-run for data collection
 - **Semantic correctness testing** — the gate catches structural defects but not business logic errors; LLM-as-judge or property-based testing could close this gap
 - **Classifier tuning for AGENT tasks** — T16/T17 frequently misclassified as SKILL; prompt engineering or fine-tuning could improve routing
-- **Larger testbed for organic split/merge** — current 17 tasks don't produce overlapping capabilities; 50+ diverse tasks would test evolutionary operations in practice
+- **Larger testbed for organic split/merge** — current 18 tasks don't produce overlapping capabilities; 50+ diverse tasks would test evolutionary operations in practice
