@@ -203,6 +203,11 @@ class MetricsStore:
         ).fetchone()
         return row[0] if row else 0
 
+    def invocation_count_total(self) -> int:
+        """Total invocations across all capabilities."""
+        row = self._conn.execute("SELECT COUNT(*) FROM invocations").fetchone()
+        return row[0] if row else 0
+
     def list_capabilities(self) -> list[str]:
         """All unique capability IDs that have been invoked."""
         rows = self._conn.execute(

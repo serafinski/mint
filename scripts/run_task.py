@@ -476,7 +476,14 @@ def main() -> int:
     parser.add_argument(
         "--enable-optimizer",
         action="store_true",
-        help="Enable the granularity optimizer (needs invocation history to add value)",
+        default=None,
+        help="Force-enable the granularity optimizer. By default, the optimizer "
+        "auto-enables after 20+ invocations have been recorded.",
+    )
+    parser.add_argument(
+        "--no-optimizer",
+        action="store_true",
+        help="Force-disable the granularity optimizer",
     )
     parser.add_argument(
         "--output-format",
@@ -648,11 +655,31 @@ def main() -> int:
     # ------------------------------------------------------------------
     from src.orchestrator.pipeline import create_pipeline
 
+    # Determine whether to run the optimizer:
+    # --enable-optimizer forces on, --no-optimizer forces off,
+    # otherwise auto-enable after 20+ invocations (enough history for
+    # meaningful prune decisions, avoids cold-start waste).
+    AUTO_OPTIMIZER_THRESHOLD = 20
+    if args.no_optimizer:
+        run_optimizer = False
+    elif args.enable_optimizer:
+        run_optimizer = True
+    else:
+        invocation_count = metrics_store.invocation_count_total()
+        run_optimizer = invocation_count >= AUTO_OPTIMIZER_THRESHOLD
+        if run_optimizer:
+            print(
+                f"Optimizer auto-enabled ({invocation_count} invocations recorded).",
+                file=sys.stderr,
+            )
+
+    # Always pass metrics_store so gap_detection records registry matches
+    # as invocations (builds history for future optimizer runs).
     pipeline = create_pipeline(
         registry,
         loader,
-        run_optimizer=args.enable_optimizer,
-        metrics_store=metrics_store if args.enable_optimizer else None,
+        run_optimizer=run_optimizer,
+        metrics_store=metrics_store,
         verification_enabled=not args.skip_verification,
     ).compile()
 
@@ -663,6 +690,31 @@ def main() -> int:
         return 1
 
     elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+    # ------------------------------------------------------------------
+    # Report optimizer actions (if it ran)
+    # ------------------------------------------------------------------
+    if run_optimizer:
+        try:
+            events = metrics_store._conn.execute(
+                "SELECT event_type, COUNT(*) FROM capability_events "
+                "GROUP BY event_type ORDER BY event_type"
+            ).fetchall()
+            event_summary = {et: n for et, n in events}
+            pruned = event_summary.get("pruned", 0)
+            split = event_summary.get("split", 0)
+            merged = event_summary.get("merged", 0)
+            created = event_summary.get("created", 0)
+            if pruned or split or merged:
+                print(
+                    f"Optimizer: pruned {pruned}, split {split}, merged {merged} "
+                    f"({created} new capabilities created)",
+                    file=sys.stderr,
+                )
+            else:
+                print("Optimizer: no actions taken (registry stable).", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Select artifact and execute
