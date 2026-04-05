@@ -293,7 +293,7 @@ All core infrastructure is built and tested. Key architectural decisions locked 
 
 ### Pilot findings (2026-03-11)
 
-First pilot run (T01, T07, T10 under `full` condition) achieved 3/3 success but took **2+ hours** — unacceptable for evaluation. Root cause: six compounding architectural bottlenecks documented in `docs/investigation_pipeline_bottlenecks.md`:
+First pilot run (T01, T07, T10 under `full` condition) achieved 3/3 success but took **2+ hours** — unacceptable for evaluation. Root cause: six compounding architectural bottlenecks documented in `docs/archive/investigation_pipeline_bottlenecks.md`:
 
 1. **Over-decomposition** (CRITICAL) — T07 fuzzy-join produces 14 capabilities instead of 1-2. Decomposition prompt optimizes for "smallest meaningful" granularity.
 2. **Full regeneration on retry** (CRITICAL) — When 2/10 artifacts fail verification, all 11 gaps are regenerated (not just the 2 failed ones).
@@ -306,7 +306,7 @@ Additionally: sandbox base image lacked data-processing packages — resolved by
 
 ### Pipeline performance fix plan
 
-**8 fixes** documented in `docs/plan.md`. Implementation order:
+**8 fixes** documented in `docs/archive/plan.md`. Implementation order:
 
 ```
 Fix 0: dynamic LLM-based import→PyPI resolution for sandbox dependencies — unblocking
@@ -383,7 +383,7 @@ All three capability types confirmed working end-to-end.
 
 ### Still needed
 
-- [x] Implement Fix 0–7 per `docs/plan.md`
+- [x] Implement Fix 0–7 per `docs/archive/plan.md`
 - [x] Re-run pilot after fixes
 - [x] Classifier prompt rewrite (Single-Capability Rule)
 - [x] Run 4 baseline conditions across T01-T10 (n_runs ≥ 5) — results stale, need re-run
@@ -395,12 +395,12 @@ All three capability types confirmed working end-to-end.
 - [x] T09 schema hint in task prompt
 - [x] Re-run full evaluation (13 tasks × 4 conditions × 5 runs) with unified model + fixes (2026-03-18, 260 records)
 - [x] Add T14-T17 tasks (SKILL/AGENT coverage) and run evaluation (2026-03-20, 340 total records)
-- [x] Critique checkpoint: does the evaluation design produce usable thesis data? — Yes, see `docs/critique_checkpoint_review.md`
+- [x] Critique checkpoint: does the evaluation design produce usable thesis data? — Yes, see `docs/archive/critique_checkpoint_review.md`
 - [x] Longitudinal optimizer test (40 sequential tasks, no snapshot reset) — `scripts/run_longitudinal.py` (2026-03-19, 35/40 success=87.5%, first cycle 69.2% → last cycle 100%, prune only — split/merge thresholds not reached)
 - [x] Level 1 CLI runner — `scripts/run_task.py` (2026-03-23); supports `--file`, `--param`, `--dry-run`, `--list`, `--skip-verification`, `--enable-optimizer`, `--no-optimizer`, `--timeout`, `--output-format json|human`. Optimizer auto-enables after 20+ invocations. Persists metrics to `data/cli_metrics.duckdb`.
 
 **Runner:** `uv run scripts/run_pilot.py` (see `docs/iteration_plan.md` → Iteration 5 for full command reference)
-**CLI:** `uv run scripts/run_task.py "task description" --file data.csv` (see `docs/plan_cli_runner.md`)
+**CLI:** `uv run scripts/run_task.py "task description" --file data.csv` (see `docs/archive/plan_cli_runner.md`)
 
 **Agent team:** Not needed — all 3 baseline conditions are condition flags on the shared harness, not separate codebases.
 

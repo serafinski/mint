@@ -415,6 +415,10 @@ uv run pytest tests/unit/ -q
 
 # --- Interactive CLI (Level 1 runner) ---
 #
+# Currently: uv run scripts/run_task.py
+# Planned:   uv run mint (MINT — Model-driven Instantiation of Novel Tools)
+#            See docs/plan_cli_upgrade.md for the typer + rich upgrade plan.
+#
 # The CLI persists capabilities (ChromaDB) and invocation metrics (DuckDB)
 # across runs. The granularity optimizer auto-enables after 20+ invocations
 # have been recorded — no flag needed. It prunes unused capabilities, splits
@@ -513,6 +517,7 @@ The sandbox uses `__name__ = "not_main"` to prevent `mcp.run()` from starting. R
 
 ### Other Future Work
 
+- **MINT rebrand** — rename project from JustInTimeMAS to MINT (Model-driven Instantiation of Novel Tools). Includes repo rename, import paths, thesis title. CLI upgrade (`uv run mint`) planned in `docs/plan_cli_upgrade.md` with typer + rich.
 - **Per-task token attribution** — implemented in harness (LangFuse trace tagging), pending re-run for data collection
 - **Semantic correctness testing** — the gate catches structural defects but not business logic errors; LLM-as-judge or property-based testing could close this gap
 - **Classifier tuning for AGENT tasks** — T16/T17 frequently misclassified as SKILL; prompt engineering or fine-tuning could improve routing

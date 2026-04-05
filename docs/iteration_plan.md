@@ -752,22 +752,30 @@ Wait for both to finish, then wire the optimization loop into the main pipeline.
 
 ---
 
-## Iteration 5: Integration & End-to-End Testing (Weeks 9–11) 🔄 IN PROGRESS
+## Iteration 5: Integration & End-to-End Testing (Weeks 9–11) ✅ COMPLETE
 
 **Goal:** Wire all three pillars together. Build evaluation infrastructure and baselines.
 
-### Infrastructure complete (707 unit tests pass)
+### Infrastructure (792 unit tests pass)
 
 | Component | Status | Notes |
 |---|---|---|
 | `src/schemas/evaluation.py` | ✅ | `EvaluationRecord` (18 fields), separate from `InvocationRecord` |
 | `src/registry/evaluation_store.py` | ✅ | DuckDB `EvaluationStore`, `evaluation_runs` table |
-| `tests/evaluation/fixtures/` | ✅ | 10 fixture files, programmatic generation (seed=42), `expected_values.json` |
-| `tests/evaluation/tasks.py` | ✅ | T01–T10 `TaskDefinition` with validators |
+| `tests/evaluation/fixtures/` | ✅ | 35 fixture files for 18 tasks, programmatic generation (seed=42), `expected_values.json` |
+| `tests/evaluation/tasks.py` | ✅ | T01–T18 `TaskDefinition` with validators. Distribution: 8 MCP (3 retrieval + 5 synthesis), 5 SKILL, 5 AGENT |
+| `tests/evaluation/execution.py` | ✅ | SKILL/AGENT execution via DeepAgent; T04/T08/T10-T17 response models |
 | `tests/evaluation/snapshots.py` | ✅ | `take_clean_snapshot` / `restore_clean_snapshot` (ChromaDB + mcp_tools + skills) |
-| `tests/evaluation/harness.py` | ✅ | Full run loop; `MetricsStore` per-run; static implementations for T01/T02/T03/T05/T09 |
+| `tests/evaluation/harness.py` | ✅ | Full run loop; `MetricsStore` per-run; `prepare()` auto-cleans before snapshot; per-task LangFuse tagging; static implementations for T01/T02/T03/T05/T09 |
 | `src/orchestrator/pipeline.py` | ✅ | Added `verification_enabled` for no_verification baseline |
+| `src/orchestrator/loading_node.py` | ✅ | Registers tools even when host import fails (source_code in metadata) |
+| `scripts/run_task.py` | ✅ | User-facing CLI; auto-optimizer after 20+ invocations; verification findings in output |
+| `scripts/run_pilot.py` | ✅ | Evaluation runner; all conditions + task selection |
 | Bucket 1 bypass fixes (B1.2, B2.1, B2.3) | ✅ | Committed pre-Iteration-5 |
+| Integration tests | ✅ | `test_pipeline.py` (Pillar 1, 3 types), `test_verification.py` (Pillar 2, 5 scenarios), `test_split_merge.py` (Pillar 3, full loop), `test_auto_optimizer.py` (all 3 operations via pipeline) |
+| Logging improvements | ✅ | Gate fail-open message, package resolution context, generator summaries, ChromaDB/LangFuse debug logs |
+| deepagents upgrade | ✅ | 0.4.1 → 0.4.12; timeouts: adversarial 300s, SKILL 240s, AGENT 300s |
+| Testbed rebalancing | ✅ | T04→SKILL (inventory reorder), T08→AGENT (data quality), T10→AGENT (trend forecasting), T18 added (hash dedup MCP). Synthesis split: 5/5/5 |
 
 ### Pilot run findings (2026-03-11)
 
@@ -775,7 +783,7 @@ First pilot run completed (T01, T07, T10 under `full` condition). **3/3 tasks su
 
 **Model change:** Switched DeepAgent components (task decomposition + adversarial probing) from `deepseek:deepseek-chat` to `openai:gpt-5-mini`. Decomposition improved from ~120s to ~30s, but model speed was a red herring — architectural issues dominated runtime. Both `.env` keys (`DEEPSEEK_API_KEY`, `OPENAI_API_KEY`) are now required.
 
-**Root cause analysis:** Six compounding architectural bottlenecks identified. Full investigation in `docs/investigation_pipeline_bottlenecks.md`:
+**Root cause analysis:** Six compounding architectural bottlenecks identified. Full investigation in `docs/archive/investigation_pipeline_bottlenecks.md`:
 
 | Issue | Impact | Root cause |
 |---|---|---|
@@ -787,7 +795,7 @@ First pilot run completed (T01, T07, T10 under `full` condition). **3/3 tasks su
 | Artifact accumulation | +5-10 min/task | LLM name non-determinism → duplicates across retries |
 | Sandbox missing pandas | Hard fail | Generated tools importing pandas fail Tier 2 unconditionally |
 
-**Fix plan:** 8 fixes documented in `docs/plan.md` (Fix 0–7). Implementation order accounts for dependencies (e.g., Fix 5 deterministic naming must precede Fix 4 skip-on-retry). Expected outcome: pilot runtime → ~15-25 min, zero test breakage, ~27 new tests.
+**Fix plan:** 8 fixes documented in `docs/archive/plan.md` (Fix 0–7). Implementation order accounts for dependencies (e.g., Fix 5 deterministic naming must precede Fix 4 skip-on-retry). Expected outcome: pilot runtime → ~15-25 min, zero test breakage, ~27 new tests.
 
 ### Pilot run findings (2026-03-12) — post-fix re-run
 
@@ -815,7 +823,7 @@ After implementing Fix 0–7 and the classifier prompt rewrite (Single-Capabilit
 
 ### Still needed
 
-- [x] Implement Fix 0–7 per `docs/plan.md`
+- [x] Implement Fix 0–7 per `docs/archive/plan.md`
 - [x] Rebuild sandbox Docker image after Fix 0
 - [x] Re-run pilot after fixes (classifier fix + Single-Capability Rule)
 - [x] Run 4 baseline conditions across T01-T10 (n_runs=5) — results stale, need re-run post-fixes
@@ -979,19 +987,33 @@ Before starting Iteration 6, assess: Does the evaluation design actually produce
 
 ---
 
-## Iteration 6: Evaluation & Analysis (Weeks 11–13)
+## Iteration 6: Evaluation & Analysis (Weeks 11–13) 🔄 IN PROGRESS
 
 **Goal:** Run formal evaluation, collect data, produce thesis figures.
 
-### Tasks
+### Completed
 
-1. **Run all baselines** — ≥5 runs per condition for statistical significance
-2. **Collect metrics** — success rate, contamination rate, reuse distribution (Gini), token cost, time-to-first-correct, convergence
-3. **Manual audit** — 20–30 generated capabilities, classify: correct / contaminated / partial
-4. **DeepAgent analysis** — Separately measure: how many tool calls do DeepAgents make per invocation? Does the adversarial agent's multi-step probing catch things a single-pass approach misses? Token cost of DeepAgent nodes vs. plain nodes?
-5. **Verification cost analysis** — How often does Tier 1 reject immediately (saving Tier 2/3 cost)? What's the token cost distribution across tiers?
-6. **Figures** — success comparison, contamination rates, registry evolution, convergence curve, token breakdown, reuse distribution, DeepAgent analysis, verification tier cost distribution
-7. **Statistical analysis** — significance tests for key comparisons
+| Task | Status | Notes |
+|---|---|---|
+| Run all baselines (pre-rebalance) | ✅ | 340 records (T01-T17, March 18+20). Being re-run with 18 tasks + upgraded deps. |
+| Statistical analysis script | ✅ | `scripts/analyze_results.py` — Clopper-Pearson CIs, Fisher's exact per task, gate vs output separation |
+| Token cost backfill | ✅ | `scripts/backfill_token_costs.py` — LangFuse REST API, per-task attribution (tagged traces) |
+| Context window analysis | ✅ | `scripts/analyze_context_utilization.py` — 1,255 traces, max 28.8% utilization. System is cost-bound. |
+| Longitudinal optimizer test | ✅ | `scripts/run_longitudinal.py` — 40 tasks, 69.2%→100%, prune only. `data/longitudinal.duckdb` |
+| Model unification | ✅ | All LLM calls unified to `openai:gpt-5-mini` (was hybrid DeepSeek/GPT-5-mini) |
+
+### In progress
+
+- **Re-run evaluation** — 18 tasks × 4 conditions × 5 runs = 360 records. Running with deepagents 0.4.12, increased timeouts (adversarial 300s, SKILL 240s, AGENT 300s), per-task LangFuse tagging, rebalanced testbed (5/5/5 synthesis). Batched: no_verification + static tonight, no_optimization + full tomorrow.
+
+### Remaining
+
+1. **Collect metrics** — success rate, token cost, time-to-first-correct, convergence (after re-run completes)
+2. **Manual audit** — 20–30 generated capabilities, classify: correct / contaminated / partial
+3. **DeepAgent analysis** — tool call counts, planning steps, token cost per agent type (data exists in LangFuse traces)
+4. **Verification cost analysis** — Tier 1 rejection rate, token distribution across tiers (data exists in evaluation logs)
+5. **Figures** — success comparison, registry evolution, convergence curve, token breakdown, context utilization
+6. **Statistical analysis** — significance tests for key comparisons (script exists, re-run after new data)
 
 ### Agent Teams usage
 **2-teammate team:**
