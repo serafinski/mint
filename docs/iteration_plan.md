@@ -995,16 +995,18 @@ Before starting Iteration 6, assess: Does the evaluation design actually produce
 
 | Task | Status | Notes |
 |---|---|---|
-| Run all baselines (pre-rebalance) | ✅ | 340 records (T01-T17, March 18+20). Being re-run with 18 tasks + upgraded deps. |
+| Run all baselines (pre-rebalance) | ✅ | 340 records (T01-T17, March 18+20). Stale — replaced by April re-run. |
 | Statistical analysis script | ✅ | `scripts/analyze_results.py` — Clopper-Pearson CIs, Fisher's exact per task, gate vs output separation |
 | Token cost backfill | ✅ | `scripts/backfill_token_costs.py` — LangFuse REST API, per-task attribution (tagged traces) |
 | Context window analysis | ✅ | `scripts/analyze_context_utilization.py` — 1,255 traces, max 28.8% utilization. System is cost-bound. |
 | Longitudinal optimizer test | ✅ | `scripts/run_longitudinal.py` — 40 tasks, 69.2%→100%, prune only. `data/longitudinal.duckdb` |
 | Model unification | ✅ | All LLM calls unified to `openai:gpt-5-mini` (was hybrid DeepSeek/GPT-5-mini) |
+| MINT CLI | ✅ | `uv run mint` — Typer + Rich. 11 subcommands. See `src/cli/` and `docs/plan_cli_upgrade.md`. |
+| Re-run batch 1 | ✅ | 180 records: no_verification (76.7% success) + static (27.8%). 2026-04-05, ~2h. |
 
 ### In progress
 
-- **Re-run evaluation** — 18 tasks × 4 conditions × 5 runs = 360 records. Running with deepagents 0.4.12, increased timeouts (adversarial 300s, SKILL 240s, AGENT 300s), per-task LangFuse tagging, rebalanced testbed (5/5/5 synthesis). Batched: no_verification + static tonight, no_optimization + full tomorrow.
+- **Re-run batch 2** — no_optimization + full conditions (18 tasks × 5 runs each = 180 records). Running with verification enabled. Expected ~8-12h.
 
 ### Remaining
 

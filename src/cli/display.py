@@ -404,9 +404,10 @@ def show_capability_detail(
         f"[bold]Tags:[/bold] {', '.join(cap.tags) if cap.tags else '(none)'}",
         f"[bold]Created:[/bold] {cap.created_at:%Y-%m-%d %H:%M}",
     ]
+    _HIDDEN_META = {"source_code", "skill_content", "agent_config"}
     if cap.metadata:
         for k, v in cap.metadata.items():
-            if k != "source_code":
+            if k not in _HIDDEN_META:
                 meta_lines.append(f"[bold]{k}:[/bold] {v}")
 
     console.print(
@@ -417,16 +418,81 @@ def show_capability_detail(
         )
     )
 
-    # Source code
-    source = (cap.metadata or {}).get("source_code")
+    meta = cap.metadata or {}
+
+    # MCP_TOOL: show source code
+    source = meta.get("source_code")
     if source:
         console.print(
             Panel(
-                Syntax(source, "python", theme="monokai", line_numbers=True),
+                Syntax(source, "python", theme="monokai", line_numbers=True, word_wrap=True),
                 title="Source Code",
                 border_style="dim",
             )
         )
+
+    # SKILL: show SKILL.md content
+    skill_content = meta.get("skill_content")
+    if skill_content:
+        console.print(
+            Panel(
+                Syntax(skill_content, "markdown", theme="monokai", word_wrap=True),
+                title="SKILL.md",
+                border_style="dim",
+            )
+        )
+
+    # AGENT: show agent config (system prompt + settings)
+    agent_config = meta.get("agent_config")
+    if agent_config:
+        import json as json_mod
+
+        if isinstance(agent_config, str):
+            try:
+                agent_config = json_mod.loads(agent_config)
+            except (json_mod.JSONDecodeError, TypeError):
+                pass
+        if isinstance(agent_config, dict):
+            # Show system prompt separately if present
+            sys_prompt = agent_config.get("system_prompt")
+            if sys_prompt:
+                console.print(
+                    Panel(
+                        sys_prompt,
+                        title="System Prompt",
+                        border_style="dim",
+                    )
+                )
+            # Show rest of config
+            other = {k: v for k, v in agent_config.items() if k != "system_prompt"}
+            if other:
+                # Truncate skill_content in display (full content
+                # is in the SKILL.md panel or via mint export)
+                display_other = dict(other)
+                if "skill_content" in display_other:
+                    sc = display_other["skill_content"]
+                    if isinstance(sc, str) and len(sc) > 200:
+                        display_other["skill_content"] = sc[:200] + "... (truncated)"
+                console.print(
+                    Panel(
+                        Syntax(
+                            json_mod.dumps(display_other, indent=2),
+                            "json",
+                            theme="monokai",
+                            word_wrap=True,
+                        ),
+                        title="Agent Config",
+                        border_style="dim",
+                    )
+                )
+        else:
+            console.print(
+                Panel(
+                    str(agent_config),
+                    title="Agent Config",
+                    border_style="dim",
+                )
+            )
 
     # Invocation history
     if metrics_store:

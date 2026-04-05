@@ -443,6 +443,32 @@ mint run "clean up this data" -f messy.csv --improve --force
 
 ---
 
+### Step 10: `--output-dir` — save generated file outputs (planned)
+
+**Problem:** Generated tools that produce files (cleaned CSVs, reports, charts) write them inside the ephemeral Docker container. When the container exits, those files are gone. The JSON output may contain file paths (e.g. `/tmp/fixture_0.csv`) that don't exist on the host, or the full file content as a giant string in the JSON — neither is useful.
+
+```bash
+# Proposed: save any file outputs to a local directory
+mint run "Clean this CSV and save the result" \
+  -f dirty.csv --output-dir ./results/
+
+# Result:
+# Output saved to: ./results/cleaned.csv
+# Summary saved to: ./results/summary.json
+```
+
+**Implementation options:**
+
+1. **Post-execution extraction** — After sandbox execution, scan the result dict for values that look like file content (long strings, CSV-like, JSON-like). Write them to `--output-dir` with auto-generated filenames.
+
+2. **Docker volume mount** — Mount `--output-dir` as a writable volume in the sandbox container. Generated tools write directly to it. More reliable but requires changing `sandbox_execute` to support output mounts.
+
+3. **Convention-based** — Instruct generators to return file content in a `files` key in the result dict (e.g. `{"files": {"cleaned.csv": "..."}, "summary": {...}}`). The CLI extracts and writes them.
+
+**Why this matters:** Without this, file-producing tasks are effectively broken for end users. They see a JSON blob with embedded file content or dead temp paths. The tool technically works but the user can't access the result.
+
+---
+
 ## What NOT to do
 
 - Don't make Rich a hard dependency for the pipeline — it's CLI-only. `src/orchestrator/` should never import Rich.

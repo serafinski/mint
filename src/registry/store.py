@@ -283,10 +283,16 @@ def seed_registry(registry: SkillRegistry) -> None:
         domain: str = "general",
         tags: list[str] | None = None,
         source_code: str | None = None,
+        skill_content: str | None = None,
+        agent_config: str | None = None,
     ) -> CapabilityDescriptor:
         metadata: dict = {"pinned": "true"}  # all seeded caps are pinned
         if source_code is not None:
             metadata["source_code"] = source_code
+        if skill_content is not None:
+            metadata["skill_content"] = skill_content
+        if agent_config is not None:
+            metadata["agent_config"] = agent_config
         kwargs: dict = {
             "name": name,
             "description": description,
@@ -426,6 +432,27 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.SKILL,
             domain="data-processing",
             tags=["data-cleaning", "etl", "workflow", "preprocessing"],
+            skill_content=(
+                "---\n"
+                "name: data-cleaning-workflow\n"
+                "description: Multi-step data cleaning workflow\n"
+                "---\n\n"
+                "# Data Cleaning Workflow\n\n"
+                "## Steps\n\n"
+                "1. **Load data** — Read the input CSV/JSON file\n"
+                "2. **Remove nulls** — Drop rows where all values "
+                "are null; flag rows with partial nulls\n"
+                "3. **Deduplicate** — Remove exact duplicate rows, "
+                "keeping the first occurrence\n"
+                "4. **Type coercion** — Convert numeric strings to "
+                "numbers, parse date columns\n"
+                "5. **Outlier flagging** — Flag values beyond 3 "
+                "standard deviations from the mean\n\n"
+                "## Output\n\n"
+                "Return a dict with: `clean_row_count`, "
+                "`removed_nulls`, `removed_duplicates`, "
+                "`outliers_flagged`, and `type_errors`.\n"
+            ),
         ),
         _cap(
             "report-generation",
@@ -437,6 +464,26 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.SKILL,
             domain="reporting",
             tags=["report", "visualization", "summary", "documentation"],
+            skill_content=(
+                "---\n"
+                "name: report-generation\n"
+                "description: Generate analysis reports from data\n"
+                "---\n\n"
+                "# Report Generation\n\n"
+                "## Steps\n\n"
+                "1. **Compute summary statistics** — mean, median, "
+                "std, min, max for numeric columns\n"
+                "2. **Build stats table** — Format as a dict of "
+                "column → statistics\n"
+                "3. **Identify anomalies** — Find the top 5 outlier "
+                "records by z-score on the primary metric\n"
+                "4. **Generate summary** — One-paragraph executive "
+                "summary describing key findings\n\n"
+                "## Output\n\n"
+                "Return a dict with: `summary` (str), "
+                "`stats_table` (dict), and `anomalies` (list of "
+                "top 5 records).\n"
+            ),
         ),
         # AGENT type
         _cap(
@@ -449,6 +496,24 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.AGENT,
             domain="analytics",
             tags=["analysis", "eda", "profiling", "insights", "autonomous"],
+            agent_config=(
+                '{"system_prompt": "You are a data analysis agent. '
+                "Given a dataset, perform exploratory data analysis:\\n"
+                "1. Profile the data (row count, column types, "
+                "missing values)\\n"
+                "2. Compute summary statistics for numeric columns\\n"
+                "3. Identify correlations between variables\\n"
+                "4. Detect patterns and anomalies\\n"
+                "5. Generate actionable insights\\n\\n"
+                "Use the sandbox_execute tool to run Python code "
+                "for analysis. Write findings to files for context "
+                'management.", '
+                '"node_config": {"name": "data_analysis_node", '
+                '"model": "openai:gpt-5-mini", '
+                '"tools": ["sandbox_execute"], '
+                '"description": "Autonomous EDA agent"}, '
+                '"is_deep_agent": true}'
+            ),
         ),
     ]
     for cap in seeds:

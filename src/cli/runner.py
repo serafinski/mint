@@ -815,22 +815,40 @@ def execute_task(
             detail = stage_details.get(node_name, "")
             elapsed = timings.get(node_name, 0)
 
-            # Skip generators that didn't produce new artifacts
+            # Skip generators that didn't produce new artifacts.
+            # When new artifacts appear, use their actual type for the
+            # label (not the node name — streaming can misattribute).
             _gen_nodes = {
                 "generate_mcp_tool",
                 "generate_skill",
                 "generate_agent",
             }
+            _type_labels = {
+                "mcp_tool": "Generating MCP tool",
+                "skill": "Generating skill",
+                "agent": "Generating agent",
+            }
+            gen_label_override: str | None = None
             if node_name in _gen_nodes:
-                cur = len(accumulated.get("generated_artifacts") or [])
+                arts = accumulated.get("generated_artifacts") or []
+                cur = len(arts)
                 new = cur - prev_artifact_count
                 if new == 0:
                     printed_nodes.add(node_name)
                     return False
+                new_arts = arts[prev_artifact_count:]
                 prev_artifact_count = cur
+                # Use the actual type of the new artifact(s)
+                types = {
+                    str(a.capability_type).split(".")[-1].lower()
+                    for a in new_arts
+                    if hasattr(a, "capability_type")
+                }
+                if len(types) == 1:
+                    gen_label_override = _type_labels.get(next(iter(types)))
                 detail = f"{new} artifact(s)"
 
-            label = _STAGE_LABEL.get(node_name, node_name)
+            label = gen_label_override or _STAGE_LABEL.get(node_name, node_name)
             detail_str = f" — {detail}" if detail else ""
             console.print(
                 f"  [green]\u2713[/green] {label}{detail_str} [dim]({elapsed:.1f}s)[/dim]"
@@ -915,17 +933,56 @@ def execute_task(
         from src.schemas.capability import CapabilityType
 
         cap_type = artifact.capability_type
-        if not json_output:
-            console.print(f"\n[dim]Executing {artifact.capability_name}...[/dim]")
+        cap_type_label = str(cap_type).split(".")[-1].upper()
 
         try:
             if cap_type == CapabilityType.MCP_TOOL:
+                if not json_output:
+                    console.print(f"\n[dim]Executing {artifact.capability_name}...[/dim]")
                 output = _execute_mcp_tool(artifact, file_paths, parsed_params) or None
             elif cap_type in (CapabilityType.SKILL, CapabilityType.AGENT):
-                output = (
-                    _execute_skill_or_agent(artifact, task_prompt, file_paths, timeout_s=timeout)
-                    or None
-                )
+                if not json_output:
+                    exec_label = f"Executing {cap_type_label}: {artifact.capability_name}"
+                    exec_stop = threading.Event()
+                    exec_start = time.monotonic()
+
+                    def _exec_timer(status_ref):
+                        while not exec_stop.is_set():
+                            sec = int(time.monotonic() - exec_start)
+                            status_ref.update(f"[cyan]{exec_label}...[/cyan] [dim]({sec}s)[/dim]")
+                            exec_stop.wait(1)
+
+                    with console.status(
+                        f"[cyan]{exec_label}...[/cyan] [dim](0s)[/dim]",
+                        spinner="dots",
+                    ) as exec_status:
+                        t = threading.Thread(
+                            target=_exec_timer,
+                            args=(exec_status,),
+                            daemon=True,
+                        )
+                        t.start()
+                        output = (
+                            _execute_skill_or_agent(
+                                artifact,
+                                task_prompt,
+                                file_paths,
+                                timeout_s=timeout,
+                            )
+                            or None
+                        )
+                        exec_stop.set()
+                        t.join(timeout=1)
+                else:
+                    output = (
+                        _execute_skill_or_agent(
+                            artifact,
+                            task_prompt,
+                            file_paths,
+                            timeout_s=timeout,
+                        )
+                        or None
+                    )
         except Exception as exc:
             err_console.print(f"[yellow]Execution error: {exc}[/yellow]")
             output = None

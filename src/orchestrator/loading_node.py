@@ -20,7 +20,7 @@ from langgraph.types import Command
 
 from src.orchestrator.tool_loader import ToolLoader
 from src.registry.store import SkillRegistry
-from src.schemas.capability import CapabilityType
+from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import TaskState, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -68,7 +68,8 @@ def loading_node(
             # dynamically. Register it with source_code so it's reusable.
             logger.warning(
                 "Host import failed for '%s': %s (registering with source_code only)",
-                artifact.capability_name, exc,
+                artifact.capability_name,
+                exc,
             )
 
         # --- Smoke-test (only if host-loadable) ---
@@ -91,12 +92,51 @@ def loading_node(
             logger.error(error_msg)
             errors.append(error_msg)
 
-    # Skills and agents are deployed by being written to disk during generation;
-    # if their artifacts appear in state.generated_artifacts the files are on disk.
+    # Register SKILL and AGENT artifacts in the registry for reuse.
+    # They're already on disk (written during generation), but without
+    # registry entries gap_detection can't find them on future runs.
     non_mcp_artifacts = [
         a for a in state.generated_artifacts if a.capability_type != CapabilityType.MCP_TOOL
     ]
-    # "deployed" = MCP tools registered in registry + skills/agents written to disk.
+    for artifact in non_mcp_artifacts:
+        try:
+            metadata: dict[str, str] = {
+                "generated": "true",
+                "source": "jit_pipeline",
+            }
+            if artifact.skill_content:
+                metadata["skill_content"] = artifact.skill_content
+            if artifact.agent_config:
+                import json
+
+                metadata["agent_config"] = (
+                    json.dumps(artifact.agent_config)
+                    if isinstance(artifact.agent_config, dict)
+                    else str(artifact.agent_config)
+                )
+            descriptor = CapabilityDescriptor(
+                name=artifact.capability_name,
+                description=artifact.description or artifact.capability_name,
+                capability_type=artifact.capability_type,
+                domain="generated",
+                metadata=metadata,
+            )
+            registry.add(descriptor)
+            registered += 1
+            logger.info(
+                "Registered %s '%s' in registry",
+                artifact.capability_type.value,
+                artifact.capability_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            error_msg = (
+                f"Failed to register {artifact.capability_type.value} "
+                f"'{artifact.capability_name}': {exc}"
+            )
+            logger.error(error_msg)
+            errors.append(error_msg)
+
+    # "deployed" = registered in registry + on disk.
     deployed = registered + len(non_mcp_artifacts)
     new_errors = len(errors) - len(state.errors)
 

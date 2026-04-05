@@ -277,7 +277,7 @@ All core infrastructure is built and tested. Key architectural decisions locked 
 
 ## Current Iteration
 
-**Iteration 5: Integration & End-to-End Testing.** Wire all three pillars together. Build evaluation infrastructure and baselines.
+**Iteration 6: Evaluation & Analysis.** Run formal evaluation, collect data, produce thesis figures. MINT CLI implemented (`uv run mint`).
 
 **Model unification (2026-03-17):** Switched all LLM calls from hybrid DeepSeek/GPT-5-mini to unified `openai:gpt-5-mini` to eliminate the mixed-model confound in evaluation.
 
@@ -327,9 +327,22 @@ After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% 
 
 **Semantic correctness gap:** Verification gate catches structural/deception issues but not business logic correctness. The gap between gate_pass_rate (100%) and success_rate (66.7%) quantifies this limitation. Deferred to future work — see `docs/iteration_plan.md` → "Pilot run findings (2026-03-12)" for full analysis and three proposed approaches.
 
-### Full evaluation results (2026-03-18 + 2026-03-20, 340 records — PENDING RE-RUN)
+### Full evaluation results (RE-RUN IN PROGRESS — 2026-04-05)
 
-<!-- TODO: UPDATE AFTER RE-RUN — new run with deepagents 0.4.12, timeouts (adversarial 300s, SKILL 240s, AGENT 300s), per-task LangFuse tagging. Task set restructured: T04 (was pipe-delimited MCP → inventory reorder SKILL), T08 (was logistic regression MCP → data quality investigation AGENT), T10 (was server log MCP → trend detection AGENT). T18 added (MCP_TOOL: hash-based deduplication). Distribution now 8 MCP / 5 SKILL / 5 AGENT (synthesis: 5/5/5). Replace table and per-task notes below. -->
+**Batch 1 complete (2026-04-05):** 180 records (18 tasks × 2 conditions × 5 runs)
+
+| Condition | Success | Gate Pass |
+|---|---|---|
+| no_verification | 69/90 (76.7%) | 90/90 (100%) |
+| static | 25/90 (27.8%) | 25/90 (27.8%) |
+
+**no_verification per-task:** T02/T03/T04/T10/T11/T12/T15 = 100%, T01/T06/T09/T14/T17 = 80%, T05/T13/T16 = 60%, T07/T18 = 40%, T08 = 20%.
+
+**static per-task:** T01/T02/T03/T05/T09 = 100% (5 tasks with static implementations), all others = 0% (by design).
+
+**Batch 2 running:** no_optimization + full conditions (with verification, ~8-12h).
+
+**Previous results (2026-03-18 + 2026-03-20, 340 records — STALE, pre-rebalance):**
 
 | Condition | Success | Gate Pass |
 |---|---|---|
@@ -337,10 +350,6 @@ After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% 
 | no_optimization | 66/85 (77.6%) | 85/85 (100%) |
 | no_verification | 72/85 (84.7%) | 84/85 (98.8%) |
 | static | 25/85 (29.4%) | 25/85 (29.4%) |
-
-Task tiers (JIT best): Always pass (T01-T03, T08, T10, T13 = 100%), High (T04 80-100%, T07 60-80%, T11 80-100%, T14 80-100%), Stochastic (T05 60%, T12 40-100%, T15 40-80%, T16 40-60%), Low (T09 0-20%, T17 variable), Never pass (T06 0%).
-
-**Key findings:** (1) Pooled JIT vs Static: 73.3% vs 14.3%, p<0.001. (2) JIT cluster (synthesis): 65.7%–81.4%. (3) Optimizer hurts in single-run evaluation — needs invocation history to add value. (4) T06 0% everywhere = semantic correctness gap poster child (gate=100%, success=0%). (5) T09 5/5 static but ~0% JIT = prompt specificity tradeoff. (6) All three capability types work end-to-end (MCP_TOOL, SKILL, AGENT) — T14 SKILL 13/15, T16 AGENT 6/15, T17 AGENT 4/4 when correctly classified vs SKILL 1/11 (type selection matters). See `docs/iteration_plan.md` for detailed per-task analysis.
 
 ### SKILL/AGENT execution support (2026-03-13)
 
@@ -397,10 +406,11 @@ All three capability types confirmed working end-to-end.
 - [x] Add T14-T17 tasks (SKILL/AGENT coverage) and run evaluation (2026-03-20, 340 total records)
 - [x] Critique checkpoint: does the evaluation design produce usable thesis data? — Yes, see `docs/archive/critique_checkpoint_review.md`
 - [x] Longitudinal optimizer test (40 sequential tasks, no snapshot reset) — `scripts/run_longitudinal.py` (2026-03-19, 35/40 success=87.5%, first cycle 69.2% → last cycle 100%, prune only — split/merge thresholds not reached)
-- [x] Level 1 CLI runner — `scripts/run_task.py` (2026-03-23); supports `--file`, `--param`, `--dry-run`, `--list`, `--skip-verification`, `--enable-optimizer`, `--no-optimizer`, `--timeout`, `--output-format json|human`. Optimizer auto-enables after 20+ invocations. Persists metrics to `data/cli_metrics.duckdb`.
+- [x] Level 1 CLI runner — `scripts/run_task.py` (2026-03-23)
+- [x] Level 2 MINT CLI — `uv run mint` (2026-04-05); Typer + Rich. Subcommands: `run`, `plan`, `retry`, `list`, `inspect`, `history`, `prune`, `seed`, `reset`, `disable`, `enable`. Animated spinner, file metadata augmentation, AST-based parameter matching, Docker check, binary file detection, user-friendly verification findings, optimizer feedback. See `src/cli/` and `docs/plan_cli_upgrade.md`.
 
 **Runner:** `uv run scripts/run_pilot.py` (see `docs/iteration_plan.md` → Iteration 5 for full command reference)
-**CLI:** `uv run scripts/run_task.py "task description" --file data.csv` (see `docs/archive/plan_cli_runner.md`)
+**CLI:** `uv run mint run "task description" --file data.csv` (see `docs/plan_cli_upgrade.md`)
 
 **Agent team:** Not needed — all 3 baseline conditions are condition flags on the shared harness, not separate codebases.
 
@@ -437,6 +447,9 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`tests/evaluation/harness.py`** — `EvaluationHarness`, `HarnessConfig`, `_run_static_implementation()`
 - **`tests/evaluation/execution.py`** — `execute_skill_artifact()`, `execute_agent_artifact()`, `_read_fixture_contents()` (DeepAgent-based SKILL/AGENT execution)
 - **`scripts/run_pilot.py`** — Evaluation runner: `uv run scripts/run_pilot.py [--condition] [--all-tasks] [--all-conditions] [--n-runs N]`
+- **`src/cli/app.py`** — MINT CLI entry point (Typer): `run`, `plan`, `retry`, `list`, `inspect`, `history`, `prune`, `seed`, `reset`, `disable`, `enable`
+- **`src/cli/runner.py`** — Pipeline execution with streaming progress, file metadata augmentation, AST-based parameter matching
+- **`src/cli/display.py`** — Rich formatting (progress table, verification findings, capability list/inspect/history)
 - **`scripts/run_task.py`** — User-facing CLI: `uv run scripts/run_task.py "task" [--file PATH] [--param K=V] [--dry-run] [--list] [--skip-verification] [--enable-optimizer] [--no-optimizer] [--timeout SECONDS] [--output-format json|human]`. Optimizer auto-enables after 20+ invocations. Persists capabilities (ChromaDB) and invocation metrics (`data/cli_metrics.duckdb`) across runs.
 
 ## Notes for AI Agents
