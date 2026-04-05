@@ -299,6 +299,130 @@ Evaluation: full condition
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 45% 8/18 tasks  T08 ⟳
 ```
 
+### Step 6: `mint export` / `mint import` — user-editable generated code (planned)
+
+Currently generated source code is stored only in ChromaDB metadata. Users can view it with `mint inspect` but cannot edit and re-register a fixed version. When a generated tool has a bug, the only option is to rephrase the task and re-generate.
+
+**`mint export`** writes a capability's source code to a local file:
+
+```bash
+# Export to a file
+mint export evaluate_inventory_a4d5d7 -o inventory_tool.py
+
+# Export to stdout
+mint export evaluate_inventory_a4d5d7
+```
+
+For MCP_TOOL: writes the Python source. For SKILL: writes SKILL.md. For AGENT: writes the agent config JSON.
+
+**`mint import`** registers a local file as a capability, replacing the generated version:
+
+```bash
+# Import a fixed tool (replaces existing by name)
+mint import inventory_tool.py --name evaluate_inventory_a4d5d7
+
+# Import a new tool with auto-detected name
+mint import my_tool.py
+
+# Import a skill
+mint import SKILL.md --type skill --name my-data-cleaner
+```
+
+The imported capability goes through verification (unless `--skip-verification`) and gets registered in ChromaDB with `source="user-edited"` metadata.
+
+**Why this matters:** The generate → fail → rephrase → regenerate loop is slow (~2-5 min per attempt). Export → edit → import lets users fix a one-line bug in seconds. This also enables a hybrid workflow: JIT generates the scaffold, the user polishes the logic.
+
+**Implementation notes:**
+- `export` reads from `registry.get(name).metadata["source_code"]`
+- `import` creates a `GeneratedArtifact`, runs it through `verify()`, then `registry.add()`
+- Imported capabilities get `metadata={"source": "user-edited", "imported_from": path}`
+- Must handle all three types (MCP_TOOL, SKILL, AGENT)
+
+### Step 7: `mint retry` — quick re-run with edited prompt (planned)
+
+When a task fails, the user currently has to retype the entire command with a modified prompt. A `mint retry` command would streamline this:
+
+```bash
+# Re-run the last task with the same files/params
+mint retry
+
+# Re-run with an edited prompt (opens $EDITOR with the previous prompt pre-filled)
+mint retry --edit
+
+# Re-run with extra instructions appended to the original prompt
+mint retry --hint "The rules JSON has a 'reorder_threshold' field per category"
+
+# Re-run but skip verification (faster iteration)
+mint retry --skip-verification
+```
+
+**Implementation:**
+- Save the last run's config (task, files, params, flags) to `data/last_run.json` at the end of every `mint run`
+- `mint retry` loads that config and re-invokes `execute_task()`
+- `--edit` opens `$EDITOR` (or `--editor` flag) with the task prompt; on save, re-runs with the edited version
+- `--hint` appends text to the original prompt without replacing it (e.g. "Additional context: ...")
+- All other flags (`--skip-verification`, `--no-optimizer`, `--timeout`, etc.) can be overridden
+
+**Why this matters:** The most common failure mode is an underspecified prompt. The user sees what went wrong (via `mint inspect` or the error message), knows exactly what context is missing, and wants to add one sentence — not retype the whole command with file paths.
+
+### Step 8: Smart prompt improvement — `mint run --improve` (planned)
+
+The most common failure mode is an underspecified prompt. File metadata augmentation (Step 2) tells the generator *what* the data looks like, but it doesn't help if the user's intent is vague ("do something with this data"). The `--hint` flag (Step 7) fixes this reactively, but only after a failure.
+
+**Proactive prompt improvement** uses an LLM call to rewrite the user's prompt into a more specific, actionable version *before* the pipeline runs.
+
+```bash
+# Auto-improve (asks for confirmation before proceeding)
+mint run "clean up this data" -f messy.csv --improve
+
+# Example flow:
+# ╭──────────────── MINT ────────────────╮
+# │ clean up this data                   │
+# │   └ messy.csv                        │
+# ╰────── JIT Capability Synthesis ──────╯
+#
+# Suggested improved prompt:
+#
+#   "Read messy.csv (CSV, 500 rows, columns: id, name, email, score, date).
+#    Clean the data by: (1) removing rows where all values are null,
+#    (2) deduplicating rows by id, (3) standardizing date format to
+#    ISO-8601, (4) trimming whitespace from string columns. Return
+#    the cleaned row count and a summary of changes made."
+#
+# Use this improved prompt? [Y/n/edit]:
+#   Y     → proceed with improved prompt
+#   n     → proceed with original prompt
+#   edit  → open improved prompt in $EDITOR, then proceed
+
+# Always improve without asking (for scripting)
+mint run "clean up this data" -f messy.csv --improve --force
+```
+
+**Implementation:**
+
+1. **Pre-pipeline LLM call** — Before decomposition, send the user's task + file metadata to a prompt-improvement prompt:
+   - Input: user task, file structure summaries (from `_describe_file()`), parameter list
+   - System prompt: "You are a task specification assistant. Rewrite the user's vague task into a precise, actionable specification. Use the file structure information to be specific about column names, data types, and expected operations. Keep the original intent. Output only the improved task description."
+   - Model: same `openai:gpt-5-mini`
+
+2. **User confirmation** — Show the improved prompt and ask:
+   - `Y` (default): use improved prompt
+   - `n`: use original prompt unchanged
+   - `edit`: open improved prompt in `$EDITOR` for manual tweaking
+
+3. **`--improve` flag** — opt-in to avoid the extra LLM call on every run
+   - Could later become default behavior with `--no-improve` to skip
+
+4. **Integration with retry** — `mint retry --improve` re-improves the original (not previously improved) prompt with fresh context from the failure
+
+**Why this matters:** The gap between "what the user typed" and "what the pipeline needs" is the single biggest source of failures. File metadata helps the *generator*, but prompt improvement helps the *decomposer* and *classifier* — the upstream stages that determine what gets built. A 5-second LLM call to clarify intent can save 2-5 minutes of failed generation.
+
+**Cost:** One additional LLM call (~2-5s, ~500 tokens). Only when `--improve` is specified. The improved prompt is shown to the user before proceeding, so there's full transparency — no hidden rewriting.
+
+**Future:** If prompt improvement proves consistently helpful, it could become the default behavior (always improve, show diff, ask to confirm). The `--no-improve` flag would then skip it for power users who write precise prompts.
+
+---
+
 ## What NOT to do
 
 - Don't make Rich a hard dependency for the pipeline — it's CLI-only. `src/orchestrator/` should never import Rich.

@@ -413,48 +413,85 @@ export LANGFUSE_HOST="http://localhost:3000"  # optional
 # Run tests
 uv run pytest tests/unit/ -q
 
-# --- Interactive CLI (Level 1 runner) ---
+# --- MINT CLI (uv run mint) ---
 #
-# Currently: uv run scripts/run_task.py
-# Planned:   uv run mint (MINT — Model-driven Instantiation of Novel Tools)
-#            See docs/plan_cli_upgrade.md for the typer + rich upgrade plan.
+# MINT — Model-driven Instantiation of Novel Tools
+# Built with Typer + Rich. Subcommands for running tasks, managing the
+# registry, and iterating on failures. Requires Docker for verification
+# and execution of generated MCP tools.
 #
-# The CLI persists capabilities (ChromaDB) and invocation metrics (DuckDB)
-# across runs. The granularity optimizer auto-enables after 20+ invocations
-# have been recorded — no flag needed. It prunes unused capabilities, splits
-# high-reuse/low-success ones into specialized variants, and merges similar
-# low-reuse SKILLs. Use --no-optimizer to disable, --enable-optimizer to
-# force on early.
+# Data storage (isolated from evaluation harness):
+#   data/cli_chroma/        — ChromaDB registry (capabilities + embeddings)
+#   data/cli_metrics.duckdb — DuckDB invocation history (optimizer input)
+#   data/last_run.json      — last run config (for mint retry)
+#
+# The granularity optimizer auto-enables after 20+ invocations — no flag
+# needed. It prunes unused capabilities, splits high-reuse/low-success
+# ones, and merges similar low-reuse SKILLs.
 
-# Parse a CSV file (will find seeded csv-parser in registry)
-uv run scripts/run_task.py "Parse this CSV and compute summary statistics" \
-  --file tests/evaluation/fixtures/t01_standard.csv
+# --- Running tasks ---
 
-# Generate a new capability on demand
-uv run scripts/run_task.py "Clean this CSV and remove duplicates" \
-  --file tests/evaluation/fixtures/t05_dirty.csv
+# Simple task (finds seeded text-statistics in registry)
+uv run mint run "Count the number of words in this text" \
+  -f tests/evaluation/fixtures/t03_document.txt
 
-# Multi-file SKILL task
-uv run scripts/run_task.py \
-  "Integrate sales with products and compute regional revenue" \
-  --file tests/evaluation/fixtures/t11_sales.csv \
-  --file tests/evaluation/fixtures/t11_products.json \
-  --file tests/evaluation/fixtures/t11_targets.csv
+# Multi-file task (JIT generates a new MCP tool)
+uv run mint run "Read this CSV and tell me which products need reordering" \
+  -f tests/evaluation/fixtures/t04_inventory.csv \
+  -f tests/evaluation/fixtures/t04_reorder_rules.json
 
 # Dry-run: decompose and classify only, no generation
-uv run scripts/run_task.py "Detect anomalies in this data" \
-  --file data.csv --dry-run
+uv run mint plan "Detect anomalies in this data" -f metrics.csv
 
-# List all registered capabilities
-uv run scripts/run_task.py --list
+# JSON output, skip verification
+uv run mint run "Count words" -f report.txt --json --skip-verification
 
-# JSON output, skip verification, verbose logging
-uv run scripts/run_task.py "Count words in this document" \
-  --file report.txt --output-format json --skip-verification --verbose
+# --- Iterating on failures ---
 
-# Override SKILL/AGENT execution timeout (default: 240s SKILL, 300s AGENT)
-uv run scripts/run_task.py "Investigate anomalies in this data" \
-  --file metrics.csv --timeout 300
+# Re-run last task with extra context
+uv run mint retry --hint "The JSON has reorder_threshold per category"
+
+# Re-run with full prompt editing in $EDITOR
+uv run mint retry --edit
+
+# Re-run as-is (maybe flaky generation)
+uv run mint retry
+
+# --- Registry management ---
+
+# List all capabilities (active + inactive)
+uv run mint list
+
+# List only active, filter by type
+uv run mint list --active-only --type skill
+
+# Inspect a capability (metadata, source code, invocation history)
+uv run mint inspect fibonacci
+
+# Disable/enable capabilities
+uv run mint disable fibonacci
+uv run mint enable fibonacci
+
+# Manual pruning (remove capabilities unused in last 30 days)
+uv run mint prune
+
+# Show invocation history
+uv run mint history
+uv run mint history --capability text-statistics
+
+# --- Setup and reset ---
+
+# Seed baseline capabilities (fibonacci, csv-parser, etc.)
+uv run mint seed
+
+# Full reset (wipe all, re-seed)
+uv run mint reset
+
+# Reset to empty (no seeded capabilities)
+uv run mint reset --no-seed
+
+# --- Legacy CLI (still works, not deprecated) ---
+uv run scripts/run_task.py "task description" --file data.csv
 
 # --- Evaluation runners ---
 
@@ -517,7 +554,10 @@ The sandbox uses `__name__ = "not_main"` to prevent `mcp.run()` from starting. R
 
 ### Other Future Work
 
-- **MINT rebrand** — rename project from JustInTimeMAS to MINT (Model-driven Instantiation of Novel Tools). Includes repo rename, import paths, thesis title. CLI upgrade (`uv run mint`) planned in `docs/plan_cli_upgrade.md` with typer + rich.
+- **MINT rebrand** — rename project from JustInTimeMAS to MINT (Model-driven Instantiation of Novel Tools). CLI (`uv run mint`) is implemented with Typer + Rich (see `src/cli/`). Remaining: repo rename, import paths, thesis title.
+- **`mint export` / `mint import`** — let users export generated source code, edit it, and re-import fixed versions. Documented in `docs/plan_cli_upgrade.md`.
+- **Smart prompt improvement (`--improve`)** — pre-pipeline LLM call to rewrite vague prompts into specific, actionable ones using file metadata. Interactive confirmation before proceeding. Documented in `docs/plan_cli_upgrade.md`.
+- **`mint fix <name> --error "..."`** — targeted code repair. Takes existing source + execution error, LLM patches the specific bug, re-verifies, re-registers. Faster than full regeneration for single-line bugs (seconds vs minutes). Documented in `docs/plan_cli_upgrade.md`.
 - **Per-task token attribution** — implemented in harness (LangFuse trace tagging), pending re-run for data collection
 - **Semantic correctness testing** — the gate catches structural defects but not business logic errors; LLM-as-judge or property-based testing could close this gap
 - **Classifier tuning for AGENT tasks** — T16/T17 frequently misclassified as SKILL; prompt engineering or fine-tuning could improve routing

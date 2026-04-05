@@ -1,0 +1,507 @@
+"""Rich-based display formatting for the MINT CLI."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.table import Table
+
+console = Console()
+err_console = Console(stderr=True)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline stage tracking
+# ---------------------------------------------------------------------------
+
+STAGE_MAP: dict[str, str] = {
+    "decomposition_node": "Decompose",
+    "gap_detection": "Registry Search",
+    "classifier_node": "Classify",
+    "generate_mcp_tool": "Generate (MCP)",
+    "generate_skill": "Generate (Skill)",
+    "generate_agent": "Generate (Agent)",
+    "verification_node": "Verify",
+    "loading_node": "Load & Register",
+    "optimizer_node": "Optimize",
+}
+
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _spinner_icon() -> str:
+    """Return a cycling spinner character based on current time."""
+    import time
+
+    idx = int(time.monotonic() * 8) % len(_SPINNER_FRAMES)
+    return f"[cyan]{_SPINNER_FRAMES[idx]}[/cyan]"
+
+
+def build_progress_table(
+    stages: dict[str, str],
+    active: str | None = None,
+    completed: set[str] | None = None,
+    timings: dict[str, float] | None = None,
+    stage_details: dict[str, str] | None = None,
+    elapsed_active: float | None = None,
+) -> Table:
+    """Build a Rich table showing pipeline stage progress."""
+    completed = completed or set()
+    timings = timings or {}
+    stage_details = stage_details or {}
+
+    table = Table(
+        show_header=False,
+        box=None,
+        padding=(0, 1),
+        expand=False,
+    )
+    table.add_column("status", width=3, no_wrap=True)
+    table.add_column("stage", min_width=20)
+    table.add_column("detail", style="dim")
+    table.add_column("time", justify="right", style="dim", min_width=8)
+
+    for node_name, label in stages.items():
+        if node_name in completed:
+            icon = "[green]\u2713[/green]"
+            detail = stage_details.get(node_name, "")
+            t = f"{timings[node_name]:.1f}s" if node_name in timings else ""
+        elif node_name == active:
+            icon = _spinner_icon()
+            detail = ""
+            t = f"{elapsed_active:.0f}s" if elapsed_active else ""
+        else:
+            icon = "[dim]\u00b7[/dim]"
+            detail = ""
+            t = ""
+        table.add_row(icon, label, detail, t)
+
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Pipeline result display
+# ---------------------------------------------------------------------------
+
+
+def show_pipeline_result(
+    state: Any,
+    artifact: Any | None,
+    output: dict | None,
+    elapsed_ms: int,
+    *,
+    verbose: bool = False,
+) -> None:
+    """Render the full pipeline result with panels and syntax highlighting."""
+    _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
+    verification_results = _get("verification_results", []) or []
+    attempt_count = _get("attempt_count", 0)
+
+    # Verification findings
+    if verification_results and artifact:
+        _show_verification_findings(verification_results, artifact, verbose=verbose)
+
+    # Output
+    console.print()
+    if artifact:
+        cap_type = str(artifact.capability_type).split(".")[-1].upper()
+        cap_name = artifact.capability_name
+        console.print(f"Capability: [bold]{cap_name}[/bold] ([cyan]{cap_type}[/cyan])")
+
+    if output:
+        formatted = json.dumps(output, indent=2, default=str)
+        console.print(
+            Panel(
+                Syntax(formatted, "json", theme="monokai"),
+                title="Output",
+                border_style="green",
+                expand=False,
+            )
+        )
+    elif artifact:
+        console.print("[yellow]The generated tool ran but produced no output.[/yellow]")
+        console.print()
+        console.print("[dim]Things to try:[/dim]")
+        console.print('[dim]  - mint retry --hint "describe what went wrong or add context"[/dim]')
+        console.print(
+            f"[dim]  - mint inspect {artifact.capability_name} "
+            "— view the generated source code[/dim]"
+        )
+        console.print("[dim]  - mint retry --edit — edit the full prompt in your editor[/dim]")
+    else:
+        console.print("[yellow]No capability was generated.[/yellow]")
+        console.print()
+        console.print("[dim]Things to try:[/dim]")
+        console.print('[dim]  - mint retry --hint "add more detail about the task"[/dim]')
+        console.print("[dim]  - mint retry --edit — edit the full prompt in your editor[/dim]")
+        console.print("[dim]  - Check that input files are correct[/dim]")
+
+    # Footer
+    elapsed_s = elapsed_ms / 1000
+    parts = [f"{elapsed_s:.1f}s"]
+    if artifact:
+        parts.append(str(artifact.capability_type).split(".")[-1].upper())
+        parts.append(f"{attempt_count} attempt(s)")
+    console.print(f"\n[dim]{' | '.join(parts)}[/dim]")
+
+
+def _find_report(verification_results: list, artifact: Any) -> Any | None:
+    name = getattr(artifact, "capability_name", None)
+    if name:
+        for r in reversed(verification_results):
+            if r.capability_name == name:
+                return r
+    return verification_results[-1] if verification_results else None
+
+
+def _show_verification_findings(
+    verification_results: list, artifact: Any, *, verbose: bool = False
+) -> None:
+    report = _find_report(verification_results, artifact)
+    if not report:
+        return
+
+    findings = getattr(report, "findings", []) or []
+    if not findings:
+        return
+
+    _SEV_STYLE = {
+        "critical": "bold red",
+        "high": "red",
+        "medium": "yellow",
+        "low": "dim",
+        "info": "dim",
+    }
+
+    _SEV_LABELS = {
+        "critical": "Blocked",
+        "high": "Warning",
+        "medium": "Note",
+        "low": "Info",
+        "info": "Info",
+    }
+
+    if verbose:
+        shown = findings
+    else:
+        shown = [
+            f for f in findings if str(getattr(f, "severity", "")).lower() in ("critical", "high")
+        ]
+
+    hidden = len(findings) - len(shown)
+
+    if not shown and not hidden:
+        return
+
+    console.print()
+    if shown:
+        console.print("[dim]Verification notes (automated safety checks on generated code):[/dim]")
+        for f in shown:
+            sev = str(getattr(f, "severity", "")).lower()
+            style = _SEV_STYLE.get(sev, "")
+            label = _SEV_LABELS.get(sev, sev.upper())
+            msg = getattr(f, "message", "")
+            explanation = _explain_finding(f)
+            console.print(f"  [{style}]{label}:[/{style}] {explanation}")
+            if verbose:
+                console.print(f"    [dim]Raw: {msg}[/dim]")
+        if hidden > 0:
+            console.print(f"  [dim]... and {hidden} more (use --verbose)[/dim]")
+    elif hidden > 0:
+        console.print(f"[dim]{hidden} minor verification note(s) (use --verbose to see)[/dim]")
+
+
+def _explain_finding(finding: Any) -> str:
+    """Translate a raw verification finding into user-friendly language."""
+    msg = str(getattr(finding, "message", "")).lower()
+
+    # Hardcoded return / mock data
+    if "hardcoded" in msg and "return" in msg:
+        return "The generated code may return fixed data instead of computing a real result."
+    if "mock" in msg or "placeholder" in msg or "fake" in msg:
+        return "The generated code contains placeholder or mock data instead of real logic."
+
+    # Missing external calls
+    if "no network" in msg or "no subprocess" in msg:
+        return (
+            "The tool's name suggests it fetches external data, but it "
+            "only reads local files. This is usually fine — the name is "
+            "just misleading."
+        )
+
+    # Silent exception handling
+    if "silent" in msg and "except" in msg:
+        return (
+            "The code silently swallows errors, which could hide bugs. "
+            "Errors should be reported, not ignored."
+        )
+
+    # Synthetic comments (TODO, FIXME)
+    if "todo" in msg or "fixme" in msg or "placeholder" in msg:
+        return "The code contains TODO/FIXME comments, suggesting it may be incomplete."
+
+    # Consistency / behavioral
+    if "consistency" in msg or "different results" in msg:
+        return (
+            "Running the tool twice with the same input produced "
+            "different results — the output may be unreliable."
+        )
+
+    # Latency
+    if "latency" in msg or "slow" in msg or "timeout" in msg:
+        return "The tool took longer than expected to run."
+
+    # Output variation
+    if "identical output" in msg or "output variation" in msg:
+        return (
+            "The tool returned the same output for different inputs, "
+            "suggesting it may ignore its parameters."
+        )
+
+    # Adversarial / demo mode
+    if "demo" in msg or "sample" in msg or "test mode" in msg:
+        return (
+            "The tool may behave differently when it detects test/demo "
+            "inputs — a sign of hardcoded test data."
+        )
+
+    # Network disconnect
+    if "network" in msg and "disconnect" in msg:
+        return (
+            "The tool claims to fetch data but works without network "
+            "access — it may be returning fake results."
+        )
+
+    # Ground truth
+    if "ground.truth" in msg or "expected result" in msg:
+        return "The tool's output doesn't match the known correct answer for a test case."
+
+    # Fallback: return the raw message as-is
+    return str(getattr(finding, "message", ""))
+
+
+# ---------------------------------------------------------------------------
+# Dry-run display
+# ---------------------------------------------------------------------------
+
+
+def show_plan_result(state: Any, elapsed_ms: int) -> None:
+    """Render dry-run (decompose + classify) results."""
+    _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
+    subtasks = _get("subtasks", []) or []
+    classified_gaps = _get("classified_gaps", []) or []
+    matches = _get("matches", []) or []
+
+    console.print()
+    if subtasks:
+        console.print(f"[bold]Subtasks ({len(subtasks)}):[/bold]")
+        for i, st in enumerate(subtasks):
+            desc = getattr(st, "description", str(st))
+            console.print(f"  {i + 1}. {desc}")
+
+    if matches:
+        console.print(f"\n[bold]Registry matches ({len(matches)}):[/bold]")
+        for m in matches:
+            cap = getattr(m, "capability", m)
+            name = getattr(cap, "name", "?")
+            console.print(f"  [green]\u2713[/green] {name}")
+
+    if classified_gaps:
+        console.print(f"\n[bold]Gaps ({len(classified_gaps)}):[/bold]")
+        for g in classified_gaps:
+            cap_type = str(getattr(g, "classified_type", "?")).split(".")[-1].upper()
+            desc = getattr(g, "description", str(g))[:80]
+            console.print(f"  [cyan][{cap_type}][/cyan] {desc}")
+
+    console.print(f"\n[dim]Completed in {elapsed_ms / 1000:.1f}s[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Capability list / inspect / history
+# ---------------------------------------------------------------------------
+
+
+def show_capability_list(
+    registry: Any,
+    metrics_store: Any | None = None,
+    *,
+    cap_type: str | None = None,
+    active_only: bool = False,
+) -> None:
+    """Render capabilities as a Rich table."""
+    from src.schemas.capability import CapabilityType
+
+    type_filter = None
+    if cap_type:
+        try:
+            type_filter = CapabilityType(cap_type.lower())
+        except ValueError:
+            err_console.print(f"[red]Unknown type: {cap_type}[/red]")
+            err_console.print(f"Valid types: {', '.join(t.value for t in CapabilityType)}")
+            raise SystemExit(1)
+
+    capabilities = registry.list_all(
+        capability_type=type_filter,
+        is_active=True if active_only else None,
+    )
+
+    if not capabilities:
+        console.print("[dim]No capabilities found.[/dim]")
+        return
+
+    table = Table(title="Registered Capabilities")
+    table.add_column("Type", style="cyan", no_wrap=True, width=8)
+    table.add_column("Name", style="bold", ratio=1)
+    table.add_column("Active", justify="center", width=6)
+    if metrics_store:
+        table.add_column("Invocations", justify="right", width=11)
+
+    for cap in sorted(capabilities, key=lambda c: (str(c.capability_type), c.name)):
+        ct = str(cap.capability_type).split(".")[-1].upper()
+        active = "[green]\u2713[/green]" if cap.is_active else "[red]\u2717[/red]"
+        desc = cap.description or ""
+        name_cell = f"{cap.name}\n[dim]{desc}[/dim]" if desc else cap.name
+        row = [ct, name_cell, active]
+        if metrics_store:
+            count = metrics_store.invocation_count(cap.name)
+            row.append(str(count))
+        table.add_row(*row)
+
+    console.print(table)
+    active = sum(1 for c in capabilities if c.is_active)
+    inactive = len(capabilities) - active
+    parts = [f"{len(capabilities)} total"]
+    if active:
+        parts.append(f"[green]{active} active[/green]")
+    if inactive:
+        parts.append(f"[yellow]{inactive} inactive[/yellow]")
+    console.print(f"\n[dim]{', '.join(parts)}[/dim]")
+
+
+def show_capability_detail(
+    registry: Any,
+    metrics_store: Any | None,
+    name: str,
+) -> None:
+    """Render capability details including source code and invocation history."""
+    cap = registry.get(name)
+    if not cap:
+        err_console.print(f"[red]Capability not found: {name}[/red]")
+        raise SystemExit(1)
+
+    ct = str(cap.capability_type).split(".")[-1].upper()
+    active = "[green]active[/green]" if cap.is_active else "[red]inactive[/red]"
+
+    # Metadata panel
+    meta_lines = [
+        f"[bold]Type:[/bold] {ct}",
+        f"[bold]Domain:[/bold] {cap.domain}",
+        f"[bold]Status:[/bold] {active}",
+        f"[bold]Tags:[/bold] {', '.join(cap.tags) if cap.tags else '(none)'}",
+        f"[bold]Created:[/bold] {cap.created_at:%Y-%m-%d %H:%M}",
+    ]
+    if cap.metadata:
+        for k, v in cap.metadata.items():
+            if k != "source_code":
+                meta_lines.append(f"[bold]{k}:[/bold] {v}")
+
+    console.print(
+        Panel(
+            "\n".join(meta_lines),
+            title=f"[bold]{name}[/bold]",
+            border_style="cyan",
+        )
+    )
+
+    # Source code
+    source = (cap.metadata or {}).get("source_code")
+    if source:
+        console.print(
+            Panel(
+                Syntax(source, "python", theme="monokai", line_numbers=True),
+                title="Source Code",
+                border_style="dim",
+            )
+        )
+
+    # Invocation history
+    if metrics_store:
+        recent = metrics_store.recent_invocations(name, limit=10)
+        if recent:
+            hist = Table(title="Recent Invocations", expand=False)
+            hist.add_column("Time", style="dim")
+            hist.add_column("Task", max_width=40)
+            hist.add_column("Success", justify="center")
+            hist.add_column("Latency", justify="right")
+            for inv in recent:
+                success = "[green]\u2713[/green]" if inv.success else "[red]\u2717[/red]"
+                latency = f"{inv.latency_ms:.0f}ms"
+                hist.add_row(
+                    f"{inv.invoked_at:%Y-%m-%d %H:%M}",
+                    inv.task_id[:40],
+                    success,
+                    latency,
+                )
+            console.print(hist)
+        else:
+            console.print("[dim]No invocation history.[/dim]")
+
+
+def show_history(
+    metrics_store: Any,
+    *,
+    capability: str | None = None,
+    limit: int = 20,
+) -> None:
+    """Show recent invocation history."""
+    if capability:
+        records = metrics_store.recent_invocations(capability, limit=limit)
+    else:
+        # Get recent invocations across all capabilities
+        rows = metrics_store._conn.execute(
+            "SELECT capability_id, task_id, success, token_cost, latency_ms, "
+            "error_message, invoked_at "
+            "FROM invocations ORDER BY invoked_at DESC LIMIT ?",
+            [limit],
+        ).fetchall()
+        from src.schemas.metrics import InvocationRecord
+
+        records = [
+            InvocationRecord(
+                capability_id=r[0],
+                task_id=r[1],
+                success=r[2],
+                token_cost=r[3],
+                latency_ms=r[4],
+                error_message=r[5],
+                invoked_at=r[6],
+            )
+            for r in rows
+        ]
+
+    if not records:
+        console.print("[dim]No invocation history.[/dim]")
+        return
+
+    table = Table(title="Invocation History", expand=False)
+    table.add_column("Time", style="dim")
+    table.add_column("Capability", style="bold")
+    table.add_column("Task", max_width=35)
+    table.add_column("Success", justify="center")
+    table.add_column("Latency", justify="right")
+
+    for r in records:
+        success = "[green]\u2713[/green]" if r.success else "[red]\u2717[/red]"
+        table.add_row(
+            f"{r.invoked_at:%H:%M:%S}",
+            r.capability_id,
+            r.task_id[:35],
+            success,
+            f"{r.latency_ms:.0f}ms",
+        )
+
+    console.print(table)

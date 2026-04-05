@@ -307,6 +307,24 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.MCP_TOOL,
             domain="mathematics",
             tags=["math", "computation", "sequence"],
+            source_code=(
+                "from typing import Annotated\n"
+                "from mcp.server.fastmcp import FastMCP\n"
+                "from pydantic import Field\n"
+                'mcp = FastMCP("fibonacci_mcp")\n'
+                "@mcp.tool()\n"
+                "async def fibonacci(\n"
+                "    n: Annotated[int, Field(description="
+                '"Index into the Fibonacci sequence", ge=0, le=1000)],\n'
+                ") -> int:\n"
+                '    """Compute the nth Fibonacci number (0-indexed)."""\n'
+                "    a, b = 0, 1\n"
+                "    for _ in range(n):\n"
+                "        a, b = b, a + b\n"
+                "    return a\n"
+                'if __name__ == "__main__":\n'
+                "    mcp.run()\n"
+            ),
         ),
         _cap(
             "csv-parser",

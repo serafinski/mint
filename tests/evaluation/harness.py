@@ -46,7 +46,7 @@ import logging
 import random
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +116,7 @@ class EvaluationHarness:
         # 2. Wipe and rebuild ChromaDB with fresh seeded registry
         try:
             import chromadb
+
             chromadb.api.shared_system_client.SharedSystemClient.clear_system_cache()
         except Exception as exc:  # noqa: BLE001
             logger.debug("ChromaDB cache clear failed (non-critical): %s", exc)
@@ -133,9 +134,7 @@ class EvaluationHarness:
         logger.info("Rebuilt clean registry with %d seeded capabilities", len(registry.list_all()))
 
         # 3. Take snapshot of the clean state
-        self._snap_id = take_clean_snapshot(
-            cfg.chroma_dir, cfg.mcp_tools_dir, cfg.skills_dir
-        )
+        self._snap_id = take_clean_snapshot(cfg.chroma_dir, cfg.mcp_tools_dir, cfg.skills_dir)
         logger.info("Clean snapshot taken: %s", self._snap_id)
         return self._snap_id
 
@@ -227,15 +226,14 @@ class EvaluationHarness:
         # causing corruption on the next SkillRegistry init.
         try:
             import chromadb
+
             chromadb.api.shared_system_client.SharedSystemClient.clear_system_cache()
         except Exception as exc:  # noqa: BLE001
             logger.debug("ChromaDB cache clear failed (non-critical): %s", exc)
         gc.collect()
 
         # Step 1: restore clean snapshot
-        snap_id = restore_clean_snapshot(
-            cfg.chroma_dir, cfg.mcp_tools_dir, cfg.skills_dir
-        )
+        snap_id = restore_clean_snapshot(cfg.chroma_dir, cfg.mcp_tools_dir, cfg.skills_dir)
         if self._snap_id and snap_id != self._snap_id:
             logger.warning(
                 "Snapshot ID mismatch: expected %s, got %s — restore may be broken",
@@ -254,6 +252,7 @@ class EvaluationHarness:
         # Step 3: create a single MetricsStore for this run (shared across tasks
         # so the optimizer accumulates data from all tasks in the same run)
         from src.registry.metrics import MetricsStore
+
         metrics_store = MetricsStore()
 
         # Step 4: randomise task order
@@ -300,7 +299,12 @@ class EvaluationHarness:
             result = self._run_static(task, registry)
         else:
             result = self._run_jit(
-                task, condition, registry, loader, metrics_store, run_id=run_id,
+                task,
+                condition,
+                registry,
+                loader,
+                metrics_store,
+                run_id=run_id,
             )
 
         elapsed_ms = int((time.monotonic() - t_start) * 1000)
@@ -342,7 +346,10 @@ class EvaluationHarness:
         # Check registry has the expected capability by exact name lookup
         cap = registry.get(task.static_capability_name)
         if cap is None:
-            logger.warning("Static capability %s not found in registry", task.static_capability_name)
+            logger.warning(
+                "Static capability %s not found in registry",
+                task.static_capability_name,
+            )
             return {
                 "gate_passed": False,
                 "output_in_range": False,
@@ -489,9 +496,17 @@ def _extract_result(
         failure_reason = "none"
         # Infer capability_type from the first match
         first_match = matches[0]
-        cap = first_match.capability if hasattr(first_match, "capability") else first_match.get("capability")
+        cap = (
+            first_match.capability
+            if hasattr(first_match, "capability")
+            else first_match.get("capability")
+        )
         if cap is not None:
-            _ct = cap.capability_type if hasattr(cap, "capability_type") else cap.get("capability_type")
+            _ct = (
+                cap.capability_type
+                if hasattr(cap, "capability_type")
+                else cap.get("capability_type")
+            )
             capability_type = str(_ct).split(".")[-1].lower() if _ct else None
 
     # Execute the artifact against fixture data to check output_in_range
@@ -506,9 +521,7 @@ def _extract_result(
             elif gate_passed and output_in_range:
                 failure_reason = "none"
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Artifact execution failed for task %s: %s", task.task_id, exc
-            )
+            logger.warning("Artifact execution failed for task %s: %s", task.task_id, exc)
     elif gate_passed and not artifacts and task.has_static_coverage:
         # Registry match with static implementation available — execute it.
         try:
@@ -531,11 +544,7 @@ def _extract_result(
         # Registry match but no static implementation. Try to extract source_code
         # from the matched capability's metadata and sandbox-execute it.
         first_match = matches[0] if matches else None
-        cap = (
-            first_match.capability
-            if first_match and hasattr(first_match, "capability")
-            else None
-        )
+        cap = first_match.capability if first_match and hasattr(first_match, "capability") else None
         matched_source = None
         if cap is not None:
             meta = cap.metadata if hasattr(cap, "metadata") else {}
@@ -601,11 +610,13 @@ def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -
 
     cap_type = artifact.capability_type
     if cap_type == CapabilityType.SKILL:
-        from tests.evaluation.execution import execute_skill_artifact, _read_fixture_contents
+        from tests.evaluation.execution import _read_fixture_contents, execute_skill_artifact
+
         fixture_contents = _read_fixture_contents(task)
         return execute_skill_artifact(artifact, task, fixture_contents)
     elif cap_type == CapabilityType.AGENT:
-        from tests.evaluation.execution import execute_agent_artifact, _read_fixture_contents
+        from tests.evaluation.execution import _read_fixture_contents, execute_agent_artifact
+
         fixture_contents = _read_fixture_contents(task)
         return execute_agent_artifact(artifact, task, fixture_contents)
     elif cap_type != CapabilityType.MCP_TOOL:
@@ -623,7 +634,10 @@ def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -
 
     # Extract the actual async function name from source code AST
     from src.verification.behavioral import _extract_function_name
-    func_name = _extract_function_name(source_code) or getattr(artifact, "capability_name", "tool").replace("-", "_")
+
+    func_name = _extract_function_name(source_code) or getattr(
+        artifact, "capability_name", "tool"
+    ).replace("-", "_")
 
     # Embed fixture file content in the sandbox code since Docker doesn't
     # mount the host filesystem.  Write each fixture to a temp path inside
@@ -636,8 +650,7 @@ def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -
                 content = host_path.read_text(encoding="utf-8", errors="replace")
                 sandbox_path = f"/tmp/fixture_{i}{host_path.suffix}"
                 fixture_preamble += (
-                    f"import pathlib as _pl\n"
-                    f"_pl.Path({sandbox_path!r}).write_text({content!r})\n"
+                    f"import pathlib as _pl\n_pl.Path({sandbox_path!r}).write_text({content!r})\n"
                 )
                 # Replace the host path in fixture_inputs with the sandbox path
                 for k, v in fixture_inputs.items():
@@ -733,6 +746,7 @@ def _build_fixture_inputs(task: TaskDefinition, source_code: str | None = None) 
     param_names: list[str] = []
     if source_code:
         from src.verification.behavioral import extract_parameter_schema
+
         schema = extract_parameter_schema(source_code)
         param_names = list(schema.keys())
 
@@ -756,7 +770,8 @@ def _build_fixture_inputs(task: TaskDefinition, source_code: str | None = None) 
     inputs: dict[str, str] = {}
     # Identify path-like parameters
     path_params = [
-        p for p in param_names
+        p
+        for p in param_names
         if any(kw in p.lower() for kw in ("path", "file", "csv", "log", "json", "txt", "doc"))
     ]
     unmatched_fixtures = list(task.fixture_paths)
@@ -792,6 +807,10 @@ def _build_fixture_inputs(task: TaskDefinition, source_code: str | None = None) 
             }
         else:
             for i, fp in enumerate(task.fixture_paths):
+                # Semantic key from filename for better fuzzy matching
+                stem = fp.stem.split("_", 1)[-1] if "_" in fp.stem else fp.stem
+                ext = fp.suffix.lstrip(".")
+                inputs[f"{stem}_{ext}_path"] = str(fp)
                 inputs[f"file_path_{i}"] = str(fp)
 
     # --- Extract non-path parameters from the task prompt ---
@@ -803,6 +822,7 @@ def _build_fixture_inputs(task: TaskDefinition, source_code: str | None = None) 
         if "column" in param_lower or "col" in param_lower:
             # Extract quoted column name from task prompt
             import re
+
             col_match = re.search(r"'(\w+)'\s*column", task.task_prompt)
             if not col_match:
                 col_match = re.search(r"column\s*['\"](\w+)['\"]", task.task_prompt)
@@ -843,6 +863,7 @@ def _run_static_implementation(task_id: str, fixture_paths: list[Path]) -> dict:
 def _static_t01(csv_path: Path) -> dict:
     """Parse standard CSV, return row_count + column_names."""
     import csv as _csv
+
     with csv_path.open() as f:
         reader = _csv.DictReader(f)
         rows = list(reader)
@@ -852,6 +873,7 @@ def _static_t01(csv_path: Path) -> dict:
 def _static_t02(config_path: Path, schema_path: Path) -> dict:
     """Validate JSON config against schema, return errors list."""
     import json as _json
+
     try:
         import jsonschema
     except ImportError:
@@ -885,6 +907,7 @@ def _static_t02(config_path: Path, schema_path: Path) -> dict:
 def _static_t03(doc_path: Path) -> dict:
     """Compute word count and Flesch readability score."""
     import re
+
     text = doc_path.read_text()
     words = re.findall(r"\b\w+\b", text)
     sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
@@ -896,9 +919,14 @@ def _static_t03(doc_path: Path) -> dict:
     n_sentences = max(len(sentences), 1)
     n_syllables = sum(syllables(w) for w in words)
     score = round(
-        max(0.0, min(100.0,
-            206.835 - 1.015 * (n_words / n_sentences) - 84.6 * (n_syllables / max(n_words, 1))
-        )), 2
+        max(
+            0.0,
+            min(
+                100.0,
+                206.835 - 1.015 * (n_words / n_sentences) - 84.6 * (n_syllables / max(n_words, 1)),
+            ),
+        ),
+        2,
     )
     return {"word_count": n_words, "readability_score": score}
 
@@ -906,6 +934,7 @@ def _static_t03(doc_path: Path) -> dict:
 def _static_t05(csv_path: Path) -> dict:
     """Remove nulls and duplicates, return counts."""
     import csv as _csv
+
     with csv_path.open() as f:
         reader = _csv.DictReader(f)
         rows = list(reader)
@@ -921,15 +950,14 @@ def _static_t05(csv_path: Path) -> dict:
             seen.add(key)
             unique.append(r)
 
-    null_count = sum(
-        1 for r in unique for v in r.values() if not v.strip()
-    )
+    null_count = sum(1 for r in unique for v in r.values() if not v.strip())
     return {"output_row_count": len(unique), "null_count": null_count}
 
 
 def _static_t09(data_path: Path) -> dict:
     """Generate a structured report from JSON data."""
     import json as _json
+
     data = _json.loads(data_path.read_text())
     records = data.get("records", [])
 
