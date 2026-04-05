@@ -809,8 +809,8 @@ def execute_task(
         printed_nodes: set[str] = set()
         prev_artifact_count = 0
 
-        def _print_completed(node_name: str) -> None:
-            """Print a completed stage line (permanent)."""
+        def _print_completed(node_name: str) -> bool:
+            """Print a completed stage line. Returns True if printed."""
             nonlocal prev_artifact_count
             detail = stage_details.get(node_name, "")
             elapsed = timings.get(node_name, 0)
@@ -826,7 +826,7 @@ def execute_task(
                 new = cur - prev_artifact_count
                 if new == 0:
                     printed_nodes.add(node_name)
-                    return
+                    return False
                 prev_artifact_count = cur
                 detail = f"{new} artifact(s)"
 
@@ -836,6 +836,7 @@ def execute_task(
                 f"  [green]\u2713[/green] {label}{detail_str} [dim]({elapsed:.1f}s)[/dim]"
             )
             printed_nodes.add(node_name)
+            return True
 
         def _timer_loop(status_ref):
             """Update spinner label with elapsed time every second."""
@@ -864,8 +865,11 @@ def execute_task(
                     if active_node and active_node != node_name:
                         completed.add(active_node)
                         timings[active_node] = time.monotonic() - stage_start
-                        _print_completed(active_node)
-                        stage_start = time.monotonic()
+                        printed = _print_completed(active_node)
+                        # Only reset timer if the stage was visible;
+                        # skipped stages fold their time into the next
+                        if printed:
+                            stage_start = time.monotonic()
 
                     active_node = node_name
                     detail = _extract_stage_detail(node_name, update)

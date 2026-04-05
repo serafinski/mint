@@ -365,7 +365,27 @@ mint retry --skip-verification
 
 **Why this matters:** The most common failure mode is an underspecified prompt. The user sees what went wrong (via `mint inspect` or the error message), knows exactly what context is missing, and wants to add one sentence — not retype the whole command with file paths.
 
-### Step 8: Smart prompt improvement — `mint run --improve` (planned)
+### Step 8: `--force-regenerate` — bypass registry matching (planned)
+
+**Problem:** `mint retry --hint` changes the prompt but the pipeline may still match an existing (wrong) capability from the registry, skipping generation entirely. The hint only helps if the pipeline reaches the generation stage.
+
+```bash
+# Current workaround (two steps)
+mint disable find_duplicate_rows_in_csv_6bb264
+mint retry --hint "count extras only"
+
+# Proposed (one step)
+mint retry --hint "count extras only" --force-regenerate
+
+# Also on mint run
+mint run "find duplicates" -f data.csv --force-regenerate
+```
+
+**Implementation:** Pass a flag through to `gap_detection_node` that forces all required capabilities to be treated as gaps regardless of registry matches. Or temporarily deactivate matched capabilities for the duration of the run and restore after.
+
+**Why this matters:** Without this, users who get a wrong result must manually disable the old capability before retrying. This breaks the fast iteration loop that `mint retry` was designed for.
+
+### Step 9: Smart prompt improvement — `mint run --improve` (planned)
 
 The most common failure mode is an underspecified prompt. File metadata augmentation (Step 2) tells the generator *what* the data looks like, but it doesn't help if the user's intent is vague ("do something with this data"). The `--hint` flag (Step 7) fixes this reactively, but only after a failure.
 
