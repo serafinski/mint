@@ -45,6 +45,10 @@ def run(
     timeout: Annotated[
         int | None, typer.Option(help="SKILL/AGENT execution timeout (seconds)")
     ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", "-o", help="Save output to this directory"),
+    ] = None,
     json: Annotated[
         bool, typer.Option("--json", help="Output as JSON (no Rich formatting)")
     ] = False,
@@ -61,6 +65,7 @@ def run(
         no_optimizer=no_optimizer,
         enable_optimizer=enable_optimizer,
         timeout=timeout,
+        output_dir=output_dir,
         json_output=json,
         verbose=verbose,
     )

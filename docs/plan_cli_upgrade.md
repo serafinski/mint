@@ -443,7 +443,27 @@ mint run "clean up this data" -f messy.csv --improve --force
 
 ---
 
-### Step 10: `--output-dir` — save generated file outputs (planned)
+### Step 10: Output quality detection — warn on empty/garbage results (planned)
+
+**Problem:** The pipeline can return "success" (exit code 0, output panel rendered) but the output is garbage — e.g. the input file paths echoed back, or a single-key dict with no real content. The user sees a green output panel and thinks it worked, but the result is useless. This is especially common with AGENT tasks where the DeepAgent's reasoning quality is stochastic.
+
+**Proposed heuristics:**
+- Output JSON has fewer than 3 keys → warn
+- Total serialized output is under 100 characters → warn
+- Output values are substrings of the input prompt (echo detection) → warn
+- Execution took >60s but output is <500 chars → warn (effort/result mismatch)
+
+**Display:**
+```
+⚠ The output looks incomplete (2 keys, 87 chars after 307s execution).
+  This may be a low-quality generation. Things to try:
+  - mint retry — re-run (may get a better result)
+  - mint retry --hint "provide detailed anomaly analysis with timestamps"
+```
+
+**Why this matters:** Without this, the user has no signal that the result is bad. They trust the green output panel and move on. A simple heuristic warning catches the obvious cases and directs them to retry.
+
+### Step 11: `--output-dir` — save generated file outputs (planned)
 
 **Problem:** Generated tools that produce files (cleaned CSVs, reports, charts) write them inside the ephemeral Docker container. When the container exits, those files are gone. The JSON output may contain file paths (e.g. `/tmp/fixture_0.csv`) that don't exist on the host, or the full file content as a giant string in the JSON — neither is useful.
 

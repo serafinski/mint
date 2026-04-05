@@ -88,6 +88,39 @@ def build_progress_table(
 # ---------------------------------------------------------------------------
 
 
+def _check_output_quality(
+    output: dict,
+    formatted: str,
+    elapsed_ms: int,
+    task_description: str,
+) -> str | None:
+    """Return a warning string if output looks like garbage, else None."""
+    n_keys = len(output)
+    n_chars = len(formatted)
+    elapsed_s = elapsed_ms / 1000
+
+    # Very few keys
+    if n_keys < 2 and n_chars < 200:
+        return f"The output looks incomplete ({n_keys} key(s), {n_chars} chars)."
+
+    # Long execution, tiny output
+    if elapsed_s > 60 and n_chars < 300:
+        return f"The output looks incomplete ({n_chars} chars after {elapsed_s:.0f}s execution)."
+
+    # Echo detection — output contains the input prompt
+    task_lower = task_description.lower()[:200] if task_description else ""
+    if task_lower:
+        output_str = formatted.lower()
+        # Check if large chunks of the task prompt appear in output
+        words = [w for w in task_lower.split() if len(w) > 4]
+        if words:
+            matches = sum(1 for w in words if w in output_str)
+            if matches > len(words) * 0.6 and n_chars < 500:
+                return "The output appears to echo the input prompt."
+
+    return None
+
+
 def show_pipeline_result(
     state: Any,
     artifact: Any | None,
@@ -100,6 +133,7 @@ def show_pipeline_result(
     _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
     verification_results = _get("verification_results", []) or []
     attempt_count = _get("attempt_count", 0)
+    task_description = _get("task_description", "") or ""
 
     # Verification findings
     if verification_results and artifact:
@@ -114,14 +148,21 @@ def show_pipeline_result(
 
     if output:
         formatted = json.dumps(output, indent=2, default=str)
+        quality_warning = _check_output_quality(output, formatted, elapsed_ms, task_description)
+        border = "yellow" if quality_warning else "green"
         console.print(
             Panel(
                 Syntax(formatted, "json", theme="monokai"),
                 title="Output",
-                border_style="green",
+                border_style=border,
                 expand=False,
             )
         )
+        if quality_warning:
+            console.print(f"\n[yellow]{quality_warning}[/yellow]")
+            console.print("[dim]Things to try:[/dim]")
+            console.print("[dim]  - mint retry — re-run (may get a better result)[/dim]")
+            console.print('[dim]  - mint retry --hint "provide more detailed output"[/dim]')
     elif artifact:
         console.print("[yellow]The generated tool ran but produced no output.[/yellow]")
         console.print()

@@ -631,6 +631,48 @@ def _record_invocation(
 
 
 # ---------------------------------------------------------------------------
+# Output saving
+# ---------------------------------------------------------------------------
+
+
+def _save_output(output_dir: Path, output: dict, artifact: Any | None) -> None:
+    """Save output to files in the specified directory."""
+    from datetime import datetime
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cap_name = getattr(artifact, "capability_name", "output") if artifact else "output"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved: list[str] = []
+
+    # Scan output for file-like content and save separately
+    for key, value in output.items():
+        if isinstance(value, str) and len(value) > 500:
+            # Detect CSV content
+            if "," in value.split("\n")[0] and "\n" in value:
+                ext = ".csv"
+            # Detect JSON content
+            elif value.strip().startswith(("{", "[")):
+                ext = ".json"
+            # Detect Markdown
+            elif value.strip().startswith("#"):
+                ext = ".md"
+            else:
+                ext = ".txt"
+            file_path = output_dir / f"{key}_{ts}{ext}"
+            file_path.write_text(value, encoding="utf-8")
+            saved.append(str(file_path))
+
+    # Always save the full result as JSON
+    result_path = output_dir / f"{cap_name}_{ts}.json"
+    result_path.write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
+    saved.append(str(result_path))
+
+    for path in saved:
+        console.print(f"  [green]\u2713[/green] Saved: [dim]{path}[/dim]")
+
+
+# ---------------------------------------------------------------------------
 # Pipeline execution with streaming progress
 # ---------------------------------------------------------------------------
 
@@ -684,6 +726,7 @@ def execute_task(
     no_optimizer: bool = False,
     enable_optimizer: bool = False,
     timeout: int | None = None,
+    output_dir: Path | None = None,
     json_output: bool = False,
     verbose: bool = False,
 ) -> int:
@@ -1027,6 +1070,11 @@ def execute_task(
         print(_format_json(final_state, artifact, output, elapsed_ms))
     else:
         show_pipeline_result(final_state, artifact, output, elapsed_ms, verbose=verbose)
+
+    # Always save output (default: data/output/, override with --output-dir)
+    if output:
+        save_dir = output_dir or _data_dir() / "mint_output"
+        _save_output(save_dir, output, artifact)
 
     # Success: artifact executed with output, or registry matched (even
     # without source_code — the system found a relevant capability)
