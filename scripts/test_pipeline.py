@@ -203,7 +203,7 @@ def run_pipeline_and_verify(
 
         # --- 7. Output validation (optional) ---
         if validate_output is not None:
-            print(f"\n  7. Output validation:")
+            print("\n  7. Output validation:")
             try:
                 valid = validate_output(artifacts, registry)
                 if valid:
@@ -214,7 +214,7 @@ def run_pipeline_and_verify(
                 print(f"     FAIL: Validation raised: {exc}")
                 all_pass = False
         else:
-            print(f"\n  7. Output validation: SKIP (no validator provided)")
+            print("\n  7. Output validation: SKIP (no validator provided)")
 
         loader.cleanup()
 
@@ -293,7 +293,7 @@ asyncio.run(_run())
         if null_count == 0:
             print(f"     null_count={null_count} OK")
         elif null_count == -1:
-            print(f"     null_count not in output (acceptable)")
+            print("     null_count not in output (acceptable)")
         else:
             print(f"     null_count={null_count} FAIL (expected 0)")
             ok = False
@@ -336,7 +336,7 @@ def _validate_skill_output(artifacts, registry) -> bool:
         if artifacts:
             atype = str(getattr(artifacts[-1], "capability_type", "")).split(".")[-1]
             print(f"     NOTE: Classifier routed to {atype} instead of SKILL")
-            print(f"     OK (artifact generated, type selection is stochastic)")
+            print("     OK (artifact generated, type selection is stochastic)")
             return True
         print("     FAIL: No artifacts generated")
         return False
@@ -358,7 +358,7 @@ def _validate_skill_output(artifacts, registry) -> bool:
 def test_skill() -> bool:
     """T11-like: Multi-source data integration -> SKILL."""
     sales = FIXTURES_DIR / "t11_sales.csv"
-    products = FIXTURES_DIR / "t11_products.json"
+    products = FIXTURES_DIR / "t11_products.xlsx"
     targets = FIXTURES_DIR / "t11_targets.csv"
 
     prompt = (
@@ -390,7 +390,7 @@ def _validate_agent_output(artifacts, registry) -> bool:
         if artifacts:
             atype = str(getattr(artifacts[-1], "capability_type", "")).split(".")[-1]
             print(f"     NOTE: Classifier routed to {atype} instead of AGENT")
-            print(f"     OK (artifact generated, type selection is stochastic)")
+            print("     OK (artifact generated, type selection is stochastic)")
             return True
         print("     FAIL: No artifacts generated")
         return False

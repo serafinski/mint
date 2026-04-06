@@ -170,7 +170,7 @@ def test_split(verbose: bool = False) -> bool:
             return False
 
         # Verify results
-        print(f"\n  Results:")
+        print("\n  Results:")
         print(f"  New variants: {new_ids}")
 
         if len(new_ids) < 2:
@@ -305,7 +305,7 @@ def test_merge(verbose: bool = False) -> bool:
             return False
 
         # Verify results
-        print(f"\n  Results:")
+        print("\n  Results:")
         print(f"  Merged capability: {merged_id}")
 
         merged = registry.get(merged_id)
@@ -504,7 +504,7 @@ def test_full_loop(verbose: bool = False) -> bool:
             return False
 
         # --- Verify results ---
-        print(f"\n  Results:")
+        print("\n  Results:")
 
         # Prune
         pruned = result.get("pruned", [])

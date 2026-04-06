@@ -84,11 +84,11 @@ def main() -> None:
     # --- Imports ---
     from src.orchestrator.pipeline import create_pipeline
     from src.orchestrator.tool_loader import ToolLoader
+    from src.registry.evaluation_store import EvaluationStore
     from src.registry.metrics import MetricsStore
     from src.registry.store import SkillRegistry, seed_registry
     from src.schemas.evaluation import EvaluationRecord
     from src.schemas.task import TaskState
-    from src.registry.evaluation_store import EvaluationStore
     from tests.evaluation.harness import _extract_result
     from tests.evaluation.snapshots import restore_clean_snapshot, take_clean_snapshot
     from tests.evaluation.tasks import ALL_TASKS
@@ -160,6 +160,21 @@ def main() -> None:
         invoke_config: dict = {}
         if langfuse_handler is not None:
             invoke_config["callbacks"] = [langfuse_handler]
+            _file_fmts = list({fp.suffix.lower().lstrip(".") for fp in task.fixture_paths}) if task.fixture_paths else []
+            invoke_config["metadata"] = {
+                "langfuse_session_id": f"longitudinal-{args.seed}",
+                "langfuse_tags": [
+                    "longitudinal",
+                    task.task_id,
+                    f"tier:{task.tier}",
+                    f"step:{i + 1}/{len(task_sequence)}",
+                    *(f"format:{fmt}" for fmt in sorted(_file_fmts)),
+                ],
+                "task_id": task.task_id,
+                "step": i + 1,
+                "total_steps": len(task_sequence),
+                "registry_size": registry.count,
+            }
 
         initial_state = TaskState(task_description=task.task_prompt)
         try:

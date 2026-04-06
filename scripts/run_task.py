@@ -578,8 +578,24 @@ def main() -> int:
     invoke_config: dict = {}
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
-        invoke_config["callbacks"] = [LangFuseCallbackHandler()]
-    except Exception:
+
+        _file_fmts = list({fp.suffix.lower().lstrip(".") for fp in file_paths}) if file_paths else []
+        _tags = ["run-task", *(f"format:{fmt}" for fmt in sorted(_file_fmts))]
+        if args.skip_verification:
+            _tags.append("no-verification")
+        if run_optimizer:
+            _tags.append("optimizer-on")
+        handler = LangFuseCallbackHandler(
+            tags=_tags,
+            user_id="run-task",
+            metadata={
+                "task": args.task[:200],
+                "files": [fp.name for fp in file_paths],
+                "optimizer": run_optimizer,
+            },
+        )
+        invoke_config["callbacks"] = [handler]
+    except Exception:  # noqa: BLE001
         pass
 
     initial_state = TaskState(task_description=task_prompt)

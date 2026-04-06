@@ -335,12 +335,32 @@ def _build_header(task: str, file_paths: list[Path]) -> str:
     return "\n".join(lines)
 
 
-def _langfuse_config() -> dict:
+def _langfuse_config(
+    *,
+    session_id: str | None = None,
+    tags: list[str] | None = None,
+    metadata: dict | None = None,
+    user_id: str = "mint-cli",
+) -> dict:
+    """Build LangFuse callback config with rich tracing metadata.
+
+    Args:
+        session_id: Groups related traces (e.g., a retry chain).
+        tags: Filterable tags (e.g., file formats, capability type).
+        metadata: Arbitrary key-value pairs attached to the trace.
+        user_id: Identifies the trace source (default: "mint-cli").
+    """
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 
-        return {"callbacks": [LangFuseCallbackHandler()]}
-    except Exception:
+        handler = LangFuseCallbackHandler(
+            session_id=session_id,
+            tags=tags or [],
+            user_id=user_id,
+            metadata=metadata or {},
+        )
+        return {"callbacks": [handler]}
+    except Exception:  # noqa: BLE001
         return {}
 
 
@@ -862,7 +882,28 @@ def execute_task(
     ).compile()
 
     initial_state = TaskState(task_description=task_prompt)
-    invoke_config = _langfuse_config()
+
+    # Build rich LangFuse tracing config
+    import uuid as _uuid
+
+    _run_id = _uuid.uuid4().hex[:12]
+    _file_formats = list({fp.suffix.lower().lstrip(".") for fp in file_paths}) if file_paths else []
+    _trace_tags = ["mint-cli", *(f"format:{fmt}" for fmt in sorted(_file_formats))]
+    if skip_verification:
+        _trace_tags.append("no-verification")
+    if run_optimizer:
+        _trace_tags.append("optimizer-on")
+    invoke_config = _langfuse_config(
+        session_id=f"mint-run-{_run_id}",
+        tags=_trace_tags,
+        metadata={
+            "task": task[:200],
+            "files": [fp.name for fp in file_paths],
+            "params": parsed_params,
+            "optimizer": run_optimizer,
+            "verification": not skip_verification,
+        },
+    )
 
     t_start = time.monotonic()
 
@@ -1219,7 +1260,10 @@ def plan_task(
     plan_pipeline = plan_builder.compile()
 
     initial_state = TaskState(task_description=task_prompt)
-    invoke_config = _langfuse_config()
+    invoke_config = _langfuse_config(
+        tags=["mint-cli", "plan"],
+        metadata={"task": task[:200], "files": [fp.name for fp in file_paths]},
+    )
     t_start = time.monotonic()
 
     console.print(

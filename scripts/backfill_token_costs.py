@@ -372,7 +372,7 @@ def print_summary(run_summaries: dict[str, dict]) -> None:
     print(f"\n  Grand total: {grand_tokens:,} tokens, ${grand_cost:.4f}, {grand_gens} generations")
 
     # Model breakdown
-    print(f"\n  Token breakdown by model:")
+    print("\n  Token breakdown by model:")
     model_totals: dict[str, dict] = defaultdict(
         lambda: {"prompt": 0, "completion": 0, "total": 0, "cost": 0.0, "count": 0}
     )

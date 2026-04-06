@@ -398,7 +398,7 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
     jit_max = max(jit_rates) * 100
     static_rate = static["successes"] / static["n"] * 100 if static["n"] > 0 else 0
 
-    lines.append(f"  Synthesis tasks only (T04-T13):")
+    lines.append("  Synthesis tasks only (T04-T13):")
     lines.append(f"    JIT cluster:  {jit_min:.1f}% – {jit_max:.1f}%")
     lines.append(f"    Static:       {static_rate:.1f}%")
     lines.append(f"    Gap:          {jit_min - static_rate:.1f} – {jit_max - static_rate:.1f} pp")

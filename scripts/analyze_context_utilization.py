@@ -229,7 +229,7 @@ def print_summary(results: dict[str, list[dict]], detail: bool = False) -> None:
     """Print summary table grouped by agent type."""
     print(f"\n{'=' * 90}")
     print("  Context Window Utilization Analysis")
-    print(f"  Model: GPT-5-mini (128K context window)")
+    print("  Model: GPT-5-mini (128K context window)")
     print(f"{'=' * 90}")
 
     header = (

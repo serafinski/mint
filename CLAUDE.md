@@ -88,8 +88,7 @@ src/
 │   ├── loop.py             # Optimization loop
 │   └── simulation.py       # Simulation harness
 ├── schemas/            # Shared Pydantic state schemas (single source of truth)
-├── mcp_tools/          # Generated & hand-built MCP tools
-└── agents/             # Agent configs & system prompts
+└── mcp_tools/          # Generated & hand-built MCP tools
 
 .deepagents/
 └── skills/             # Generated skills runtime location — DeepAgents loads from here automatically
@@ -285,7 +284,7 @@ All core infrastructure is built and tested. Key architectural decisions locked 
 
 - **`src/schemas/evaluation.py`** — `EvaluationRecord` Pydantic model (18 fields). Separate from `InvocationRecord`. `success` property = `gate_passed AND output_in_range`. 21 unit tests.
 - **`src/registry/evaluation_store.py`** — Separate DuckDB `EvaluationStore`. `evaluation_runs` table. Methods: `record_run()`, `get_runs()`, `compute_success_rate()`, `compute_gate_pass_rate()`, `run_count()`, `failure_breakdown()`. 17 unit tests.
-- **`tests/evaluation/fixtures/`** — 10 fixture files generated programmatically (seed=42) + `expected_values.json` with pre-computed validator values. `generate.py` regenerates deterministically.
+- **`tests/evaluation/fixtures/`** — 33 fixture files generated programmatically (seed=42) + `expected_values.json` with pre-computed validator values. `generate.py` regenerates deterministically. Format diversity: CSV, JSON, TXT, YAML, XML, Excel (.xlsx), TSV.
 - **`tests/evaluation/tasks.py`** — `TaskDefinition` frozen dataclass. T01–T18 with validators reading `expected_values.json` at import time. Static coverage: T01 (csv-parser), T02 (json-validator), T03 (text-statistics), T05 (data-cleaning-workflow), T09 (report-generation). Task type distribution: 8 MCP_TOOL (3 retrieval + 5 synthesis), 5 SKILL, 5 AGENT. `ALL_TASKS` (18 tasks), `PILOT_TASKS=[T01,T07,T05]`, `get_task()`.
 - **`tests/evaluation/snapshots.py`** — `take_clean_snapshot()`, `restore_clean_snapshot()`, `snapshot_exists()`, `_hash_snapshot()`. Covers ChromaDB dir + `src/mcp_tools/` + `.deepagents/skills/`. SHA-256 hash (excluding `meta.json`) as snap ID. Idempotent. 19 unit tests.
 - **`tests/evaluation/harness.py`** — `HarnessConfig` dataclass, `EvaluationHarness` class. `prepare()`, `run_pilot()`, `run_condition()`, `close()`. Run loop: restore snapshot → seed registry → shuffle tasks → execute per condition → record to `EvaluationStore`. `MetricsStore` created once per run (shared across tasks so optimizer accumulates data). Static implementations for T01/T02/T03/T05/T09. `_execute_artifact()` uses `sandbox_execute` for MCP_TOOL artifacts. 22 unit tests.

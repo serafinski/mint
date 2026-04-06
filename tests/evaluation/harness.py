@@ -409,12 +409,23 @@ class EvaluationHarness:
         invoke_config: dict = {}
         if self._config.langfuse_handler is not None:
             invoke_config["callbacks"] = [self._config.langfuse_handler]
+            _file_formats = list({
+                fp.suffix.lower().lstrip(".") for fp in task.fixture_paths
+            }) if task.fixture_paths else []
             invoke_config["metadata"] = {
                 "langfuse_session_id": run_id,
-                "langfuse_tags": [condition, task.task_id],
+                "langfuse_tags": [
+                    condition,
+                    task.task_id,
+                    f"tier:{task.tier}",
+                    *(f"format:{fmt}" for fmt in sorted(_file_formats)),
+                ],
                 "task_id": task.task_id,
                 "condition": condition,
                 "run_id": run_id,
+                "tier": task.tier,
+                "has_static_coverage": task.has_static_coverage,
+                "file_formats": _file_formats,
             }
 
         initial_state = TaskState(task_description=task.task_prompt)

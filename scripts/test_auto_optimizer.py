@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import sys
 import tempfile
 from pathlib import Path
@@ -164,7 +163,7 @@ def main() -> int:
         print(f"  Invocations seeded: {total_invocations}")
 
         # Verify metrics
-        print(f"\n  Metrics:")
+        print("\n  Metrics:")
         print(f"    unused-temp-tool: invocations={metrics.invocation_count('unused-temp-tool')}")
         rr = metrics.reuse_rate("broad-data-processor")
         sr = metrics.success_rate("broad-data-processor")
@@ -243,7 +242,7 @@ def main() -> int:
             if not cap or not cap.is_active:
                 print(f"    FAIL: Pinned '{name}' was pruned or missing")
                 all_pass = False
-        print(f"    Pinned capabilities: all survived")
+        print("    Pinned capabilities: all survived")
 
         # --- SPLIT ---
         split_events = [e for e in events if e[1] == "split"]
