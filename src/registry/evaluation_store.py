@@ -1,7 +1,7 @@
 """DuckDB-backed store for evaluation run records (Iteration 5).
 
 Separate from the operational MetricsStore — this table tracks experimental
-outcomes across the four baseline conditions for thesis analysis.
+outcomes across the five baseline conditions for thesis analysis.
 """
 
 from __future__ import annotations

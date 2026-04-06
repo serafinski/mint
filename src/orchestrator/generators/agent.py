@@ -280,11 +280,11 @@ def _generate_single_agent(
             return None, error_msg
         logger.info("Wrote DeepAgent skill '%s' to %s", result.agent_name, skill_dir)
 
-    # Override whatever name the LLM chose with the deterministic slug
+    # Use deterministic slug for the artifact metadata (disk file keeps LLM name)
     if result.agent_name != forced_name:
         logger.debug(
-            "Overriding LLM agent name '%s' with stable slug '%s'",
-            result.agent_name, forced_name,
+            "Artifact metadata uses stable slug '%s' (LLM chose '%s'; disk file unchanged)",
+            forced_name, result.agent_name,
         )
 
     artifact = GeneratedArtifact(

@@ -1,9 +1,9 @@
 """Integration tests for the capability classifier.
 
-These tests invoke the real LLM (DeepSeek) to verify that the classification
+These tests invoke the real LLM (openai:gpt-5-mini) to verify that the classification
 prompt produces correct, reproducible results with ``temperature=0``.
 
-Requires DEEPSEEK_API_KEY environment variable to be set.
+Requires OPENAI_API_KEY environment variable to be set.
 """
 
 from __future__ import annotations
@@ -16,11 +16,11 @@ from src.orchestrator.classifier import classify_gap
 from src.schemas.capability import CapabilityType
 from src.schemas.task import ClassifiedGap, GapItem
 
-_has_api_key = bool(os.environ.get("DEEPSEEK_API_KEY"))
+_has_api_key = bool(os.environ.get("OPENAI_API_KEY"))
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not _has_api_key, reason="DEEPSEEK_API_KEY not set"),
+    pytest.mark.skipif(not _has_api_key, reason="OPENAI_API_KEY not set"),
 ]
 
 

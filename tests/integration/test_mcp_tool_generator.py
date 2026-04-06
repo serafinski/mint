@@ -1,10 +1,10 @@
 """Integration tests for the MCP tool generator (real LLM calls).
 
 Verifies that the MCP tool generator produces valid FastMCP code using the
-real DeepSeek LLM, that generated tools can be loaded and executed via
-ToolLoader, and that all calls appear in LangFuse.
+real LLM (openai:gpt-5-mini), that generated tools can be loaded and executed
+via ToolLoader, and that all calls appear in LangFuse.
 
-Requires DEEPSEEK_API_KEY environment variable to be set.
+Requires OPENAI_API_KEY environment variable to be set.
 """
 
 from __future__ import annotations
@@ -19,11 +19,11 @@ from src.orchestrator.tool_loader import ToolLoader
 from src.schemas.capability import CapabilityType
 from src.schemas.task import ClassifiedGap, TaskState
 
-_has_api_key = bool(os.environ.get("DEEPSEEK_API_KEY"))
+_has_api_key = bool(os.environ.get("OPENAI_API_KEY"))
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not _has_api_key, reason="DEEPSEEK_API_KEY not set"),
+    pytest.mark.skipif(not _has_api_key, reason="OPENAI_API_KEY not set"),
 ]
 
 

@@ -175,11 +175,11 @@ def plan(
 @app.command("list")
 def list_capabilities(
     cap_type: Annotated[Optional[str], typer.Option("--type", "-t", help="Filter by type")] = None,
-    inactive: Annotated[bool, typer.Option("--inactive", help="Include deactivated")] = False,
+    active_only: Annotated[bool, typer.Option("--active-only", help="Show only active capabilities")] = False,
 ):
     """List all capabilities in the registry."""
     from src.cli.display import show_capability_list
-    show_capability_list(cap_type=cap_type, include_inactive=inactive)
+    show_capability_list(registry, metrics_store, cap_type=cap_type, active_only=active_only)
 
 
 @app.command()
@@ -280,7 +280,7 @@ def execute_task(task, files, params, ...):
 mint = "src.cli.app:app"
 ```
 
-This allows (command name TBD — `jit` is a placeholder):
+This allows:
 ```bash
 uv run mint run "Parse this CSV" --file data.csv
 uv run mint list

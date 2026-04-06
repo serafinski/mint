@@ -1255,7 +1255,7 @@ def plan_task(
     file_paths = _resolve_files(files)
     task_prompt = _build_task_prompt(task, file_paths, {})
 
-    registry, _, _metrics_store = _create_infra()
+    registry, _, _ = _create_infra()
 
     from langgraph.graph import END, StateGraph
     from langgraph.types import Command

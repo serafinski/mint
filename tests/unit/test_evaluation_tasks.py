@@ -20,6 +20,10 @@ from tests.evaluation.tasks import (
     T11,
     T12,
     T13,
+    T14,
+    T15,
+    T16,
+    T17,
     T18,
     get_task,
 )
@@ -365,6 +369,156 @@ class TestT13Validator:
 
     def test_empty_output(self):
         assert not T13.validator({})
+
+
+class TestT14Validator:
+    def test_valid_reconciliation(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T14"]
+        assert T14.validator({
+            "department_count": ev["department_count"],
+            "department_spending": ev["department_spending"],
+            "over_budget_count": ev["over_budget_count"],
+            "flagged_transactions": ev["flagged_transactions"],
+        })
+
+    def test_wrong_department_count(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T14"]
+        assert not T14.validator({
+            "department_count": 999,
+            "department_spending": ev["department_spending"],
+            "over_budget_count": ev["over_budget_count"],
+            "flagged_transactions": ev["flagged_transactions"],
+        })
+
+    def test_wrong_over_budget(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T14"]
+        assert not T14.validator({
+            "department_count": ev["department_count"],
+            "department_spending": ev["department_spending"],
+            "over_budget_count": 999,
+            "flagged_transactions": ev["flagged_transactions"],
+        })
+
+    def test_empty_output(self):
+        assert not T14.validator({})
+
+
+class TestT15Validator:
+    def test_valid_etl(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T15"]
+        assert T15.validator({
+            "n_days": ev["n_days"],
+            "metrics_aggregated": ev["metrics_aggregated"],
+            "alert_days": ev["alert_days"],
+        })
+
+    def test_wrong_n_days(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T15"]
+        assert not T15.validator({
+            "n_days": 999,
+            "metrics_aggregated": ev["metrics_aggregated"],
+            "alert_days": ev["alert_days"],
+        })
+
+    def test_wrong_alert_days(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T15"]
+        assert not T15.validator({
+            "n_days": ev["n_days"],
+            "metrics_aggregated": ev["metrics_aggregated"],
+            "alert_days": 999,
+        })
+
+    def test_empty_output(self):
+        assert not T15.validator({})
+
+
+class TestT16Validator:
+    def test_valid_root_cause(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T16"]
+        assert T16.validator({
+            "root_cause_metric": ev["root_cause_metric"],
+            "cascade_chain": [ev["root_cause_metric"], "some_other_metric"],
+            "n_metrics_investigated": 4,
+        })
+
+    def test_wrong_root_cause(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T16"]
+        assert not T16.validator({
+            "root_cause_metric": "wrong_metric",
+            "cascade_chain": [ev["root_cause_metric"], "other"],
+            "n_metrics_investigated": 4,
+        })
+
+    def test_short_cascade_chain(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T16"]
+        assert not T16.validator({
+            "root_cause_metric": ev["root_cause_metric"],
+            "cascade_chain": ["only_one"],
+            "n_metrics_investigated": 4,
+        })
+
+    def test_too_few_investigated(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T16"]
+        assert not T16.validator({
+            "root_cause_metric": ev["root_cause_metric"],
+            "cascade_chain": [ev["root_cause_metric"], "other"],
+            "n_metrics_investigated": 1,
+        })
+
+    def test_empty_output(self):
+        assert not T16.validator({})
+
+
+class TestT17Validator:
+    def test_valid_fraud_investigation(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T17"]
+        assert T17.validator({
+            "total_alerts": ev["total_alerts"],
+            "high_severity_alerts": ev["high_severity_alerts"],
+            "fraud_customer_ids": ev["fraud_customer_ids"],
+        })
+
+    def test_wrong_total_alerts(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T17"]
+        assert not T17.validator({
+            "total_alerts": 999,
+            "high_severity_alerts": ev["high_severity_alerts"],
+            "fraud_customer_ids": ev["fraud_customer_ids"],
+        })
+
+    def test_too_few_fraud_customers(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T17"]
+        assert not T17.validator({
+            "total_alerts": ev["total_alerts"],
+            "high_severity_alerts": ev["high_severity_alerts"],
+            "fraud_customer_ids": [999],
+        })
+
+    def test_fraud_customers_by_name(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T17"]
+        names = ev["fraud_customer_names"][:2]
+        assert T17.validator({
+            "total_alerts": ev["total_alerts"],
+            "high_severity_alerts": ev["high_severity_alerts"],
+            "fraud_customer_ids": names,
+        })
+
+    def test_empty_output(self):
+        assert not T17.validator({})
 
 
 class TestT18Validator:

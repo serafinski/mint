@@ -1,13 +1,19 @@
-"""Loading node — dynamically loads and registers generated MCP_TOOL artifacts.
+"""Loading node — loads MCP_TOOL artifacts and registers all artifact types.
 
-Skills and agents are already written to disk during generation and do not
-require loading.  This node handles only MCP_TOOL artifacts:
+MCP_TOOL artifacts are dynamically loaded via importlib.  Skills and agents
+are already written to disk during generation and do not require dynamic
+loading, but all three types are registered in the capability registry here.
+
+MCP_TOOL handling:
 
 1. Load the module via importlib (``ToolLoader.load_tool``).
 2. Smoke-test with empty inputs (``ToolLoader.execute_tool``) — log a warning
-   on failure but still register, since Tier 2 behavioral testing (Iteration 3)
-   will perform proper input-driven tests.
+   on failure but still register.
 3. Register in the capability registry (``ToolLoader.register_tool``).
+
+SKILL / AGENT handling:
+
+1. Register in the capability registry (already on disk from generation).
 """
 
 from __future__ import annotations

@@ -17,9 +17,9 @@ On each call the node:
    classified gaps; the replace-by-name logic in each generator ensures that
    re-generated artifacts overwrite the old versions rather than accumulating.
 
-**Stub gate (Iteration 2 default):** ``gate_fn=None`` uses ``_stub_gate``,
-which always returns a passing ``VerificationReport``.  In Iteration 3 this
-parameter will be replaced with the real ``gate.verify`` function.
+**No-verification baseline:** ``gate_fn=None`` uses ``_stub_gate``, which
+always returns a passing ``VerificationReport``.  The real ``gate.verify``
+is wired as the default in ``pipeline.py``.
 """
 
 from __future__ import annotations

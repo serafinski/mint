@@ -12,7 +12,7 @@ Gate rules:
 * Tier 0 CRITICAL (invalid SKILL.md) → reject immediately; skip Tier 1/2/3.
 * Tier 1 CRITICAL (mock artefact, hardcoded data, syntax error) → reject; skip Tier 2/3.
 * Tier 2 CRITICAL or HIGH finding → reject; skip Tier 3.
-* Tier 3 CRITICAL finding → reject.
+* After Tier 3: any CRITICAL or HIGH finding across all tiers → reject.
 
 Public API
 ----------

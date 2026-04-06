@@ -207,7 +207,7 @@ def create_optimization_loop(
                         partner_id != skill_id
                         and partner_id in low_reuse_set  # only active caps are in low_reuse_set
                         and partner_id not in paired
-                        and similar_cap.is_active  # defensive: search() does not filter by is_active
+                        and similar_cap.is_active
                         and score >= 0.5  # meaningful semantic similarity
                     ):
                         merge_cands.append((skill_id, partner_id))

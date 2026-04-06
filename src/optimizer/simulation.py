@@ -176,8 +176,8 @@ def generate_synthetic_registry(
 
 
 def _compute_utility(
-    metrics_store: MetricsStore,
     capability_id: str,
+    metrics_store: MetricsStore,
     *,
     alpha: float = 1.0,
     beta: float = 0.1,
@@ -350,7 +350,7 @@ def run_simulation(
                 score = _real_compute_utility(cap.name, metrics_store)
                 utility_scores.append(float(score))
             except Exception:
-                utility_scores.append(_compute_utility(metrics_store, cap.name))
+                utility_scores.append(_compute_utility(cap.name, metrics_store))
 
         # 4. Compute KL divergence vs previous cycle
         current_histogram = _scores_to_histogram(utility_scores)

@@ -3,11 +3,12 @@
 Generates edge-case test inputs, executes them in the Docker sandbox,
 and detects behavioral contamination. No LLM calls — pure Python.
 
-Four test categories:
+Five test categories:
   - Nonexistent entity: empty / missing / invalid inputs
   - Consistency: same input twice must produce same output
   - Boundary: min/max values, zero, negative, empty strings
   - Latency: execution must complete within a reasonable bound
+  - Output variation: different inputs should produce different outputs
 """
 
 import ast

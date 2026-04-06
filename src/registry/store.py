@@ -218,7 +218,8 @@ class SkillRegistry:
             n_results: Maximum number of results to return.
             min_confidence: Minimum similarity score to include in results.
             is_active: Filter by active status. ``True`` (default) returns only
-                active capabilities; ``None`` returns all regardless of status.
+                active capabilities; ``False`` returns only inactive
+                capabilities; ``None`` returns all regardless of status.
         """
         results = self._collection.query(query_texts=[query], n_results=n_results)
 
@@ -235,7 +236,7 @@ class SkillRegistry:
             if score < min_confidence:
                 continue
             descriptor = self._descriptor_from_metadata(name, meta)
-            if is_active is not None and not descriptor.is_active:
+            if is_active is not None and descriptor.is_active != is_active:
                 continue
             pairs.append((descriptor, score))
         return pairs

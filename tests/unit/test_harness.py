@@ -306,7 +306,7 @@ class TestRunPilot:
         mock_registry_cls.return_value = mock_registry
 
         harness = EvaluationHarness(config)
-        records = harness.run_pilot([T04])  # T04 has no static coverage → immediate failure
+        records = harness.run_pilot([T04])  # T04 uses JIT pipeline (full condition)
 
         assert len(records) == 1
         assert records[0].is_pilot is True

@@ -1,10 +1,10 @@
 """Integration tests for the agent generator (real LLM calls).
 
 Verifies that the agent generator produces valid configurations using the
-real DeepSeek LLM, that DeepAgent skills are written to disk, and that
-all calls appear in LangFuse.
+real LLM (openai:gpt-5-mini), that DeepAgent skills are written to disk,
+and that all calls appear in LangFuse.
 
-Requires DEEPSEEK_API_KEY environment variable to be set.
+Requires OPENAI_API_KEY environment variable to be set.
 """
 
 from __future__ import annotations
@@ -23,11 +23,11 @@ from src.orchestrator.generators.skill import _get_validate_skill
 from src.schemas.capability import CapabilityType
 from src.schemas.task import ClassifiedGap, GeneratedArtifact, TaskState
 
-_has_api_key = bool(os.environ.get("DEEPSEEK_API_KEY"))
+_has_api_key = bool(os.environ.get("OPENAI_API_KEY"))
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not _has_api_key, reason="DEEPSEEK_API_KEY not set"),
+    pytest.mark.skipif(not _has_api_key, reason="OPENAI_API_KEY not set"),
 ]
 
 
