@@ -14,7 +14,7 @@ Reuse clusters
 CSV cluster  : T01, T04, T05, T07  (tabular ingestion variants)
 Analytics    : T08, T09             (T09 can reuse T08's cleaned output)
 
-Pilot tasks: T01 (seeded retrieval), T07 (moderate JIT), T10 (complex JIT).
+Pilot tasks: T01 (seeded retrieval), T07 (moderate JIT), T05 (moderate JIT, static coverage).
 """
 
 from __future__ import annotations
@@ -930,7 +930,7 @@ T18 = TaskDefinition(
 
 ALL_TASKS: list[TaskDefinition] = [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12, T13, T14, T15, T16, T17, T18]
 
-PILOT_TASKS: list[TaskDefinition] = [T01, T07, T05]  # retrieval + moderate JIT (fuzzy-join) + complex JIT (data-cleaning)
+PILOT_TASKS: list[TaskDefinition] = [T01, T07, T05]  # retrieval + moderate JIT (fuzzy-join) + moderate JIT (data-cleaning, static coverage)
 
 _TASK_MAP: dict[str, TaskDefinition] = {t.task_id: t for t in ALL_TASKS}
 

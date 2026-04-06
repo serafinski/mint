@@ -166,8 +166,10 @@ def _verify_inner(
     t3_report = adversarial.probe(artifact)
     all_findings.extend(t3_report.findings)
 
-    has_critical = any(f.severity == Severity.CRITICAL for f in all_findings)
-    overall_passed = not has_critical
+    has_blocking = any(
+        f.severity in (Severity.CRITICAL, Severity.HIGH) for f in all_findings
+    )
+    overall_passed = not has_blocking
     logger.info(
         "Verification complete for %s: passed=%s, findings=%d",
         name,

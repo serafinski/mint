@@ -46,7 +46,7 @@ def extract_parameter_schema(source_code: str) -> dict[str, dict]:
         if node.name.startswith("_"):
             continue
         schema: dict[str, dict] = {}
-        for arg in node.args.args:
+        for arg in (*node.args.args, *node.args.kwonlyargs):
             annotation = arg.annotation
             if isinstance(annotation, ast.Subscript):
                 # Annotated[X, ...] -> extract the first type argument
@@ -365,15 +365,17 @@ def _test_boundary(
         code = _build_sandbox_code(source_code, func_name, inputs)
         result = _sandbox(code, timeout=15)
 
-        if not result.get("success") and "Timeout" in result.get("stderr", ""):
-            findings.append(
-                VerificationFinding(
-                    tier=2,
-                    category="boundary",
-                    severity=Severity.HIGH,
-                    message=f"Tool timed out on {label} boundary inputs: {inputs}",
+        if not result.get("success"):
+            stderr = result.get("stderr", "")
+            if "Timeout" in stderr or "timed out" in stderr.lower() or "killed" in stderr.lower():
+                findings.append(
+                    VerificationFinding(
+                        tier=2,
+                        category="boundary",
+                        severity=Severity.HIGH,
+                        message=f"Tool timed out on {label} boundary inputs: {inputs}",
+                    )
                 )
-            )
 
     return findings
 

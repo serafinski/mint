@@ -57,7 +57,7 @@ def _save_last_run(
     """Persist last run config for `mint retry`."""
     data = {
         "task": task,
-        "files": [str(f) for f in files] if files else [],
+        "files": [str(f.resolve()) for f in files] if files else [],
         "params": params or [],
         "skip_verification": skip_verification,
         "no_optimizer": no_optimizer,
@@ -85,7 +85,8 @@ def _setup_logging(verbose: bool) -> None:
         level=logging.DEBUG if verbose else logging.WARNING,
         stream=sys.stderr,
     )
-    # Third-party loggers: fully silence (we never want their output)
+    # Third-party loggers: suppress noise but keep ERROR+ visible
+    third_party_level = logging.WARNING if verbose else logging.CRITICAL
     for noisy in (
         "opentelemetry",
         "urllib3",
@@ -94,7 +95,7 @@ def _setup_logging(verbose: bool) -> None:
         "openai",
         "chromadb",
     ):
-        logging.getLogger(noisy).setLevel(logging.CRITICAL)
+        logging.getLogger(noisy).setLevel(third_party_level)
     # Pipeline loggers: suppress INFO/WARNING noise but keep ERROR+
     for internal in (
         "src.orchestrator",
@@ -639,7 +640,13 @@ def _save_output(output_dir: Path, output: dict, artifact: Any | None) -> None:
     """Save output to files in the specified directory."""
     from datetime import datetime
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "Cannot create output directory %s: %s", output_dir, exc
+        )
+        return
 
     cap_name = getattr(artifact, "capability_name", "output") if artifact else "output"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -761,6 +768,13 @@ def execute_task(
         return 1
 
     registry, loader, metrics_store = _create_infra()
+
+    # Validate mutually exclusive flags
+    if no_optimizer and enable_optimizer:
+        err_console.print(
+            "[red]--no-optimizer and --enable-optimizer are mutually exclusive.[/red]"
+        )
+        return 1
 
     # Determine optimizer state
     if no_optimizer:
@@ -1058,11 +1072,11 @@ def execute_task(
         except Exception:
             pass
 
-    # Record invocation
-    _record_invocation(metrics_store, artifact, task_prompt, output, elapsed_ms)
-
-    # Update elapsed after execution
+    # Update elapsed after execution (includes sandbox/DeepAgent time)
     elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+    # Record invocation with final elapsed time
+    _record_invocation(metrics_store, artifact, task_prompt, output, elapsed_ms)
 
     # Output
     if json_output:
@@ -1073,9 +1087,13 @@ def execute_task(
         show_pipeline_result(final_state, artifact, output, elapsed_ms, verbose=verbose)
 
     # Always save output (default: data/output/, override with --output-dir)
+    save_dir = output_dir or _data_dir() / "mint_output"
     if output:
-        save_dir = output_dir or _data_dir() / "mint_output"
         _save_output(save_dir, output, artifact)
+    elif artifact is not None:
+        # Save metadata even for empty outputs so the attempt is recorded
+        cap_name = getattr(artifact, "capability_name", "unknown")
+        _save_output(save_dir, {"_empty": True, "_capability": cap_name}, artifact)
 
     # Success: artifact executed with output, or registry matched (even
     # without source_code — the system found a relevant capability)

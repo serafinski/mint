@@ -77,7 +77,9 @@ def _compute_kl_divergence(
     measure different aspects of convergence (see ``_kl_divergence`` there).
     """
     if not prev_scores or not curr_scores:
-        return 0.0
+        # Empty distribution signals catastrophic failure (e.g. all pruned),
+        # NOT convergence.  Return inf to prevent false convergence.
+        return float("inf") if (prev_scores and not curr_scores) else 0.0
 
     # Use union of keys so distributions are comparable
     all_keys = sorted(set(prev_scores) | set(curr_scores))

@@ -59,7 +59,11 @@ _llm_lock = threading.Lock()
 
 
 def _get_llm():
-    """Lazily create the generator LLM on first use (thread-safe)."""
+    """Lazily create the generator LLM on first use (thread-safe).
+
+    The returned instance is shared across threads (MAX_GENERATION_WORKERS=4).
+    LangChain chat model objects backed by ``httpx`` are thread-safe.
+    """
     global _generator_llm  # noqa: PLW0603
     if _generator_llm is None:
         with _llm_lock:

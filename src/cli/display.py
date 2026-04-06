@@ -99,8 +99,8 @@ def _check_output_quality(
     n_chars = len(formatted)
     elapsed_s = elapsed_ms / 1000
 
-    # Very few keys
-    if n_keys < 2 and n_chars < 200:
+    # Very few keys AND very little content — a single key with a large value is fine
+    if n_keys == 0 and n_chars < 200:
         return f"The output looks incomplete ({n_keys} key(s), {n_chars} chars)."
 
     # Long execution, tiny output

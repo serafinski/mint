@@ -175,7 +175,7 @@ class EvaluationStore:
         self, condition: str, *, exclude_pilot: bool = True
     ) -> float:
         """Fraction of runs where the verification gate passed."""
-        clauses = ["condition = ?", "condition != 'static'"]
+        clauses = ["condition = ?"]
         params: list[object] = [condition]
         if exclude_pilot:
             clauses.append("is_pilot = FALSE")

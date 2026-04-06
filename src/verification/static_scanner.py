@@ -243,15 +243,26 @@ def _check_missing_external_calls(
 # ---------------------------------------------------------------------------
 
 def _check_mock_artifacts(source_code: str, findings: list[VerificationFinding]) -> None:
-    """Detect mock/demo variable names and string literals."""
+    """Detect mock/demo variable names and string literals.
+
+    Reports at most one CRITICAL finding per distinct indicator word to avoid
+    flooding the report (a single match is sufficient to reject).
+    """
+    seen_indicators: set[str] = set()
+    positions: list[str] = []
     for m in _MOCK_NAMES.finditer(source_code):
+        word = m.group().lower()
+        if word not in seen_indicators:
+            seen_indicators.add(word)
+            positions.append(f"'{m.group()}' at position {m.start()}")
+    if seen_indicators:
         findings.append(
             VerificationFinding(
                 tier=1,
                 category="mock_artifact",
                 severity=Severity.CRITICAL,
-                message=f"Mock/demo indicator '{m.group()}' at position {m.start()}",
-                location=f"position {m.start()}",
+                message=f"Mock/demo indicator(s): {'; '.join(positions)}",
+                location="multiple" if len(positions) > 1 else positions[0],
             )
         )
 

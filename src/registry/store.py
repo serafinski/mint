@@ -206,6 +206,7 @@ class SkillRegistry:
         n_results: int = 3,
         *,
         min_confidence: float = 0.0,
+        is_active: bool | None = True,
     ) -> list[tuple[CapabilityDescriptor, float]]:
         """Semantic search. Returns (capability, score) pairs sorted by relevance.
 
@@ -215,6 +216,8 @@ class SkillRegistry:
             query: Natural-language search query.
             n_results: Maximum number of results to return.
             min_confidence: Minimum similarity score to include in results.
+            is_active: Filter by active status. ``True`` (default) returns only
+                active capabilities; ``None`` returns all regardless of status.
         """
         results = self._collection.query(query_texts=[query], n_results=n_results)
 
@@ -231,7 +234,7 @@ class SkillRegistry:
             if score < min_confidence:
                 continue
             descriptor = self._descriptor_from_metadata(name, meta)
-            if not descriptor.is_active:
+            if is_active is not None and not descriptor.is_active:
                 continue
             pairs.append((descriptor, score))
         return pairs
@@ -249,19 +252,25 @@ class SkillRegistry:
         gaps: list[tuple[str, str]] = []
 
         for query in queries:
+            # search() filters out is_active=False, so also query unfiltered
+            # to detect deactivated capabilities and produce accurate gap reasons.
             results = self.search(query, n_results=1)
-            # A deactivated capability does not fulfil the requirement — treat it as
-            # a gap so the pipeline generates a replacement.
-            if results and results[0][1] >= threshold and results[0][0].is_active:
+            unfiltered = self.search(query, n_results=1, is_active=None)
+
+            if results and results[0][1] >= threshold:
                 cap, score = results[0]
                 matches.append((cap, score, query))
             else:
-                best_score = results[0][1] if results else 0.0
-                reason = (
-                    f"capability '{results[0][0].name}' is deactivated"
-                    if results and results[0][1] >= threshold and not results[0][0].is_active
-                    else f"best score {best_score:.2f} below threshold {threshold:.2f}"
-                )
+                # Check whether a deactivated capability would have matched.
+                if (
+                    unfiltered
+                    and unfiltered[0][1] >= threshold
+                    and not unfiltered[0][0].is_active
+                ):
+                    reason = f"capability '{unfiltered[0][0].name}' is deactivated"
+                else:
+                    best_score = results[0][1] if results else 0.0
+                    reason = f"best score {best_score:.2f} below threshold {threshold:.2f}"
                 gaps.append((query, reason))
 
         return matches, gaps

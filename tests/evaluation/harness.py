@@ -169,7 +169,9 @@ class EvaluationHarness:
         The registry is restored to the clean snapshot before each run.
         """
         all_records: list[EvaluationRecord] = []
-        rng = random.Random(self._config.base_seed)
+        # Use condition name in seed to ensure independent orderings per condition
+        condition_seed = hash((condition, self._config.base_seed)) % (2**31)
+        rng = random.Random(condition_seed)
         condition_seeds = [rng.randint(0, 2**31) for _ in range(self._config.n_runs)]
 
         for run_idx, seed in enumerate(condition_seeds):
@@ -596,6 +598,7 @@ def _extract_result(
         "capability_type": capability_type,
         "verification_tier_reached": verification_tier_reached,
         "token_cost": 0,  # populated from LangFuse in Iteration 6
+        "invocation_record_id": _get("trace_id", None),
     }
 
 
@@ -950,6 +953,8 @@ def _static_t05(csv_path: Path) -> dict:
             seen.add(key)
             unique.append(r)
 
+    # null_count counts nulls in the *cleaned* output (should be 0 after proper cleaning).
+    # Counting on `unique` (which derives from non_null) is correct: the cleaned data has no nulls.
     null_count = sum(1 for r in unique for v in r.values() if not v.strip())
     return {"output_row_count": len(unique), "null_count": null_count}
 
