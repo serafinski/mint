@@ -129,6 +129,10 @@ def _generate_large_inputs(schema: dict[str, dict]) -> dict[str, Any]:
             inputs[name] = 1e12
         elif type_str == "str":
             inputs[name] = "a" * 10_000
+        elif type_str == "list":
+            inputs[name] = list(range(1000))
+        elif type_str == "dict":
+            inputs[name] = {f"key_{i}": i for i in range(100)}
         else:
             inputs[name] = ""
     return inputs
@@ -243,25 +247,40 @@ def _test_output_variation(
     parsed_a = _parse_sandbox_output(result_a)
     parsed_b = _parse_sandbox_output(result_b)
 
-    if (
-        parsed_a is not None
-        and parsed_b is not None
-        and parsed_a.get("error") is None
-        and parsed_b.get("error") is None
-        and parsed_a.get("result") == parsed_b.get("result")
-        and parsed_a.get("result") not in _TRIVIAL_RESULTS
-    ):
-        findings.append(
-            VerificationFinding(
-                tier=2,
-                category="output_variation",
-                severity=Severity.MEDIUM,
-                message=(
-                    f"Tool returned identical output for very different inputs: "
-                    f"{parsed_a.get('result')!r} — may be ignoring parameters"
-                ),
+    if parsed_a is not None and parsed_b is not None:
+        err_a = parsed_a.get("error")
+        err_b = parsed_b.get("error")
+
+        # Flag when one input succeeds and the other crashes
+        if (err_a is None) != (err_b is None):
+            findings.append(
+                VerificationFinding(
+                    tier=2,
+                    category="output_variation",
+                    severity=Severity.MEDIUM,
+                    message=(
+                        "Tool succeeds for one input but crashes for another — "
+                        "may not handle diverse inputs robustly"
+                    ),
+                )
             )
-        )
+        elif (
+            err_a is None
+            and err_b is None
+            and parsed_a.get("result") == parsed_b.get("result")
+            and parsed_a.get("result") not in _TRIVIAL_RESULTS
+        ):
+            findings.append(
+                VerificationFinding(
+                    tier=2,
+                    category="output_variation",
+                    severity=Severity.MEDIUM,
+                    message=(
+                        f"Tool returned identical output for very different inputs: "
+                        f"{parsed_a.get('result')!r} — may be ignoring parameters"
+                    ),
+                )
+            )
 
     return findings
 
@@ -317,7 +336,17 @@ def _test_consistency(
     parsed1 = _parse_sandbox_output(result1)
     parsed2 = _parse_sandbox_output(result2)
 
-    if parsed1 is not None and parsed2 is not None:
+    if parsed1 is None or parsed2 is None:
+        # At least one sandbox run timed out or failed to produce output
+        findings.append(
+            VerificationFinding(
+                tier=2,
+                category="consistency",
+                severity=Severity.INFO,
+                message="Consistency test inconclusive: sandbox timed out or produced no output",
+            )
+        )
+    else:
         # Compare result values (not elapsed time)
         if parsed1.get("result") != parsed2.get("result"):
             findings.append(

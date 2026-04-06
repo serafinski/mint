@@ -86,7 +86,7 @@ def prune(
     for cap in active:
         # Never prune pinned capabilities (seeded entries that should survive
         # optimizer cycles regardless of invocation count)
-        if cap.metadata.get("pinned") == "true":
+        if (cap.metadata or {}).get("pinned") == "true":
             logger.debug("Skipping pinned capability '%s'", cap.name)
             continue
         count = metrics_store.invocations_since(cap.name, cutoff)
@@ -175,14 +175,19 @@ def split(
     # They contain no generated code and therefore do not go through the
     # three-tier verification gate.  Verification applies only to code artifacts
     # (MCP tools, SKILL.md files, agent configs) produced by the pipeline generators.
-    new_ids: list[str] = []
+    # Validate all variant names first (all-or-nothing: if any name collides,
+    # abort the entire split so the parent is not left deactivated with missing variants).
     for variant in result.variants:
         if registry.get(variant.name) is not None:
             logger.warning(
-                "split(): variant name '%s' already exists in registry, skipping",
+                "split(): variant name '%s' already exists — aborting split of '%s'",
                 variant.name,
+                capability_id,
             )
-            continue
+            return []
+
+    new_ids: list[str] = []
+    for variant in result.variants:
         new_cap = CapabilityDescriptor(
             name=variant.name,
             description=variant.description,
@@ -196,14 +201,7 @@ def split(
         )
         new_ids.append(variant.name)
 
-    if not new_ids:
-        logger.warning(
-            "split(): all variant names for '%s' already exist — parent not deactivated",
-            capability_id,
-        )
-        return new_ids
-
-    # Deactivate parent
+    # Deactivate parent only after all variants are successfully added
     registry.deactivate(capability_id)
     metrics_store.record_event(capability_id, "split", f"into {new_ids}")
     logger.info("Split '%s' into %s", capability_id, new_ids)

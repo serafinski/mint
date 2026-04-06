@@ -107,15 +107,21 @@ def _check_output_quality(
     if elapsed_s > 60 and n_chars < 300:
         return f"The output looks incomplete ({n_chars} chars after {elapsed_s:.0f}s execution)."
 
-    # Echo detection — output contains the input prompt
+    # Echo detection — output contains the input prompt.
+    # Filter out common data-processing words to avoid false positives
+    # (e.g. "return", "count", "column" appear in both prompts and outputs).
+    _ECHO_STOPWORDS = {
+        "return", "count", "column", "parse", "value", "input", "output",
+        "field", "number", "string", "should", "which", "where", "their",
+        "about", "using", "after", "before", "between", "given", "based",
+    }
     task_lower = task_description.lower()[:200] if task_description else ""
     if task_lower:
         output_str = formatted.lower()
-        # Check if large chunks of the task prompt appear in output
-        words = [w for w in task_lower.split() if len(w) > 4]
+        words = [w for w in task_lower.split() if len(w) > 5 and w not in _ECHO_STOPWORDS]
         if words:
             matches = sum(1 for w in words if w in output_str)
-            if matches > len(words) * 0.6 and n_chars < 500:
+            if matches > len(words) * 0.7 and n_chars < 500:
                 return "The output appears to echo the input prompt."
 
     return None
@@ -568,27 +574,7 @@ def show_history(
     if capability:
         records = metrics_store.recent_invocations(capability, limit=limit)
     else:
-        # Get recent invocations across all capabilities
-        rows = metrics_store._conn.execute(
-            "SELECT capability_id, task_id, success, token_cost, latency_ms, "
-            "error_message, invoked_at "
-            "FROM invocations ORDER BY invoked_at DESC LIMIT ?",
-            [limit],
-        ).fetchall()
-        from src.schemas.metrics import InvocationRecord
-
-        records = [
-            InvocationRecord(
-                capability_id=r[0],
-                task_id=r[1],
-                success=r[2],
-                token_cost=r[3],
-                latency_ms=r[4],
-                error_message=r[5],
-                invoked_at=r[6],
-            )
-            for r in rows
-        ]
+        records = metrics_store.recent_invocations_all(limit=limit)
 
     if not records:
         console.print("[dim]No invocation history.[/dim]")

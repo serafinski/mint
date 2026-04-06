@@ -398,7 +398,7 @@ class EvaluationHarness:
             registry,
             loader,
             run_optimizer=run_optimizer,
-            metrics_store=metrics_store if run_optimizer else None,
+            metrics_store=metrics_store,
             verification_enabled=verification_enabled,
         ).compile()
 
@@ -459,8 +459,9 @@ def _extract_result(
     if artifacts:
         from src.schemas.capability import CapabilityType
 
-        # Use the last generated artifact (pipeline produces the correct type
-        # based on classification — no need to prefer MCP_TOOL).
+        # Sort by capability_name for deterministic selection when parallel
+        # generation produces multiple artifacts (as_completed ordering varies).
+        artifacts = sorted(artifacts, key=lambda a: a.capability_name or "")
         artifact = artifacts[-1]
         capability_type = str(artifact.capability_type).split(".")[-1].lower()
 

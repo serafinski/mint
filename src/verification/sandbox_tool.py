@@ -194,6 +194,15 @@ def _sandbox_execute_with_install(
 
     ephemeral_tag = f"jit-sandbox-eph-{uuid.uuid4().hex[:8]}"
 
+    # Validate package names: only allow alphanumeric, hyphens, underscores,
+    # dots, and version specifiers. Reject anything that looks suspicious.
+    import re as _re
+
+    _VALID_PKG = _re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?([<>=!~]+[A-Za-z0-9.*]+)?$")
+    packages = [p for p in packages if _VALID_PKG.match(p)]
+    if not packages:
+        return sandbox_execute(code, timeout=timeout)
+
     # Phase 1: install packages (with network, 60s timeout)
     pip_args = ", ".join(repr(p) for p in packages)
     install_script = (

@@ -242,3 +242,28 @@ class MetricsStore:
             )
             for r in rows
         ]
+
+    def recent_invocations_all(self, *, limit: int = 20) -> list[InvocationRecord]:
+        """Most recent invocations across all capabilities, newest first."""
+        rows = self._conn.execute(
+            """
+            SELECT capability_id, task_id, success,
+                   token_cost, latency_ms, error_message, invoked_at
+            FROM invocations
+            ORDER BY invoked_at DESC
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+        return [
+            InvocationRecord(
+                capability_id=r[0],
+                task_id=r[1],
+                success=r[2],
+                token_cost=r[3],
+                latency_ms=r[4],
+                error_message=r[5],
+                invoked_at=r[6],
+            )
+            for r in rows
+        ]

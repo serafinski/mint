@@ -7,6 +7,7 @@ This is a plain Python node — no LLM calls.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Literal
 
@@ -69,7 +70,7 @@ def gap_detection_node(
         for m in matches:
             metrics_store.record_invocation(InvocationRecord(
                 capability_id=m.capability.name,
-                task_id=state.task_description[:100],
+                task_id=hashlib.sha256(state.task_description.encode()).hexdigest()[:16],
                 success=True,
                 token_cost=0,
                 latency_ms=0.0,

@@ -638,7 +638,7 @@ def _record_invocation(
 
 def _save_output(output_dir: Path, output: dict, artifact: Any | None) -> None:
     """Save output to files in the specified directory."""
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -649,7 +649,7 @@ def _save_output(output_dir: Path, output: dict, artifact: Any | None) -> None:
         return
 
     cap_name = getattr(artifact, "capability_name", "output") if artifact else "output"
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     saved: list[str] = []
 
     # Scan output for file-like content and save separately

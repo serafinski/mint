@@ -97,17 +97,30 @@ def _strip_code_fences(text: str) -> str:
     the outer closing fence is absent.  An odd count of backtick-triple sequences
     in the body means one fence is unmatched — that is the outer closing fence.
     An even count means all fences are matched inner pairs — leave them intact.
+
+    Edge case: when the body has an even number of fences AND ends with two
+    consecutive bare ````` lines (inner close + outer close), the outer close
+    is stripped.
     """
     text = text.strip()
     if not text.startswith("```"):
         return text
     # Remove opening fence (with optional language tag)
     body = re.sub(r"^```[a-zA-Z]*\n?", "", text, count=1)
-    # Count all backtick-triple occurrences in the body.
-    # Odd  → last one is the unmatched outer closing fence → strip it.
-    # Even → all fences are matched inner pairs → leave them intact.
-    if len(re.findall(r"```", body)) % 2 == 1:
+    fence_count = len(re.findall(r"```", body))
+    if fence_count % 2 == 1:
+        # Odd → last one is the unmatched outer closing fence → strip it.
         body = re.sub(r"\n?```\s*$", "", body, count=1)
+    elif fence_count >= 2 and re.search(r"\n```\s*$", body):
+        # Even count — check for the pattern of two consecutive ``` lines at
+        # the end (inner code block close followed by outer wrapper close).
+        lines = body.rstrip().split("\n")
+        if (
+            len(lines) >= 2
+            and lines[-1].strip() == "```"
+            and lines[-2].strip() == "```"
+        ):
+            body = re.sub(r"\n?```\s*$", "", body, count=1)
     return body.strip()
 
 

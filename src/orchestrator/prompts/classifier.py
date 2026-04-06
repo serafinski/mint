@@ -107,7 +107,12 @@ Answer: classified_type=agent, confidence=0.85, rationale="Requires adaptive \
 investigation: profiling data, detecting anomalies, then investigating whether \
 they cluster or correlate — strategy adapts based on intermediate findings."
 
-## Task
+## Task Context
+
+Original task description (for domain context — classify the **gap**, not the
+whole task): {task_context}
+
+## Gap to Classify
 
 Gap description: "{description}"
 Search query: "{query}"

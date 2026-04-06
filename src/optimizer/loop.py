@@ -19,6 +19,7 @@ from src.optimizer.utility import compute_all_utilities
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
 from src.schemas.capability import CapabilityType
+from src.schemas.metrics import GranularityMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -147,9 +148,13 @@ def create_optimization_loop(
         split_cands: list[str] = []
         merge_cands: list[tuple[str, str]] = []
 
+        # Cache metrics to avoid redundant DuckDB queries for merge candidates
+        metrics_cache: dict[str, GranularityMetrics] = {}
+
         for cap_id in state.capabilities_snapshot:
             try:
                 m = metrics_store.compute_granularity_metrics(cap_id)
+                metrics_cache[cap_id] = m
                 cap = registry.get(cap_id)
                 if cap is None:
                     continue
@@ -173,10 +178,8 @@ def create_optimization_loop(
             cap = registry.get(cap_id)
             if cap is None or cap.capability_type != CapabilityType.SKILL:
                 continue
-            try:
-                m = metrics_store.compute_granularity_metrics(cap_id)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Failed to compute metrics for '%s' (merge): %s", cap_id, e)
+            m = metrics_cache.get(cap_id)
+            if m is None:
                 continue
             if m.reuse_rate < merge_reuse_threshold:
                 low_reuse_skills.append(cap_id)
