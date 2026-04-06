@@ -659,14 +659,23 @@ def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -
     # the container and update fixture_inputs to point there.
     fixture_preamble = ""
     if task.fixture_paths:
+        _BINARY_FIXTURE_EXTENSIONS = {".xlsx", ".xls", ".parquet", ".pickle", ".pkl"}
         for i, fp in enumerate(task.fixture_paths):
             host_path = Path(fp) if Path(fp).is_absolute() else Path.cwd() / fp
             if host_path.exists():
-                content = host_path.read_text(encoding="utf-8", errors="replace")
                 sandbox_path = f"/tmp/fixture_{i}{host_path.suffix}"
-                fixture_preamble += (
-                    f"import pathlib as _pl\n_pl.Path({sandbox_path!r}).write_text({content!r})\n"
-                )
+                if host_path.suffix.lower() in _BINARY_FIXTURE_EXTENSIONS:
+                    import base64
+                    b64 = base64.b64encode(host_path.read_bytes()).decode("ascii")
+                    fixture_preamble += (
+                        f"import pathlib as _pl, base64 as _b64\n"
+                        f"_pl.Path({sandbox_path!r}).write_bytes(_b64.b64decode({b64!r}))\n"
+                    )
+                else:
+                    content = host_path.read_text(encoding="utf-8", errors="replace")
+                    fixture_preamble += (
+                        f"import pathlib as _pl\n_pl.Path({sandbox_path!r}).write_text({content!r})\n"
+                    )
                 # Replace the host path in fixture_inputs with the sandbox path
                 for k, v in fixture_inputs.items():
                     if str(v) == str(fp):
@@ -691,7 +700,12 @@ async def _run():
         _kwargs = {{k: v for k, v in _all_inputs.items() if k in _valid}}
         # Fuzzy-match: for unmatched params, find extra inputs that share
         # a root word (e.g. "features" ↔ "feature_columns").
-        _unmatched = _valid - set(_kwargs)
+        # Only try to fill params that are truly required (no default value)
+        _required = {{
+            name for name, p in _sig.parameters.items()
+            if p.default is inspect.Parameter.empty
+        }}
+        _unmatched = _required - set(_kwargs)
         _unused = {{k: v for k, v in _all_inputs.items() if k not in _kwargs}}
         def _words(s):
             return set(w.rstrip("s") for w in s.lower().replace("_", " ").split() if len(w) > 2)
@@ -711,7 +725,13 @@ async def _run():
 
 asyncio.run(_run())
 """
-    extra_pkgs = resolve_extra_packages(source_code)
+    # Prefer pip_packages declared by the generator (accurate PyPI names).
+    # Fall back to LLM-based import resolution for old artifacts.
+    declared_pkgs = getattr(artifact, "pip_packages", None)
+    if declared_pkgs:
+        extra_pkgs = declared_pkgs
+    else:
+        extra_pkgs = resolve_extra_packages(source_code)
     # Allow more time when dynamic deps need installation (Phase 1 pip + Phase 2 exec).
     exec_timeout = 60 if extra_pkgs else 30
     logger.debug("Sandbox extra_packages=%s timeout=%s", extra_pkgs, exec_timeout)
