@@ -181,12 +181,10 @@ def split(
     # abort the entire split so the parent is not left deactivated with missing variants).
     for variant in result.variants:
         if registry.get(variant.name) is not None:
-            logger.warning(
-                "split(): variant name '%s' already exists — aborting split of '%s'",
-                variant.name,
-                capability_id,
+            raise ValueError(
+                f"split(): variant name '{variant.name}' already exists in registry — "
+                f"aborting split of '{capability_id}'"
             )
-            return []
 
     new_ids: list[str] = []
     for variant in result.variants:

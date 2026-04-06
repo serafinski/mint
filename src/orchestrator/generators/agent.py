@@ -267,20 +267,22 @@ def _generate_single_agent(
 
     if result.is_deep_agent and result.skill_content:
         agent_config["skill_content"] = result.skill_content
-        # Write the DeepAgent skill to disk so the DeepAgents runtime can load it
-        skill_dir = (output_dir or SKILLS_OUTPUT_DIR) / result.agent_name
+        # Write the DeepAgent skill to disk so the DeepAgents runtime can load it.
+        # Use forced_name (not result.agent_name) so the directory matches the
+        # artifact's capability_name.
+        skill_dir = (output_dir or SKILLS_OUTPUT_DIR) / forced_name
         try:
             skill_dir.mkdir(parents=True, exist_ok=True)
             (skill_dir / "SKILL.md").write_text(result.skill_content)
         except OSError as exc:
             error_msg = (
-                f"Failed to write DeepAgent skill '{result.agent_name}' to disk: {exc}"
+                f"Failed to write DeepAgent skill '{forced_name}' to disk: {exc}"
             )
             logger.error(error_msg)
             return None, error_msg
-        logger.info("Wrote DeepAgent skill '%s' to %s", result.agent_name, skill_dir)
+        logger.info("Wrote DeepAgent skill '%s' to %s", forced_name, skill_dir)
 
-    # Use deterministic slug for the artifact metadata (disk file keeps LLM name)
+    # Use deterministic slug for the artifact metadata and disk path.
     if result.agent_name != forced_name:
         logger.debug(
             "Artifact metadata uses stable slug '%s' (LLM chose '%s'; disk file unchanged)",

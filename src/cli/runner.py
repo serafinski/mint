@@ -473,6 +473,14 @@ def _match_files_to_params(
 
 
 def _execute_mcp_tool(artifact: Any, file_paths: list[Path], params: dict) -> dict:
+    """Execute an MCP tool artifact inside the Docker sandbox.
+
+    Binary files (Excel, Parquet, Pickle, etc.) are base64-encoded before
+    injection into the sandbox so they survive the transfer intact.  Which
+    extensions count as binary is governed by ``BINARY_EXTENSIONS`` in
+    ``src/config.py`` — the business-analytics testbed commonly uses
+    ``.xlsx``, ``.parquet``, and ``.pkl`` files.
+    """
     from src.verification.behavioral import _extract_function_name
     from src.verification.sandbox_tool import resolve_extra_packages, sandbox_execute
 
@@ -485,7 +493,6 @@ def _execute_mcp_tool(artifact: Any, file_paths: list[Path], params: dict) -> di
     fixture_preamble_lines: list[str] = []
     sandbox_paths: list[str] = []
 
-    _BINARY_FILE_EXTENSIONS = {".xlsx", ".xls", ".parquet", ".pickle", ".pkl"}
     for i, fp in enumerate(file_paths):
         if not fp.exists():
             sandbox_paths.append("")
@@ -498,7 +505,7 @@ def _execute_mcp_tool(artifact: Any, file_paths: list[Path], params: dict) -> di
             )
         sandbox_path = f"/tmp/fixture_{i}{fp.suffix}"
         sandbox_paths.append(sandbox_path)
-        if fp.suffix.lower() in _BINARY_FILE_EXTENSIONS:
+        if fp.suffix.lower() in _BINARY_EXTENSIONS:
             # Binary files: use base64 encoding to transfer into sandbox
             import base64
             b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
@@ -828,6 +835,8 @@ def _extract_stage_detail(node_name: str, state_update: Any) -> str:
         if status:
             return str(status).split(".")[-1]
         return ""
+    elif node_name == "optimizer_node":
+        return "prune/split/merge"
     return ""
 
 

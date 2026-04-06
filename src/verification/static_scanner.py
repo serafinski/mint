@@ -320,31 +320,35 @@ def scan(
             )
 
     # --- Tier 1: AST + regex ---
-    try:
-        tree = ast.parse(source_code)
-    except SyntaxError as exc:
-        findings.append(
-            VerificationFinding(
-                tier=1,
-                category="syntax",
-                severity=Severity.CRITICAL,
-                message=f"SyntaxError: {exc.msg} at line {exc.lineno}",
-                location=f"line {exc.lineno}",
+    # AST checks only apply to MCP_TOOL (Python source).  SKILL (YAML/markdown)
+    # and AGENT (JSON config) are not valid Python — skip AST entirely for them
+    # to avoid spurious SyntaxError findings.
+    if capability_type == CapabilityType.MCP_TOOL or capability_type == "mcp_tool":
+        try:
+            tree = ast.parse(source_code)
+        except SyntaxError as exc:
+            findings.append(
+                VerificationFinding(
+                    tier=1,
+                    category="syntax",
+                    severity=Severity.CRITICAL,
+                    message=f"SyntaxError: {exc.msg} at line {exc.lineno}",
+                    location=f"line {exc.lineno}",
+                )
             )
-        )
-        return VerificationReport(
-            capability_name=capability_name,
-            findings=findings,
-            overall_passed=False,
-            tier_reached=1,
-        )
+            return VerificationReport(
+                capability_name=capability_name,
+                findings=findings,
+                overall_passed=False,
+                tier_reached=1,
+            )
 
-    # AST checks
-    for node in ast.walk(tree):
-        _check_hardcoded_return(node, findings)
-        _check_silent_except(node, findings)
+        # AST checks
+        for node in ast.walk(tree):
+            _check_hardcoded_return(node, findings)
+            _check_silent_except(node, findings)
 
-    _check_missing_external_calls(tree, source_code, findings)
+        _check_missing_external_calls(tree, source_code, findings)
 
     # Regex checks
     _check_mock_artifacts(source_code, findings)

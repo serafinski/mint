@@ -3,8 +3,10 @@
 Tier structure (cheapest first, fail-fast):
 
   0  Skills only : ``quick_validate.py`` structural check            (~0 cost)
-  1  All          : AST + regex static scan                           (~0 cost)
-  2  All          : Behavioural testing in Docker sandbox    (moderate cost)
+  1  MCP_TOOL    : AST + regex static scan                           (~0 cost)
+     SKILL/AGENT : regex-only scan (not Python — AST does not apply)
+  2  MCP_TOOL    : Behavioural testing in Docker sandbox    (moderate cost)
+     SKILL/AGENT : skipped (no executable source_code)
   3  All          : Adversarial DeepAgent probing              (high cost)
 
 Gate rules:
@@ -28,7 +30,6 @@ from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import Severity, VerificationFinding, VerificationReport
 from src.verification import adversarial, behavioral, static_scanner
-from src.verification.static_scanner import scan_text_only
 
 logger = logging.getLogger(__name__)
 
@@ -58,22 +59,21 @@ def _static_scan(artifact: GeneratedArtifact) -> VerificationReport:
         )
 
     if artifact.capability_type == CapabilityType.SKILL:
-        # Tier 0: quick_validate structural check.  Returns early on failure.
-        t0_report = static_scanner.scan(
+        # Tier 0 (quick_validate) + Tier 1 (regex-only — AST is skipped for
+        # non-MCP_TOOL types inside static_scanner.scan()).
+        return static_scanner.scan(
             source_code=artifact.skill_content or "",
             capability_name=name,
             capability_type="skill",
         )
-        if t0_report.tier_reached == 0:
-            # quick_validate failed — return as-is (CRITICAL, reject).
-            return t0_report
-        # Tier 1: regex-only scan on SKILL.md content (it is not Python,
-        # so AST checks do not apply).
-        return scan_text_only(artifact.skill_content or "", name)
 
-    # AGENT: regex-only scan on the JSON-serialised config.
+    # AGENT: regex-only scan on the JSON-serialised config (AST skipped).
     config_str = json.dumps(artifact.agent_config) if artifact.agent_config else ""
-    return scan_text_only(config_str, name)
+    return static_scanner.scan(
+        source_code=config_str,
+        capability_name=name,
+        capability_type="agent",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -448,7 +448,11 @@ def _test_latency(
 
 
 def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
-    """Run all four behavioral test categories on an artifact.
+    """Run all five behavioral test categories on an MCP_TOOL artifact.
+
+    Categories: nonexistent entity, consistency, boundary, latency,
+    and output variation.  SKILL/AGENT artifacts have no ``source_code``
+    and are skipped with an INFO finding.
 
     Returns a list of ``VerificationFinding`` objects (tier=2).
     """

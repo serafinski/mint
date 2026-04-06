@@ -20,7 +20,6 @@ class BaselineCondition(StrEnum):
     NO_VERIFICATION = "no_verification"
     NO_OPTIMIZATION = "no_optimization"
     STATIC = "static"
-    LONGITUDINAL = "longitudinal"
 
 
 class TaskTier(StrEnum):

@@ -432,8 +432,12 @@ class TestGenerateAgentNode:
             def with_structured_output(self, schema):
                 return MockStructuredLLM()
 
-        # Block the target directory by creating a FILE at that path
-        blocker = tmp_path / "test-deep-agent"
+        # Block the target directory by creating a FILE at the forced_name path
+        # (the generator uses forced_name, not result.agent_name, for the directory).
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+
+        forced_name = slugify_gap_hyphen(gap.query)
+        blocker = tmp_path / forced_name
         blocker.write_text("not a directory")
 
         with (
@@ -670,6 +674,11 @@ class TestGenerateSingleAgent:
         assert artifact.agent_config["is_deep_agent"] is True
         assert "skill_content" in artifact.agent_config
 
-        skill_path = tmp_path / "test-investigator" / "SKILL.md"
+        # Skill is written under forced_name (deterministic slug with hash),
+        # not result.agent_name.
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+
+        forced_name = slugify_gap_hyphen(self._gap().query)
+        skill_path = tmp_path / forced_name / "SKILL.md"
         assert skill_path.exists(), f"SKILL.md not found at {skill_path}"
         assert skill_path.read_text() == VALID_SKILL_CONTENT

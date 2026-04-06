@@ -335,9 +335,13 @@ class TestGenerateSkillNode:
             rationale="Multi-step",
         )
 
-        # Block the target directory by creating a FILE at that path
+        # Block the target directory by creating a FILE at the forced_name path
+        # (the generator uses forced_name, not skill_name, for the directory).
         # mkdir(...) will raise NotADirectoryError (subclass of OSError)
-        blocker = tmp_path / "csv-loader"
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+
+        forced_name = slugify_gap_hyphen(gap.query)
+        blocker = tmp_path / forced_name
         blocker.write_text("not a directory")
 
         with (

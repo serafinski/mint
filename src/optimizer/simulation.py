@@ -205,6 +205,9 @@ def run_simulation(
     config: SimConfig,
     *,
     with_optimization: bool = True,
+    split_reuse_threshold: float = 0.6,
+    split_success_threshold: float = 0.7,
+    merge_reuse_threshold: float = 0.05,
 ) -> list[SimResult]:
     """Run the simulation for config.n_cycles cycles.
 
@@ -212,6 +215,9 @@ def run_simulation(
         config: Simulation configuration.
         with_optimization: If True, apply prune/split/merge operations each cycle.
             If False, only generate invocations (baseline).
+        split_reuse_threshold: Reuse rate above which a capability is a split candidate.
+        split_success_threshold: Success rate below which a high-reuse capability is split.
+        merge_reuse_threshold: Reuse rate below which a SKILL is a merge candidate.
 
     Returns:
         List of SimResult, one per cycle.
@@ -280,14 +286,15 @@ def run_simulation(
             except Exception:
                 pass
 
-            # Split candidates: SKILL/AGENT with reuse > 0.6 and success < 0.7.
+            # Split candidates: SKILL/AGENT with high reuse and mediocre success.
+            # Thresholds match loop.py defaults (parameterised for consistency).
             # Requires LLM call; silently skipped without a valid API key.
             active_caps = registry.list_all(is_active=True)
             for cap in active_caps:
                 if cap.capability_type not in (CapabilityType.SKILL, CapabilityType.AGENT):
                     continue
                 m = metrics_store.compute_granularity_metrics(cap.name)
-                if m.reuse_rate > 0.6 and m.success_rate < 0.7:
+                if m.reuse_rate > split_reuse_threshold and m.success_rate < split_success_threshold:
                     try:
                         new_ids = ops.split(registry, metrics_store, cap.name)
                         if new_ids:
@@ -295,7 +302,7 @@ def run_simulation(
                     except Exception:
                         pass
 
-            # Merge candidates: SKILL pairs with reuse < 0.05 AND high embedding
+            # Merge candidates: SKILL pairs with low reuse AND high embedding
             # similarity (score >= 0.5).  Uses registry.search() to find partners,
             # matching the strategy in loop.py identify_candidates_node.
             # Requires LLM call; silently skipped without a valid API key.
@@ -305,7 +312,7 @@ def run_simulation(
                 if cap.capability_type != CapabilityType.SKILL:
                     continue
                 m = metrics_store.compute_granularity_metrics(cap.name)
-                if m.reuse_rate < 0.05:
+                if m.reuse_rate < merge_reuse_threshold:
                     low_reuse_skills.append(cap.name)
 
             low_reuse_set = set(low_reuse_skills)

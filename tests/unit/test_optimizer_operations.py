@@ -319,10 +319,10 @@ class TestSplit:
             ],
         )
 
-        result = split(registry, store, "data-workflow")
+        with pytest.raises(ValueError, match="already exists in registry"):
+            split(registry, store, "data-workflow")
 
         # All-or-nothing: no variants registered, parent not deactivated
-        assert result == []
         assert registry.add.call_count == 0
         registry.deactivate.assert_not_called()
 
@@ -353,9 +353,9 @@ class TestSplit:
             ],
         )
 
-        result = split(registry, store, "data-workflow")
+        with pytest.raises(ValueError, match="already exists in registry"):
+            split(registry, store, "data-workflow")
 
-        assert result == []
         registry.add.assert_not_called()
         registry.deactivate.assert_not_called()
 

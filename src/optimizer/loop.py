@@ -269,14 +269,23 @@ def create_optimization_loop(
             except Exception as e:  # noqa: BLE001
                 errors.append(f"merge {pair} failed: {e}")
 
+        # Filter utility_scores to only include capabilities that are still
+        # active after prune/split/merge, so pipeline.py carries accurate
+        # scores for the next cycle's KL divergence calculation.
+        active_caps = {cap.name for cap in registry.list_all(is_active=True)}
+        filtered_scores = {
+            k: v for k, v in state.utility_scores.items() if k in active_caps
+        }
+
         return Command(
             update={
                 "pruned": pruned,
                 "split_results": split_results,
                 "merge_results": merge_results,
                 "errors": errors,
-                # Stored for reference only — cross-pipeline persistence is via
-                # _prev_optimizer_scores in pipeline.py, not this field.
+                # Explicitly return filtered utility_scores so pipeline.py can
+                # reliably read result["utility_scores"] for cross-cycle KL.
+                "utility_scores": filtered_scores,
                 "previous_utility_scores": state.utility_scores,
             },
             goto=END,

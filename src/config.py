@@ -36,14 +36,40 @@ DOCKER_PREINSTALLED: frozenset[str] = frozenset({"mcp", "pydantic"})
 #: Maximum file size (bytes) for user-provided input files.
 FILE_SIZE_LIMIT_BYTES: int = 10 * 1024 * 1024  # 10 MB
 
-#: File extensions treated as binary (not read as text for prompt augmentation).
+#: File extensions treated as binary.  Used for two purposes:
+#:
+#: 1. **CLI file validation** (``_resolve_files``): files matching these
+#:    extensions are rejected *unless* they are also in the "processable
+#:    binary" carve-out (currently ``.xlsx`` / ``.xls``, handled via openpyxl).
+#: 2. **Sandbox file transfer** (``_execute_mcp_tool``): matching files are
+#:    base64-encoded before injection into the Docker sandbox, since they
+#:    cannot survive a plain-text write.
+#:
+#: The business-analytics testbed routinely produces and consumes Excel
+#: (``.xlsx``/``.xls``), Parquet, and Pickle files — keep those here so
+#: the sandbox transfer path handles them correctly.
 BINARY_EXTENSIONS: frozenset[str] = frozenset({
+    # Images
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".ico",
-    ".webp", ".svg", ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav",
-    ".flac", ".ogg", ".webm", ".pdf", ".zip", ".gz", ".tar", ".bz2",
-    ".7z", ".rar", ".xz", ".exe", ".dll", ".so", ".dylib", ".bin",
-    ".dat", ".db", ".sqlite", ".sqlite3", ".duckdb", ".parquet",
-    ".pickle", ".pkl", ".npy", ".npz", ".h5", ".hdf5",
+    ".webp", ".svg",
+    # Audio / video
+    ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav",
+    ".flac", ".ogg", ".webm",
+    # Documents
+    ".pdf",
+    # Archives
+    ".zip", ".gz", ".tar", ".bz2", ".7z", ".rar", ".xz",
+    # Executables / shared libs
+    ".exe", ".dll", ".so", ".dylib",
+    # Data — common in the business-analytics testbed
+    ".xlsx", ".xls",
+    ".parquet",
+    ".pickle", ".pkl",
+    ".bin", ".dat",
+    # Databases
+    ".db", ".sqlite", ".sqlite3", ".duckdb",
+    # Scientific / ML
+    ".npy", ".npz", ".h5", ".hdf5",
 })
 
 # ---------------------------------------------------------------------------

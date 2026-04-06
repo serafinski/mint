@@ -18,6 +18,9 @@ err_console = Console(stderr=True)
 # Pipeline stage tracking
 # ---------------------------------------------------------------------------
 
+# Superset of all possible pipeline nodes.  optimizer_node is only present
+# when run_optimizer=True; extra entries are harmless (only nodes that emit
+# stream events get looked up).
 STAGE_MAP: dict[str, str] = {
     "decomposition_node": "Decompose",
     "gap_detection": "Registry Search",

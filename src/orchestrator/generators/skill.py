@@ -298,7 +298,9 @@ def _generate_single_skill(
         return None, error_msg
 
     # --- Write to disk ---
-    target_dir = (output_dir or SKILLS_OUTPUT_DIR) / skill_name
+    # Always use forced_name for the directory so it matches the artifact's
+    # capability_name (which also uses forced_name with its hash suffix).
+    target_dir = (output_dir or SKILLS_OUTPUT_DIR) / forced_name
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / "SKILL.md").write_text(content)
