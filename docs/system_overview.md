@@ -268,12 +268,11 @@ The system is designed to never hang or crash:
 
 ### Dynamic Dependency Resolution
 
-Generated MCP tools may import packages not in the base Docker image. The sandbox resolves this dynamically:
+Generated MCP tools may import packages not in the base Docker image. The generator declares required PyPI packages via `pip_packages` in its structured output (e.g., `["pyyaml", "scikit-learn"]`). These are stored on `GeneratedArtifact.pip_packages` and used directly at execution time.
 
-1. `extract_imports()` uses AST to find all imports in generated code
-2. `sys.stdlib_module_names` filters out standard library modules
-3. An LLM call maps import names to PyPI package names (e.g., `sklearn` -> `scikit-learn`)
-4. Two-phase Docker execution: Phase 1 installs packages with network, commits to ephemeral image; Phase 2 runs code with network disabled
+For code paths without generator-declared packages (behavioral testing, old registry matches), the sandbox falls back to LLM-based import resolution: AST-based import extraction, stdlib filtering, then an LLM call to map import names to PyPI names.
+
+Execution uses two-phase Docker: Phase 1 installs packages with network, commits to ephemeral image; Phase 2 runs code with network disabled. Binary files (xlsx, parquet) are transferred via base64 encoding.
 
 ### Retry with Feedback
 
