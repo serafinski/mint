@@ -103,21 +103,21 @@ class TestStaticT05:
 
 class TestStaticT09:
     def test_output_passes_validator(self):
-        output = _run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.json"])
+        output = _run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.xml"])
         assert T09.validator(output), f"T09 validator failed on: {output}"
 
     def test_has_required_keys(self):
-        output = _run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.json"])
+        output = _run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.xml"])
         assert "summary" in output
         assert "stats_table" in output
         assert "anomalies" in output
 
     def test_exactly_five_anomalies(self):
-        output = _run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.json"])
+        output = _run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.xml"])
         assert len(output["anomalies"]) == 5
 
     def test_summary_is_string(self):
-        output = _run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.json"])
+        output = _run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.xml"])
         assert isinstance(output["summary"], str) and len(output["summary"]) > 0
 
 

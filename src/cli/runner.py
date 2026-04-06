@@ -130,11 +130,13 @@ def _resolve_files(paths: list[Path] | None) -> list[Path]:
         if not fp.exists():
             err_console.print(f"[red]File not found: {fp}[/red]")
             raise SystemExit(1)
-        if fp.suffix.lower() in _BINARY_EXTENSIONS:
+        # Excel files are binary but can be described via openpyxl
+        _EXCEL_EXTENSIONS = {".xlsx", ".xls"}
+        if fp.suffix.lower() in _BINARY_EXTENSIONS and fp.suffix.lower() not in _EXCEL_EXTENSIONS:
             err_console.print(
                 f"[red]Binary file not supported: {fp.name}[/red]\n"
-                "MINT can only process text files "
-                "(CSV, JSON, TXT, etc.)."
+                "MINT can only process text files and Excel "
+                "(CSV, JSON, XLSX, TXT, etc.)."
             )
             raise SystemExit(1)
         resolved.append(fp.resolve())
@@ -152,6 +154,33 @@ def _describe_file(fp: Path) -> str:
         if size < 1024 * 1024
         else f"{size / (1024 * 1024):.1f}MB"
     )
+
+    # Excel files are binary — handle before text read
+    if suffix in (".xlsx", ".xls"):
+        try:
+            import openpyxl
+
+            wb = openpyxl.load_workbook(str(fp), read_only=True, data_only=True)
+            sheets = wb.sheetnames
+            desc = f"  {fp.name} ({size_str}, Excel, {len(sheets)} sheet(s))\n"
+            for sheet_name in sheets[:5]:
+                ws = wb[sheet_name]
+                header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+                columns = [str(c) for c in header_row if c is not None]
+                n_rows = max(ws.max_row - 1, 0) if ws.max_row else 0
+                desc += f"    Sheet '{sheet_name}': {n_rows} rows\n"
+                if columns:
+                    desc += f"      Columns: {', '.join(columns[:20])}\n"
+                sample_row = next(ws.iter_rows(min_row=2, max_row=2, values_only=True), ())
+                if sample_row:
+                    sample_vals = [str(v) for v in sample_row if v is not None]
+                    desc += f"      Sample: {', '.join(sample_vals[:10])}\n"
+            wb.close()
+            return desc.rstrip()
+        except ImportError:
+            return f"  {fp.name} ({size_str}, Excel — install openpyxl for column preview)"
+        except Exception:  # noqa: BLE001
+            return f"  {fp.name} ({size_str}, Excel)"
 
     try:
         content = fp.read_text(encoding="utf-8", errors="replace")
@@ -186,10 +215,72 @@ def _describe_file(fp: Path) -> str:
                 keys = list(data.keys())
                 desc = f"  {fp.name} ({size_str}, JSON object)\n"
                 desc += f"    Keys: {', '.join(keys[:20])}"
+                # Show the structure of the first value so the generator
+                # knows the nested schema (e.g., {min, max, unit}).
+                if keys:
+                    sample_val = data[keys[0]]
+                    sample_repr = json_mod.dumps(sample_val, default=str)
+                    if len(sample_repr) <= 200:
+                        desc += f"\n    Sample value ({keys[0]}): {sample_repr}"
                 return desc
         except (json_mod.JSONDecodeError, AttributeError):
             pass
         return f"  {fp.name} ({size_str}, JSON)"
+
+    if suffix == ".tsv":
+        header = lines[0] if lines else ""
+        columns = [c.strip().strip('"') for c in header.split("\t")]
+        n_rows = max(len(lines) - 1, 0)
+        sample = lines[1] if len(lines) > 1 else ""
+        desc = f"  {fp.name} ({size_str}, TSV, {n_rows} rows)\n"
+        desc += f"    Columns: {', '.join(columns)}\n"
+        if sample:
+            desc += f"    Sample row: {sample[:200]}"
+        return desc
+
+    if suffix in (".yaml", ".yml"):
+        try:
+            import yaml as yaml_mod
+
+            data = yaml_mod.safe_load(content)
+            if isinstance(data, dict):
+                keys = list(data.keys())
+                desc = f"  {fp.name} ({size_str}, YAML)\n"
+                desc += f"    Top-level keys: {', '.join(str(k) for k in keys[:20])}"
+                return desc
+            elif isinstance(data, list):
+                desc = f"  {fp.name} ({size_str}, YAML list, {len(data)} items)"
+                return desc
+        except Exception:  # noqa: BLE001
+            pass
+        return f"  {fp.name} ({size_str}, YAML)"
+
+    if suffix == ".xml":
+        try:
+            import xml.etree.ElementTree as ET
+
+            root = ET.fromstring(content)
+            children = [child.tag for child in root]
+            unique_tags = list(dict.fromkeys(children))[:15]
+            desc = f"  {fp.name} ({size_str}, XML)\n"
+            desc += f"    Root: <{root.tag}>, {len(children)} children\n"
+            desc += f"    Child tags: {', '.join(unique_tags)}"
+            if root.attrib:
+                attrs = ', '.join(f'{k}={v!r}' for k, v in list(root.attrib.items())[:5])
+                desc += f"\n    Root attributes: {attrs}"
+            return desc
+        except Exception:  # noqa: BLE001
+            pass
+        return f"  {fp.name} ({size_str}, XML)"
+
+    if suffix == ".sql":
+        # Show first few non-empty, non-comment lines for schema context
+        meaningful = [l.strip() for l in lines if l.strip() and not l.strip().startswith("--")]
+        preview = meaningful[:5]
+        desc = f"  {fp.name} ({size_str}, SQL, {len(lines)} lines)\n"
+        if preview:
+            desc += f"    Preview: {'; '.join(preview)[:300]}"
+        return desc
 
     if suffix == ".txt":
         n_words = len(content.split())

@@ -197,7 +197,7 @@ T04 = TaskDefinition(
         "Build an inventory reorder pipeline using these two data sources:\n"
         "1. Inventory CSV at tests/evaluation/fixtures/t04_inventory.csv "
         "(columns: product_id, product_name, current_stock, daily_usage, unit_cost, warehouse)\n"
-        "2. Reorder rules JSON at tests/evaluation/fixtures/t04_reorder_rules.json "
+        "2. Reorder rules YAML at tests/evaluation/fixtures/t04_reorder_rules.yaml "
         "(contains min_days_of_stock threshold, reorder_days_supply multiplier, max_order_value cap)\n\n"
         "Pipeline stages:\n"
         "(1) Load both data sources.\n"
@@ -215,7 +215,7 @@ T04 = TaskDefinition(
     static_capability_name=None,
     fixture_paths=[
         FIXTURES_DIR / "t04_inventory.csv",
-        FIXTURES_DIR / "t04_reorder_rules.json",
+        FIXTURES_DIR / "t04_reorder_rules.yaml",
     ],
     validator=_validate_t04,
 )
@@ -415,20 +415,19 @@ T09 = TaskDefinition(
     tier="complex",
     description="Generate structured report: summary section, stats table, and top-5 anomalies",
     task_prompt=(
-        "Generate an analytics report from the data at "
-        "tests/evaluation/fixtures/t09_report_data.json. "
-        "The JSON file has structure: "
-        '{\"title\": str, \"period\": {\"start\": str, \"end\": str}, '
-        '\"records\": [{\"region\": str, \"product\": str, \"revenue\": float, '
-        '\"units\": int, \"returns\": int}, ...]}. '
-        "Load the file, access the 'records' list, and identify the top 5 "
+        "Generate an analytics report from the XML data at "
+        "tests/evaluation/fixtures/t09_report_data.xml. "
+        "The XML has structure: <report><title>, <period start=... end=...>, "
+        "<records> containing <record> elements with <region>, <product>, "
+        "<revenue>, <units>, <returns> child elements. "
+        "Parse the XML, extract the records, and identify the top 5 "
         "revenue anomalies (highest outliers). "
         "Return a dict with keys 'summary' (str), 'stats_table' (dict or list), "
         "and 'anomalies' (list of exactly 5 items)."
     ),
     has_static_coverage=True,
     static_capability_name="report-generation",
-    fixture_paths=[FIXTURES_DIR / "t09_report_data.json"],
+    fixture_paths=[FIXTURES_DIR / "t09_report_data.xml"],
     validator=_validate_t09,
 )
 
@@ -515,7 +514,7 @@ T11 = TaskDefinition(
     task_prompt=(
         "Build a data integration pipeline using these three data sources:\n"
         "1. Sales CSV at tests/evaluation/fixtures/t11_sales.csv (columns: order_id, product_id, quantity, unit_price, region)\n"
-        "2. Product catalog JSON at tests/evaluation/fixtures/t11_products.json (fields: product_id, name, category)\n"
+        "2. Product catalog Excel at tests/evaluation/fixtures/t11_products.xlsx (columns: product_id, name, category)\n"
         "3. Regional targets CSV at tests/evaluation/fixtures/t11_targets.csv (columns: region, target_revenue)\n\n"
         "Steps: (1) Join the sales data with the product catalog on product_id to enrich sales records with product names and categories. "
         "(2) Compute per-region revenue totals by summing quantity * unit_price for each region. "
@@ -528,7 +527,7 @@ T11 = TaskDefinition(
     static_capability_name=None,
     fixture_paths=[
         FIXTURES_DIR / "t11_sales.csv",
-        FIXTURES_DIR / "t11_products.json",
+        FIXTURES_DIR / "t11_products.xlsx",
         FIXTURES_DIR / "t11_targets.csv",
     ],
     validator=_validate_t11,
@@ -663,8 +662,8 @@ T14 = TaskDefinition(
         "Build a budget reconciliation pipeline using these three data sources:\n"
         "1. Department budgets CSV at tests/evaluation/fixtures/t14_departments.csv "
         "(columns: department, annual_budget)\n"
-        "2. Transactions CSV at tests/evaluation/fixtures/t14_transactions.csv "
-        "(columns: txn_id, department, amount, category, date)\n"
+        "2. Transactions TSV at tests/evaluation/fixtures/t14_transactions.tsv "
+        "(tab-separated, columns: txn_id, department, amount, category, date)\n"
         "3. Allocation rules JSON at tests/evaluation/fixtures/t14_rules.json "
         "(contains max_single_transaction threshold and category_caps as fraction of budget)\n\n"
         "Pipeline stages:\n"
@@ -682,7 +681,7 @@ T14 = TaskDefinition(
     static_capability_name=None,
     fixture_paths=[
         FIXTURES_DIR / "t14_departments.csv",
-        FIXTURES_DIR / "t14_transactions.csv",
+        FIXTURES_DIR / "t14_transactions.tsv",
         FIXTURES_DIR / "t14_rules.json",
     ],
     validator=_validate_t14,
@@ -776,7 +775,7 @@ T16 = TaskDefinition(
         "You are investigating a service degradation incident. You have:\n"
         "1. System metrics CSV at tests/evaluation/fixtures/t16_system_metrics.csv "
         "(columns: timestamp, db_connections, query_latency_ms, request_queue_depth, error_rate, cpu_usage)\n"
-        "2. Incident report JSON at tests/evaluation/fixtures/t16_incident.json "
+        "2. Incident report YAML at tests/evaluation/fixtures/t16_incident.yaml "
         "(contains title, symptoms, onset_time, affected_service)\n\n"
         "The incident involves a cascading failure where one metric spiked first and "
         "caused other metrics to degrade in sequence. Your task is to:\n\n"
@@ -803,7 +802,7 @@ T16 = TaskDefinition(
     static_capability_name=None,
     fixture_paths=[
         FIXTURES_DIR / "t16_system_metrics.csv",
-        FIXTURES_DIR / "t16_incident.json",
+        FIXTURES_DIR / "t16_incident.yaml",
     ],
     validator=_validate_t16,
 )

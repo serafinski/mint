@@ -271,7 +271,7 @@ def _gen_t04(fixtures_dir: Path, rng: random.Random) -> dict:
     writer.writerows(inventory_rows)
     (fixtures_dir / "t04_inventory.csv").write_text(buf.getvalue())
 
-    # --- Reorder rules JSON ---
+    # --- Reorder rules YAML ---
     min_days_stock = 14  # reorder if stock < 14 days of usage
     reorder_multiplier = 30  # order 30 days' worth
     rules = {
@@ -279,7 +279,8 @@ def _gen_t04(fixtures_dir: Path, rng: random.Random) -> dict:
         "reorder_days_supply": reorder_multiplier,
         "max_order_value": 5000.0,
     }
-    (fixtures_dir / "t04_reorder_rules.json").write_text(json.dumps(rules, indent=2))
+    import yaml
+    (fixtures_dir / "t04_reorder_rules.yaml").write_text(yaml.dump(rules, default_flow_style=False))
 
     # --- Compute expected values ---
     items_below_threshold = 0
@@ -613,7 +614,21 @@ def _gen_t09(fixtures_dir: Path, rng: random.Random) -> dict:
     for i in range(5):
         data["records"][i]["revenue"] = round(rng.uniform(500000, 1000000), 2)
 
-    (fixtures_dir / "t09_report_data.json").write_text(json.dumps(data, indent=2))
+    # Write as XML for format diversity
+    import xml.etree.ElementTree as ET
+
+    root_el = ET.Element("report")
+    ET.SubElement(root_el, "title").text = data["title"]
+    period_el = ET.SubElement(root_el, "period", start=data["period"]["start"], end=data["period"]["end"])
+    records_el = ET.SubElement(root_el, "records")
+    for rec in data["records"]:
+        rec_el = ET.SubElement(records_el, "record")
+        for key, val in rec.items():
+            ET.SubElement(rec_el, key).text = str(val)
+
+    tree = ET.ElementTree(root_el)
+    ET.indent(tree, space="  ")
+    tree.write(fixtures_dir / "t09_report_data.xml", encoding="unicode", xml_declaration=True)
 
     return {
         "T09": {
@@ -696,7 +711,17 @@ def _gen_t11(fixtures_dir: Path, rng: random.Random) -> dict:
         {"product_id": i + 1, "name": f"Product_{chr(65 + i)}", "category": rng.choice(_T11_CATEGORIES)}
         for i in range(10)
     ]
-    (fixtures_dir / "t11_products.json").write_text(json.dumps(products, indent=2))
+    # Write as Excel for format diversity
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Products"
+    ws.append(["product_id", "name", "category"])
+    for p in products:
+        ws.append([p["product_id"], p["name"], p["category"]])
+    wb.save(fixtures_dir / "t11_products.xlsx")
+    wb.close()
 
     # --- Sales data (CSV) ---
     sales_rows = []
@@ -941,11 +966,13 @@ def _gen_t14(fixtures_dir: Path, rng: random.Random) -> dict:
             "category": rng.choice(["salary", "equipment", "travel", "software", "training"]),
             "date": f"2024-{rng.randint(1,12):02d}-{rng.randint(1,28):02d}",
         })
+    # Write as TSV for format diversity
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["txn_id", "department", "amount", "category", "date"])
+    writer = csv.DictWriter(buf, fieldnames=["txn_id", "department", "amount", "category", "date"],
+                            delimiter="\t")
     writer.writeheader()
     writer.writerows(txn_rows)
-    (fixtures_dir / "t14_transactions.csv").write_text(buf.getvalue())
+    (fixtures_dir / "t14_transactions.tsv").write_text(buf.getvalue())
 
     # --- Allocation rules ---
     rules = {
@@ -1115,7 +1142,9 @@ def _gen_t16(fixtures_dir: Path, rng: random.Random) -> dict:
         "onset_time": rows[incident_start]["timestamp"],
         "affected_service": "api-gateway",
     }
-    (fixtures_dir / "t16_incident.json").write_text(json.dumps(incident_report, indent=2))
+    # Write as YAML for format diversity
+    import yaml
+    (fixtures_dir / "t16_incident.yaml").write_text(yaml.dump(incident_report, default_flow_style=False))
 
     return {
         "T16": {

@@ -961,11 +961,20 @@ def _static_t05(csv_path: Path) -> dict:
 
 
 def _static_t09(data_path: Path) -> dict:
-    """Generate a structured report from JSON data."""
-    import json as _json
+    """Generate a structured report from XML data."""
+    import xml.etree.ElementTree as ET
 
-    data = _json.loads(data_path.read_text())
-    records = data.get("records", [])
+    tree = ET.parse(data_path)
+    root = tree.getroot()
+    records = []
+    for rec_el in root.findall(".//record"):
+        records.append({
+            "region": rec_el.findtext("region", ""),
+            "product": rec_el.findtext("product", ""),
+            "revenue": float(rec_el.findtext("revenue", "0")),
+            "units": int(rec_el.findtext("units", "0")),
+            "returns": int(rec_el.findtext("returns", "0")),
+        })
 
     total_revenue = sum(r["revenue"] for r in records)
     total_units = sum(r["units"] for r in records)
