@@ -112,6 +112,10 @@ class GeneratedArtifact(BaseModel):
             "gaps whose query matches an existing passing artifact are skipped."
         ),
     )
+    pip_packages: list[str] = Field(
+        default_factory=list,
+        description="PyPI package names declared by the generator (e.g. ['pyyaml', 'scikit-learn'])",
+    )
     generated_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="When this artifact was generated",

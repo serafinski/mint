@@ -44,6 +44,15 @@ class GeneratedToolCode(BaseModel):
     tool_name: str = Field(..., description="Snake_case name for the tool function")
     source_code: str = Field(..., description="Complete Python source file for the MCP tool")
     description: str = Field(..., description="Brief description of what the tool does")
+    pip_packages: list[str] = Field(
+        default_factory=list,
+        description=(
+            "PyPI package names required by this tool (e.g. ['pyyaml', 'scikit-learn', 'openpyxl']). "
+            "Use the pip install name, NOT the Python import name "
+            "(e.g. 'pyyaml' not 'yaml', 'scikit-learn' not 'sklearn', 'Pillow' not 'PIL'). "
+            "Omit stdlib and packages already in the base image (mcp, pydantic)."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -229,6 +238,7 @@ def generate_single_tool(
                 capability_type=CapabilityType.MCP_TOOL,
                 source_code=result.source_code,
                 description=result.description,
+                pip_packages=result.pip_packages,
                 gap_query=gap.query,
             ),
             None,
@@ -306,6 +316,7 @@ def generate_single_tool(
             capability_type=CapabilityType.MCP_TOOL,
             source_code=repaired.source_code,
             description=repaired.description,
+            pip_packages=repaired.pip_packages,
             gap_query=gap.query,
         ),
         None,

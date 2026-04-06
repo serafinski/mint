@@ -574,7 +574,8 @@ def main() -> int:
 
     from src.schemas.task import TaskState
 
-    # Optional LangFuse tracing
+    # Optional LangFuse tracing — use config["metadata"]["langfuse_*"] keys
+    # (the convention LangFuse's LangChain integration reads from LangGraph).
     invoke_config: dict = {}
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
@@ -585,16 +586,14 @@ def main() -> int:
             _tags.append("no-verification")
         if run_optimizer:
             _tags.append("optimizer-on")
-        handler = LangFuseCallbackHandler(
-            tags=_tags,
-            user_id="run-task",
-            metadata={
-                "task": args.task[:200],
-                "files": [fp.name for fp in file_paths],
-                "optimizer": run_optimizer,
-            },
-        )
-        invoke_config["callbacks"] = [handler]
+        invoke_config["callbacks"] = [LangFuseCallbackHandler()]
+        invoke_config["metadata"] = {
+            "langfuse_tags": _tags,
+            "langfuse_user_id": "run-task",
+            "task": args.task[:200],
+            "files": [fp.name for fp in file_paths],
+            "optimizer": run_optimizer,
+        }
     except Exception:  # noqa: BLE001
         pass
 

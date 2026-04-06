@@ -99,12 +99,12 @@ def _check_output_quality(
     n_chars = len(formatted)
     elapsed_s = elapsed_ms / 1000
 
-    # Very few keys AND very little content — a single key with a large value is fine
-    if n_keys == 0 and n_chars < 200:
-        return f"The output looks incomplete ({n_keys} key(s), {n_chars} chars)."
+    # Empty output — no keys at all
+    if n_keys == 0:
+        return "The output is empty (0 keys)."
 
-    # Long execution, tiny output
-    if elapsed_s > 60 and n_chars < 300:
+    # Long execution, almost no content — likely a real problem
+    if elapsed_s > 60 and n_chars < 50:
         return f"The output looks incomplete ({n_chars} chars after {elapsed_s:.0f}s execution)."
 
     # Echo detection — output contains the input prompt.

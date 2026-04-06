@@ -83,7 +83,12 @@ scikit-learn, scipy, requests, beautifulsoup4, etc.)
 - The tool must be self-contained — no dependencies on external state or files
 - All non-file parameters (thresholds, limits, flags, etc.) MUST have sensible \
 default values so the tool can be called with just the data inputs. Only file \
-path parameters should be required (no default).\
+path parameters should be required (no default).
+- In the `pip_packages` field, list ALL non-stdlib PyPI packages your code \
+imports. Use the **pip install name**, not the Python import name. Common \
+mappings: yaml → pyyaml, sklearn → scikit-learn, cv2 → opencv-python, \
+PIL → Pillow, bs4 → beautifulsoup4. If you only use stdlib + mcp + pydantic, \
+leave pip_packages empty.\
 """
 
 MCP_TOOL_USER_PROMPT = """\

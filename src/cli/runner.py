@@ -344,6 +344,11 @@ def _langfuse_config(
 ) -> dict:
     """Build LangFuse callback config with rich tracing metadata.
 
+    Uses ``config["metadata"]["langfuse_*"]`` keys — the convention that
+    LangFuse's LangChain integration reads to set trace-level attributes.
+    This works with LangGraph's pipeline invoke (constructor args on
+    ``CallbackHandler`` don't propagate through LangGraph).
+
     Args:
         session_id: Groups related traces (e.g., a retry chain).
         tags: Filterable tags (e.g., file formats, capability type).
@@ -353,13 +358,14 @@ def _langfuse_config(
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 
-        handler = LangFuseCallbackHandler(
-            session_id=session_id,
-            tags=tags or [],
-            user_id=user_id,
-            metadata=metadata or {},
-        )
-        return {"callbacks": [handler]}
+        handler = LangFuseCallbackHandler()
+        config_metadata = {
+            **(metadata or {}),
+            "langfuse_session_id": session_id,
+            "langfuse_tags": tags or [],
+            "langfuse_user_id": user_id,
+        }
+        return {"callbacks": [handler], "metadata": config_metadata}
     except Exception:  # noqa: BLE001
         return {}
 
@@ -421,7 +427,7 @@ def _match_files_to_params(
     schema = extract_parameter_schema(source_code)
     param_names = list(schema.keys())
 
-    _PATH_KEYWORDS = ("path", "file", "csv", "json", "txt", "log", "doc")
+    _PATH_KEYWORDS = ("path", "file", "csv", "json", "txt", "log", "doc", "tsv", "yaml", "yml", "xml", "xlsx", "xls", "sql", "parquet")
     path_params = [p for p in param_names if any(kw in p.lower() for kw in _PATH_KEYWORDS)]
 
     inputs: dict[str, str] = {}
@@ -479,6 +485,7 @@ def _execute_mcp_tool(artifact: Any, file_paths: list[Path], params: dict) -> di
     fixture_preamble_lines: list[str] = []
     sandbox_paths: list[str] = []
 
+    _BINARY_FILE_EXTENSIONS = {".xlsx", ".xls", ".parquet", ".pickle", ".pkl"}
     for i, fp in enumerate(file_paths):
         if not fp.exists():
             sandbox_paths.append("")
@@ -489,12 +496,21 @@ def _execute_mcp_tool(artifact: Any, file_paths: list[Path], params: dict) -> di
                 f"[yellow]Warning: {fp.name} is {size // (1024 * 1024)}MB — "
                 "large files may cause sandbox issues[/yellow]"
             )
-        content = fp.read_text(encoding="utf-8", errors="replace")
         sandbox_path = f"/tmp/fixture_{i}{fp.suffix}"
         sandbox_paths.append(sandbox_path)
-        fixture_preamble_lines.append(
-            f"import pathlib as _pl\n_pl.Path({sandbox_path!r}).write_text({content!r})"
-        )
+        if fp.suffix.lower() in _BINARY_FILE_EXTENSIONS:
+            # Binary files: use base64 encoding to transfer into sandbox
+            import base64
+            b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
+            fixture_preamble_lines.append(
+                f"import pathlib as _pl, base64 as _b64\n"
+                f"_pl.Path({sandbox_path!r}).write_bytes(_b64.b64decode({b64!r}))"
+            )
+        else:
+            content = fp.read_text(encoding="utf-8", errors="replace")
+            fixture_preamble_lines.append(
+                f"import pathlib as _pl\n_pl.Path({sandbox_path!r}).write_text({content!r})"
+            )
 
     # Match files to tool params using AST extraction + keyword overlap
     fixture_inputs = _match_files_to_params(source_code, file_paths, sandbox_paths)
@@ -538,7 +554,14 @@ async def _run():
 asyncio.run(_run())
 """
 
-    extra_pkgs = resolve_extra_packages(source_code)
+    # Prefer pip_packages declared by the generator (accurate PyPI names).
+    # Fall back to LLM-based import resolution for artifacts without them
+    # (e.g., registry matches from before this feature).
+    declared_pkgs = getattr(artifact, "pip_packages", None)
+    if declared_pkgs:
+        extra_pkgs = declared_pkgs
+    else:
+        extra_pkgs = resolve_extra_packages(source_code)
     exec_timeout = 60 if extra_pkgs else 30
     result = sandbox_execute(sandbox_code, timeout=exec_timeout, extra_packages=extra_pkgs or None)
 

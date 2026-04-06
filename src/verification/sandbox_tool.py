@@ -44,7 +44,7 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
     Results are cached in ``_pip_resolution_cache`` for the session.
     Falls back to identity mapping (import name = pip name) on any error.
     """
-    # Check cache first — only query uncached imports.
+    # Check cache — only query uncached imports.
     uncached = [name for name in import_names if name not in _pip_resolution_cache]
     if not uncached:
         return {name: _pip_resolution_cache[name] for name in import_names}
