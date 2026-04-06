@@ -197,7 +197,7 @@ Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in th
    - Use `response_format` for structured output (Pydantic model with subtasks)
    - System prompt instructs the agent to plan decomposition, produce subtasks with capability annotations, and write results to files
    - Use `deepseek-chat` as the model (`deepseek-reasoner` lacks `tool_choice` support required by DeepAgents)
-   - **Operational boundaries:** `recursion_limit=35` (~17 logical steps; each tool call = 2 graph steps), timeout at node level (120s), fresh initialization per invocation
+   - **Operational boundaries:** `recursion_limit=50` (~17 logical steps; each tool call = 2 graph steps), timeout at node level (120s), fresh initialization per invocation
    - Trace with LangFuse via callback handler
 
 2. **Capability classifier** (`src/orchestrator/classifier.py`)
@@ -275,9 +275,9 @@ use the existing schemas from src/schemas/.
 
 The three generator nodes are chained sequentially: `generate_mcp_tool` → `generate_skill` → `generate_agent`. Each node filters by `classified_type` and hands off via `Command(goto=...)`. No `TaskState` schema changes (no Annotated reducers) are required. Send-based parallel fan-out is future work.
 
-### ✅ Decision: `DECOMPOSITION_RECURSION_LIMIT` raised to 35
+### ✅ Decision: `DECOMPOSITION_RECURSION_LIMIT` raised to 50
 
-Integration tests confirmed `recursion_limit=25` was too low for the DeepAgent to complete real tasks. Raised to 35 (~17 logical steps). The production fallback (return partial results with error flag) remains in place.
+Integration tests confirmed `recursion_limit=25` was too low for the DeepAgent to complete real tasks. Raised to 50 (~25 logical steps). The production fallback (return partial results with error flag) remains in place.
 
 *Phase C (single session):* ✅ COMPLETE
 
@@ -389,7 +389,7 @@ Assessment: Generated capabilities are structurally valid and executable (344/34
    - Writes intermediate analysis to files (context management)
    - Tests network-disconnected behavior
    - Uses `response_format=AdversarialFindings` for structured output
-   - **Operational boundaries:** `recursion_limit=35`, timeout at node level (180s), fresh initialization
+   - **Operational boundaries:** `recursion_limit=50`, timeout at node level (180s), fresh initialization
    - **Only runs if Tier 2 passes**
    - **Focused on 3 specific attack patterns:** (1) hidden demo/sample mode detection, (2) network-disconnect behavioral change, (3) ground-truth comparison where available
    - Trace with LangFuse
@@ -436,7 +436,7 @@ Create an agent team with 4 teammates:
   Implement as a DeepAgent (create_deep_agent with sandbox backend). The agent
   uses write_todos for planning, execute tool for running probes, file system
   for intermediate analysis. Use response_format for structured findings.
-  recursion_limit=35, timeout=180s. Focus on 3 attack patterns: hidden demo mode,
+  recursion_limit=50, timeout=180s. Focus on 3 attack patterns: hidden demo mode,
   network-disconnect behavior change, ground-truth comparison.
   Trace with LangFuse. See the deep-agents skill for patterns. Write tests.
 - "devil" teammate: after the other 3 finish, review all tiers and find ways a
@@ -1094,8 +1094,8 @@ DeepAgents are powerful but expensive and unpredictable. These constraints apply
 
 | Constraint | Value | Rationale |
 |---|---|---|
-| `recursion_limit` (decomposition) | 35 | ~17 logical steps; each tool call = 2 graph steps |
-| `recursion_limit` (adversarial) | 35 | Adversarial probing needs more exploration room |
+| `recursion_limit` (decomposition) | 50 | ~25 logical steps; each tool call = 2 graph steps |
+| `recursion_limit` (adversarial) | 50 | Adversarial probing needs more exploration room |
 | `recursion_limit` (failure analysis) | 25 | Failure analysis is focused investigation |
 | Node-level timeout (decomposition) | 120s | Prevents pipeline hang if agent loops |
 | Node-level timeout (adversarial) | 180s | Longer for sandbox execution |

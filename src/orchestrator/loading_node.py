@@ -136,8 +136,8 @@ def loading_node(
             logger.error(error_msg)
             errors.append(error_msg)
 
-    # "deployed" = registered in registry + on disk.
-    deployed = registered + len(non_mcp_artifacts)
+    # "deployed" = successfully registered in registry (MCP tools + SKILL/AGENT).
+    deployed = registered
     new_errors = len(errors) - len(state.errors)
 
     # Gaps were detected but nothing was actually deployed → pipeline failed.

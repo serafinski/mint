@@ -5,7 +5,7 @@ The agent uses ``write_todos`` for planning and ``response_format`` for
 structured subtask output.
 
 Operational boundaries (from CLAUDE.md):
-- ``recursion_limit=35`` (max steps)
+- ``recursion_limit=50`` (max steps)
 - Node-level timeout: 120 s
 - Graph is a stateless CompiledStateGraph; state is fresh per ``.invoke()`` call
 - On timeout / error: return partial results with error flag
@@ -74,7 +74,7 @@ def decomposition_node(
 ) -> Command[Literal["gap_detection"]]:
     """Decompose a task into subtasks using a DeepAgent.
 
-    The agent is invoked with a 120 s timeout and a recursion limit of 35.
+    The agent is invoked with a 120 s timeout and a recursion limit of 50.
     On timeout or error the node returns partial results (empty subtasks)
     with the error recorded in ``state.errors``.
     """

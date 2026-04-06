@@ -50,7 +50,7 @@ def gap_detection_node(
     ]
     gaps = []
     for query, reason in gaps_raw:
-        gaps.append(GapItem(description=query, query=query))
+        gaps.append(GapItem(description=reason or query, query=query))
 
     logger.info(
         "Gap detection: %d matches, %d gaps from %d required capabilities",

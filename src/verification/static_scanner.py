@@ -25,7 +25,7 @@ from src.schemas.verification import Severity, VerificationFinding, Verification
 # ---------------------------------------------------------------------------
 
 _MOCK_NAMES = re.compile(
-    r"(mock|fake|dummy|placeholder|DEMO|TEST_DATA)",
+    r"\b(mock|fake|dummy|placeholder|DEMO|TEST_DATA)\b",
     re.IGNORECASE,
 )
 
@@ -149,10 +149,27 @@ def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> 
         return
 
     body = node.body
-    # Check if the body is effectively silent: only `pass`, or empty
+    # Check if the body is effectively silent: only `pass`, `return None`,
+    # `return {}`, `return "..."`, or similar swallowed-exception patterns.
     has_reraise = False
     has_logging = False
     is_only_pass = len(body) == 1 and isinstance(body[0], ast.Pass)
+    is_silent_return = False
+
+    if len(body) == 1 and isinstance(body[0], ast.Return):
+        ret_val = body[0].value
+        # return None (explicit or implicit)
+        if ret_val is None:
+            is_silent_return = True
+        elif isinstance(ret_val, ast.Constant) and ret_val.value is None:
+            is_silent_return = True
+        # return {}, return [], return "", return 0, return False, etc.
+        elif isinstance(ret_val, ast.Constant):
+            is_silent_return = True
+        elif isinstance(ret_val, ast.Dict) and len(ret_val.keys) == 0:
+            is_silent_return = True
+        elif isinstance(ret_val, ast.List) and len(ret_val.elts) == 0:
+            is_silent_return = True
 
     for child in ast.walk(node):
         if isinstance(child, ast.Raise):
@@ -168,8 +185,15 @@ def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> 
             if isinstance(func, ast.Name) and func.id in ("print", "logging"):
                 has_logging = True
 
-    if (is_bare or is_only_pass) and not has_reraise and not has_logging:
-        label = "bare except" if is_bare else "except Exception: pass"
+    if (is_bare or is_only_pass or is_silent_return) and not has_reraise and not has_logging:
+        if is_bare:
+            label = "bare except"
+        elif is_only_pass:
+            label = "except Exception: pass"
+        elif is_silent_return:
+            label = "except Exception: return <default>"
+        else:
+            label = "silent except"
         findings.append(
             VerificationFinding(
                 tier=1,

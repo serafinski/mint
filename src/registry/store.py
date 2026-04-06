@@ -231,6 +231,8 @@ class SkillRegistry:
             if score < min_confidence:
                 continue
             descriptor = self._descriptor_from_metadata(name, meta)
+            if not descriptor.is_active:
+                continue
             pairs.append((descriptor, score))
         return pairs
 

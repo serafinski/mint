@@ -63,7 +63,7 @@ class OptimizerState(BaseModel):
 def _compute_kl_divergence(
     prev_scores: dict[str, float], curr_scores: dict[str, float]
 ) -> float:
-    """Compute KL(prev || curr) between two capability utility score distributions.
+    """Compute KL(curr || prev) between two capability utility score distributions.
 
     Each capability's raw utility score is treated as a point mass; both
     distributions are shifted to be non-negative, epsilon-smoothed, and
@@ -98,7 +98,8 @@ def _compute_kl_divergence(
     prev = prev / prev.sum()
     curr = curr / curr.sum()
 
-    return float(entropy(prev, curr))
+    # KL(curr || prev): measures surprise of new data given old expectations
+    return float(entropy(curr, prev))
 
 
 def create_optimization_loop(

@@ -581,7 +581,7 @@ def _extract_result(
                 )
                 failure_reason = "output_rejected"
         else:
-            failure_reason = "output_rejected"
+            failure_reason = "no_source_code"
             logger.info(
                 "Task %s matched in registry but no source_code in metadata — "
                 "cannot validate output",

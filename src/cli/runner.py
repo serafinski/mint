@@ -82,7 +82,7 @@ def load_last_run() -> dict | None:
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        level=logging.WARNING,
+        level=logging.DEBUG if verbose else logging.WARNING,
         stream=sys.stderr,
     )
     # Third-party loggers: fully silence (we never want their output)
@@ -649,7 +649,8 @@ def _save_output(output_dir: Path, output: dict, artifact: Any | None) -> None:
     for key, value in output.items():
         if isinstance(value, str) and len(value) > 500:
             # Detect CSV content
-            if "," in value.split("\n")[0] and "\n" in value:
+            first_line = value.split("\n")[0]
+            if "," in first_line and "\n" in value and first_line.count(",") >= 2:
                 ext = ".csv"
             # Detect JSON content
             elif value.strip().startswith(("{", "[")):

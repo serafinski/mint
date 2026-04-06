@@ -31,7 +31,7 @@ from scipy import stats  # noqa: E402
 
 CONDITIONS = ["full", "no_verification", "no_optimization", "static"]
 RETRIEVAL_TASKS = {"T01", "T02", "T03"}
-ALL_TASK_IDS = [f"T{i:02d}" for i in range(1, 18)]
+ALL_TASK_IDS = [f"T{i:02d}" for i in range(1, 19)]
 SYNTHESIS_TASK_IDS = [t for t in ALL_TASK_IDS if t not in RETRIEVAL_TASKS]
 CONDITION_LABELS = {
     "static": "Static",
@@ -70,6 +70,34 @@ def fisher_exact_2x2(
         [b_success, b_total - b_success],
     ]
     return stats.fisher_exact(table)
+
+
+def holm_bonferroni(p_values: list[float | None]) -> list[float | None]:
+    """Apply Holm-Bonferroni correction to a list of p-values.
+
+    None entries (missing tests) are passed through unchanged.
+    Returns adjusted p-values (capped at 1.0).
+    """
+    indexed = [(i, p) for i, p in enumerate(p_values) if p is not None]
+    if not indexed:
+        return list(p_values)
+
+    # Sort by p-value ascending
+    indexed.sort(key=lambda x: x[1])
+    m = len(indexed)
+    adjusted = [None] * len(p_values)
+
+    prev_adj = 0.0
+    for rank, (orig_idx, p) in enumerate(indexed):
+        # Holm step-down: multiply by (m - rank)
+        adj = p * (m - rank)
+        # Enforce monotonicity: adjusted values must be non-decreasing
+        adj = max(adj, prev_adj)
+        adj = min(adj, 1.0)
+        adjusted[orig_idx] = adj
+        prev_adj = adj
+
+    return adjusted
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
@@ -199,10 +227,11 @@ def print_condition_table(title: str, data: list[dict]) -> list[str]:
 
 
 def print_per_task_table(per_task: list[dict]) -> list[str]:
-    """Per-task success with CIs and Fisher's exact vs static."""
+    """Per-task success with CIs and Holm-Bonferroni-corrected Fisher's exact vs static."""
     lines = [
         f"\n{'='*80}",
         "  Per-Task Success Rates with 95% CIs and Fisher's Exact Test (JIT vs Static)",
+        "  (p-values adjusted via Holm-Bonferroni correction)",
         f"{'='*80}",
     ]
 
@@ -228,8 +257,12 @@ def print_per_task_table(per_task: list[dict]) -> list[str]:
         "noverif_k,noverif_n,noverif_rate,noverif_ci_lo,noverif_ci_hi,"
         "noopt_k,noopt_n,noopt_rate,noopt_ci_lo,noopt_ci_hi,"
         "static_k,static_n,static_rate,"
-        "fisher_full_p,fisher_noverif_p,fisher_noopt_p"
+        "fisher_full_p_adj,fisher_noverif_p_adj,fisher_noopt_p_adj"
     ]
+
+    # Pass 1: collect all raw p-values for Holm-Bonferroni correction
+    all_raw_p: list[float | None] = []  # flat list, 3 per task
+    task_data: list[tuple[list[str], list[str]]] = []  # (parts, csv_parts) per task
 
     for tid in ALL_TASK_IDS:
         td = by_task.get(tid, {})
@@ -258,16 +291,27 @@ def print_per_task_table(per_task: list[dict]) -> list[str]:
             else "0,0,0"
         )
 
-        # Fisher's exact test: each JIT condition vs static
-        p_values = []
+        # Fisher's exact test: each JIT condition vs static (raw p-values)
         for cond in ["full", "no_verification", "no_optimization"]:
             d = td.get(cond, {"successes": 0, "n": 0})
             if d["n"] > 0 and s["n"] > 0:
                 _, p = fisher_exact_2x2(d["successes"], d["n"], s["successes"], s["n"])
-                p_values.append(p)
+                all_raw_p.append(p)
+            else:
+                all_raw_p.append(None)
+
+        task_data.append((parts, csv_parts))
+
+    # Pass 2: apply Holm-Bonferroni correction across ALL per-task tests
+    adjusted_p = holm_bonferroni(all_raw_p)
+
+    # Pass 3: format corrected p-values into output
+    for task_idx, (parts, csv_parts) in enumerate(task_data):
+        p_values = adjusted_p[task_idx * 3 : task_idx * 3 + 3]
+        for p in p_values:
+            if p is not None:
                 parts.append(f"{fmt_p(p):>7}")
             else:
-                p_values.append(None)
                 parts.append(f"{'—':>7}")
         csv_parts.append(",".join(f"{p:.6f}" if p is not None else "" for p in p_values))
 
@@ -360,28 +404,35 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
     lines.append(f"    Gap:          {jit_min - static_rate:.1f} – {jit_max - static_rate:.1f} pp")
     lines.append("")
 
-    # Pairwise Fisher's exact between JIT conditions
-    lines.append("  Pairwise Fisher's exact between JIT conditions (synthesis only):")
-    jit_names = [d["condition"] for d in jit_conds]
+    # Pairwise Fisher's exact between JIT conditions (with Holm-Bonferroni)
+    lines.append("  Pairwise Fisher's exact between JIT conditions (Holm-Bonferroni adjusted):")
+    pairs: list[tuple[str, str, float]] = []
+    raw_cluster_p: list[float] = []
     for i in range(len(jit_conds)):
         for j in range(i + 1, len(jit_conds)):
             a, b = jit_conds[i], jit_conds[j]
             _, p = fisher_exact_2x2(a["successes"], a["n"], b["successes"], b["n"])
             la = CONDITION_LABELS.get(a["condition"], a["condition"])
             lb = CONDITION_LABELS.get(b["condition"], b["condition"])
-            sig = " *" if p < 0.05 else ""
-            lines.append(f"    {la} vs {lb}: p={fmt_p(p)}{sig}")
+            pairs.append((la, lb, p))
+            raw_cluster_p.append(p)
+
+    adjusted_cluster_p = holm_bonferroni(raw_cluster_p)
+    for (la, lb, _raw_p), adj_p in zip(pairs, adjusted_cluster_p):
+        sig = " *" if adj_p is not None and adj_p < 0.05 else ""
+        lines.append(f"    {la} vs {lb}: p_adj={fmt_p(adj_p)}{sig}")
 
     lines.append("")
 
-    # Overall JIT vs static (pooled)
+    # Overall JIT vs static (pooled) — single test, no correction needed
     jit_total_k = sum(d["successes"] for d in jit_conds)
     jit_total_n = sum(d["n"] for d in jit_conds)
     _, p_pooled = fisher_exact_2x2(
         jit_total_k, jit_total_n, static["successes"], static["n"]
     )
     lines.append(
-        f"  Pooled JIT vs Static: {jit_total_k}/{jit_total_n} "
+        f"  Pooled JIT vs Static (NOTE: pooling inflates significance): "
+        f"{jit_total_k}/{jit_total_n} "
         f"({jit_total_k/jit_total_n*100:.1f}%) vs "
         f"{static['successes']}/{static['n']} ({static_rate:.1f}%), "
         f"p={fmt_p(p_pooled)}"
@@ -473,13 +524,13 @@ def main() -> None:
 
     # ── Table 1: All tasks ───────────────────────────────────────────────
     all_data = query_condition_summary(conn)
-    csv_all = print_condition_table("Table 1: Success Rates — All Tasks (T01-T13)", all_data)
+    csv_all = print_condition_table("Table 1: Success Rates — All Tasks (T01-T18)", all_data)
 
     # ── Table 2: Synthesis tasks only (T04-T13) ──────────────────────────
     task_filter = " OR ".join(f"task_id = '{t}'" for t in SYNTHESIS_TASK_IDS)
     synth_data = query_condition_summary(conn, task_filter)
     csv_synth = print_condition_table(
-        "Table 2: Success Rates — Synthesis Tasks Only (T04-T13)", synth_data
+        "Table 2: Success Rates — Synthesis Tasks Only (T04-T18)", synth_data
     )
 
     # ── Table 3: Retrieval tasks only (T01-T03) ─────────────────────────

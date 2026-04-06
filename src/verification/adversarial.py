@@ -9,7 +9,7 @@ The DeepAgent uses ``sandbox_execute`` for Docker-isolated code execution
 and ``response_format=AdversarialFindings`` for structured output.
 
 Operational boundaries (from CLAUDE.md):
-- ``recursion_limit=35``
+- ``recursion_limit=50``
 - Node-level timeout: 300 s
 - Fresh agent per invocation
 - On timeout / error: return partial report with error flag, never raise

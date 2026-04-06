@@ -257,6 +257,7 @@ def _sandbox_execute_with_install(
                 "--network", "none",
                 "--memory", "128m",
                 "--cpus", "0.5",
+                "--user", "sandbox",
                 "-v", f"{script_path}:/sandbox/script.py:ro",
                 ephemeral_tag,
                 "/sandbox/script.py",

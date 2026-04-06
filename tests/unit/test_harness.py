@@ -272,7 +272,7 @@ class TestExtractResult:
         result = _extract_result(state, T07, loader)
         assert result["gate_passed"] is True
         assert result["output_in_range"] is False
-        assert result["failure_reason"] == "output_rejected"
+        assert result["failure_reason"] == "no_source_code"
 
     def test_registry_match_execution_failure_does_not_raise(self):
         """Registry match execution fails → gate passes, output not validated."""

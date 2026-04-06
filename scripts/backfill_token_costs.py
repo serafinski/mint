@@ -243,7 +243,7 @@ def compute_run_costs(
             n_jit_tasks = rw["n_distinct_tasks"]
         else:
             n_jit_tasks = rw["n_distinct_tasks"] - len(
-                RETRIEVAL_TASKS & set()  # We don't know which tasks, estimate
+                RETRIEVAL_TASKS  # Exclude retrieval tasks from per-JIT-task estimate
             )
             # Rough: subtract 3 for T01-T03 if this is a full-task run
             if rw["n_distinct_tasks"] >= 13:

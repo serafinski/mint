@@ -352,6 +352,10 @@ def retry(
         bool | None,
         typer.Option("--no-optimizer", help="Override: disable optimizer"),
     ] = None,
+    enable_optimizer: Annotated[
+        bool | None,
+        typer.Option("--enable-optimizer", help="Override: enable optimizer"),
+    ] = None,
     timeout: Annotated[
         int | None, typer.Option(help="Override: execution timeout (seconds)")
     ] = None,
@@ -408,7 +412,11 @@ def retry(
         no_optimizer=(
             no_optimizer if no_optimizer is not None else last.get("no_optimizer", False)
         ),
-        enable_optimizer=last.get("enable_optimizer", False),
+        enable_optimizer=(
+            enable_optimizer
+            if enable_optimizer is not None
+            else last.get("enable_optimizer", False)
+        ),
         timeout=timeout if timeout is not None else last.get("timeout"),
         json_output=json,
         verbose=verbose,

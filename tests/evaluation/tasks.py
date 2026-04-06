@@ -183,7 +183,7 @@ def _validate_t04(output: dict) -> bool:
         ok_below = abs(actual_below - _t04_ev["items_below_threshold"]) <= 2
         actual_cost = float(output.get("total_reorder_cost", -1))
         expected_cost = _t04_ev["total_reorder_cost"]
-        ok_cost = abs(actual_cost - expected_cost) / max(expected_cost, 1) < 0.20
+        ok_cost = abs(actual_cost - expected_cost) / max(abs(expected_cost), 1) < 0.20
         return ok_count and ok_below and ok_cost
     except (TypeError, ValueError):
         return False
@@ -829,9 +829,16 @@ def _validate_t17(output: dict) -> bool:
         # Accept both IDs and names
         expected_ids = set(_t17_ev["fraud_customer_ids"])
         expected_names = set(n.lower() for n in _t17_ev["fraud_customer_names"])
+        def _to_int(v: object) -> int | None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
         matched = sum(
             1 for x in identified
             if (isinstance(x, int) and x in expected_ids)
+            or (_to_int(x) is not None and _to_int(x) in expected_ids)
             or (isinstance(x, str) and x.lower() in expected_names)
         )
         if matched < 2:
@@ -923,7 +930,7 @@ T18 = TaskDefinition(
 
 ALL_TASKS: list[TaskDefinition] = [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12, T13, T14, T15, T16, T17, T18]
 
-PILOT_TASKS: list[TaskDefinition] = [T01, T07, T05]  # retrieval + moderate JIT + complex JIT
+PILOT_TASKS: list[TaskDefinition] = [T01, T07, T05]  # retrieval + moderate JIT (fuzzy-join) + complex JIT (data-cleaning)
 
 _TASK_MAP: dict[str, TaskDefinition] = {t.task_id: t for t in ALL_TASKS}
 
