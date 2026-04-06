@@ -98,7 +98,7 @@ def _select_artifact(state: Any) -> Any | None:
 # MCP_TOOL execution (replicates harness._execute_artifact for CLI)
 # ---------------------------------------------------------------------------
 
-_FILE_SIZE_LIMIT_BYTES = 10 * 1024 * 1024  # 10 MB
+from src.config import FILE_SIZE_LIMIT_BYTES as _FILE_SIZE_LIMIT_BYTES
 
 
 def _execute_mcp_tool(artifact: Any, file_paths: list[Path], params: dict) -> dict:
@@ -212,8 +212,8 @@ def _execute_skill_or_agent(
     Raises ``_ExecutionTimeout`` if the execution exceeds the timeout so the
     caller can show a clear message to the user.
     """
-    from src.schemas.capability import CapabilityType
     import tests.evaluation.execution as _exec_mod
+    from src.schemas.capability import CapabilityType
 
     # Override module-level timeouts if the user specified --timeout
     _orig_skill_timeout = _exec_mod.SKILL_EXECUTION_TIMEOUT_S
@@ -653,13 +653,12 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Full pipeline
     # ------------------------------------------------------------------
-    from src.orchestrator.pipeline import create_pipeline
-
     # Determine whether to run the optimizer:
     # --enable-optimizer forces on, --no-optimizer forces off,
     # otherwise auto-enable after 20+ invocations (enough history for
     # meaningful prune decisions, avoids cold-start waste).
-    AUTO_OPTIMIZER_THRESHOLD = 20
+    from src.config import AUTO_OPTIMIZER_THRESHOLD
+    from src.orchestrator.pipeline import create_pipeline
     if args.no_optimizer:
         run_optimizer = False
     elif args.enable_optimizer:

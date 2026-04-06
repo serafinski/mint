@@ -19,8 +19,8 @@ from src.cli.display import (
     show_plan_result,
 )
 
-_FILE_SIZE_LIMIT_BYTES = 10 * 1024 * 1024  # 10 MB
-_AUTO_OPTIMIZER_THRESHOLD = 20
+from src.config import AUTO_OPTIMIZER_THRESHOLD as _AUTO_OPTIMIZER_THRESHOLD
+from src.config import FILE_SIZE_LIMIT_BYTES as _FILE_SIZE_LIMIT_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -119,40 +119,7 @@ def _parse_params(raw: list[str] | None) -> dict[str, str]:
     return params
 
 
-_BINARY_EXTENSIONS = frozenset(
-    {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".gif",
-        ".bmp",
-        ".webp",
-        ".ico",
-        ".pdf",
-        ".zip",
-        ".gz",
-        ".tar",
-        ".bz2",
-        ".xz",
-        ".7z",
-        ".exe",
-        ".dll",
-        ".so",
-        ".dylib",
-        ".bin",
-        ".mp3",
-        ".mp4",
-        ".wav",
-        ".avi",
-        ".mov",
-        ".mkv",
-        ".parquet",
-        ".avro",
-        ".orc",
-        ".pickle",
-        ".pkl",
-    }
-)
+from src.config import BINARY_EXTENSIONS as _BINARY_EXTENSIONS
 
 
 def _resolve_files(paths: list[Path] | None) -> list[Path]:
@@ -434,7 +401,12 @@ async def _run():
         _sig = inspect.signature({func_name})
         _valid = set(_sig.parameters.keys())
         _kwargs = {{k: v for k, v in _all_inputs.items() if k in _valid}}
-        _unmatched = _valid - set(_kwargs)
+        # Only try to fill params that are truly required (no default value)
+        _required = {{
+            name for name, p in _sig.parameters.items()
+            if p.default is inspect.Parameter.empty
+        }}
+        _unmatched = _required - set(_kwargs)
         _unused = {{k: v for k, v in _all_inputs.items() if k not in _kwargs}}
         def _words(s):
             return set(w.rstrip("s") for w in s.lower().replace("_", " ").split() if len(w) > 2)

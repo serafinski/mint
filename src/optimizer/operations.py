@@ -13,6 +13,8 @@ from datetime import UTC, datetime, timedelta
 
 from langchain.chat_models import init_chat_model
 from langfuse.langchain import CallbackHandler as LangfuseHandler
+
+from src.config import DEFAULT_LLM_MODEL
 from pydantic import BaseModel, Field
 
 from src.registry.metrics import MetricsStore
@@ -104,7 +106,7 @@ def split(
     metrics_store: MetricsStore,
     capability_id: str,
     *,
-    llm_model: str = "openai:gpt-5-mini",
+    llm_model: str = "",
 ) -> list[str]:
     """Split a capability into specialized variants.
 
@@ -135,7 +137,7 @@ def split(
             "Only SKILL and AGENT types can be split."
         )
 
-    llm = init_chat_model(llm_model)
+    llm = init_chat_model(llm_model or DEFAULT_LLM_MODEL)
     structured_llm = llm.with_structured_output(SplitResult)
     lf_config = _langfuse_config()
 
@@ -214,7 +216,7 @@ def merge(
     metrics_store: MetricsStore,
     capability_ids: list[str],
     *,
-    llm_model: str = "openai:gpt-5-mini",
+    llm_model: str = "",
 ) -> str:
     """Merge multiple capabilities into a single broader capability.
 
@@ -249,7 +251,7 @@ def merge(
         types = ", ".join(sorted(non_skill_types))
         raise ValueError(f"Merge is only supported for SKILL capabilities. Got: {types}")
 
-    llm = init_chat_model(llm_model)
+    llm = init_chat_model(llm_model or DEFAULT_LLM_MODEL)
     structured_llm = llm.with_structured_output(MergeResult)
     lf_config = _langfuse_config()
 

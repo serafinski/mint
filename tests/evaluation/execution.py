@@ -184,6 +184,7 @@ def _execute_skill_inner(
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
 
+    from src.config import DEFAULT_LLM_MODEL
     from src.verification.sandbox_tool import sandbox_execute
 
     skill_content = getattr(artifact, "skill_content", None) or ""
@@ -192,7 +193,7 @@ def _execute_skill_inner(
     result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
 
     agent = create_deep_agent(
-        model=init_chat_model("openai:gpt-5-mini"),
+        model=init_chat_model(DEFAULT_LLM_MODEL),
         tools=[sandbox_execute],
         system_prompt=system_prompt,
         response_format=result_model,
@@ -282,6 +283,7 @@ def _execute_agent_inner(
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
 
+    from src.config import DEFAULT_LLM_MODEL
     from src.verification.sandbox_tool import sandbox_execute
 
     # Extract system prompt from agent_config
@@ -298,7 +300,7 @@ def _execute_agent_inner(
     result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
 
     agent = create_deep_agent(
-        model=init_chat_model("openai:gpt-5-mini"),
+        model=init_chat_model(DEFAULT_LLM_MODEL),
         tools=[sandbox_execute],
         system_prompt=system_prompt,
         response_format=result_model,

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import chromadb
 
+from src.config import DEFAULT_LLM_MODEL
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 
 
@@ -520,7 +521,7 @@ def seed_registry(registry: SkillRegistry) -> None:
                 "for analysis. Write findings to files for context "
                 'management.", '
                 '"node_config": {"name": "data_analysis_node", '
-                '"model": "openai:gpt-5-mini", '
+                f'"model": "{DEFAULT_LLM_MODEL}", '
                 '"tools": ["sandbox_execute"], '
                 '"description": "Autonomous EDA agent"}, '
                 '"is_deep_agent": true}'

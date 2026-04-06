@@ -196,7 +196,7 @@ Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in th
    - Invoked from within a LangGraph node function (DeepAgents are complete graphs, not nodes)
    - Use `response_format` for structured output (Pydantic model with subtasks)
    - System prompt instructs the agent to plan decomposition, produce subtasks with capability annotations, and write results to files
-   - Use `deepseek-chat` as the model (`deepseek-reasoner` lacks `tool_choice` support required by DeepAgents)
+   - Use `openai:gpt-5-mini` as the model (unified across all components since March 2026; originally `deepseek-chat`)
    - **Operational boundaries:** `recursion_limit=50` (~17 logical steps; each tool call = 2 graph steps), timeout at node level (120s), fresh initialization per invocation
    - Trace with LangFuse via callback handler
 
@@ -209,7 +209,7 @@ Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in th
 3. **MCP tool generator** (`src/orchestrator/generators/mcp_tool.py`)
    - Plain LangGraph node
    - Given a capability description + I/O schema, generate a Python MCP tool
-   - Use Claude API (or DeepSeek) for code generation
+   - Use `openai:gpt-5-mini` for code generation (configurable via `src/config.py`)
    - **Few-shot prompting required:** include a complete valid MCP tool example in the prompt
    - **Repair pass:** if Pydantic validation fails on the response, send raw output + validation error back to the model once
    - Output: Python function + FastMCP server wrapper + basic test harness
@@ -549,7 +549,7 @@ This section documents ways a malicious or lazy LLM code generator could produce
 
 **B3.2: The DeepAgent is only as smart as its LLM**
 - **Attack:** Craft a tool that subtly returns plausible but wrong results. For example, a unit conversion tool that is off by 5%. The ground-truth comparison attack pattern relies on the DeepAgent writing a reference implementation -- if the agent doesn't think to verify the specific conversion factor, it passes.
-- **Root cause:** The adversarial agent uses `deepseek-chat`, which may not catch subtle numerical errors in domains it doesn't deeply understand.
+- **Root cause:** The adversarial agent uses a general-purpose LLM (`openai:gpt-5-mini`), which may not catch subtle numerical errors in domains it doesn't deeply understand.
 - **Suggested mitigation:** For deterministic tools, consider a separate automated ground-truth check (outside the DeepAgent) that compares against known test vectors. The DeepAgent adds value for non-deterministic tools.
 - **Risk level:** MEDIUM. The ground-truth attack pattern is the weakest of the three because it relies entirely on the LLM's domain knowledge.
 
@@ -781,7 +781,7 @@ Wait for both to finish, then wire the optimization loop into the main pipeline.
 
 First pilot run completed (T01, T07, T10 under `full` condition). **3/3 tasks succeeded** but total runtime was **2+ hours** — unacceptable for evaluation (target: ~15-25 min).
 
-**Model change:** Switched DeepAgent components (task decomposition + adversarial probing) from `deepseek:deepseek-chat` to `openai:gpt-5-mini`. Decomposition improved from ~120s to ~30s, but model speed was a red herring — architectural issues dominated runtime. Both `.env` keys (`DEEPSEEK_API_KEY`, `OPENAI_API_KEY`) are now required.
+**Model change:** Switched DeepAgent components (task decomposition + adversarial probing) from `deepseek:deepseek-chat` to `openai:gpt-5-mini`. Decomposition improved from ~120s to ~30s, but model speed was a red herring — architectural issues dominated runtime. Only `OPENAI_API_KEY` is required (DeepSeek key no longer needed after full unification).
 
 **Root cause analysis:** Six compounding architectural bottlenecks identified. Full investigation in `docs/archive/investigation_pipeline_bottlenecks.md`:
 
@@ -951,6 +951,7 @@ Design 10–15 tasks spanning multiple difficulty levels:
    - **JIT without verification** — Pillar 1 only, bypass Pillar 2
    - **JIT without optimization** — Pillars 1 + 2, bypass Pillar 3
    - **Full system** — all three pillars active
+   - **Longitudinal** — same as full, but 40 sequential tasks without snapshot reset (tests optimizer convergence over time)
 
 5. **Integration tests** — Full lifecycle, capability reuse, evolutionary operations
 
@@ -958,7 +959,7 @@ Design 10–15 tasks spanning multiple difficulty levels:
 
 ### ✅ Decision: No agent team — baselines are condition flags, not separate codebases
 
-The original plan called for a 3-teammate agent team to build three separate baseline implementations. During harness design, it became clear that all four conditions share the same run loop (restore snapshot → seed registry → invoke pipeline → validate output → record to DB). The only differences are two boolean flags:
+The original plan called for a 3-teammate agent team to build three separate baseline implementations. During harness design, it became clear that all five conditions share the same run loop (restore snapshot → seed registry → invoke pipeline → validate output → record to DB). The only differences are two boolean flags:
 
 - `verification_enabled=False` for the no-verification condition
 - `run_optimizer=False` for the no-optimization condition
@@ -1180,7 +1181,7 @@ These are full feasibility reviews, not just exit criteria checks. Budget 1–2 
 | Dynamic MCP tool loading flaky | Start with importlib (Option B); upgrade to subprocess if needed |
 | Agent Teams overhead too high | Start with 2 teammates; scale up only when justified |
 | Generated skills don't conform to format | Validate with `tools/quick_validate.py` in gate |
-| DeepSeek output malformed | Few-shot examples, repair pass, LangFuse logging |
+| LLM output malformed | Few-shot examples, repair pass, LangFuse logging |
 | Scope creep | Exit criteria per iteration, minimum viable scope defined |
 | Timeline overrun | Minimum viable scope per pillar, critique checkpoints catch problems early |
 

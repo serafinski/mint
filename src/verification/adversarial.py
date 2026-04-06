@@ -150,8 +150,10 @@ def _create_adversarial_agent():
 
     from src.verification.sandbox_tool import sandbox_execute
 
+    from src.config import DEFAULT_LLM_MODEL
+
     return create_deep_agent(
-        model=init_chat_model("openai:gpt-5-mini"),
+        model=init_chat_model(DEFAULT_LLM_MODEL),
         tools=[sandbox_execute],
         system_prompt=ADVERSARIAL_SYSTEM_PROMPT,
         response_format=AdversarialFindings,

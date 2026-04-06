@@ -17,12 +17,9 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-SANDBOX_IMAGE = "jit-sandbox"
+from src.config import DOCKER_PREINSTALLED, SANDBOX_IMAGE
 
-# Packages that never need pip install: Python stdlib (resolved programmatically)
-# plus the minimal set pre-installed in the sandbox Dockerfile (mcp, pydantic).
-_DOCKER_PREINSTALLED = frozenset({"mcp", "pydantic"})
-_BASE_PACKAGES = frozenset(sys.stdlib_module_names) | _DOCKER_PREINSTALLED
+_BASE_PACKAGES = frozenset(sys.stdlib_module_names) | DOCKER_PREINSTALLED
 
 # Session-level cache: avoids repeated LLM calls for the same import names.
 _pip_resolution_cache: dict[str, str] = {}
@@ -53,7 +50,9 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
         return {name: _pip_resolution_cache[name] for name in import_names}
 
     try:
-        llm = init_chat_model("openai:gpt-5-mini", temperature=0)
+        from src.config import DEFAULT_LLM_MODEL
+
+        llm = init_chat_model(DEFAULT_LLM_MODEL, temperature=0)
         structured_llm = llm.with_structured_output(_PackageMapping, method="function_calling")
 
         prompt = (

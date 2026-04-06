@@ -1,7 +1,7 @@
 """Evaluation schemas for Iteration 5 end-to-end testing.
 
 Separate from the operational InvocationRecord — evaluation records track
-experimental outcomes across the four baseline conditions.
+experimental outcomes across the five baseline conditions.
 """
 
 from __future__ import annotations

@@ -21,7 +21,7 @@ See `docs/thesis_proposal.md` for full details.
 - **LangGraph** - Multi-agent orchestration and pipeline graphs
 - **DeepAgents** (`deepagents` package) - Agent harness with built-in planning (`write_todos`), file system context management, subagent spawning, and conversation summarization. Used for task decomposition (Pillar 1) and adversarial probing (Pillar 2).
 - **LLM Provider** - Provider-agnostic via `init_chat_model("provider:model")`.
-  - `openai:gpt-5-mini` — unified model for all components (classifiers, generators, behavioral testing, DeepAgent components). Originally used a hybrid DeepSeek/GPT-5-mini split; unified to `openai:gpt-5-mini` in March 2026 to eliminate mixed-model confounds in evaluation.
+  - `openai:gpt-5-mini` — unified default for all components, centralized in `src/config.py` as `DEFAULT_LLM_MODEL`. Override via `JIT_LLM_MODEL` environment variable for experiments.
   - **Environment:** Requires `OPENAI_API_KEY` in `.env`
 - **Claude Code** - Code generation (development tool only, not part of the runtime system)
 - **MCP SDK** - Tool serving (Python, FastMCP pattern)
@@ -157,7 +157,7 @@ Use **Command API** for routing: `Command(update={...}, goto="next_node")`. Use 
 
 ### LLM Initialization
 
-Use `init_chat_model("openai:gpt-5-mini")` for all LLM-calling components (plain LangGraph nodes and DeepAgent components alike). Never hardcode provider imports.
+Import `DEFAULT_LLM_MODEL` from `src.config` and use `init_chat_model(DEFAULT_LLM_MODEL)` for all LLM-calling components. Never hardcode `"openai:gpt-5-mini"` directly — use the config constant so the model can be changed in one place (or via `JIT_LLM_MODEL` env var).
 
 ### DeepAgents Integration
 
@@ -327,9 +327,9 @@ After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% 
 
 **Semantic correctness gap:** Verification gate catches structural/deception issues but not business logic correctness. The gap between gate_pass_rate (100%) and success_rate (66.7%) quantifies this limitation. Deferred to future work — see `docs/iteration_plan.md` → "Pilot run findings (2026-03-12)" for full analysis and three proposed approaches.
 
-### Full evaluation results (RE-RUN IN PROGRESS — 2026-04-05)
+### Full evaluation results (ALL STALE — full re-run required after 2026-04-06 audit/prompt fixes)
 
-**Batch 1 complete (2026-04-05):** 180 records (18 tasks × 2 conditions × 5 runs)
+**Batch 1 (2026-04-05, STALE — generator prompt changed):** 180 records (18 tasks × 2 conditions × 5 runs)
 
 | Condition | Success | Gate Pass |
 |---|---|---|
@@ -340,7 +340,7 @@ After Fix 0–7 and classifier prompt rewrite (Single-Capability Rule): **66.7% 
 
 **static per-task:** T01/T02/T03/T05/T09 = 100% (5 tasks with static implementations), all others = 0% (by design).
 
-**Batch 2 running:** no_optimization + full conditions (with verification, ~8-12h).
+**Batch 2:** not started (blocked on purging stale data + full re-run).
 
 **Previous results (2026-03-18 + 2026-03-20, 340 records — STALE, pre-rebalance):**
 
@@ -422,11 +422,12 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/optimizer/operations.py`** — `prune(registry, metrics_store, window_days) -> list[str]`, `split(registry, metrics_store, capability_id, llm_model) -> list[str]` (SKILL/AGENT only), `merge(registry, metrics_store, capability_ids, llm_model) -> str` (SKILL only)
 - **`src/optimizer/loop.py`** — `create_optimization_loop(registry, metrics_store, ...) -> CompiledStateGraph`, `OptimizerState`
 - **`src/optimizer/simulation.py`** — `SimConfig`, `SimResult`, `generate_synthetic_registry()`, `run_simulation(config, with_optimization) -> list[SimResult]`, `plot_results()`, `compare_baselines()`
+- **`src/config.py`** — Centralized constants: `DEFAULT_LLM_MODEL` (env: `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env: `JIT_SANDBOX_IMAGE`), `DOCKER_PREINSTALLED`, `FILE_SIZE_LIMIT_BYTES`, `BINARY_EXTENSIONS`, `AUTO_OPTIMIZER_THRESHOLD`
 - **`src/schemas/`** — All 18 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState` (now includes `attempt_count: int = 0`), `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact`, `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
 - **`src/orchestrator/decomposition.py`** — `decomposition_node()` (DeepAgent-backed task decomposition)
 - **`src/orchestrator/classifier.py`** — `classify_gap()`, `classifier_node()` (LLM-based classification)
 - **`src/orchestrator/prompts/`** — All prompt constants for decomposition, classification, and all three generators
-- **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry)` (detects registry gaps, always routes to `"classifier_node"`)
+- **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry, metrics_store=None)` (detects registry gaps, records match invocations, always routes to `"classifier_node"`)
 - **`src/orchestrator/loading_node.py`** — `loading_node(state, loader, registry)` (loads + registers MCP_TOOL artifacts, sets terminal status)
 - **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader, *, run_optimizer=False, metrics_store=None)` (9-node pipeline; real three-tier gate wired via `gate_fn=gate_verify` closure; optional `optimizer_node` appended after `loading_node` when `run_optimizer=True`)
 - **`src/orchestrator/verification_node.py`** — `verification_node(state, gate_fn=None)` (retry + artifact replacement logic; real gate wired in pipeline.py)
@@ -482,4 +483,4 @@ When working on this project:
 
 ---
 
-**Last updated:** March 2026
+**Last updated:** April 2026

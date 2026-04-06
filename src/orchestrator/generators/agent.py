@@ -48,8 +48,8 @@ class AgentGenerationResult(BaseModel):
     system_prompt: str = Field(..., description="Markdown system prompt for the agent")
     node_name: str = Field(..., description="Snake_case LangGraph node function name")
     model: str = Field(
-        default="openai:gpt-5-mini",
-        description="LLM model identifier",
+        default="",
+        description="LLM model identifier (empty = system default)",
     )
     tools: list[str] = Field(default_factory=list, description="Tool names the agent needs")
     description: str = Field(..., description="One-sentence summary of what the agent does")
@@ -83,7 +83,9 @@ def _get_llm():
             if _agent_gen_llm is None:
                 from langchain.chat_models import init_chat_model
 
-                _agent_gen_llm = init_chat_model("openai:gpt-5-mini", request_timeout=300)
+                from src.config import DEFAULT_LLM_MODEL
+
+                _agent_gen_llm = init_chat_model(DEFAULT_LLM_MODEL, request_timeout=300)
     return _agent_gen_llm
 
 
@@ -178,11 +180,14 @@ def _generate_single_agent(
     llm = _get_llm()
     structured_llm = llm.with_structured_output(AgentGenerationResult)
 
+    from src.config import DEFAULT_LLM_MODEL
+
     prompt = AGENT_GENERATOR_PROMPT.format(
         description=gap.description,
         query=gap.query,
         task_context=task_context,
         forced_name=forced_name,
+        model_default=DEFAULT_LLM_MODEL,
     )
 
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level

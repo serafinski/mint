@@ -40,7 +40,9 @@ def _get_llm():
     if _classifier_llm is None:
         from langchain.chat_models import init_chat_model
 
-        _classifier_llm = init_chat_model("openai:gpt-5-mini", temperature=0, request_timeout=300)
+        from src.config import DEFAULT_LLM_MODEL
+
+        _classifier_llm = init_chat_model(DEFAULT_LLM_MODEL, temperature=0, request_timeout=300)
     return _classifier_llm
 
 

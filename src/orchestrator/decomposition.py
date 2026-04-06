@@ -56,8 +56,10 @@ def _get_agent():
     No state carried between calls").  ``create_deep_agent()`` compiles a
     LangGraph graph without making any API calls, so the overhead is minimal.
     """
+    from src.config import DEFAULT_LLM_MODEL
+
     return create_deep_agent(
-        model="openai:gpt-5-mini",
+        model=DEFAULT_LLM_MODEL,
         system_prompt=DECOMPOSITION_SYSTEM_PROMPT,
         response_format=DecompositionResult,
         name="task-decomposer",

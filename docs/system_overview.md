@@ -115,7 +115,7 @@ The system was originally hybrid (DeepSeek for plain nodes, GPT-5-mini for DeepA
 
 The evaluation uses a **business analytics pipeline** testbed -- 18 tasks spanning data ingestion, transformation, quality investigation, and report generation. Tasks were chosen to naturally produce diverse capability types and range from trivial (CSV parsing) to complex (autonomous anomaly investigation).
 
-**17 Tasks:**
+**18 Tasks:**
 
 | Task | Description | Type | Difficulty |
 |---|---|---|---|
@@ -153,9 +153,9 @@ Each condition runs 5 times (randomized task order, different seeds) for 340 tot
 
 **Validators:** Each task has a ground-truth validator that compares output against pre-computed expected values (from deterministic fixtures with seed=42). Success = gate_passed AND output_in_range.
 
-### Results (pre-upgrade, 340 records from 2026-03-18 + 2026-03-20; re-run pending with 360 records)
+### Results (pre-upgrade, 340 records from 2026-03-18 + 2026-03-20)
 
-> **TODO: UPDATE AFTER RE-RUN** — A new evaluation is pending (deepagents 0.4.12, increased timeouts: adversarial 300s, SKILL 240s, AGENT 300s, per-task LangFuse tagging). Numbers below are from the pre-upgrade run. Update headline table, per-task breakdown, verification tradeoff, token costs, and capability type distribution after the new run completes.
+> **NOTE:** These results are from the pre-upgrade run. Evaluation re-run is in progress (batch 1 complete: 180 records; batch 2 blocked on audit fixes — see CLAUDE.md). Infrastructure upgrades (deepagents 0.4.12, increased timeouts: adversarial 300s, SKILL 240s, AGENT 300s, per-task LangFuse tagging) are applied. Update headline table after batch 2 completes.
 
 #### Headline Numbers
 
@@ -490,6 +490,18 @@ uv run mint reset
 # Reset to empty (no seeded capabilities)
 uv run mint reset --no-seed
 
+# --- Output ---
+#
+# All output is auto-saved to data/mint_output/ with timestamped filenames.
+# Large string values (CSV, JSON, Markdown) are extracted as separate files.
+# Override the directory with --output-dir:
+
+uv run mint run "Clean this CSV" -f data.csv --output-dir ./results/
+
+# Output quality detection: warns if output looks incomplete (too few keys,
+# too small for execution time, or echoes the input prompt). Yellow border
+# on the output panel + retry suggestions.
+
 # --- Legacy CLI (still works, not deprecated) ---
 uv run scripts/run_task.py "task description" --file data.csv
 
@@ -556,6 +568,7 @@ The sandbox uses `__name__ = "not_main"` to prevent `mcp.run()` from starting. R
 
 - **MINT rebrand** — rename project from JustInTimeMAS to MINT (Model-driven Instantiation of Novel Tools). CLI (`uv run mint`) is implemented with Typer + Rich (see `src/cli/`). Remaining: repo rename, import paths, thesis title.
 - **`mint export` / `mint import`** — let users export generated source code, edit it, and re-import fixed versions. Documented in `docs/plan_cli_upgrade.md`.
+- **`--force-regenerate`** — bypass registry matching on retry so `mint retry --hint` doesn't reuse a broken cached tool. Documented in `docs/plan_cli_upgrade.md`.
 - **Smart prompt improvement (`--improve`)** — pre-pipeline LLM call to rewrite vague prompts into specific, actionable ones using file metadata. Interactive confirmation before proceeding. Documented in `docs/plan_cli_upgrade.md`.
 - **`mint fix <name> --error "..."`** — targeted code repair. Takes existing source + execution error, LLM patches the specific bug, re-verifies, re-registers. Faster than full regeneration for single-line bugs (seconds vs minutes). Documented in `docs/plan_cli_upgrade.md`.
 - **Per-task token attribution** — implemented in harness (LangFuse trace tagging), pending re-run for data collection
