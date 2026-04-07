@@ -1,6 +1,6 @@
 """Pilot evaluation runner for Iteration 5.
 
-Runs T01 (seeded retrieval), T07 (moderate JIT), T10 (complex JIT)
+Runs T01 (seeded retrieval), T07 (moderate JIT), T05 (moderate JIT - data cleaning)
 through the full pipeline and records results to data/evaluation.duckdb.
 
 Usage::
@@ -54,7 +54,7 @@ def main() -> None:
     parser.add_argument(
         "--all-tasks",
         action="store_true",
-        help="Run all 10 tasks instead of pilot subset [T01, T07, T10]",
+        help="Run all 10 tasks instead of pilot subset [T01, T07, T05]",
     )
     parser.add_argument(
         "--all-conditions",

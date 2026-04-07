@@ -79,7 +79,7 @@ def test_all_gaps_populates_gaps_empty_matches():
     gap = cmd.update["gaps"][0]
     assert isinstance(gap, GapItem)
     assert gap.query == "translate text to Klingon"
-    assert gap.description == "translate text to Klingon"
+    assert gap.description == "similarity 0.12 below threshold 0.3"
 
 
 # ---------------------------------------------------------------------------

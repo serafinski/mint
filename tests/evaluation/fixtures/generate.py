@@ -32,7 +32,7 @@ FIXTURES_DIR = Path(__file__).parent
 def generate_all_fixtures(
     fixtures_dir: Path = FIXTURES_DIR, seed: int = 42
 ) -> dict:
-    """Generate all 13 task fixtures and return the expected_values dict.
+    """Generate all 17 task fixtures and return the expected_values dict.
 
     Idempotent — safe to call multiple times; files are overwritten.
     """
@@ -53,6 +53,11 @@ def generate_all_fixtures(
     expected.update(_gen_t11(fixtures_dir, rng))
     expected.update(_gen_t12(fixtures_dir, rng))
     expected.update(_gen_t13(fixtures_dir, rng))
+    expected.update(_gen_t14(fixtures_dir, rng))
+    expected.update(_gen_t15(fixtures_dir, rng))
+    expected.update(_gen_t16(fixtures_dir, rng))
+    expected.update(_gen_t17(fixtures_dir, rng))
+    expected.update(_gen_t18(fixtures_dir, rng))
 
     out_path = fixtures_dir / "expected_values.json"
     out_path.write_text(json.dumps(expected, indent=2))
@@ -230,33 +235,70 @@ def _gen_t03(fixtures_dir: Path, _rng: random.Random) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# T04 — Pipe-delimited CSV with mixed types
+# T04 — Inventory reorder pipeline (targets SKILL classification)
 # ---------------------------------------------------------------------------
 
-_T04_COLUMNS = ["id", "product_name", "score", "active"]
-_PRODUCTS = ["Widget", "Gadget", "Doohickey", "Thingamajig", "Whatsit"]
+_T04_PRODUCTS = ["Widget-A", "Widget-B", "Gadget-X", "Gadget-Y", "Sensor-1",
+                 "Sensor-2", "Module-P", "Module-Q", "Cable-S", "Cable-T"]
 
 
 def _gen_t04(fixtures_dir: Path, rng: random.Random) -> dict:
-    rows = 30
-    lines = ["|".join(_T04_COLUMNS)]
-    for i in range(1, rows + 1):
-        lines.append(
-            "|".join(
-                [
-                    str(i),
-                    rng.choice(_PRODUCTS) + f"_{i}",
-                    str(round(rng.uniform(0.0, 10.0), 2)),
-                    str(rng.choice([True, False])).lower(),
-                ]
-            )
-        )
-    (fixtures_dir / "t04_pipe_delimited.csv").write_text("\n".join(lines))
+    """Generate inventory CSV + supplier rules JSON for a reorder pipeline.
+
+    The SKILL must: load inventory, apply reorder rules, identify items
+    below threshold, compute reorder quantities, and summarize.
+    """
+    # --- Inventory CSV ---
+    inventory_rows = []
+    for i, product in enumerate(_T04_PRODUCTS):
+        stock = rng.randint(5, 200)
+        daily_usage = round(rng.uniform(1.0, 15.0), 1)
+        unit_cost = round(rng.uniform(5.0, 100.0), 2)
+        inventory_rows.append({
+            "product_id": i + 1,
+            "product_name": product,
+            "current_stock": stock,
+            "daily_usage": daily_usage,
+            "unit_cost": unit_cost,
+            "warehouse": rng.choice(["WH-North", "WH-South"]),
+        })
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["product_id", "product_name",
+                                              "current_stock", "daily_usage",
+                                              "unit_cost", "warehouse"])
+    writer.writeheader()
+    writer.writerows(inventory_rows)
+    (fixtures_dir / "t04_inventory.csv").write_text(buf.getvalue())
+
+    # --- Reorder rules YAML ---
+    min_days_stock = 14  # reorder if stock < 14 days of usage
+    reorder_multiplier = 30  # order 30 days' worth
+    rules = {
+        "min_days_of_stock": min_days_stock,
+        "reorder_days_supply": reorder_multiplier,
+        "max_order_value": 5000.0,
+    }
+    import yaml
+    (fixtures_dir / "t04_reorder_rules.yaml").write_text(yaml.dump(rules, default_flow_style=False))
+
+    # --- Compute expected values ---
+    items_below_threshold = 0
+    total_reorder_cost = 0.0
+    for row in inventory_rows:
+        days_of_stock = row["current_stock"] / row["daily_usage"] if row["daily_usage"] > 0 else 999
+        if days_of_stock < min_days_stock:
+            items_below_threshold += 1
+            reorder_qty = math.ceil(row["daily_usage"] * reorder_multiplier)
+            order_cost = reorder_qty * row["unit_cost"]
+            total_reorder_cost += min(order_cost, rules["max_order_value"])
+
     return {
         "T04": {
-            "row_count": rows,
-            "delimiter": "|",
-            "column_names": _T04_COLUMNS,
+            "product_count": len(_T04_PRODUCTS),
+            "items_below_threshold": items_below_threshold,
+            "total_reorder_cost": round(total_reorder_cost, 2),
+            "min_days_of_stock": min_days_stock,
         }
     }
 
@@ -335,20 +377,61 @@ def _gen_t06(fixtures_dir: Path, rng: random.Random) -> dict:
     writer.writerows(rows)
     (fixtures_dir / "t06_missing_values.csv").write_text(buf.getvalue())
 
-    # Pre-compute variance of each numeric column (non-null values only)
+    # Pre-compute expected post-KNN-imputation variance (population, ddof=0).
+    #
+    # We run a reference KNN imputation (k=5, Euclidean distance on shared
+    # non-NaN features) and use the resulting full-dataset variance as the
+    # ground truth.  This accounts for the inherent variance shrinkage of
+    # KNN imputation (imputed values are neighbor means, which regress toward
+    # the population mean).  Generated tools using sklearn.impute.KNNImputer
+    # or equivalent manual implementations should produce variances within
+    # ±10% of these reference values.
+    feature_cols = columns[1:]
+    n_cols = len(feature_cols)
+
+    # Build a 2-D list (n_rows × n_cols), None for missing
+    matrix: list[list[float | None]] = []
+    for r in rows:
+        matrix.append([float(r[c]) if r[c] != "" else None for c in feature_cols])
+
+    # KNN imputation (k=5, Euclidean on shared non-None features)
+    imputed = [list(row) for row in matrix]  # deep copy
+    for i in range(n_rows):
+        for j in range(n_cols):
+            if matrix[i][j] is not None:
+                continue
+            # Collect distances to rows that have feature j
+            dists: list[tuple[float, float]] = []
+            for k in range(n_rows):
+                if k == i or matrix[k][j] is None:
+                    continue
+                # Euclidean distance on shared non-None features (excl. j)
+                shared_sq = 0.0
+                n_shared = 0
+                for f in range(n_cols):
+                    if matrix[i][f] is not None and matrix[k][f] is not None:
+                        shared_sq += (matrix[i][f] - matrix[k][f]) ** 2  # type: ignore[operator]
+                        n_shared += 1
+                if n_shared == 0:
+                    continue
+                dists.append((shared_sq ** 0.5, matrix[k][j]))  # type: ignore[arg-type]
+            dists.sort(key=lambda x: x[0])
+            neighbors = dists[:5]
+            if neighbors:
+                imputed[i][j] = sum(v for _, v in neighbors) / len(neighbors)
+
+    # Compute population variance (ddof=0) of each column after imputation
     variances: dict[str, float] = {}
-    for col in columns[1:]:
-        vals = [
-            float(r[col]) for r in rows if r[col] != ""
-        ]
+    for j, col in enumerate(feature_cols):
+        vals = [imputed[i][j] for i in range(n_rows) if imputed[i][j] is not None]
         mean = sum(vals) / len(vals)
         variances[col] = round(sum((v - mean) ** 2 for v in vals) / len(vals), 4)
 
     return {
         "T06": {
             "n_rows": n_rows,
-            "columns": columns[1:],
-            "original_variances": variances,
+            "columns": feature_cols,
+            "expected_variances": variances,
             "variance_tolerance_pct": 10,
         }
     }
@@ -429,47 +512,78 @@ def _gen_t07(fixtures_dir: Path, rng: random.Random) -> dict:
 
 
 def _gen_t08(fixtures_dir: Path, rng: random.Random) -> dict:
-    """Create a dataset where LR can beat majority baseline by >5%."""
-    n_rows = 200
-    # 30% positive class → majority baseline accuracy = 0.70
-    n_positive = 60
-    n_negative = 140
+    """Generate a messy dataset for autonomous data quality investigation.
 
+    The AGENT must: profile the data, identify quality issues (nulls,
+    outliers, type mismatches), decide which fixes to apply, and report.
+    """
+    n_rows = 100
+    columns = ["id", "name", "age", "salary", "department", "join_date"]
     rows = []
-    # Positive class: feature_x high, feature_y low
-    for _ in range(n_positive):
-        rows.append({
-            "feature_x": round(rng.gauss(8.0, 1.5), 3),
-            "feature_y": round(rng.gauss(2.0, 1.0), 3),
-            "feature_z": round(rng.gauss(5.0, 2.0), 3),
-            "label": 1,
-        })
-    # Negative class: feature_x low, feature_y high
-    for _ in range(n_negative):
-        rows.append({
-            "feature_x": round(rng.gauss(2.0, 1.5), 3),
-            "feature_y": round(rng.gauss(8.0, 1.0), 3),
-            "feature_z": round(rng.gauss(5.0, 2.0), 3),
-            "label": 0,
-        })
 
-    rng.shuffle(rows)
+    departments = ["Engineering", "Sales", "Marketing", "Support", "HR"]
+
+    for i in range(1, n_rows + 1):
+        age = rng.randint(22, 65)
+        salary = round(rng.gauss(60000, 15000), 2)
+        dept = rng.choice(departments)
+        base_date = datetime(2015, 1, 1) + timedelta(days=rng.randint(0, 3000))
+        join_date = base_date.strftime("%Y-%m-%d")
+
+        row = {
+            "id": i,
+            "name": rng.choice(_NAMES) + f" {chr(65 + rng.randint(0, 25))}.",
+            "age": age,
+            "salary": salary,
+            "department": dept,
+            "join_date": join_date,
+        }
+
+        # Inject quality issues
+        # ~10% null ages
+        if rng.random() < 0.10:
+            row["age"] = ""
+        # ~8% null salaries
+        if rng.random() < 0.08:
+            row["salary"] = ""
+        # ~5% outlier salaries (negative or extremely high)
+        if rng.random() < 0.05:
+            row["salary"] = round(rng.choice([-5000, 500000, -1200, 999999]), 2)
+        # ~5% invalid dates
+        if rng.random() < 0.05:
+            row["join_date"] = rng.choice(["not-a-date", "00/00/0000", ""])
+        # ~3% wrong department names (typos)
+        if rng.random() < 0.03:
+            row["department"] = rng.choice(["Engneering", "Sals", "Mktg", ""])
+
+        rows.append(row)
 
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["feature_x", "feature_y", "feature_z", "label"])
+    writer = csv.DictWriter(buf, fieldnames=columns)
     writer.writeheader()
     writer.writerows(rows)
-    (fixtures_dir / "t08_classification.csv").write_text(buf.getvalue())
+    (fixtures_dir / "t08_messy_data.csv").write_text(buf.getvalue())
 
-    majority_class_accuracy = n_negative / n_rows  # 0.70
+    # Compute expected quality issue counts
+    null_ages = sum(1 for r in rows if r["age"] == "")
+    null_salaries = sum(1 for r in rows if r["salary"] == "")
+    invalid_dates = sum(1 for r in rows if r["join_date"] in ("not-a-date", "00/00/0000", ""))
+    salary_outliers = sum(
+        1 for r in rows
+        if r["salary"] != "" and (float(r["salary"]) < 0 or float(r["salary"]) > 300000)
+    )
+    total_issues = null_ages + null_salaries + invalid_dates + salary_outliers
 
     return {
         "T08": {
             "n_rows": n_rows,
-            "majority_class_accuracy": majority_class_accuracy,
-            "accuracy_margin": 0.05,
-            "features": ["feature_x", "feature_y", "feature_z"],
-            "label_column": "label",
+            "n_columns": len(columns),
+            "total_quality_issues": total_issues,
+            "null_ages": null_ages,
+            "null_salaries": null_salaries,
+            "invalid_dates": invalid_dates,
+            "salary_outliers": salary_outliers,
+            "valid_departments": departments,
         }
     }
 
@@ -500,7 +614,21 @@ def _gen_t09(fixtures_dir: Path, rng: random.Random) -> dict:
     for i in range(5):
         data["records"][i]["revenue"] = round(rng.uniform(500000, 1000000), 2)
 
-    (fixtures_dir / "t09_report_data.json").write_text(json.dumps(data, indent=2))
+    # Write as XML for format diversity
+    import xml.etree.ElementTree as ET
+
+    root_el = ET.Element("report")
+    ET.SubElement(root_el, "title").text = data["title"]
+    period_el = ET.SubElement(root_el, "period", start=data["period"]["start"], end=data["period"]["end"])
+    records_el = ET.SubElement(root_el, "records")
+    for rec in data["records"]:
+        rec_el = ET.SubElement(records_el, "record")
+        for key, val in rec.items():
+            ET.SubElement(rec_el, key).text = str(val)
+
+    tree = ET.ElementTree(root_el)
+    ET.indent(tree, space="  ")
+    tree.write(fixtures_dir / "t09_report_data.xml", encoding="unicode", xml_declaration=True)
 
     return {
         "T09": {
@@ -514,45 +642,56 @@ def _gen_t09(fixtures_dir: Path, rng: random.Random) -> dict:
 # T10 — Unstructured server log file
 # ---------------------------------------------------------------------------
 
-_SEVERITIES = ["INFO", "WARNING", "ERROR", "DEBUG"]
-_LOG_MESSAGES = [
-    "User {user} logged in",
-    "Request processed in {ms}ms",
-    "Database query returned {n} rows",
-    "Cache miss for key {key}",
-    "Connection timeout to {host}",
-    "Authentication failed for {user}",
-    "Disk usage at {pct}%",
-    "Scheduled job {job} completed",
-]
-
-
 def _gen_t10(fixtures_dir: Path, rng: random.Random) -> dict:
-    n_lines = 200
-    base_time = datetime(2024, 1, 15, 8, 0, 0)
-    lines = []
-    for i in range(n_lines):
-        ts = base_time + timedelta(seconds=i * rng.randint(1, 30))
-        severity = rng.choice(_SEVERITIES)
-        msg_template = rng.choice(_LOG_MESSAGES)
-        msg = msg_template.format(
-            user=rng.choice(_NAMES),
-            ms=rng.randint(10, 5000),
-            n=rng.randint(0, 10000),
-            key=f"cache:{rng.randint(1, 999)}",
-            host=f"db-{rng.randint(1, 5)}.internal",
-            pct=rng.randint(50, 99),
-            job=f"job_{rng.randint(1, 20)}",
-        )
-        lines.append(f"{ts.strftime('%Y-%m-%d %H:%M:%S')} {severity} {msg}")
+    """Generate weekly sales data with trend + seasonality for forecasting.
 
-    (fixtures_dir / "t10_server.log").write_text("\n".join(lines))
+    The AGENT must: analyze the time series, detect the upward trend,
+    identify seasonal patterns, and forecast the next 4 weeks.
+    """
+    n_weeks = 52  # one year of weekly data
+    base_date = datetime(2024, 1, 1)
+    rows = []
+
+    # Linear trend: ~1000 base + ~20/week growth
+    # Seasonal: ~15% amplitude with period 13 weeks (quarterly)
+    base_sales = 1000.0
+    trend_per_week = 20.0
+    seasonal_amplitude = 150.0
+    seasonal_period = 13  # quarterly
+
+    for i in range(n_weeks):
+        date = base_date + timedelta(weeks=i)
+        trend = base_sales + trend_per_week * i
+        seasonal = seasonal_amplitude * math.sin(2 * math.pi * i / seasonal_period)
+        noise = rng.gauss(0, 50)
+        sales = round(max(0, trend + seasonal + noise), 2)
+        rows.append({
+            "week": date.strftime("%Y-%m-%d"),
+            "sales": sales,
+            "promotions": 1 if rng.random() < 0.15 else 0,
+            "region": rng.choice(["North", "South", "East", "West"]),
+        })
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["week", "sales", "promotions", "region"])
+    writer.writeheader()
+    writer.writerows(rows)
+    (fixtures_dir / "t10_weekly_sales.csv").write_text(buf.getvalue())
+
+    # Expected values: trend direction, approximate final value, data points
+    last_4_sales = [r["sales"] for r in rows[-4:]]
+    avg_last_4 = round(sum(last_4_sales) / len(last_4_sales), 2)
+    first_4_sales = [r["sales"] for r in rows[:4]]
+    avg_first_4 = round(sum(first_4_sales) / len(first_4_sales), 2)
 
     return {
         "T10": {
-            "expected_log_lines": n_lines,
-            "columns": ["timestamp", "severity", "message"],
-            "valid_severities": _SEVERITIES,
+            "n_weeks": n_weeks,
+            "trend_direction": "upward",  # agent should detect this
+            "avg_first_4_weeks": avg_first_4,
+            "avg_last_4_weeks": avg_last_4,
+            "has_seasonality": True,
+            "n_forecast_weeks": 4,
         }
     }
 
@@ -572,7 +711,17 @@ def _gen_t11(fixtures_dir: Path, rng: random.Random) -> dict:
         {"product_id": i + 1, "name": f"Product_{chr(65 + i)}", "category": rng.choice(_T11_CATEGORIES)}
         for i in range(10)
     ]
-    (fixtures_dir / "t11_products.json").write_text(json.dumps(products, indent=2))
+    # Write as Excel for format diversity
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Products"
+    ws.append(["product_id", "name", "category"])
+    for p in products:
+        ws.append([p["product_id"], p["name"], p["category"]])
+    wb.save(fixtures_dir / "t11_products.xlsx")
+    wb.close()
 
     # --- Sales data (CSV) ---
     sales_rows = []
@@ -782,6 +931,365 @@ def _gen_t13(fixtures_dir: Path, rng: random.Random) -> dict:
             "anomaly_count": len(planted_anomalies),
             "planted_anomalies": planted_anomalies,
             "metrics_analyzed": len(_T13_METRICS),
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T14 — Budget reconciliation pipeline (targets SKILL classification)
+# ---------------------------------------------------------------------------
+
+_T14_DEPARTMENTS = ["Engineering", "Marketing", "Sales", "Support", "HR"]
+
+
+def _gen_t14(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Three data sources: departments CSV, transactions CSV, allocation rules JSON."""
+    # --- Departments with budgets ---
+    dept_rows = [
+        {"department": dept, "annual_budget": round(rng.uniform(100000, 500000), 2)}
+        for dept in _T14_DEPARTMENTS
+    ]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["department", "annual_budget"])
+    writer.writeheader()
+    writer.writerows(dept_rows)
+    (fixtures_dir / "t14_departments.csv").write_text(buf.getvalue())
+
+    # --- Transactions (spending) ---
+    txn_rows = []
+    for i in range(1, 81):
+        dept = rng.choice(_T14_DEPARTMENTS)
+        txn_rows.append({
+            "txn_id": i,
+            "department": dept,
+            "amount": round(rng.uniform(500, 25000), 2),
+            "category": rng.choice(["salary", "equipment", "travel", "software", "training"]),
+            "date": f"2024-{rng.randint(1,12):02d}-{rng.randint(1,28):02d}",
+        })
+    # Write as TSV for format diversity
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["txn_id", "department", "amount", "category", "date"],
+                            delimiter="\t")
+    writer.writeheader()
+    writer.writerows(txn_rows)
+    (fixtures_dir / "t14_transactions.tsv").write_text(buf.getvalue())
+
+    # --- Allocation rules ---
+    rules = {
+        "max_single_transaction": 20000,
+        "category_caps": {
+            "travel": 0.15,      # max 15% of budget
+            "equipment": 0.25,   # max 25% of budget
+        },
+    }
+    (fixtures_dir / "t14_rules.json").write_text(json.dumps(rules, indent=2))
+
+    # Pre-compute expected values
+    dept_spending: dict[str, float] = {}
+    for txn in txn_rows:
+        dept_spending[txn["department"]] = round(
+            dept_spending.get(txn["department"], 0.0) + txn["amount"], 2
+        )
+    budgets = {d["department"]: d["annual_budget"] for d in dept_rows}
+    over_budget = sum(
+        1 for dept in _T14_DEPARTMENTS
+        if dept_spending.get(dept, 0.0) > budgets[dept]
+    )
+    flagged_transactions = sum(
+        1 for txn in txn_rows if txn["amount"] > rules["max_single_transaction"]
+    )
+
+    return {
+        "T14": {
+            "department_count": len(_T14_DEPARTMENTS),
+            "department_spending": dept_spending,
+            "spending_tolerance_pct": 5,
+            "over_budget_count": over_budget,
+            "flagged_transactions": flagged_transactions,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T15 — Time-series ETL with configurable aggregation (targets SKILL)
+# ---------------------------------------------------------------------------
+
+
+def _gen_t15(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Hourly metrics CSV + aggregation config JSON."""
+    # --- Hourly metrics (7 days x 24 hours = 168 rows) ---
+    base_time = datetime(2024, 3, 1, 0, 0, 0)
+    metrics_rows = []
+    for i in range(168):
+        ts = base_time + timedelta(hours=i)
+        metrics_rows.append({
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "cpu_pct": round(rng.uniform(10, 90), 1),
+            "memory_pct": round(rng.uniform(20, 85), 1),
+            "requests_per_sec": rng.randint(50, 500),
+            "error_count": rng.randint(0, 20),
+        })
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["timestamp", "cpu_pct", "memory_pct", "requests_per_sec", "error_count"])
+    writer.writeheader()
+    writer.writerows(metrics_rows)
+    (fixtures_dir / "t15_hourly_metrics.csv").write_text(buf.getvalue())
+
+    # --- Aggregation config ---
+    agg_config = {
+        "aggregation_interval": "daily",
+        "metrics": {
+            "cpu_pct": ["mean", "max"],
+            "memory_pct": ["mean", "max"],
+            "requests_per_sec": ["sum"],
+            "error_count": ["sum"],
+        },
+        "alert_thresholds": {
+            "cpu_pct_max": 85,
+            "memory_pct_max": 80,
+            "error_count_sum": 100,
+        },
+    }
+    (fixtures_dir / "t15_agg_config.json").write_text(json.dumps(agg_config, indent=2))
+
+    # Pre-compute daily aggregates
+    from collections import defaultdict
+    daily_data: dict[str, list[dict]] = defaultdict(list)
+    for row in metrics_rows:
+        day = row["timestamp"][:10]
+        daily_data[day].append(row)
+
+    n_days = len(daily_data)
+    alert_days = 0
+    for day, rows in daily_data.items():
+        cpu_max = max(float(r["cpu_pct"]) for r in rows)
+        mem_max = max(float(r["memory_pct"]) for r in rows)
+        error_sum = sum(int(r["error_count"]) for r in rows)
+        if (cpu_max > agg_config["alert_thresholds"]["cpu_pct_max"]
+                or mem_max > agg_config["alert_thresholds"]["memory_pct_max"]
+                or error_sum > agg_config["alert_thresholds"]["error_count_sum"]):
+            alert_days += 1
+
+    return {
+        "T15": {
+            "n_days": n_days,
+            "metrics_aggregated": len(agg_config["metrics"]),
+            "alert_days": alert_days,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T16 — Root cause diagnosis (targets AGENT classification)
+# ---------------------------------------------------------------------------
+
+
+def _gen_t16(fixtures_dir: Path, rng: random.Random) -> dict:
+    """System metrics with a planted cascading failure chain."""
+    n_rows = 120
+    base_time = datetime(2024, 7, 1, 0, 0, 0)
+
+    # Root cause: database connection pool exhaustion (db_connections spikes)
+    # Cascade: db_connections↑ → query_latency↑ → request_queue↑ → error_rate↑
+    root_cause_metric = "db_connections"
+    cascade_chain = ["db_connections", "query_latency_ms", "request_queue_depth", "error_rate"]
+    incident_start = 60  # row index where incident begins
+
+    rows = []
+    for i in range(n_rows):
+        ts = base_time + timedelta(minutes=i * 5)
+        row: dict = {"timestamp": ts.strftime("%Y-%m-%d %H:%M:%S")}
+
+        if i < incident_start:
+            # Normal operation
+            row["db_connections"] = rng.randint(5, 30)
+            row["query_latency_ms"] = round(rng.uniform(5, 50), 1)
+            row["request_queue_depth"] = rng.randint(0, 10)
+            row["error_rate"] = round(rng.uniform(0.0, 0.02), 4)
+            row["cpu_usage"] = round(rng.uniform(20, 60), 1)
+        else:
+            # Cascading failure with staggered onset
+            elapsed = i - incident_start
+            # Root cause: db_connections spike immediately
+            row["db_connections"] = rng.randint(80, 100) if elapsed >= 0 else rng.randint(5, 30)
+            # query_latency follows after ~5 steps
+            row["query_latency_ms"] = round(rng.uniform(500, 2000), 1) if elapsed >= 5 else round(rng.uniform(5, 50), 1)
+            # request_queue follows after ~10 steps
+            row["request_queue_depth"] = rng.randint(50, 200) if elapsed >= 10 else rng.randint(0, 10)
+            # error_rate follows after ~15 steps
+            row["error_rate"] = round(rng.uniform(0.1, 0.5), 4) if elapsed >= 15 else round(rng.uniform(0.0, 0.02), 4)
+            # cpu stays normal (red herring)
+            row["cpu_usage"] = round(rng.uniform(20, 60), 1)
+
+        rows.append(row)
+
+    fieldnames = ["timestamp", "db_connections", "query_latency_ms", "request_queue_depth", "error_rate", "cpu_usage"]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    (fixtures_dir / "t16_system_metrics.csv").write_text(buf.getvalue())
+
+    # Incident description (what the agent sees)
+    incident_report = {
+        "title": "Service degradation detected",
+        "symptoms": [
+            "Elevated error rates observed",
+            "Increased request queue depth",
+            "User-reported slow response times",
+        ],
+        "onset_time": rows[incident_start]["timestamp"],
+        "affected_service": "api-gateway",
+    }
+    # Write as YAML for format diversity
+    import yaml
+    (fixtures_dir / "t16_incident.yaml").write_text(yaml.dump(incident_report, default_flow_style=False))
+
+    return {
+        "T16": {
+            "root_cause_metric": root_cause_metric,
+            "cascade_chain": cascade_chain,
+            "incident_start_row": incident_start,
+            "n_metrics": len(fieldnames) - 1,  # exclude timestamp
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T17 — Fraud investigation with cross-referencing (targets AGENT)
+# ---------------------------------------------------------------------------
+
+_T17_NAMES = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Heidi",
+              "Ivan", "Judy", "Karl", "Linda", "Mike", "Nancy", "Oscar"]
+
+
+def _gen_t17(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Transactions CSV + customers CSV + alerts JSON with planted fraud patterns."""
+    # --- Customers ---
+    customers = []
+    for i, name in enumerate(_T17_NAMES):
+        customers.append({
+            "customer_id": i + 1,
+            "name": name,
+            "account_age_days": rng.randint(30, 2000),
+            "risk_score": round(rng.uniform(0, 1), 2),
+        })
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["customer_id", "name", "account_age_days", "risk_score"])
+    writer.writeheader()
+    writer.writerows(customers)
+    (fixtures_dir / "t17_customers.csv").write_text(buf.getvalue())
+
+    # --- Transactions (some fraudulent) ---
+    fraud_customer_ids = [1, 3, 5]  # Alice, Carol, Eve
+    transactions = []
+    for i in range(1, 101):
+        cid = rng.choice(range(1, len(_T17_NAMES) + 1))
+        is_fraud = cid in fraud_customer_ids and rng.random() < 0.4
+        amount = round(rng.uniform(5000, 50000) if is_fraud else rng.uniform(10, 2000), 2)
+        transactions.append({
+            "txn_id": i,
+            "customer_id": cid,
+            "amount": amount,
+            "merchant": rng.choice(["ShopA", "ShopB", "ShopC", "OnlineX", "OnlineY"]),
+            "timestamp": f"2024-06-{rng.randint(1,30):02d} {rng.randint(0,23):02d}:{rng.randint(0,59):02d}:00",
+            "flagged": is_fraud,
+        })
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["txn_id", "customer_id", "amount", "merchant", "timestamp", "flagged"])
+    writer.writeheader()
+    writer.writerows(transactions)
+    (fixtures_dir / "t17_transactions.csv").write_text(buf.getvalue())
+
+    # --- Alerts (pre-generated, some real, some false positives) ---
+    alerts = []
+    for txn in transactions:
+        if txn["flagged"]:
+            alerts.append({
+                "alert_id": f"ALT-{txn['txn_id']:04d}",
+                "txn_id": txn["txn_id"],
+                "customer_id": txn["customer_id"],
+                "reason": rng.choice(["high_amount", "velocity_spike", "unusual_merchant"]),
+                "severity": "high",
+            })
+    # Add some false positive alerts (normal transactions flagged)
+    normal_txns = [t for t in transactions if not t["flagged"]]
+    for txn in rng.sample(normal_txns, min(5, len(normal_txns))):
+        alerts.append({
+            "alert_id": f"ALT-{txn['txn_id']:04d}",
+            "txn_id": txn["txn_id"],
+            "customer_id": txn["customer_id"],
+            "reason": "amount_threshold",
+            "severity": "low",
+        })
+
+    (fixtures_dir / "t17_alerts.json").write_text(json.dumps(alerts, indent=2))
+
+    # Pre-compute expected values
+    true_fraud_count = sum(1 for t in transactions if t["flagged"])
+    fraud_customer_names = [c["name"] for c in customers if c["customer_id"] in fraud_customer_ids]
+    total_alerts = len(alerts)
+    high_severity_alerts = sum(1 for a in alerts if a["severity"] == "high")
+
+    return {
+        "T17": {
+            "total_alerts": total_alerts,
+            "high_severity_alerts": high_severity_alerts,
+            "true_fraud_count": true_fraud_count,
+            "fraud_customer_ids": fraud_customer_ids,
+            "fraud_customer_names": fraud_customer_names,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T18 — Record deduplication via hashing (targets MCP_TOOL classification)
+# ---------------------------------------------------------------------------
+
+
+def _gen_t18(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Generate a CSV with exact and near-duplicate records for hash-based dedup.
+
+    The MCP_TOOL must: compute a hash per row (on key columns), identify
+    exact duplicates by hash, return unique count + duplicate count.
+    """
+    columns = ["order_id", "customer", "product", "quantity", "price"]
+    base_rows = []
+    for i in range(1, 51):  # 50 unique orders
+        base_rows.append({
+            "order_id": i,
+            "customer": rng.choice(_NAMES) + f"_{rng.randint(1, 99)}",
+            "product": rng.choice(["Widget", "Gadget", "Sensor", "Module", "Cable"]),
+            "quantity": rng.randint(1, 20),
+            "price": round(rng.uniform(10.0, 500.0), 2),
+        })
+
+    # Add exact duplicates (repeat rows 1-12)
+    duplicate_rows = [dict(r) for r in base_rows[:12]]
+    # Add a second copy of rows 1-5 (triple duplicates)
+    triple_rows = [dict(r) for r in base_rows[:5]]
+
+    all_rows = base_rows + duplicate_rows + triple_rows
+    rng.shuffle(all_rows)
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns)
+    writer.writeheader()
+    writer.writerows(all_rows)
+    (fixtures_dir / "t18_orders_with_dupes.csv").write_text(buf.getvalue())
+
+    # Expected: 50 unique, 17 duplicate rows (12 + 5)
+    unique_count = len(base_rows)  # 50
+    total_rows = len(all_rows)  # 67
+    duplicate_count = total_rows - unique_count  # 17
+
+    return {
+        "T18": {
+            "total_rows": total_rows,
+            "unique_count": unique_count,
+            "duplicate_count": duplicate_count,
+            "key_columns": columns,
         }
     }
 

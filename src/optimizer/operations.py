@@ -13,6 +13,8 @@ from datetime import UTC, datetime, timedelta
 
 from langchain.chat_models import init_chat_model
 from langfuse.langchain import CallbackHandler as LangfuseHandler
+
+from src.config import DEFAULT_LLM_MODEL
 from pydantic import BaseModel, Field
 
 from src.registry.metrics import MetricsStore
@@ -86,7 +88,7 @@ def prune(
     for cap in active:
         # Never prune pinned capabilities (seeded entries that should survive
         # optimizer cycles regardless of invocation count)
-        if cap.metadata.get("pinned") == "true":
+        if (cap.metadata or {}).get("pinned") == "true":
             logger.debug("Skipping pinned capability '%s'", cap.name)
             continue
         count = metrics_store.invocations_since(cap.name, cutoff)
@@ -104,7 +106,7 @@ def split(
     metrics_store: MetricsStore,
     capability_id: str,
     *,
-    llm_model: str = "deepseek:deepseek-chat",
+    llm_model: str = "",
 ) -> list[str]:
     """Split a capability into specialized variants.
 
@@ -135,7 +137,7 @@ def split(
             "Only SKILL and AGENT types can be split."
         )
 
-    llm = init_chat_model(llm_model)
+    llm = init_chat_model(llm_model or DEFAULT_LLM_MODEL)
     structured_llm = llm.with_structured_output(SplitResult)
     lf_config = _langfuse_config()
 
@@ -175,14 +177,17 @@ def split(
     # They contain no generated code and therefore do not go through the
     # three-tier verification gate.  Verification applies only to code artifacts
     # (MCP tools, SKILL.md files, agent configs) produced by the pipeline generators.
-    new_ids: list[str] = []
+    # Validate all variant names first (all-or-nothing: if any name collides,
+    # abort the entire split so the parent is not left deactivated with missing variants).
     for variant in result.variants:
         if registry.get(variant.name) is not None:
-            logger.warning(
-                "split(): variant name '%s' already exists in registry, skipping",
-                variant.name,
+            raise ValueError(
+                f"split(): variant name '{variant.name}' already exists in registry — "
+                f"aborting split of '{capability_id}'"
             )
-            continue
+
+    new_ids: list[str] = []
+    for variant in result.variants:
         new_cap = CapabilityDescriptor(
             name=variant.name,
             description=variant.description,
@@ -196,14 +201,7 @@ def split(
         )
         new_ids.append(variant.name)
 
-    if not new_ids:
-        logger.warning(
-            "split(): all variant names for '%s' already exist — parent not deactivated",
-            capability_id,
-        )
-        return new_ids
-
-    # Deactivate parent
+    # Deactivate parent only after all variants are successfully added
     registry.deactivate(capability_id)
     metrics_store.record_event(capability_id, "split", f"into {new_ids}")
     logger.info("Split '%s' into %s", capability_id, new_ids)
@@ -216,7 +214,7 @@ def merge(
     metrics_store: MetricsStore,
     capability_ids: list[str],
     *,
-    llm_model: str = "deepseek:deepseek-chat",
+    llm_model: str = "",
 ) -> str:
     """Merge multiple capabilities into a single broader capability.
 
@@ -251,7 +249,7 @@ def merge(
         types = ", ".join(sorted(non_skill_types))
         raise ValueError(f"Merge is only supported for SKILL capabilities. Got: {types}")
 
-    llm = init_chat_model(llm_model)
+    llm = init_chat_model(llm_model or DEFAULT_LLM_MODEL)
     structured_llm = llm.with_structured_output(MergeResult)
     lf_config = _langfuse_config()
 

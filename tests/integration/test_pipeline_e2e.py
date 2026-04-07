@@ -1,7 +1,7 @@
 """End-to-end integration test for the Phase C JIT capability pipeline.
 
 Exercises the full graph with a real registry and real ToolLoader.
-Requires DEEPSEEK_API_KEY to run (marked as integration + skipped otherwise).
+Requires OPENAI_API_KEY to run (marked as integration + skipped otherwise).
 
 Test strategy:
 - Seed the registry with standard capabilities.
@@ -24,11 +24,11 @@ from src.orchestrator.tool_loader import ToolLoader
 from src.registry.store import SkillRegistry, seed_registry
 from src.schemas.task import TaskState, TaskStatus
 
-_has_api_key = bool(os.environ.get("DEEPSEEK_API_KEY"))
+_has_api_key = bool(os.environ.get("OPENAI_API_KEY"))
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not _has_api_key, reason="DEEPSEEK_API_KEY not set"),
+    pytest.mark.skipif(not _has_api_key, reason="OPENAI_API_KEY not set"),
 ]
 
 

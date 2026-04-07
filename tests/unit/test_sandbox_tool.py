@@ -283,14 +283,14 @@ class TestResolveImportsViaLLM:
         mock_structured = MagicMock()
         mock_llm.with_structured_output.return_value = mock_structured
         mock_structured.invoke.return_value = _PackageMapping(
-            mappings={"sklearn": "scikit-learn", "cv2": "opencv-python"}
+            mappings={"fuzzywuzzy": "fuzzywuzzy", "msgpack": "msgpack"}
         )
         mock_init.return_value = mock_llm
 
-        result = _resolve_imports_via_llm(["sklearn", "cv2"])
+        result = _resolve_imports_via_llm(["fuzzywuzzy", "msgpack"])
 
-        assert result == {"sklearn": "scikit-learn", "cv2": "opencv-python"}
-        mock_init.assert_called_once_with("deepseek-chat", temperature=0)
+        assert result == {"fuzzywuzzy": "fuzzywuzzy", "msgpack": "msgpack"}
+        mock_init.assert_called_once()
         mock_structured.invoke.assert_called_once()
 
     @patch("src.verification.sandbox_tool.init_chat_model")
@@ -313,26 +313,26 @@ class TestResolveImportsViaLLM:
     def test_fallback_on_llm_error(self, mock_init):
         mock_init.side_effect = RuntimeError("API key missing")
 
-        result = _resolve_imports_via_llm(["sklearn"])
+        result = _resolve_imports_via_llm(["fuzzywuzzy"])
 
-        # Falls back to identity mapping.
-        assert result == {"sklearn": "sklearn"}
+        # Falls back to identity mapping for unknown imports.
+        assert result == {"fuzzywuzzy": "fuzzywuzzy"}
 
     @patch("src.verification.sandbox_tool.init_chat_model")
     def test_missing_key_in_llm_response_uses_identity(self, mock_init):
         mock_llm = MagicMock()
         mock_structured = MagicMock()
         mock_llm.with_structured_output.return_value = mock_structured
-        # LLM returns mapping for sklearn but omits cv2.
+        # LLM returns mapping for fuzzywuzzy but omits msgpack.
         mock_structured.invoke.return_value = _PackageMapping(
-            mappings={"sklearn": "scikit-learn"}
+            mappings={"fuzzywuzzy": "fuzzywuzzy"}
         )
         mock_init.return_value = mock_llm
 
-        result = _resolve_imports_via_llm(["sklearn", "cv2"])
+        result = _resolve_imports_via_llm(["fuzzywuzzy", "msgpack"])
 
-        assert result["sklearn"] == "scikit-learn"
-        assert result["cv2"] == "cv2"  # fallback to identity
+        assert result["fuzzywuzzy"] == "fuzzywuzzy"
+        assert result["msgpack"] == "msgpack"  # fallback to identity
 
 
 class TestResolveExtraPackages:

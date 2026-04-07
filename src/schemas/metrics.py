@@ -43,7 +43,7 @@ class GranularityMetrics(BaseModel):
         description="When these metrics were computed",
     )
     window_size: int = Field(
-        ..., description="Number of invocations in the computation window"
+        ..., ge=1, description="Number of invocations in the computation window"
     )
 
     model_config = {"extra": "forbid"}

@@ -22,9 +22,10 @@ would be needed to accomplish it.
 5. Specify ``depends_on`` indices when a subtask requires the output of an
    earlier one. Use zero-based indexing.
 6. Keep subtask descriptions concrete and actionable.
-7. HARD LIMIT: produce at most 3 subtasks and at most 5 total \
-   required_capabilities across all subtasks combined. A single subtask \
-   with 1 capability is the correct output for most tasks.
+7. AIM for at most 3 subtasks and at most 5 total required_capabilities \
+   across all subtasks combined. A single subtask with 1 capability is \
+   the correct output for most tasks. The pipeline enforces a hard cap \
+   of 8 capabilities — anything beyond that is truncated.
 8. NEVER list generic infrastructure operations as separate required \
    capabilities. File I/O, string manipulation, lowercasing, whitespace \
    trimming, and regex are implementation details that belong inside a \

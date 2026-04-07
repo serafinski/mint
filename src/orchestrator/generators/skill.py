@@ -81,7 +81,9 @@ def _get_llm():
             if _skill_llm is None:
                 from langchain.chat_models import init_chat_model
 
-                _skill_llm = init_chat_model("deepseek:deepseek-chat", request_timeout=300)
+                from src.config import DEFAULT_LLM_MODEL
+
+                _skill_llm = init_chat_model(DEFAULT_LLM_MODEL, request_timeout=300)
     return _skill_llm
 
 
@@ -97,17 +99,30 @@ def _strip_code_fences(text: str) -> str:
     the outer closing fence is absent.  An odd count of backtick-triple sequences
     in the body means one fence is unmatched — that is the outer closing fence.
     An even count means all fences are matched inner pairs — leave them intact.
+
+    Edge case: when the body has an even number of fences AND ends with two
+    consecutive bare ````` lines (inner close + outer close), the outer close
+    is stripped.
     """
     text = text.strip()
     if not text.startswith("```"):
         return text
     # Remove opening fence (with optional language tag)
     body = re.sub(r"^```[a-zA-Z]*\n?", "", text, count=1)
-    # Count all backtick-triple occurrences in the body.
-    # Odd  → last one is the unmatched outer closing fence → strip it.
-    # Even → all fences are matched inner pairs → leave them intact.
-    if len(re.findall(r"```", body)) % 2 == 1:
+    fence_count = len(re.findall(r"```", body))
+    if fence_count % 2 == 1:
+        # Odd → last one is the unmatched outer closing fence → strip it.
         body = re.sub(r"\n?```\s*$", "", body, count=1)
+    elif fence_count >= 2 and re.search(r"\n```\s*$", body):
+        # Even count — check for the pattern of two consecutive ``` lines at
+        # the end (inner code block close followed by outer wrapper close).
+        lines = body.rstrip().split("\n")
+        if (
+            len(lines) >= 2
+            and lines[-1].strip() == "```"
+            and lines[-2].strip() == "```"
+        ):
+            body = re.sub(r"\n?```\s*$", "", body, count=1)
     return body.strip()
 
 
@@ -222,14 +237,9 @@ def _generate_single_skill(
         logger.warning(error_msg)
         return None, error_msg
 
-    skill_name = extract_skill_name(content)
-    if not skill_name:
-        # Derive a fallback name from the query; collapse consecutive hyphens
-        skill_name = re.sub(r"[^a-z0-9-]", "-", gap.query.lower().strip())
-        skill_name = re.sub(r"-{2,}", "-", skill_name)
-        skill_name = skill_name[:64].strip("-")
-        if not skill_name:
-            return None, f"Cannot derive skill name from query: {gap.query!r}"
+    # Use the deterministic forced_name for validation (the artifact will use it
+    # regardless of what name the LLM put in frontmatter).
+    skill_name = extract_skill_name(content) or forced_name
 
     is_valid, message = validate_skill_content(content, skill_name)
 
@@ -283,7 +293,9 @@ def _generate_single_skill(
         return None, error_msg
 
     # --- Write to disk ---
-    target_dir = (output_dir or SKILLS_OUTPUT_DIR) / skill_name
+    # Always use forced_name for the directory so it matches the artifact's
+    # capability_name (which also uses forced_name with its hash suffix).
+    target_dir = (output_dir or SKILLS_OUTPUT_DIR) / forced_name
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / "SKILL.md").write_text(content)
@@ -356,12 +368,20 @@ def generate_skill(
                 gap = futures[future]
                 raw_results.append((None, f"Generation failed for skill {gap.query!r}: {exc}"))
 
+    failed_queries: list[str] = []
     for artifact, error in raw_results:
         if artifact is not None:
             artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
         if error is not None:
             errors.append(error)
+            failed_queries.append(error[:80])
+
+    if failed_queries:
+        logger.warning(
+            "generate_skill: %d/%d gaps failed generation: %s",
+            len(failed_queries), len(gaps_to_generate), failed_queries,
+        )
 
     return Command(
         update={

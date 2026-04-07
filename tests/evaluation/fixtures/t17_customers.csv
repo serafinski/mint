@@ -1,0 +1,16 @@
+customer_id,name,account_age_days,risk_score
+1,Alice,801,0.58
+2,Bob,1388,0.53
+3,Carol,553,0.17
+4,Dave,611,0.2
+5,Eve,1456,0.62
+6,Frank,138,0.46
+7,Grace,1965,0.01
+8,Heidi,825,0.66
+9,Ivan,1387,0.85
+10,Judy,1381,0.36
+11,Karl,250,0.02
+12,Linda,1806,0.88
+13,Mike,821,0.23
+14,Nancy,809,0.51
+15,Oscar,1483,0.1

@@ -1,20 +1,21 @@
 """Evaluation schemas for Iteration 5 end-to-end testing.
 
 Separate from the operational InvocationRecord — evaluation records track
-experimental outcomes across the four baseline conditions.
+experimental outcomes across the five baseline conditions.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from src.schemas.capability import CapabilityType
+
 
 class BaselineCondition(StrEnum):
-    """The four evaluation conditions compared in the thesis."""
+    """The evaluation conditions compared in the thesis."""
 
     FULL = "full"
     NO_VERIFICATION = "no_verification"
@@ -39,6 +40,7 @@ class FailureReason(StrEnum):
     TIER2 = "tier2"
     TIER3 = "tier3"
     OUTPUT_REJECTED = "output_rejected"
+    NO_SOURCE_CODE = "no_source_code"
 
 
 class HumanLabel(StrEnum):
@@ -57,11 +59,11 @@ class EvaluationRecord(BaseModel):
 
     # --- Experimental identifiers ---
     run_id: str = Field(..., description="Groups all tasks in one experimental run")
-    condition: Literal["full", "no_verification", "no_optimization", "static"] = Field(
+    condition: BaselineCondition = Field(
         ..., description="Baseline condition"
     )
     task_id: str = Field(..., description="Testbed task identifier (e.g. 'T01')")
-    task_tier: Literal["trivial", "moderate", "complex"] = Field(
+    task_tier: TaskTier = Field(
         ..., description="Difficulty tier of the task"
     )
 
@@ -69,7 +71,7 @@ class EvaluationRecord(BaseModel):
     attempt_count: int = Field(
         ..., ge=0, description="Number of generation+verification cycles"
     )
-    capability_type: Literal["mcp_tool", "skill", "agent"] | None = Field(
+    capability_type: CapabilityType | None = Field(
         None, description="Type of generated capability; None for static baseline"
     )
     verification_tier_reached: int | None = Field(
@@ -92,9 +94,9 @@ class EvaluationRecord(BaseModel):
     attempt_latency_ms: int = Field(
         ..., ge=0, description="Wall-clock time for all generation attempts (secondary metric)"
     )
-    failure_reason: Literal[
-        "none", "generation_failed", "tier1", "tier2", "tier3", "output_rejected"
-    ] = Field(..., description="Why the run failed; 'none' on success")
+    failure_reason: FailureReason = Field(
+        ..., description="Why the run failed; 'none' on success"
+    )
 
     # --- Registry state ---
     registry_snapshot_id: str = Field(
@@ -113,7 +115,7 @@ class EvaluationRecord(BaseModel):
     )
 
     # --- Manual audit (Iteration 6) ---
-    human_label: Literal["correct", "contaminated", "partial"] | None = Field(
+    human_label: HumanLabel | None = Field(
         None, description="Manually assigned correctness label; populated in Iteration 6 audit"
     )
 

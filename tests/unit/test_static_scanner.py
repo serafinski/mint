@@ -12,7 +12,7 @@ Tests cover all five contamination categories plus:
 from __future__ import annotations
 
 from src.schemas.verification import Severity
-from src.verification.static_scanner import scan, scan_text_only, should_proceed_to_tier2
+from src.verification.static_scanner import scan, should_proceed_to_tier2
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -237,27 +237,43 @@ def do_thing():
 # ===================================================================
 
 class TestMockArtifacts:
-    def test_mock_variable(self):
-        code = "mock_data = [1, 2, 3]\n"
+    def test_mock_standalone(self):
+        """'mock' as a standalone word is flagged."""
+        code = 'x = mock\n'
         report = scan(code, "mock-tool")
         findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert len(findings) >= 1
         assert findings[0].severity == Severity.CRITICAL
 
-    def test_fake_in_string(self):
+    def test_mock_in_compound_word_not_flagged(self):
+        """'mock' inside a compound like 'mock_data' is NOT flagged (H4 fix)."""
+        code = "mock_data = [1, 2, 3]\n"
+        report = scan(code, "mock-tool")
+        findings = [f for f in report.findings if f.category == "mock_artifact"]
+        assert len(findings) == 0
+
+    def test_fake_standalone_in_string(self):
         code = 'result = "This is fake data"\n'
         report = scan(code, "fake-tool")
         findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert len(findings) >= 1
 
-    def test_placeholder_detected(self):
-        code = "placeholder_value = 42\n"
+    def test_placeholder_standalone(self):
+        """'placeholder' as a standalone word is flagged."""
+        code = 'x = "placeholder"\n'
         report = scan(code, "placeholder-tool")
         findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert len(findings) >= 1
 
-    def test_dummy_detected(self):
-        code = "dummy_response = {}\n"
+    def test_placeholder_in_compound_not_flagged(self):
+        """'placeholder' inside 'placeholder_value' is NOT flagged (H4 fix)."""
+        code = "placeholder_value = 42\n"
+        report = scan(code, "placeholder-tool")
+        findings = [f for f in report.findings if f.category == "mock_artifact"]
+        assert len(findings) == 0
+
+    def test_dummy_standalone(self):
+        code = 'x = "dummy"\n'
         report = scan(code, "dummy-tool")
         findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert len(findings) >= 1
@@ -268,11 +284,27 @@ class TestMockArtifacts:
         findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert len(findings) >= 1
 
-    def test_demo_in_uppercase(self):
-        code = 'DEMO_MODE = True\n'
+    def test_demo_standalone(self):
+        """'DEMO' as a standalone word is flagged."""
+        code = 'mode = "DEMO"\n'
         report = scan(code, "demo-tool")
         findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert len(findings) >= 1
+
+    def test_demo_in_compound_not_flagged(self):
+        """'DEMO' inside 'DEMO_MODE' is NOT flagged (H4 fix: no more
+        false positives on 'demographics', 'remediation', etc.)."""
+        code = 'DEMO_MODE = True\n'
+        report = scan(code, "demo-tool")
+        findings = [f for f in report.findings if f.category == "mock_artifact"]
+        assert len(findings) == 0
+
+    def test_demographics_not_flagged(self):
+        """H4: 'demographics' must NOT be flagged."""
+        code = 'demographics_data = load("demographics.csv")\n'
+        report = scan(code, "demographics-tool")
+        findings = [f for f in report.findings if f.category == "mock_artifact"]
+        assert len(findings) == 0
 
     def test_sample_not_flagged(self):
         """'sample' was removed from mock indicators — too many false positives
@@ -486,7 +518,7 @@ class TestShouldProceed:
         assert should_proceed_to_tier2(report) is True
 
     def test_critical_blocks(self):
-        code = 'mock_data = 42\n'
+        code = 'x = "mock"\n'
         report = scan(code, "mock-tool")
         assert should_proceed_to_tier2(report) is False
 
@@ -525,7 +557,7 @@ class TestReportStructure:
         """Code with multiple issues produces findings for each."""
         code = '''\
 # TODO: fix this
-mock_result = "hello"
+result = "mock"
 
 def fetch_data():
     try:
@@ -544,28 +576,29 @@ def fetch_data():
 
 
 # ===================================================================
-# scan_text_only — regex-only scan for non-Python content
+# scan with non-MCP types — regex-only scan for non-Python content
+# (formerly scan_text_only, now handled by scan() with capability_type)
 # ===================================================================
 
-class TestScanTextOnly:
+class TestScanNonMcpTypes:
     def test_clean_text_returns_empty_findings(self):
         text = "---\nname: my-skill\ndescription: Loads CSV data from disk.\n---\n\n## Overview\n\nThis skill reads files.\n"
-        report = scan_text_only(text, "my-skill")
+        report = scan(text, "my-skill", "skill")
         assert report.findings == []
         assert report.overall_passed is True
         assert report.tier_reached == 1
 
     def test_mock_indicator_detected_as_critical(self):
-        text = "---\nname: my-skill\ndescription: Loads data.\n---\n\nmock_result = [1, 2, 3]\n"
-        report = scan_text_only(text, "my-skill")
+        text = "---\nname: my-skill\ndescription: Loads data.\n---\n\nThis is a mock of the real API.\n"
+        report = scan(text, "my-skill", "skill")
         mock_findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert len(mock_findings) >= 1
         assert all(f.severity.value == "critical" for f in mock_findings)
         assert report.overall_passed is False
 
     def test_synthetic_comment_detected_as_high(self):
-        text = "# TODO: implement real data fetching\nUse this skill for analysis.\n"
-        report = scan_text_only(text, "todo-skill")
+        text = "# TODO: implement real data fetching\nUse this for analysis.\n"
+        report = scan(text, "todo-agent", "agent")
         synthetic = [f for f in report.findings if f.category == "synthetic_data"]
         assert len(synthetic) >= 1
         assert all(f.severity.value == "high" for f in synthetic)
@@ -573,27 +606,27 @@ class TestScanTextOnly:
     def test_no_ast_syntax_error_for_non_python(self):
         """YAML/markdown content must not produce a syntax error finding."""
         yaml_text = "---\nname: test-skill\ndescription: A skill.\n---\n\n## Body\n\nSome markdown content.\n"
-        report = scan_text_only(yaml_text, "test-skill")
+        report = scan(yaml_text, "test-skill", "skill")
         syntax_findings = [f for f in report.findings if f.category == "syntax"]
         assert len(syntax_findings) == 0
 
     def test_tier_reached_is_1(self):
-        report = scan_text_only("some plain text", "text-cap")
+        report = scan("some plain text", "text-cap", "agent")
         assert report.tier_reached == 1
 
     def test_capability_name_in_report(self):
-        report = scan_text_only("content", "cap-name")
+        report = scan("content", "cap-name", "agent")
         assert report.capability_name == "cap-name"
 
     def test_json_config_with_mock_detected(self):
         """JSON agent config containing 'mock' is caught by regex scan."""
         import json
         config = json.dumps({"system_prompt": "You are a mock testing agent."})
-        report = scan_text_only(config, "agent-cap")
+        report = scan(config, "agent-cap", "agent")
         assert report.overall_passed is False
         assert any(f.category == "mock_artifact" for f in report.findings)
 
     def test_empty_text_returns_clean_report(self):
-        report = scan_text_only("", "empty-cap")
+        report = scan("", "empty-cap", "agent")
         assert report.findings == []
         assert report.overall_passed is True

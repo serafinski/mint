@@ -56,7 +56,9 @@ class TestOptimizerState:
 class TestKLDivergence:
     def test_empty_distributions(self):
         assert _compute_kl_divergence({}, {}) == 0.0
-        assert _compute_kl_divergence({"a": 1.0}, {}) == 0.0
+        # prev non-empty, curr empty → catastrophic (all pruned) → inf
+        assert _compute_kl_divergence({"a": 1.0}, {}) == float("inf")
+        # prev empty, curr non-empty → first cycle, no comparison → 0.0
         assert _compute_kl_divergence({}, {"a": 1.0}) == 0.0
 
     def test_identical_distributions(self):

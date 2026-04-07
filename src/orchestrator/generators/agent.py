@@ -48,8 +48,8 @@ class AgentGenerationResult(BaseModel):
     system_prompt: str = Field(..., description="Markdown system prompt for the agent")
     node_name: str = Field(..., description="Snake_case LangGraph node function name")
     model: str = Field(
-        default="deepseek:deepseek-chat",
-        description="LLM model identifier",
+        default="",
+        description="LLM model identifier (empty = system default)",
     )
     tools: list[str] = Field(default_factory=list, description="Tool names the agent needs")
     description: str = Field(..., description="One-sentence summary of what the agent does")
@@ -83,7 +83,9 @@ def _get_llm():
             if _agent_gen_llm is None:
                 from langchain.chat_models import init_chat_model
 
-                _agent_gen_llm = init_chat_model("deepseek:deepseek-chat", request_timeout=300)
+                from src.config import DEFAULT_LLM_MODEL
+
+                _agent_gen_llm = init_chat_model(DEFAULT_LLM_MODEL, request_timeout=300)
     return _agent_gen_llm
 
 
@@ -178,11 +180,14 @@ def _generate_single_agent(
     llm = _get_llm()
     structured_llm = llm.with_structured_output(AgentGenerationResult)
 
+    from src.config import DEFAULT_LLM_MODEL
+
     prompt = AGENT_GENERATOR_PROMPT.format(
         description=gap.description,
         query=gap.query,
         task_context=task_context,
         forced_name=forced_name,
+        model_default=DEFAULT_LLM_MODEL,
     )
 
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
@@ -261,25 +266,35 @@ def _generate_single_agent(
     }
 
     if result.is_deep_agent and result.skill_content:
+        # Rewrite the frontmatter name to forced_name so the directory name
+        # matches the SKILL.md name field (DeepAgents expects these to match).
+        if result.agent_name != forced_name:
+            result.skill_content = re.sub(
+                r"(?m)^(name:\s*).+$",
+                rf"\g<1>{forced_name}",
+                result.skill_content,
+                count=1,
+            )
+
         agent_config["skill_content"] = result.skill_content
-        # Write the DeepAgent skill to disk so the DeepAgents runtime can load it
-        skill_dir = (output_dir or SKILLS_OUTPUT_DIR) / result.agent_name
+        # Write the DeepAgent skill to disk so the DeepAgents runtime can load it.
+        skill_dir = (output_dir or SKILLS_OUTPUT_DIR) / forced_name
         try:
             skill_dir.mkdir(parents=True, exist_ok=True)
             (skill_dir / "SKILL.md").write_text(result.skill_content)
         except OSError as exc:
             error_msg = (
-                f"Failed to write DeepAgent skill '{result.agent_name}' to disk: {exc}"
+                f"Failed to write DeepAgent skill '{forced_name}' to disk: {exc}"
             )
             logger.error(error_msg)
             return None, error_msg
-        logger.info("Wrote DeepAgent skill '%s' to %s", result.agent_name, skill_dir)
+        logger.info("Wrote DeepAgent skill '%s' to %s", forced_name, skill_dir)
 
-    # Override whatever name the LLM chose with the deterministic slug
+    # Use deterministic slug for the artifact metadata and disk path.
     if result.agent_name != forced_name:
         logger.debug(
-            "Overriding LLM agent name '%s' with stable slug '%s'",
-            result.agent_name, forced_name,
+            "Artifact metadata uses stable slug '%s' (LLM chose '%s'; disk file unchanged)",
+            forced_name, result.agent_name,
         )
 
     artifact = GeneratedArtifact(
@@ -338,12 +353,20 @@ def generate_agent(
                 gap = futures[future]
                 raw_results.append((None, f"Generation failed for agent {gap.query!r}: {exc}"))
 
+    failed_queries: list[str] = []
     for artifact, error in raw_results:
         if artifact is not None:
             artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
         if error is not None:
             errors.append(error)
+            failed_queries.append(error[:80])
+
+    if failed_queries:
+        logger.warning(
+            "generate_agent: %d/%d gaps failed generation: %s",
+            len(failed_queries), len(gaps_to_generate), failed_queries,
+        )
 
     return Command(
         update={

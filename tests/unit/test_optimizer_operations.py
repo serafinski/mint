@@ -290,8 +290,8 @@ class TestSplit:
         assert mock_structured.invoke.call_count == 2
 
     @patch("src.optimizer.operations.init_chat_model")
-    def test_split_skips_variant_if_name_already_exists(self, mock_init):
-        """split(): if a variant name already exists in the registry, it is skipped."""
+    def test_split_aborts_if_any_variant_name_collides(self, mock_init):
+        """split(): if any variant name already exists, abort entirely (all-or-nothing)."""
         cap = _make_cap("data-workflow", cap_type=CapabilityType.SKILL, domain="data", tags=["etl"])
 
         existing = _make_cap("data-workflow-small", cap_type=CapabilityType.SKILL)
@@ -319,13 +319,12 @@ class TestSplit:
             ],
         )
 
-        result = split(registry, store, "data-workflow")
+        with pytest.raises(ValueError, match="already exists in registry"):
+            split(registry, store, "data-workflow")
 
-        # Only the non-colliding variant is registered
-        assert result == ["data-workflow-large"]
-        assert registry.add.call_count == 1
-        # Parent deactivated because at least one variant was added
-        registry.deactivate.assert_called_once_with("data-workflow")
+        # All-or-nothing: no variants registered, parent not deactivated
+        assert registry.add.call_count == 0
+        registry.deactivate.assert_not_called()
 
     @patch("src.optimizer.operations.init_chat_model")
     def test_split_does_not_deactivate_parent_when_all_variants_collide(self, mock_init):
@@ -354,9 +353,9 @@ class TestSplit:
             ],
         )
 
-        result = split(registry, store, "data-workflow")
+        with pytest.raises(ValueError, match="already exists in registry"):
+            split(registry, store, "data-workflow")
 
-        assert result == []
         registry.add.assert_not_called()
         registry.deactivate.assert_not_called()
 

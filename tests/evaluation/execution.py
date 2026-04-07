@@ -25,13 +25,33 @@ logger = logging.getLogger(__name__)
 # Timeouts (seconds) — matching CLAUDE.md operational boundaries
 # ---------------------------------------------------------------------------
 
-SKILL_EXECUTION_TIMEOUT_S = 120
-AGENT_EXECUTION_TIMEOUT_S = 180
+SKILL_EXECUTION_TIMEOUT_S = 240
+AGENT_EXECUTION_TIMEOUT_S = 300
 _RECURSION_LIMIT = 50
 
 # ---------------------------------------------------------------------------
 # Response models (harness-internal, not pipeline state)
 # ---------------------------------------------------------------------------
+
+
+class T04Result(BaseModel):
+    product_count: int
+    items_below_threshold: int
+    total_reorder_cost: float
+
+
+class T08Result(BaseModel):
+    n_rows: int
+    n_columns: int
+    quality_issues_found: int
+    issue_categories: list[str] = []
+
+
+class T10Result(BaseModel):
+    n_weeks: int
+    trend_direction: str
+    has_seasonality: bool = False
+    forecast: list[float] = []
 
 
 class T11Result(BaseModel):
@@ -52,15 +72,48 @@ class T13Result(BaseModel):
     metrics_analyzed: int
 
 
+class T14Result(BaseModel):
+    department_count: int
+    department_spending: dict[str, float]
+    over_budget_count: int
+    flagged_transactions: int
+
+
+class T15Result(BaseModel):
+    n_days: int
+    metrics_aggregated: int
+    alert_days: int
+
+
+class T16Result(BaseModel):
+    root_cause_metric: str
+    cascade_chain: list[str]
+    n_metrics_investigated: int
+
+
+class T17Result(BaseModel):
+    total_alerts: int
+    high_severity_alerts: int
+    fraud_customer_ids: list
+
+
 class GenericResult(BaseModel):
     """Fallback for tasks without a dedicated response model."""
+    model_config = {"extra": "allow"}
     result: dict = {}
 
 
 TASK_RESULT_MODELS: dict[str, type[BaseModel]] = {
+    "T04": T04Result,
+    "T08": T08Result,
+    "T10": T10Result,
     "T11": T11Result,
     "T12": T12Result,
     "T13": T13Result,
+    "T14": T14Result,
+    "T15": T15Result,
+    "T16": T16Result,
+    "T17": T17Result,
 }
 
 
@@ -94,8 +147,8 @@ def _format_fixture_message(fixture_contents: dict[str, str]) -> str:
 # ---------------------------------------------------------------------------
 
 _SKILL_SYSTEM_PREAMBLE = """\
-You are a skill executor for a data analytics pipeline. You receive input data
-files and must process them according to the skill instructions below.
+You are a skill executor. You receive input data files and must process them
+according to the skill instructions below.
 
 Use the sandbox_execute tool to run Python code for any computation. When using
 sandbox_execute, write the data files to /tmp/ inside the sandbox first, then
@@ -132,6 +185,7 @@ def _execute_skill_inner(
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
 
+    from src.config import DEFAULT_LLM_MODEL
     from src.verification.sandbox_tool import sandbox_execute
 
     skill_content = getattr(artifact, "skill_content", None) or ""
@@ -140,7 +194,7 @@ def _execute_skill_inner(
     result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
 
     agent = create_deep_agent(
-        model=init_chat_model("openai:gpt-5-mini"),
+        model=init_chat_model(DEFAULT_LLM_MODEL),
         tools=[sandbox_execute],
         system_prompt=system_prompt,
         response_format=result_model,
@@ -156,8 +210,8 @@ def _execute_skill_inner(
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
         config["callbacks"] = [LangFuseCallbackHandler()]
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
@@ -230,6 +284,7 @@ def _execute_agent_inner(
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
 
+    from src.config import DEFAULT_LLM_MODEL
     from src.verification.sandbox_tool import sandbox_execute
 
     # Extract system prompt from agent_config
@@ -246,7 +301,7 @@ def _execute_agent_inner(
     result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
 
     agent = create_deep_agent(
-        model=init_chat_model("openai:gpt-5-mini"),
+        model=init_chat_model(DEFAULT_LLM_MODEL),
         tools=[sandbox_execute],
         system_prompt=system_prompt,
         response_format=result_model,
@@ -262,8 +317,8 @@ def _execute_agent_inner(
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
         config["callbacks"] = [LangFuseCallbackHandler()]
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:

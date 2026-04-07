@@ -40,7 +40,9 @@ def _get_llm():
     if _classifier_llm is None:
         from langchain.chat_models import init_chat_model
 
-        _classifier_llm = init_chat_model("deepseek:deepseek-chat", temperature=0, request_timeout=300)
+        from src.config import DEFAULT_LLM_MODEL
+
+        _classifier_llm = init_chat_model(DEFAULT_LLM_MODEL, temperature=0, request_timeout=300)
     return _classifier_llm
 
 
@@ -49,7 +51,9 @@ def _get_llm():
 # ---------------------------------------------------------------------------
 
 
-def classify_gap(gap: GapItem, *, total_gaps: int = 1) -> ClassifiedGap:
+def classify_gap(
+    gap: GapItem, *, total_gaps: int = 1, task_context: str = ""
+) -> ClassifiedGap:
     """Classify a single gap into a ``CapabilityType``.
 
     Uses a single LLM call at ``temperature=0`` with structured output.
@@ -61,6 +65,7 @@ def classify_gap(gap: GapItem, *, total_gaps: int = 1) -> ClassifiedGap:
             task.  Passed to the prompt so the LLM knows whether the task
             was decomposed into a single capability (strong MCP_TOOL signal)
             or many (more room for SKILL/AGENT).
+        task_context: Original task description for domain context.
     """
     llm = _get_llm()
     structured_llm = llm.with_structured_output(ClassificationResult)
@@ -69,6 +74,7 @@ def classify_gap(gap: GapItem, *, total_gaps: int = 1) -> ClassifiedGap:
         description=gap.description,
         query=gap.query,
         total_gaps=total_gaps,
+        task_context=task_context[:300] if task_context else "(not provided)",
     )
 
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
@@ -122,7 +128,9 @@ def classifier_node(
 
     total_gaps = len(state.gaps)
     for gap in state.gaps:
-        result = classify_gap(gap, total_gaps=total_gaps)
+        result = classify_gap(
+            gap, total_gaps=total_gaps, task_context=state.task_description
+        )
         classified.append(result)
         # Detect the LLM-failure fallback and surface it in state.errors so
         # downstream nodes and operators can observe classification failures.

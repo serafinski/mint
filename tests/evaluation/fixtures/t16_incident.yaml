@@ -1,0 +1,7 @@
+affected_service: api-gateway
+onset_time: '2024-07-01 05:00:00'
+symptoms:
+- Elevated error rates observed
+- Increased request queue depth
+- User-reported slow response times
+title: Service degradation detected

@@ -3,11 +3,12 @@
 Generates edge-case test inputs, executes them in the Docker sandbox,
 and detects behavioral contamination. No LLM calls — pure Python.
 
-Four test categories:
+Five test categories:
   - Nonexistent entity: empty / missing / invalid inputs
   - Consistency: same input twice must produce same output
   - Boundary: min/max values, zero, negative, empty strings
   - Latency: execution must complete within a reasonable bound
+  - Output variation: different inputs should produce different outputs
 """
 
 import ast
@@ -46,7 +47,7 @@ def extract_parameter_schema(source_code: str) -> dict[str, dict]:
         if node.name.startswith("_"):
             continue
         schema: dict[str, dict] = {}
-        for arg in node.args.args:
+        for arg in (*node.args.args, *node.args.kwonlyargs):
             annotation = arg.annotation
             if isinstance(annotation, ast.Subscript):
                 # Annotated[X, ...] -> extract the first type argument
@@ -129,6 +130,10 @@ def _generate_large_inputs(schema: dict[str, dict]) -> dict[str, Any]:
             inputs[name] = 1e12
         elif type_str == "str":
             inputs[name] = "a" * 10_000
+        elif type_str == "list":
+            inputs[name] = list(range(1000))
+        elif type_str == "dict":
+            inputs[name] = {f"key_{i}": i for i in range(100)}
         else:
             inputs[name] = ""
     return inputs
@@ -210,6 +215,7 @@ def _test_parameterless_smoke(source_code: str, func_name: str, _sandbox=sandbox
                     f"Parameterless tool returned non-empty output: {result_val!r} — "
                     "may be returning hardcoded/canned data"
                 ),
+                location="parameterless_smoke",
             )
         ]
     return []
@@ -243,25 +249,42 @@ def _test_output_variation(
     parsed_a = _parse_sandbox_output(result_a)
     parsed_b = _parse_sandbox_output(result_b)
 
-    if (
-        parsed_a is not None
-        and parsed_b is not None
-        and parsed_a.get("error") is None
-        and parsed_b.get("error") is None
-        and parsed_a.get("result") == parsed_b.get("result")
-        and parsed_a.get("result") not in _TRIVIAL_RESULTS
-    ):
-        findings.append(
-            VerificationFinding(
-                tier=2,
-                category="output_variation",
-                severity=Severity.MEDIUM,
-                message=(
-                    f"Tool returned identical output for very different inputs: "
-                    f"{parsed_a.get('result')!r} — may be ignoring parameters"
-                ),
+    if parsed_a is not None and parsed_b is not None:
+        err_a = parsed_a.get("error")
+        err_b = parsed_b.get("error")
+
+        # Flag when one input succeeds and the other crashes
+        if (err_a is None) != (err_b is None):
+            findings.append(
+                VerificationFinding(
+                    tier=2,
+                    category="output_variation",
+                    severity=Severity.MEDIUM,
+                    message=(
+                        "Tool succeeds for one input but crashes for another — "
+                        "may not handle diverse inputs robustly"
+                    ),
+                    location="output_variation",
+                )
             )
-        )
+        elif (
+            err_a is None
+            and err_b is None
+            and parsed_a.get("result") == parsed_b.get("result")
+            and parsed_a.get("result") not in _TRIVIAL_RESULTS
+        ):
+            findings.append(
+                VerificationFinding(
+                    tier=2,
+                    category="output_variation",
+                    severity=Severity.MEDIUM,
+                    message=(
+                        f"Tool returned identical output for very different inputs: "
+                        f"{parsed_a.get('result')!r} — may be ignoring parameters"
+                    ),
+                    location="output_variation",
+                )
+            )
 
     return findings
 
@@ -281,9 +304,22 @@ def _test_nonexistent_entity(
 
     parsed = _parse_sandbox_output(result)
     if parsed is None and not result.get("success"):
-        # The tool crashed outright — that's acceptable for invalid input.
-        # But if it returned success=True with no output, that's suspicious.
+        # The tool crashed outright — acceptable for invalid input.
         pass
+    elif parsed is None and result.get("success"):
+        # Sandbox returned success (exit 0) but output is unparseable — suspicious.
+        findings.append(
+            VerificationFinding(
+                tier=2,
+                category="nonexistent_entity",
+                severity=Severity.MEDIUM,
+                message=(
+                    "Sandbox succeeded but produced unparseable output for "
+                    "nonexistent entity inputs — tool may be silently failing"
+                ),
+                location="nonexistent_entity",
+            )
+        )
     elif parsed and parsed.get("error") is None and parsed.get("result") in ("None", "''", '""'):
         findings.append(
             VerificationFinding(
@@ -294,6 +330,7 @@ def _test_nonexistent_entity(
                     "Tool returned empty/None for nonexistent entity inputs "
                     "without raising an error — may silently swallow invalid input"
                 ),
+                location="nonexistent_entity",
             )
         )
 
@@ -317,7 +354,17 @@ def _test_consistency(
     parsed1 = _parse_sandbox_output(result1)
     parsed2 = _parse_sandbox_output(result2)
 
-    if parsed1 is not None and parsed2 is not None:
+    if parsed1 is None or parsed2 is None:
+        # At least one sandbox run timed out or failed to produce output
+        findings.append(
+            VerificationFinding(
+                tier=2,
+                category="consistency",
+                severity=Severity.INFO,
+                message="Consistency test inconclusive: sandbox timed out or produced no output",
+            )
+        )
+    else:
         # Compare result values (not elapsed time)
         if parsed1.get("result") != parsed2.get("result"):
             findings.append(
@@ -329,6 +376,7 @@ def _test_consistency(
                         "Tool returned different results for identical inputs: "
                         f"run1={parsed1.get('result')!r} vs run2={parsed2.get('result')!r}"
                     ),
+                    location="consistency",
                 )
             )
         if parsed1.get("error") != parsed2.get("error"):
@@ -341,6 +389,7 @@ def _test_consistency(
                         "Tool raised different errors for identical inputs: "
                         f"run1={parsed1.get('error')!r} vs run2={parsed2.get('error')!r}"
                     ),
+                    location="consistency",
                 )
             )
 
@@ -365,15 +414,28 @@ def _test_boundary(
         code = _build_sandbox_code(source_code, func_name, inputs)
         result = _sandbox(code, timeout=15)
 
-        if not result.get("success") and "Timeout" in result.get("stderr", ""):
-            findings.append(
-                VerificationFinding(
-                    tier=2,
-                    category="boundary",
-                    severity=Severity.HIGH,
-                    message=f"Tool timed out on {label} boundary inputs: {inputs}",
+        if not result.get("success"):
+            stderr = result.get("stderr", "")
+            if "Timeout" in stderr or "timed out" in stderr.lower() or "killed" in stderr.lower():
+                findings.append(
+                    VerificationFinding(
+                        tier=2,
+                        category="boundary",
+                        severity=Severity.HIGH,
+                        message=f"Tool timed out on {label} boundary inputs: {inputs}",
+                        location=f"boundary/{label}",
+                    )
                 )
-            )
+            else:
+                findings.append(
+                    VerificationFinding(
+                        tier=2,
+                        category="boundary",
+                        severity=Severity.MEDIUM,
+                        message=f"Tool crashed on {label} boundary inputs: {stderr[:200] or '(no stderr)'}",
+                        location=f"boundary/{label}",
+                    )
+                )
 
     return findings
 
@@ -404,6 +466,7 @@ def _test_latency(
                 category="latency",
                 severity=Severity.MEDIUM,
                 message=f"Tool execution took {elapsed:.2f}s (threshold: {LATENCY_THRESHOLD_S}s)",
+                location="latency",
             )
         )
 
@@ -416,7 +479,11 @@ def _test_latency(
 
 
 def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
-    """Run all four behavioral test categories on an artifact.
+    """Run all five behavioral test categories on an MCP_TOOL artifact.
+
+    Categories: nonexistent entity, consistency, boundary, latency,
+    and output variation.  SKILL/AGENT artifacts have no ``source_code``
+    and are skipped with an INFO finding.
 
     Returns a list of ``VerificationFinding`` objects (tier=2).
     """

@@ -17,12 +17,9 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-SANDBOX_IMAGE = "jit-sandbox"
+from src.config import DOCKER_PREINSTALLED, SANDBOX_IMAGE
 
-# Packages that never need pip install: Python stdlib (resolved programmatically)
-# plus the minimal set pre-installed in the sandbox Dockerfile (mcp, pydantic).
-_DOCKER_PREINSTALLED = frozenset({"mcp", "pydantic"})
-_BASE_PACKAGES = frozenset(sys.stdlib_module_names) | _DOCKER_PREINSTALLED
+_BASE_PACKAGES = frozenset(sys.stdlib_module_names) | DOCKER_PREINSTALLED
 
 # Session-level cache: avoids repeated LLM calls for the same import names.
 _pip_resolution_cache: dict[str, str] = {}
@@ -47,14 +44,16 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
     Results are cached in ``_pip_resolution_cache`` for the session.
     Falls back to identity mapping (import name = pip name) on any error.
     """
-    # Check cache first — only query uncached imports.
+    # Check cache — only query uncached imports.
     uncached = [name for name in import_names if name not in _pip_resolution_cache]
     if not uncached:
         return {name: _pip_resolution_cache[name] for name in import_names}
 
     try:
-        llm = init_chat_model("deepseek-chat", temperature=0)
-        structured_llm = llm.with_structured_output(_PackageMapping)
+        from src.config import DEFAULT_LLM_MODEL
+
+        llm = init_chat_model(DEFAULT_LLM_MODEL, temperature=0)
+        structured_llm = llm.with_structured_output(_PackageMapping, method="function_calling")
 
         prompt = (
             "Map each Python import name to its correct PyPI package name "
@@ -73,7 +72,11 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
             _pip_resolution_cache[name] = pip_name
 
     except Exception as exc:
-        logger.warning("LLM package resolution failed (%s), falling back to identity mapping", exc)
+        logger.warning(
+            "LLM package resolution failed for imports %s: %s. "
+            "Falling back to identity mapping (import name = pip name).",
+            list(uncached), exc,
+        )
         for name in uncached:
             _pip_resolution_cache[name] = name
 
@@ -190,6 +193,15 @@ def _sandbox_execute_with_install(
 
     ephemeral_tag = f"jit-sandbox-eph-{uuid.uuid4().hex[:8]}"
 
+    # Validate package names: only allow alphanumeric, hyphens, underscores,
+    # dots, and version specifiers. Reject anything that looks suspicious.
+    import re as _re
+
+    _VALID_PKG = _re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?([<>=!~]+[A-Za-z0-9.*]+)?$")
+    packages = [p for p in packages if _VALID_PKG.match(p)]
+    if not packages:
+        return sandbox_execute(code, timeout=timeout)
+
     # Phase 1: install packages (with network, 60s timeout)
     pip_args = ", ".join(repr(p) for p in packages)
     install_script = (
@@ -253,6 +265,7 @@ def _sandbox_execute_with_install(
                 "--network", "none",
                 "--memory", "128m",
                 "--cpus", "0.5",
+                "--user", "sandbox",
                 "-v", f"{script_path}:/sandbox/script.py:ro",
                 ephemeral_tag,
                 "/sandbox/script.py",

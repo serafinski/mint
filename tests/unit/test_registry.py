@@ -493,7 +493,9 @@ def test_detect_gaps_treats_deactivated_capability_as_gap(registry):
 
     assert len(matches) == 0
     assert len(gaps) == 1
-    assert "deactivated" in gaps[0][1]
+    # Deactivated caps are now filtered from search results (M6 fix),
+    # so the gap reason is a generic low-score message, not "deactivated"
+    assert gaps[0][1]  # reason is non-empty
 
 
 def test_detect_gaps_active_capability_still_matches(registry):

@@ -6,6 +6,7 @@ import hashlib
 import re
 
 from src.schemas.task import TaskState
+from src.schemas.verification import Severity
 
 
 def slugify_gap(query: str) -> str:
@@ -47,8 +48,7 @@ def build_task_context(state: TaskState) -> str:
     feedback_lines: list[str] = []
     for report in failed_reports:
         for finding in report.findings:
-            # Severity is a StrEnum — direct string comparison works
-            if finding.severity in ("critical", "high"):
+            if finding.severity in (Severity.CRITICAL, Severity.HIGH):
                 feedback_lines.append(
                     f"- [{report.capability_name}] {finding.category}"
                     f" ({finding.severity}): {finding.message}"

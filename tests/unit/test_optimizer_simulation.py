@@ -263,7 +263,7 @@ class TestComputeUtility:
         config = SimConfig(n_capabilities=5, seed=99)
         generate_synthetic_registry(config, fresh_registry, fresh_metrics)
         caps = fresh_registry.list_all(is_active=None)
-        score = _compute_utility(fresh_metrics, caps[0].name)
+        score = _compute_utility(caps[0].name, fresh_metrics)
         assert isinstance(score, float)
 
 

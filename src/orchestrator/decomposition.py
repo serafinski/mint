@@ -5,7 +5,7 @@ The agent uses ``write_todos`` for planning and ``response_format`` for
 structured subtask output.
 
 Operational boundaries (from CLAUDE.md):
-- ``recursion_limit=35`` (max steps)
+- ``recursion_limit=50`` (max steps)
 - Node-level timeout: 120 s
 - Graph is a stateless CompiledStateGraph; state is fresh per ``.invoke()`` call
 - On timeout / error: return partial results with error flag
@@ -56,8 +56,10 @@ def _get_agent():
     No state carried between calls").  ``create_deep_agent()`` compiles a
     LangGraph graph without making any API calls, so the overhead is minimal.
     """
+    from src.config import DEFAULT_LLM_MODEL
+
     return create_deep_agent(
-        model="openai:gpt-5-mini",
+        model=DEFAULT_LLM_MODEL,
         system_prompt=DECOMPOSITION_SYSTEM_PROMPT,
         response_format=DecompositionResult,
         name="task-decomposer",
@@ -74,7 +76,7 @@ def decomposition_node(
 ) -> Command[Literal["gap_detection"]]:
     """Decompose a task into subtasks using a DeepAgent.
 
-    The agent is invoked with a 120 s timeout and a recursion limit of 35.
+    The agent is invoked with a 120 s timeout and a recursion limit of 50.
     On timeout or error the node returns partial results (empty subtasks)
     with the error recorded in ``state.errors``.
     """
@@ -84,7 +86,8 @@ def decomposition_node(
     try:
         langfuse_handler = LangFuseCallbackHandler()
         callbacks = [langfuse_handler]
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
         callbacks = []
 
     config = {
@@ -200,9 +203,12 @@ def decomposition_node(
         )
         required_caps = required_caps[:MAX_CAPS_HARD]
 
-    # Fallback: if no subtasks were produced, treat the whole task as one subtask
+    # Fallback: if no subtasks were produced, use the first sentence of the task
+    # description as a capability query (the full description is too long for
+    # effective semantic search in the registry).
     if not subtasks:
-        required_caps = [state.task_description]
+        first_sentence = state.task_description.split(".")[0].strip()
+        required_caps = [first_sentence[:200] if first_sentence else state.task_description[:200]]
 
     return Command(
         update={

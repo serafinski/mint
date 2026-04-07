@@ -272,7 +272,7 @@ class TestExtractResult:
         result = _extract_result(state, T07, loader)
         assert result["gate_passed"] is True
         assert result["output_in_range"] is False
-        assert result["failure_reason"] == "output_rejected"
+        assert result["failure_reason"] == "no_source_code"
 
     def test_registry_match_execution_failure_does_not_raise(self):
         """Registry match execution fails → gate passes, output not validated."""
@@ -306,7 +306,7 @@ class TestRunPilot:
         mock_registry_cls.return_value = mock_registry
 
         harness = EvaluationHarness(config)
-        records = harness.run_pilot([T04])  # T04 has no static coverage → immediate failure
+        records = harness.run_pilot([T04])  # T04 uses JIT pipeline (full condition)
 
         assert len(records) == 1
         assert records[0].is_pilot is True

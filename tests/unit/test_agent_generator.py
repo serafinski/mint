@@ -42,7 +42,7 @@ def _valid_plain_result() -> AgentGenerationResult:
         agent_name="data-quality-monitor",
         system_prompt="# Data Quality Monitor\n\nYou monitor data quality.",
         node_name="data_quality_monitor_node",
-        model="deepseek:deepseek-chat",
+        model="openai:gpt-5-mini",
         tools=["read_dataset", "compute_statistics"],
         description="Monitors data quality metrics and flags anomalies.",
         is_deep_agent=False,
@@ -56,7 +56,7 @@ def _valid_deep_agent_result() -> AgentGenerationResult:
         agent_name="test-investigator",
         system_prompt="# Test Investigator\n\nYou investigate failures.",
         node_name="test_investigator_node",
-        model="deepseek:deepseek-chat",
+        model="openai:gpt-5-mini",
         tools=["read_logs", "inspect_stage"],
         description="Investigates failures through multi-step analysis.",
         is_deep_agent=True,
@@ -327,7 +327,7 @@ class TestGenerateAgentNode:
             capability_type=CapabilityType.AGENT,
             agent_config={
                 "system_prompt": "# Monitor",
-                "node_config": {"name": "monitor_node", "model": "deepseek:deepseek-chat",
+                "node_config": {"name": "monitor_node", "model": "openai:gpt-5-mini",
                                 "tools": [], "description": "Monitors data quality."},
                 "is_deep_agent": False,
             },
@@ -374,7 +374,7 @@ class TestGenerateAgentNode:
             capability_type=CapabilityType.AGENT,
             agent_config={
                 "system_prompt": "# Monitor",
-                "node_config": {"name": "monitor_node", "model": "deepseek:deepseek-chat",
+                "node_config": {"name": "monitor_node", "model": "openai:gpt-5-mini",
                                 "tools": [], "description": "Monitors data quality."},
                 "is_deep_agent": False,
             },
@@ -417,7 +417,7 @@ class TestGenerateAgentNode:
             agent_name="test-deep-agent",
             system_prompt="You are a test deep agent.",
             node_name="test_deep_agent",
-            model="deepseek:deepseek-chat",
+            model="openai:gpt-5-mini",
             tools=[],
             description="A test deep agent.",
             is_deep_agent=True,
@@ -432,8 +432,12 @@ class TestGenerateAgentNode:
             def with_structured_output(self, schema):
                 return MockStructuredLLM()
 
-        # Block the target directory by creating a FILE at that path
-        blocker = tmp_path / "test-deep-agent"
+        # Block the target directory by creating a FILE at the forced_name path
+        # (the generator uses forced_name, not result.agent_name, for the directory).
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+
+        forced_name = slugify_gap_hyphen(gap.query)
+        blocker = tmp_path / forced_name
         blocker.write_text("not a directory")
 
         with (
@@ -472,7 +476,7 @@ class TestGenerateSingleAgent:
         agent_name="InvalidName",
         system_prompt="You are a monitor agent.",
         node_name="monitor_node",
-        model="deepseek:deepseek-chat",
+        model="openai:gpt-5-mini",
         tools=[],
         description="Monitors data quality.",
         is_deep_agent=False,
@@ -482,7 +486,7 @@ class TestGenerateSingleAgent:
         agent_name="data-quality-monitor",
         system_prompt="You are a data quality monitor.",
         node_name="data_quality_monitor_node",
-        model="deepseek:deepseek-chat",
+        model="openai:gpt-5-mini",
         tools=[],
         description="Monitors data quality metrics.",
         is_deep_agent=False,
@@ -650,7 +654,7 @@ class TestGenerateSingleAgent:
             agent_name="test-investigator",
             system_prompt="You investigate failures.",
             node_name="test_investigator_node",
-            model="deepseek:deepseek-chat",
+            model="openai:gpt-5-mini",
             tools=[],
             description="Investigates failures.",
             is_deep_agent=True,
@@ -670,6 +674,14 @@ class TestGenerateSingleAgent:
         assert artifact.agent_config["is_deep_agent"] is True
         assert "skill_content" in artifact.agent_config
 
-        skill_path = tmp_path / "test-investigator" / "SKILL.md"
+        # Skill is written under forced_name (deterministic slug with hash),
+        # not result.agent_name.
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+
+        forced_name = slugify_gap_hyphen(self._gap().query)
+        skill_path = tmp_path / forced_name / "SKILL.md"
         assert skill_path.exists(), f"SKILL.md not found at {skill_path}"
-        assert skill_path.read_text() == VALID_SKILL_CONTENT
+        # The frontmatter name is rewritten to forced_name so directory and
+        # SKILL.md name field match (DeepAgents requires this).
+        written = skill_path.read_text()
+        assert f"name: {forced_name}" in written

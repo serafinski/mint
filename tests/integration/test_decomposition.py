@@ -1,12 +1,12 @@
 """Integration tests for the task decomposition DeepAgent.
 
-These tests invoke the real DeepAgent with a live LLM API call.
-They verify that:
+These tests invoke the real DeepAgent with a live LLM API call
+(openai:gpt-5-mini).  They verify that:
 - ``write_todos`` planning is used by the agent
 - ``response_format`` returns structured subtasks via ``structured_response``
 - The node-level timeout and recursion limit are respected
 
-Requires DEEPSEEK_API_KEY environment variable to be set.
+Requires OPENAI_API_KEY environment variable to be set.
 """
 
 from __future__ import annotations
@@ -22,11 +22,11 @@ from src.orchestrator.decomposition import (
 from src.orchestrator.prompts.decomposition import DECOMPOSITION_SYSTEM_PROMPT
 from src.schemas.task import DecompositionResult, TaskState, TaskStatus
 
-_has_api_key = bool(os.environ.get("DEEPSEEK_API_KEY"))
+_has_api_key = bool(os.environ.get("OPENAI_API_KEY"))
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not _has_api_key, reason="DEEPSEEK_API_KEY not set"),
+    pytest.mark.skipif(not _has_api_key, reason="OPENAI_API_KEY not set"),
 ]
 
 
@@ -72,7 +72,7 @@ class TestDecompositionIntegration:
         from deepagents import create_deep_agent
 
         agent = create_deep_agent(
-            model="deepseek:deepseek-chat",
+            model="openai:gpt-5-mini",
             system_prompt=DECOMPOSITION_SYSTEM_PROMPT,
             response_format=DecompositionResult,
             name="test-decomposer",

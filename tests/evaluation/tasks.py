@@ -14,7 +14,7 @@ Reuse clusters
 CSV cluster  : T01, T04, T05, T07  (tabular ingestion variants)
 Analytics    : T08, T09             (T09 can reuse T08's cleaned output)
 
-Pilot tasks: T01 (seeded retrieval), T07 (moderate JIT), T10 (complex JIT).
+Pilot tasks: T01 (seeded retrieval), T07 (moderate JIT), T05 (moderate JIT, static coverage).
 """
 
 from __future__ import annotations
@@ -169,37 +169,54 @@ T03 = TaskDefinition(
 )
 
 # ---------------------------------------------------------------------------
-# T04 — Pipe-delimited CSV (JIT)
+# T04 — Inventory reorder pipeline (targets SKILL)
 # ---------------------------------------------------------------------------
 
 _t04_ev = _EV["T04"]
 
 
 def _validate_t04(output: dict) -> bool:
-    """row_count == expected AND delimiter detected as '|' AND no parse errors."""
+    """product_count matches AND items_below_threshold within ±2 AND cost within ±20%."""
     try:
-        ok_count = int(output.get("row_count", -1)) == _t04_ev["row_count"]
-        ok_delim = output.get("delimiter") == "|"
-        ok_errors = not output.get("parse_errors", False)
-        return ok_count and ok_delim and ok_errors
+        ok_count = int(output.get("product_count", -1)) == _t04_ev["product_count"]
+        actual_below = int(output.get("items_below_threshold", -1))
+        ok_below = abs(actual_below - _t04_ev["items_below_threshold"]) <= 2
+        actual_cost = float(output.get("total_reorder_cost", -1))
+        expected_cost = _t04_ev["total_reorder_cost"]
+        ok_cost = abs(actual_cost - expected_cost) / max(abs(expected_cost), 1) < 0.20
+        return ok_count and ok_below and ok_cost
     except (TypeError, ValueError):
         return False
 
 
 T04 = TaskDefinition(
     task_id="T04",
-    tier="trivial",
-    description="Parse a pipe-delimited CSV with mixed column types",
+    tier="complex",
+    description="Inventory reorder pipeline: check stock levels against rules, compute reorder quantities",
     task_prompt=(
-        "Parse the pipe-delimited file at tests/evaluation/fixtures/t04_pipe_delimited.csv. "
-        "Auto-detect the delimiter. "
-        "Return a dict with keys 'row_count' (int, number of data rows excluding "
-        "the header), 'delimiter' (str), "
-        "and 'parse_errors' (bool, True if any errors occurred)."
+        "Build an inventory reorder pipeline using these two data sources:\n"
+        "1. Inventory CSV at tests/evaluation/fixtures/t04_inventory.csv "
+        "(columns: product_id, product_name, current_stock, daily_usage, unit_cost, warehouse)\n"
+        "2. Reorder rules YAML at tests/evaluation/fixtures/t04_reorder_rules.yaml "
+        "(contains min_days_of_stock threshold, reorder_days_supply multiplier, max_order_value cap)\n\n"
+        "Pipeline stages:\n"
+        "(1) Load both data sources.\n"
+        "(2) For each product, compute days_of_stock = current_stock / daily_usage.\n"
+        "(3) Identify products where days_of_stock < min_days_of_stock (these need reordering).\n"
+        "(4) For each product needing reorder, compute reorder_qty = ceil(daily_usage * reorder_days_supply), "
+        "then order_cost = reorder_qty * unit_cost, capped at max_order_value.\n"
+        "(5) Sum total_reorder_cost across all products needing reorder.\n\n"
+        "Return a dict with keys:\n"
+        "- 'product_count' (int): total number of products\n"
+        "- 'items_below_threshold' (int): number of products needing reorder\n"
+        "- 'total_reorder_cost' (float): sum of capped order costs"
     ),
     has_static_coverage=False,
     static_capability_name=None,
-    fixture_paths=[FIXTURES_DIR / "t04_pipe_delimited.csv"],
+    fixture_paths=[
+        FIXTURES_DIR / "t04_inventory.csv",
+        FIXTURES_DIR / "t04_reorder_rules.yaml",
+    ],
     validator=_validate_t04,
 )
 
@@ -245,17 +262,24 @@ _t06_ev = _EV["T06"]
 
 
 def _validate_t06(output: dict) -> bool:
-    """null_count == 0 AND variance of each column within ±10% of original."""
+    """null_count == 0 AND variance of each column within ±10% of reference.
+
+    Reference variances are post-KNN-imputation (population, ddof=0),
+    computed by the fixture generator using a reference KNN implementation.
+    This accounts for the inherent variance shrinkage of KNN imputation.
+    """
     try:
         if int(output.get("null_count", -1)) != 0:
             return False
         variances = output.get("column_variances", {})
         tol = _t06_ev["variance_tolerance_pct"]
-        for col, orig_var in _t06_ev["original_variances"].items():
+        # Support both old ("original_variances") and new ("expected_variances") keys
+        ref_variances = _t06_ev.get("expected_variances") or _t06_ev.get("original_variances", {})
+        for col, ref_var in ref_variances.items():
             returned = variances.get(col)
             if returned is None:
                 return False
-            if not _within_pct(float(returned), orig_var, tol):
+            if not _within_pct(float(returned), ref_var, tol):
                 return False
         return True
     except (TypeError, ValueError, AttributeError):
@@ -321,45 +345,51 @@ T07 = TaskDefinition(
 )
 
 # ---------------------------------------------------------------------------
-# T08 — Logistic regression (JIT)
+# T08 — Data quality investigation agent (targets AGENT)
 # ---------------------------------------------------------------------------
 
 _t08_ev = _EV["T08"]
 
 
 def _validate_t08(output: dict) -> bool:
-    """accuracy > majority_class_accuracy + 0.05 AND output has required keys."""
+    """quality_issues_found > 0 AND n_rows matches AND n_columns matches."""
     try:
-        if not _check_keys_present(output, ["accuracy", "baseline_accuracy"]):
-            return False
-        accuracy = float(output["accuracy"])
-        threshold = _t08_ev["majority_class_accuracy"] + _t08_ev["accuracy_margin"]
-        return accuracy > threshold
+        actual_issues = int(output.get("quality_issues_found", 0))
+        ok_issues = actual_issues > 0  # agent should find at least some issues
+        ok_rows = int(output.get("n_rows", -1)) == _t08_ev["n_rows"]
+        ok_cols = int(output.get("n_columns", -1)) == _t08_ev["n_columns"]
+        return ok_issues and ok_rows and ok_cols
     except (TypeError, ValueError):
         return False
 
 
 T08 = TaskDefinition(
     task_id="T08",
-    tier="moderate",
-    description="Train logistic regression on pre-cleaned data, return accuracy vs majority baseline",
+    tier="complex",
+    description="Data quality investigation: autonomously profile a messy dataset, identify and categorize issues",
     task_prompt=(
-        "Train a logistic regression classifier on "
-        "tests/evaluation/fixtures/t08_classification.csv "
-        f"(features: {_t08_ev['features']}, label: {_t08_ev['label_column']}). "
-        "Use an 80/20 train/test split. "
-        "Return a dict with keys 'accuracy' (float) and 'baseline_accuracy' "
-        "(float, majority-class baseline on the test set)."
+        "You are investigating data quality issues in a messy employee dataset.\n"
+        "Dataset: tests/evaluation/fixtures/t08_messy_data.csv "
+        "(columns: id, name, age, salary, department, join_date)\n\n"
+        "Your task is to autonomously:\n"
+        "(1) Load and profile the dataset — check shape, dtypes, null counts per column.\n"
+        "(2) Identify quality issues: missing values (nulls/blanks), salary outliers "
+        "(negative or unreasonably high values > $300,000), invalid dates, "
+        "and department name typos/misspellings.\n"
+        "(3) Categorize each issue type and count occurrences.\n"
+        "(4) Decide which issues are most critical based on their frequency and impact.\n\n"
+        "This requires adaptive investigation — the analysis path depends on what "
+        "the initial profiling reveals. Examine the data before deciding what to check.\n\n"
+        "Return a dict with keys:\n"
+        "- 'n_rows' (int): total rows in the dataset\n"
+        "- 'n_columns' (int): total columns\n"
+        "- 'quality_issues_found' (int): total count of all quality issues detected\n"
+        "- 'issue_categories' (list of str): names of issue types found "
+        "(e.g., 'null_ages', 'salary_outliers', 'invalid_dates')"
     ),
     has_static_coverage=False,
     static_capability_name=None,
-    fixture_paths=[FIXTURES_DIR / "t08_classification.csv"],
-    extra_inputs={
-        "features": _t08_ev["features"],
-        "label_column": _t08_ev["label_column"],
-        "test_size": 0.2,
-        "random_state": 42,
-    },
+    fixture_paths=[FIXTURES_DIR / "t08_messy_data.csv"],
     validator=_validate_t08,
 )
 
@@ -385,32 +415,38 @@ T09 = TaskDefinition(
     tier="complex",
     description="Generate structured report: summary section, stats table, and top-5 anomalies",
     task_prompt=(
-        "Generate an analytics report from the data at "
-        "tests/evaluation/fixtures/t09_report_data.json. "
-        "Identify the top 5 revenue anomalies (highest outliers). "
+        "Generate an analytics report from the XML data at "
+        "tests/evaluation/fixtures/t09_report_data.xml. "
+        "The XML has structure: <report><title>, <period start=... end=...>, "
+        "<records> containing <record> elements with <region>, <product>, "
+        "<revenue>, <units>, <returns> child elements. "
+        "Parse the XML, extract the records, and identify the top 5 "
+        "revenue anomalies (highest outliers). "
         "Return a dict with keys 'summary' (str), 'stats_table' (dict or list), "
         "and 'anomalies' (list of exactly 5 items)."
     ),
     has_static_coverage=True,
     static_capability_name="report-generation",
-    fixture_paths=[FIXTURES_DIR / "t09_report_data.json"],
+    fixture_paths=[FIXTURES_DIR / "t09_report_data.xml"],
     validator=_validate_t09,
 )
 
 # ---------------------------------------------------------------------------
-# T10 — Log file parsing (JIT, PILOT task)
+# T10 — Trend detection and forecasting agent (targets AGENT)
 # ---------------------------------------------------------------------------
 
 _t10_ev = _EV["T10"]
 
 
 def _validate_t10(output: dict) -> bool:
-    """len(df) == expected AND timestamps valid AND no null severities."""
+    """trend_direction == 'upward' AND n_weeks matches AND forecast provided."""
     try:
-        ok_count = int(output.get("row_count", -1)) == _t10_ev["expected_log_lines"]
-        ok_ts = bool(output.get("timestamps_valid", False))
-        ok_sev = int(output.get("null_severity_count", -1)) == 0
-        return ok_count and ok_ts and ok_sev
+        ok_trend = output.get("trend_direction", "").lower() in ("upward", "up", "increasing", "positive")
+        ok_weeks = int(output.get("n_weeks", -1)) == _t10_ev["n_weeks"]
+        # Agent should provide some forecast (list of numbers or a summary)
+        forecast = output.get("forecast")
+        ok_forecast = forecast is not None and isinstance(forecast, list)
+        return ok_trend and ok_weeks and ok_forecast
     except (TypeError, ValueError):
         return False
 
@@ -418,18 +454,31 @@ def _validate_t10(output: dict) -> bool:
 T10 = TaskDefinition(
     task_id="T10",
     tier="complex",
-    description="Parse an unstructured server log into a DataFrame with timestamp, severity, message",
+    description="Trend detection and forecasting: analyze weekly sales, detect trend and seasonality, forecast next 4 weeks",
     task_prompt=(
-        "Parse the log file at tests/evaluation/fixtures/t10_server.log. "
-        "Each line has format: 'YYYY-MM-DD HH:MM:SS SEVERITY message'. "
-        "Return a dict with keys 'row_count' (int), 'timestamps_valid' (bool, "
-        "True if all timestamps parsed successfully), and 'null_severity_count' (int)."
+        "You are analyzing weekly sales data to detect trends and make forecasts.\n"
+        "Dataset: tests/evaluation/fixtures/t10_weekly_sales.csv "
+        "(columns: week, sales, promotions, region)\n\n"
+        "Your task is to autonomously:\n"
+        "(1) Load the data and examine the sales column over time.\n"
+        "(2) Detect the overall trend direction (upward, downward, or flat) by "
+        "comparing early weeks to later weeks.\n"
+        "(3) Check for seasonality or cyclical patterns in the data.\n"
+        "(4) Forecast the next 4 weeks of sales using an appropriate method "
+        "(moving average, linear extrapolation, or any method you choose based "
+        "on what the data shows).\n\n"
+        "This requires adaptive analysis — examine the data first, then decide "
+        "which forecasting approach is most appropriate based on the patterns you find.\n\n"
+        "Return a dict with keys:\n"
+        "- 'n_weeks' (int): number of weeks in the input data\n"
+        "- 'trend_direction' (str): 'upward', 'downward', or 'flat'\n"
+        "- 'has_seasonality' (bool): whether cyclical patterns were detected\n"
+        "- 'forecast' (list of float): predicted sales for the next 4 weeks"
     ),
     has_static_coverage=False,
     static_capability_name=None,
-    fixture_paths=[FIXTURES_DIR / "t10_server.log"],
+    fixture_paths=[FIXTURES_DIR / "t10_weekly_sales.csv"],
     validator=_validate_t10,
-    is_pilot=True,  # pilot task
 )
 
 # ---------------------------------------------------------------------------
@@ -465,7 +514,7 @@ T11 = TaskDefinition(
     task_prompt=(
         "Build a data integration pipeline using these three data sources:\n"
         "1. Sales CSV at tests/evaluation/fixtures/t11_sales.csv (columns: order_id, product_id, quantity, unit_price, region)\n"
-        "2. Product catalog JSON at tests/evaluation/fixtures/t11_products.json (fields: product_id, name, category)\n"
+        "2. Product catalog Excel at tests/evaluation/fixtures/t11_products.xlsx (columns: product_id, name, category)\n"
         "3. Regional targets CSV at tests/evaluation/fixtures/t11_targets.csv (columns: region, target_revenue)\n\n"
         "Steps: (1) Join the sales data with the product catalog on product_id to enrich sales records with product names and categories. "
         "(2) Compute per-region revenue totals by summing quantity * unit_price for each region. "
@@ -478,7 +527,7 @@ T11 = TaskDefinition(
     static_capability_name=None,
     fixture_paths=[
         FIXTURES_DIR / "t11_sales.csv",
-        FIXTURES_DIR / "t11_products.json",
+        FIXTURES_DIR / "t11_products.xlsx",
         FIXTURES_DIR / "t11_targets.csv",
     ],
     validator=_validate_t11,
@@ -577,12 +626,310 @@ T13 = TaskDefinition(
 )
 
 # ---------------------------------------------------------------------------
+# T14 — Budget reconciliation pipeline (targets SKILL)
+# ---------------------------------------------------------------------------
+
+_t14_ev = _EV["T14"]
+
+
+def _validate_t14(output: dict) -> bool:
+    """department_count correct AND spending within ±5% AND over_budget_count exact AND flagged_transactions exact."""
+    try:
+        if int(output.get("department_count", -1)) != _t14_ev["department_count"]:
+            return False
+        spending = output.get("department_spending", {})
+        tol = _t14_ev["spending_tolerance_pct"]
+        for dept, expected in _t14_ev["department_spending"].items():
+            actual = spending.get(dept)
+            if actual is None:
+                return False
+            if not _within_pct(float(actual), expected, tol):
+                return False
+        if int(output.get("over_budget_count", -1)) != _t14_ev["over_budget_count"]:
+            return False
+        if int(output.get("flagged_transactions", -1)) != _t14_ev["flagged_transactions"]:
+            return False
+        return True
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+T14 = TaskDefinition(
+    task_id="T14",
+    tier="complex",
+    description="Budget reconciliation pipeline: aggregate spending by department, compare against budgets, apply allocation rules",
+    task_prompt=(
+        "Build a budget reconciliation pipeline using these three data sources:\n"
+        "1. Department budgets CSV at tests/evaluation/fixtures/t14_departments.csv "
+        "(columns: department, annual_budget)\n"
+        "2. Transactions TSV at tests/evaluation/fixtures/t14_transactions.tsv "
+        "(tab-separated, columns: txn_id, department, amount, category, date)\n"
+        "3. Allocation rules JSON at tests/evaluation/fixtures/t14_rules.json "
+        "(contains max_single_transaction threshold and category_caps as fraction of budget)\n\n"
+        "Pipeline stages:\n"
+        "(1) Load all three data sources.\n"
+        "(2) Aggregate total spending per department from the transactions.\n"
+        "(3) Compare each department's total spending against its annual_budget to find over-budget departments.\n"
+        "(4) Flag individual transactions that exceed the max_single_transaction threshold from the rules.\n\n"
+        "Return a dict with keys:\n"
+        "- 'department_count' (int): number of departments\n"
+        "- 'department_spending' (dict): mapping department name to float total spending\n"
+        "- 'over_budget_count' (int): number of departments where spending > annual_budget\n"
+        "- 'flagged_transactions' (int): count of transactions exceeding max_single_transaction"
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[
+        FIXTURES_DIR / "t14_departments.csv",
+        FIXTURES_DIR / "t14_transactions.tsv",
+        FIXTURES_DIR / "t14_rules.json",
+    ],
+    validator=_validate_t14,
+)
+
+# ---------------------------------------------------------------------------
+# T15 — Time-series ETL with configurable aggregation (targets SKILL)
+# ---------------------------------------------------------------------------
+
+_t15_ev = _EV["T15"]
+
+
+def _validate_t15(output: dict) -> bool:
+    """n_days == 7 AND metrics_aggregated == 4 AND alert_days correct."""
+    try:
+        if int(output.get("n_days", -1)) != _t15_ev["n_days"]:
+            return False
+        if int(output.get("metrics_aggregated", -1)) != _t15_ev["metrics_aggregated"]:
+            return False
+        if int(output.get("alert_days", -1)) != _t15_ev["alert_days"]:
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+T15 = TaskDefinition(
+    task_id="T15",
+    tier="complex",
+    description="Time-series ETL pipeline: aggregate hourly metrics to daily per config, detect threshold breaches",
+    task_prompt=(
+        "Build a configurable time-series ETL pipeline using these inputs:\n"
+        "1. Hourly metrics CSV at tests/evaluation/fixtures/t15_hourly_metrics.csv "
+        "(columns: timestamp, cpu_pct, memory_pct, requests_per_sec, error_count)\n"
+        "2. Aggregation config JSON at tests/evaluation/fixtures/t15_agg_config.json\n\n"
+        "The config specifies:\n"
+        "- 'aggregation_interval': 'daily' — group hourly rows by date\n"
+        "- 'metrics': dict mapping each metric name to a list of aggregation functions "
+        "(e.g., 'cpu_pct': ['mean', 'max'] means compute daily mean and daily max of cpu_pct)\n"
+        "- 'alert_thresholds': dict mapping metric+function to threshold values "
+        "(e.g., 'cpu_pct_max': 85 means alert if any day's max cpu_pct > 85)\n\n"
+        "Pipeline stages:\n"
+        "(1) Load the hourly metrics and parse timestamps.\n"
+        "(2) Group rows by day (extract date from timestamp).\n"
+        "(3) For each day, compute the aggregations specified in the config for each metric.\n"
+        "(4) Check each day's aggregated values against the alert_thresholds and count alert days "
+        "(a day is an alert day if ANY of its aggregated values exceeds the corresponding threshold).\n\n"
+        "Return a dict with keys:\n"
+        "- 'n_days' (int): number of unique days in the data\n"
+        "- 'metrics_aggregated' (int): number of distinct metrics processed\n"
+        "- 'alert_days' (int): number of days where at least one threshold was breached"
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[
+        FIXTURES_DIR / "t15_hourly_metrics.csv",
+        FIXTURES_DIR / "t15_agg_config.json",
+    ],
+    validator=_validate_t15,
+)
+
+# ---------------------------------------------------------------------------
+# T16 — Root cause diagnosis (targets AGENT)
+# ---------------------------------------------------------------------------
+
+_t16_ev = _EV["T16"]
+
+
+def _validate_t16(output: dict) -> bool:
+    """root_cause_metric matches AND cascade_chain has >=2 items AND n_metrics_investigated > 0."""
+    try:
+        identified_root = output.get("root_cause_metric", "")
+        if identified_root != _t16_ev["root_cause_metric"]:
+            return False
+        chain = output.get("cascade_chain", [])
+        if not isinstance(chain, list) or len(chain) < 2:
+            return False
+        n_investigated = int(output.get("n_metrics_investigated", 0))
+        if n_investigated < 2:
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+T16 = TaskDefinition(
+    task_id="T16",
+    tier="complex",
+    description="Root cause diagnosis: investigate a cascading system failure, identify the root cause metric and the cascade chain",
+    task_prompt=(
+        "You are investigating a service degradation incident. You have:\n"
+        "1. System metrics CSV at tests/evaluation/fixtures/t16_system_metrics.csv "
+        "(columns: timestamp, db_connections, query_latency_ms, request_queue_depth, error_rate, cpu_usage)\n"
+        "2. Incident report YAML at tests/evaluation/fixtures/t16_incident.yaml "
+        "(contains title, symptoms, onset_time, affected_service)\n\n"
+        "The incident involves a cascading failure where one metric spiked first and "
+        "caused other metrics to degrade in sequence. Your task is to:\n\n"
+        "(1) Read the incident report to understand the symptoms and onset time.\n"
+        "(2) Examine the metrics data around the onset time. Look at each metric's "
+        "behavior before and after the incident start.\n"
+        "(3) Identify which metric changed FIRST (the root cause) by comparing onset "
+        "times of anomalies across metrics. The root cause metric is the one that "
+        "deviated from normal earliest.\n"
+        "(4) Determine the cascade chain — the order in which other metrics were affected "
+        "after the root cause. Look for staggered onset patterns.\n"
+        "(5) Note: not all metrics are part of the cascade. Some may remain normal "
+        "throughout the incident (red herrings).\n\n"
+        "This requires adaptive investigation: examine the data, form hypotheses about "
+        "which metric is the root cause, test those hypotheses by checking temporal "
+        "ordering, and revise if the evidence doesn't support your initial theory.\n\n"
+        "Return a dict with keys:\n"
+        "- 'root_cause_metric' (str): the name of the metric that spiked first\n"
+        "- 'cascade_chain' (list of str): ordered list of metrics in the cascade "
+        "(starting with the root cause, then each subsequent metric in order)\n"
+        "- 'n_metrics_investigated' (int): how many distinct metrics you examined"
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[
+        FIXTURES_DIR / "t16_system_metrics.csv",
+        FIXTURES_DIR / "t16_incident.yaml",
+    ],
+    validator=_validate_t16,
+)
+
+# ---------------------------------------------------------------------------
+# T17 — Fraud investigation with cross-referencing (targets AGENT)
+# ---------------------------------------------------------------------------
+
+_t17_ev = _EV["T17"]
+
+
+def _validate_t17(output: dict) -> bool:
+    """high_severity_alerts correct AND at least 2 of 3 fraud customers identified AND total_alerts correct."""
+    try:
+        if int(output.get("total_alerts", -1)) != _t17_ev["total_alerts"]:
+            return False
+        if int(output.get("high_severity_alerts", -1)) != _t17_ev["high_severity_alerts"]:
+            return False
+        # Fraud customer identification: at least 2 of the 3 planted fraud customers
+        identified = output.get("fraud_customer_ids", [])
+        if not isinstance(identified, list):
+            identified = []
+        # Accept both IDs and names
+        expected_ids = set(_t17_ev["fraud_customer_ids"])
+        expected_names = set(n.lower() for n in _t17_ev["fraud_customer_names"])
+        def _to_int(v: object) -> int | None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
+        matched = sum(
+            1 for x in identified
+            if (isinstance(x, int) and x in expected_ids)
+            or (_to_int(x) is not None and _to_int(x) in expected_ids)
+            or (isinstance(x, str) and x.lower() in expected_names)
+        )
+        if matched < 2:
+            return False
+        return True
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+T17 = TaskDefinition(
+    task_id="T17",
+    tier="complex",
+    description="Fraud investigation: cross-reference transactions, customers, and alerts to identify fraud patterns and prioritize",
+    task_prompt=(
+        "You are investigating potential fraud. You have three data sources:\n"
+        "1. Customers CSV at tests/evaluation/fixtures/t17_customers.csv "
+        "(columns: customer_id, name, account_age_days, risk_score)\n"
+        "2. Transactions CSV at tests/evaluation/fixtures/t17_transactions.csv "
+        "(columns: txn_id, customer_id, amount, merchant, timestamp, flagged)\n"
+        "3. Alerts JSON at tests/evaluation/fixtures/t17_alerts.json "
+        "(list of alert objects with alert_id, txn_id, customer_id, reason, severity)\n\n"
+        "Your investigation should:\n"
+        "(1) Start by examining the alerts to understand the scope of potential fraud.\n"
+        "(2) Cross-reference each alert with the transaction details (amount, merchant, timestamp) "
+        "and customer profile (account age, risk score) to assess legitimacy.\n"
+        "(3) Identify which customers are involved in genuine fraud by looking for patterns: "
+        "multiple high-amount transactions, high-severity alerts, or unusually high risk scores.\n"
+        "(4) Distinguish true fraud from false positive alerts (some alerts flag normal transactions).\n\n"
+        "Adapt your investigation based on what you find — if a customer has multiple "
+        "high-severity alerts, investigate their full transaction history. If an alert "
+        "seems like a false positive (low amount, old account), deprioritize it.\n\n"
+        "Return a dict with keys:\n"
+        "- 'total_alerts' (int): total number of alerts in the dataset\n"
+        "- 'high_severity_alerts' (int): count of alerts with severity='high'\n"
+        "- 'fraud_customer_ids' (list): customer_ids (int) or names (str) of customers "
+        "you identified as genuinely fraudulent (should be the top 3 most suspicious)"
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[
+        FIXTURES_DIR / "t17_customers.csv",
+        FIXTURES_DIR / "t17_transactions.csv",
+        FIXTURES_DIR / "t17_alerts.json",
+    ],
+    validator=_validate_t17,
+)
+
+# ---------------------------------------------------------------------------
+# T18 — Record deduplication via hashing (MCP_TOOL)
+# ---------------------------------------------------------------------------
+
+_t18_ev = _EV["T18"]
+
+
+def _validate_t18(output: dict) -> bool:
+    """unique_count == 50 AND duplicate_count == 17 AND total_rows == 67."""
+    try:
+        ok_unique = int(output.get("unique_count", -1)) == _t18_ev["unique_count"]
+        ok_dupes = int(output.get("duplicate_count", -1)) == _t18_ev["duplicate_count"]
+        ok_total = int(output.get("total_rows", -1)) == _t18_ev["total_rows"]
+        return ok_unique and ok_dupes and ok_total
+    except (TypeError, ValueError):
+        return False
+
+
+T18 = TaskDefinition(
+    task_id="T18",
+    tier="moderate",
+    description="Deduplicate records by hashing: compute hash per row, identify exact duplicates, return counts",
+    task_prompt=(
+        "Deduplicate the orders CSV at tests/evaluation/fixtures/t18_orders_with_dupes.csv. "
+        "The file contains exact duplicate rows (same values in all columns). "
+        "Compute a hash of each row (using all columns: order_id, customer, product, "
+        "quantity, price), identify rows with identical hashes, and keep only unique rows.\n\n"
+        "Return a dict with keys:\n"
+        "- 'total_rows' (int): total rows in the input (excluding header)\n"
+        "- 'unique_count' (int): number of unique rows after deduplication\n"
+        "- 'duplicate_count' (int): number of duplicate rows removed"
+    ),
+    has_static_coverage=False,
+    static_capability_name=None,
+    fixture_paths=[FIXTURES_DIR / "t18_orders_with_dupes.csv"],
+    validator=_validate_t18,
+)
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
-ALL_TASKS: list[TaskDefinition] = [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12, T13]
+ALL_TASKS: list[TaskDefinition] = [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12, T13, T14, T15, T16, T17, T18]
 
-PILOT_TASKS: list[TaskDefinition] = [T01, T07, T10]  # retrieval + moderate JIT + complex JIT
+PILOT_TASKS: list[TaskDefinition] = [T01, T07, T05]  # retrieval + moderate JIT (fuzzy-join) + moderate JIT (data-cleaning, static coverage)
 
 _TASK_MAP: dict[str, TaskDefinition] = {t.task_id: t for t in ALL_TASKS}
 

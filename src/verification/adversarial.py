@@ -9,8 +9,8 @@ The DeepAgent uses ``sandbox_execute`` for Docker-isolated code execution
 and ``response_format=AdversarialFindings`` for structured output.
 
 Operational boundaries (from CLAUDE.md):
-- ``recursion_limit=35``
-- Node-level timeout: 180 s
+- ``recursion_limit=50``
+- Node-level timeout: 300 s
 - Fresh agent per invocation
 - On timeout / error: return partial report with error flag, never raise
 """
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ADVERSARIAL_RECURSION_LIMIT = 50
-ADVERSARIAL_TIMEOUT_S = 180
+ADVERSARIAL_TIMEOUT_S = 300
 
 # ---------------------------------------------------------------------------
 # Pydantic models for structured DeepAgent output
@@ -150,8 +150,10 @@ def _create_adversarial_agent():
 
     from src.verification.sandbox_tool import sandbox_execute
 
+    from src.config import DEFAULT_LLM_MODEL
+
     return create_deep_agent(
-        model=init_chat_model("openai:gpt-5-mini"),
+        model=init_chat_model(DEFAULT_LLM_MODEL),
         tools=[sandbox_execute],
         system_prompt=ADVERSARIAL_SYSTEM_PROMPT,
         response_format=AdversarialFindings,
@@ -284,8 +286,8 @@ def probe(artifact: GeneratedArtifact) -> VerificationReport:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
 
         config["callbacks"] = [LangFuseCallbackHandler()]
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:

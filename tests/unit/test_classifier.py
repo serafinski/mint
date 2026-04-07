@@ -276,7 +276,7 @@ class TestClassifierNode:
 
         calls: list[dict] = []
 
-        def _mock_classify(gap, *, total_gaps=1):
+        def _mock_classify(gap, *, total_gaps=1, task_context=""):
             calls.append({"query": gap.query, "total_gaps": total_gaps})
             return ClassifiedGap(
                 description=gap.description,
