@@ -139,13 +139,20 @@ def test_mcp_csv() -> bool:
     )
 
 
-def test_mcp_yaml_config() -> bool:
-    """MCP_TOOL: Read YAML config + CSV inventory (new formats)."""
+def test_skill_yaml_config() -> bool:
+    """SKILL: Inventory reorder pipeline with CSV + YAML config (domain workflow)."""
     return _run_mint(
         task=(
-            "Read the inventory CSV and the reorder rules YAML. "
-            "For each product, compute days_of_stock = current_stock / daily_usage. "
-            "Count how many products have days_of_stock below the min_days_of_stock threshold. "
+            "Build an inventory reorder pipeline using these two data sources:\n"
+            "1. Inventory CSV (columns: product_id, product_name, current_stock, daily_usage, unit_cost, warehouse)\n"
+            "2. Reorder rules YAML (contains min_days_of_stock threshold, reorder_days_supply multiplier, max_order_value cap)\n\n"
+            "Pipeline stages:\n"
+            "(1) Load both data sources.\n"
+            "(2) For each product, compute days_of_stock = current_stock / daily_usage.\n"
+            "(3) Identify products where days_of_stock < min_days_of_stock (these need reordering).\n"
+            "(4) For each product needing reorder, compute reorder_qty = ceil(daily_usage * reorder_days_supply), "
+            "then order_cost = reorder_qty * unit_cost, capped at max_order_value.\n"
+            "(5) Sum total_reorder_cost across all products needing reorder.\n\n"
             "Return a dict with keys 'product_count' (int), "
             "'items_below_threshold' (int), and 'total_reorder_cost' (float)."
         ),
@@ -153,7 +160,7 @@ def test_mcp_yaml_config() -> bool:
             FIXTURES_DIR / "t04_inventory.csv",
             FIXTURES_DIR / "t04_reorder_rules.yaml",
         ],
-        test_name="MCP_TOOL — CSV + YAML (inventory reorder)",
+        test_name="SKILL — CSV + YAML (inventory reorder pipeline)",
     )
 
 
@@ -324,7 +331,7 @@ def main() -> int:
         pass  # skip pipeline tests
     elif args.mcp_only:
         results["MCP_TOOL — CSV"] = test_mcp_csv()
-        results["MCP_TOOL — YAML config"] = test_mcp_yaml_config()
+        results["SKILL — YAML config"] = test_skill_yaml_config()
         results["MCP_TOOL — XML"] = test_mcp_xml()
         results["MCP_TOOL — TSV"] = test_mcp_tsv()
     elif args.skill_only:
@@ -335,9 +342,9 @@ def main() -> int:
         # Full test suite: prioritized by format diversity + capability type
         # 1. MCP_TOOL with CSV (seeded match — fast, verifies basic flow)
         results["MCP_TOOL — CSV"] = test_mcp_csv()
-        # 2. MCP_TOOL with YAML config (new format)
-        results["MCP_TOOL — YAML config"] = test_mcp_yaml_config()
-        # 3. SKILL with Excel (new format + different capability type)
+        # 2. SKILL with YAML config (domain workflow + new format)
+        results["SKILL — YAML config"] = test_skill_yaml_config()
+        # 3. SKILL with Excel (multi-source integration + new format)
         results["SKILL — Excel"] = test_skill_excel()
         # 4. AGENT with YAML incident (new format + third capability type)
         results["AGENT — YAML incident"] = test_agent_yaml_incident()
