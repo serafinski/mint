@@ -523,7 +523,6 @@ def seed_registry(registry: SkillRegistry) -> None:
                 'management.", '
                 '"node_config": {"name": "data_analysis_node", '
                 f'"model": "{DEFAULT_LLM_MODEL}", '
-                '"tools": ["sandbox_execute"], '
                 '"description": "Autonomous EDA agent"}, '
                 '"is_deep_agent": true}'
             ),
