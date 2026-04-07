@@ -99,6 +99,7 @@ class T17Result(BaseModel):
 
 class GenericResult(BaseModel):
     """Fallback for tasks without a dedicated response model."""
+    model_config = {"extra": "allow"}
     result: dict = {}
 
 
@@ -146,8 +147,8 @@ def _format_fixture_message(fixture_contents: dict[str, str]) -> str:
 # ---------------------------------------------------------------------------
 
 _SKILL_SYSTEM_PREAMBLE = """\
-You are a skill executor for a data analytics pipeline. You receive input data
-files and must process them according to the skill instructions below.
+You are a skill executor. You receive input data files and must process them
+according to the skill instructions below.
 
 Use the sandbox_execute tool to run Python code for any computation. When using
 sandbox_execute, write the data files to /tmp/ inside the sandbox first, then

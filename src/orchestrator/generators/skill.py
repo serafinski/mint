@@ -237,14 +237,9 @@ def _generate_single_skill(
         logger.warning(error_msg)
         return None, error_msg
 
-    skill_name = extract_skill_name(content)
-    if not skill_name:
-        # Derive a fallback name from the query; collapse consecutive hyphens
-        skill_name = re.sub(r"[^a-z0-9-]", "-", gap.query.lower().strip())
-        skill_name = re.sub(r"-{2,}", "-", skill_name)
-        skill_name = skill_name[:64].strip("-")
-        if not skill_name:
-            return None, f"Cannot derive skill name from query: {gap.query!r}"
+    # Use the deterministic forced_name for validation (the artifact will use it
+    # regardless of what name the LLM put in frontmatter).
+    skill_name = extract_skill_name(content) or forced_name
 
     is_valid, message = validate_skill_content(content, skill_name)
 

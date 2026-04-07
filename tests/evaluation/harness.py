@@ -237,11 +237,12 @@ class EvaluationHarness:
         # Step 1: restore clean snapshot
         snap_id = restore_clean_snapshot(cfg.chroma_dir, cfg.mcp_tools_dir, cfg.skills_dir)
         if self._snap_id and snap_id != self._snap_id:
-            logger.warning(
-                "Snapshot ID mismatch: expected %s, got %s — restore may be broken",
-                self._snap_id,
-                snap_id,
+            msg = (
+                f"Snapshot ID mismatch: expected {self._snap_id}, got {snap_id} "
+                "— registry state may be corrupted"
             )
+            logger.error(msg)
+            raise RuntimeError(msg)
 
         # Step 2: rebuild registry and loader from the restored snapshot
         registry = SkillRegistry(

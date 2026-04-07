@@ -582,9 +582,8 @@ class TestGenerateSingleSkill:
         assert len(captured_prompts) >= 1
         assert custom_context in captured_prompts[0]
 
-    def test_all_special_char_query_returns_error(self, tmp_path):
-        """When gap.query is all special chars, derived skill_name is empty → error."""
-        # "@#$%" → "----" → collapse → "-" → strip → "" → guard triggers
+    def test_all_special_char_query_uses_forced_name(self, tmp_path):
+        """When gap.query is all special chars, forced_name (hash-based slug) is used."""
         content_no_name = "---\ndescription: Some skill.\n---\n\n# Body\n"
         gap = ClassifiedGap(
             description="Something",
@@ -606,9 +605,10 @@ class TestGenerateSingleSkill:
         ):
             artifact, error = _generate_single_skill(gap, "context", output_dir=tmp_path)
 
-        assert artifact is None
-        assert error is not None
-        assert "Cannot derive skill name" in error
+        # forced_name is a hash-based slug — always valid even for special-char queries
+        assert error is None
+        assert artifact is not None
+        assert artifact.capability_name  # non-empty slug from slugify_gap_hyphen
 
 
 # ---------------------------------------------------------------------------

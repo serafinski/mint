@@ -266,10 +266,18 @@ def _generate_single_agent(
     }
 
     if result.is_deep_agent and result.skill_content:
+        # Rewrite the frontmatter name to forced_name so the directory name
+        # matches the SKILL.md name field (DeepAgents expects these to match).
+        if result.agent_name != forced_name:
+            result.skill_content = re.sub(
+                r"(?m)^(name:\s*).+$",
+                rf"\g<1>{forced_name}",
+                result.skill_content,
+                count=1,
+            )
+
         agent_config["skill_content"] = result.skill_content
         # Write the DeepAgent skill to disk so the DeepAgents runtime can load it.
-        # Use forced_name (not result.agent_name) so the directory matches the
-        # artifact's capability_name.
         skill_dir = (output_dir or SKILLS_OUTPUT_DIR) / forced_name
         try:
             skill_dir.mkdir(parents=True, exist_ok=True)

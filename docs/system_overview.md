@@ -167,9 +167,9 @@ The evaluation uses a **business analytics pipeline** testbed -- 18 tasks spanni
 | T17 | Adaptive ETL orchestration (schema drift handling) | AGENT | Complex |
 | T18 | Record deduplication via row hashing | MCP_TOOL | Moderate |
 
-T01-T03 have matching seeded capabilities in the registry (testing retrieval). T04-T18 require the system to generate new capabilities (testing synthesis). The testbed is balanced across capability types: 8 MCP_TOOL (3 retrieval + 5 synthesis), 5 SKILL, 5 AGENT.
+Five tasks have matching seeded capabilities in the registry: T01-T03 (MCP_TOOL type, exact-type retrieval) and T05, T09 (SKILL type, cross-type coverage — the JIT pipeline may classify these as MCP_TOOL but the static baseline uses the seeded SKILL). The remaining 13 tasks (T04, T06-T08, T10-T18) require the system to generate new capabilities (testing synthesis). The testbed is balanced across capability types: 8 MCP_TOOL (3 retrieval + 5 synthesis), 5 SKILL (2 retrieval + 3 synthesis), 5 AGENT.
 
-**Fixture format diversity:** 33 fixture files across 7 formats (CSV, JSON, TXT, YAML, XML, Excel/.xlsx, TSV), generated programmatically with seed=42 for reproducibility.
+**Fixture format diversity:** 32 fixture files (31 data files + 1 expected-values manifest) across 7 formats (CSV, JSON, TXT, YAML, XML, Excel/.xlsx, TSV), generated programmatically with seed=42 for reproducibility.
 
 **4 Baseline Conditions (additive ablation):**
 

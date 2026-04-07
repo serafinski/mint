@@ -106,7 +106,7 @@ class TestEvaluationRecord:
             assert r.task_tier == tier
 
     def test_all_failure_reasons_valid(self):
-        for reason in ["none", "generation_failed", "tier1", "tier2", "tier3", "output_rejected"]:
+        for reason in ["none", "generation_failed", "tier1", "tier2", "tier3", "output_rejected", "no_source_code"]:
             r = EvaluationRecord(**{**_BASE, "failure_reason": reason})
             assert r.failure_reason == reason
 
@@ -131,7 +131,11 @@ class TestStrEnums:
     def test_failure_reason_values(self):
         assert FailureReason.NONE == "none"
         assert FailureReason.GENERATION_FAILED == "generation_failed"
+        assert FailureReason.TIER1 == "tier1"
+        assert FailureReason.TIER2 == "tier2"
+        assert FailureReason.TIER3 == "tier3"
         assert FailureReason.OUTPUT_REJECTED == "output_rejected"
+        assert FailureReason.NO_SOURCE_CODE == "no_source_code"
 
     def test_human_label_values(self):
         assert HumanLabel.CORRECT == "correct"

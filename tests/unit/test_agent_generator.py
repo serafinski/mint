@@ -681,4 +681,7 @@ class TestGenerateSingleAgent:
         forced_name = slugify_gap_hyphen(self._gap().query)
         skill_path = tmp_path / forced_name / "SKILL.md"
         assert skill_path.exists(), f"SKILL.md not found at {skill_path}"
-        assert skill_path.read_text() == VALID_SKILL_CONTENT
+        # The frontmatter name is rewritten to forced_name so directory and
+        # SKILL.md name field match (DeepAgents requires this).
+        written = skill_path.read_text()
+        assert f"name: {forced_name}" in written

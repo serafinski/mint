@@ -444,8 +444,8 @@ def _validate_t10(output: dict) -> bool:
         ok_trend = output.get("trend_direction", "").lower() in ("upward", "up", "increasing", "positive")
         ok_weeks = int(output.get("n_weeks", -1)) == _t10_ev["n_weeks"]
         # Agent should provide some forecast (list of numbers or a summary)
-        forecast = output.get("forecast") or output.get("forecast_values") or output.get("next_4_weeks")
-        ok_forecast = forecast is not None and (isinstance(forecast, list) or isinstance(forecast, dict))
+        forecast = output.get("forecast")
+        ok_forecast = forecast is not None and isinstance(forecast, list)
         return ok_trend and ok_weeks and ok_forecast
     except (TypeError, ValueError):
         return False

@@ -762,8 +762,8 @@ Wait for both to finish, then wire the optimization loop into the main pipeline.
 |---|---|---|
 | `src/schemas/evaluation.py` | ✅ | `EvaluationRecord` (18 fields), separate from `InvocationRecord` |
 | `src/registry/evaluation_store.py` | ✅ | DuckDB `EvaluationStore`, `evaluation_runs` table |
-| `tests/evaluation/fixtures/` | ✅ | 35 fixture files for 18 tasks, programmatic generation (seed=42), `expected_values.json` |
-| `tests/evaluation/tasks.py` | ✅ | T01–T18 `TaskDefinition` with validators. Distribution: 8 MCP (3 retrieval + 5 synthesis), 5 SKILL, 5 AGENT |
+| `tests/evaluation/fixtures/` | ✅ | 32 fixture files for 18 tasks, programmatic generation (seed=42), `expected_values.json` |
+| `tests/evaluation/tasks.py` | ✅ | T01–T18 `TaskDefinition` with validators. Distribution: 8 MCP (3 retrieval + 5 synthesis), 5 SKILL (2 retrieval + 3 synthesis), 5 AGENT |
 | `tests/evaluation/execution.py` | ✅ | SKILL/AGENT execution via DeepAgent; T04/T08/T10-T17 response models |
 | `tests/evaluation/snapshots.py` | ✅ | `take_clean_snapshot` / `restore_clean_snapshot` (ChromaDB + mcp_tools + skills) |
 | `tests/evaluation/harness.py` | ✅ | Full run loop; `MetricsStore` per-run; `prepare()` auto-cleans before snapshot; per-task LangFuse tagging; static implementations for T01/T02/T03/T05/T09 |

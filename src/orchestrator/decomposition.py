@@ -203,9 +203,12 @@ def decomposition_node(
         )
         required_caps = required_caps[:MAX_CAPS_HARD]
 
-    # Fallback: if no subtasks were produced, treat the whole task as one subtask
+    # Fallback: if no subtasks were produced, use the first sentence of the task
+    # description as a capability query (the full description is too long for
+    # effective semantic search in the registry).
     if not subtasks:
-        required_caps = [state.task_description]
+        first_sentence = state.task_description.split(".")[0].strip()
+        required_caps = [first_sentence[:200] if first_sentence else state.task_description[:200]]
 
     return Command(
         update={
