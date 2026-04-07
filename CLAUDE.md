@@ -322,8 +322,18 @@ All numbers pending confirmation after full re-run with post-audit code.
 
 - [ ] Run additional code audits and contradiction checks (catch issues before burning $5+ on a full eval run)
 - [ ] Purge stale evaluation data
+- [ ] Pre-eval integration sanity checks (~$0.20, ~15 min total):
+  - [ ] `uv run scripts/test_pipeline.py` — full 9-node pipeline (MCP_TOOL, SKILL, AGENT)
+  - [ ] `uv run scripts/test_verification.py` — three-tier gate with real Docker/LLM
+  - [ ] `uv run scripts/test_mint.py --quick` — CLI format detection (no LLM)
+  - [ ] `uv run scripts/test_auto_optimizer.py` — prune/split/merge through real pipeline
+  - [ ] `uv run scripts/test_split_merge.py` — optimizer operations independently
 - [ ] Full evaluation re-run (18 × 4 × 5 = 360 records)
-- [ ] Re-validate longitudinal optimizer test
+- [ ] Re-validate longitudinal optimizer test (`uv run scripts/run_longitudinal.py`)
+- [ ] Post-eval analysis:
+  - [ ] `uv run scripts/backfill_token_costs.py --write` — LangFuse → DuckDB token costs
+  - [ ] `uv run scripts/analyze_results.py --csv` — statistical analysis + CSV export
+  - [ ] `uv run scripts/analyze_context_utilization.py --csv` — context window metrics
 - [ ] Produce thesis figures and analysis
 
 ## Stable Interfaces
