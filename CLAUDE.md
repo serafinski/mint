@@ -320,20 +320,60 @@ All numbers pending confirmation after full re-run with post-audit code.
 
 ### What remains
 
-- [ ] Run additional code audits and contradiction checks (catch issues before burning $5+ on a full eval run)
-- [ ] Purge stale evaluation data
-- [ ] Pre-eval integration sanity checks (~$0.20, ~15 min total):
-  - [ ] `uv run scripts/test_pipeline.py` — full 9-node pipeline (MCP_TOOL, SKILL, AGENT)
-  - [ ] `uv run scripts/test_verification.py` — three-tier gate with real Docker/LLM
-  - [ ] `uv run scripts/test_mint.py --quick` — CLI format detection (no LLM)
-  - [ ] `uv run scripts/test_auto_optimizer.py` — prune/split/merge through real pipeline
-  - [ ] `uv run scripts/test_split_merge.py` — optimizer operations independently
-- [ ] Full evaluation re-run (18 × 4 × 5 = 360 records)
-- [ ] Re-validate longitudinal optimizer test (`uv run scripts/run_longitudinal.py`)
-- [ ] Post-eval analysis:
+- [x] Run code audits and contradiction checks (9 passes complete, diminishing returns)
+- [ ] Baseline verification (~5 min):
+  - [ ] `uv run pytest tests/unit/` — confirm 814+ tests still pass after audit fixes
+  - [ ] `docker build -t jit-sandbox sandbox/` — rebuild sandbox image if Dockerfile changed
+- [ ] Targeted pre-eval checks (~10 min):
+  - [ ] Prompt review — read all prompts in `src/orchestrator/prompts/` for consistency with current implementation (catches LLM-told vs system-does mismatches)
+  - [ ] Snapshot integrity — verify `tests/evaluation/snapshots/` has correct seeded capabilities (T01-T03 MCP_TOOL, T05/T09 SKILL)
+  - [ ] Fixture file audit — verify all 32 fixtures in `tests/evaluation/tasks.py` exist and are valid
+- [ ] Purge stale data (no eval DuckDB exists, but stale runtime state remains):
+  - [ ] `rm -rf data/chroma/` — old ChromaDB vectors
+  - [ ] `rm -rf data/cli_chroma/` — old CLI ChromaDB
+  - [ ] `rm -rf .deepagents/skills/` — 10 generated skills from old runs
+  - [ ] `rm data/logs/longitudinal_20260319_011101.log` — old log
+  - [ ] `rm data/context_utilization.csv` — old metrics (optional)
+- [ ] Pre-eval integration sanity checks (~$0.20, ~15 min):
+  - [ ] `uv run scripts/test_pipeline.py` — full 9-node pipeline (~$0.15, ~5 min)
+  - [ ] `uv run scripts/test_verification.py` — three-tier gate with Docker/LLM (~$0.02, ~3 min)
+  - [ ] `uv run scripts/test_mint.py --quick` — CLI format detection ($0, ~30s)
+  - [ ] `uv run scripts/test_auto_optimizer.py` — prune/split/merge (~$0.01, ~1 min)
+  - [ ] `uv run scripts/test_split_merge.py` — optimizer operations (~$0.01, ~2 min)
+- [ ] Pre-eval pilot spot-check (~$0.50, ~30 min):
+  - [ ] `uv run scripts/run_pilot.py --tasks T04,T07,T14 --all-conditions --n-runs 1` — 12 runs, check outputs
+  - [ ] `uv run scripts/test_mint.py` — full CLI smoke test, all 3 types + 6 formats (~$0.20, ~15 min)
+  - [ ] Spot-check any failures in LangFuse — distinguish code bugs from LLM generation issues
+  - [ ] Pilot validation checklist (after 12 runs complete):
+    - [ ] Verify exactly 12 records written to `data/evaluation.duckdb` (not fewer = silent data loss)
+    - [ ] Open 2-3 LangFuse traces, skim actual LLM inputs/outputs — catch "works but for wrong reason"
+    - [ ] Check success rates aren't suspiciously uniform across conditions (= evaluation bias)
+    - [ ] Compare `no_verification` vs `full` — if nearly identical, the gate isn't doing anything
+    - [ ] Check token costs are being recorded (not all zeros)
+- [ ] Full evaluation re-run (~$5, ~26h sequential / ~13h with 2 conditions parallel):
+  - [ ] `rm data/evaluation.duckdb` — purge pilot records before full run (pilot contamination)
+  - [ ] `uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5` (18 × 4 × 5 = 360 records)
+  - [ ] Cost breakdown: static ~$0 (0.1h), no_verification ~$0.37 (5h), no_optimization ~$2.21 (10h), full ~$2.32 (11h)
+  - [ ] Adversarial probing is 83% of cost (~$0.025/run); pipeline direct is ~$0.005/run
+- [ ] Re-validate longitudinal optimizer test (~$1.50, ~3h):
+  - [ ] Restore clean state first: `rm -rf data/chroma/ .deepagents/skills/` (full eval leaves dirty state)
+  - [ ] `uv run scripts/run_longitudinal.py` (40 tasks, sequential, optimizer enabled)
+  - [ ] Longitudinal validation checklist:
+    - [ ] Verify 40 records in `data/longitudinal.duckdb`
+    - [ ] Check convergence: success rate of last 10 tasks > first 10 tasks
+    - [ ] Verify `data/longitudinal_optimizer_log.json` exists and shows prune/split/merge events
+    - [ ] Check optimizer actually fired (not 0 operations across 40 tasks)
+- [ ] Post-eval analysis (~$0, ~5 min):
   - [ ] `uv run scripts/backfill_token_costs.py --write` — LangFuse → DuckDB token costs
   - [ ] `uv run scripts/analyze_results.py --csv` — statistical analysis + CSV export
   - [ ] `uv run scripts/analyze_context_utilization.py --csv` — context window metrics
+- [ ] Post-eval sanity checks (spot hidden issues audits can't catch):
+  - [ ] Token cost sanity: spot-check 3-4 runs in LangFuse, compare actual trace costs vs what `backfill_token_costs.py` attributed — look for mismatches
+  - [ ] Verify 360 records in `data/evaluation.duckdb` (not fewer)
+  - [ ] Check no condition has suspiciously uniform success rates (= evaluation bias or bug that helps/hurts uniformly)
+  - [ ] Compare `no_verification` vs `full` success rates — if nearly identical, verification gate may not be working
+  - [ ] Compare `no_optimization` vs `full` — if identical, optimizer isn't firing (expected for snapshot-reset, but confirm)
+  - [ ] Look for tasks that are 100% or 0% across ALL conditions — may indicate task definition issue, not system issue
 - [ ] Produce thesis figures and analysis
 
 ## Stable Interfaces
