@@ -9,8 +9,10 @@ is a single-step LLM task with structured output.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Literal
 
@@ -18,7 +20,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from src.orchestrator.generators.skill import extract_skill_name, validate_skill_content
-from src.orchestrator.generators.utils import build_task_context
+from src.orchestrator.generators.utils import build_task_context, slugify_gap_hyphen
 from src.orchestrator.prompts.agent_generator import AGENT_GENERATOR_PROMPT, AGENT_REPAIR_PROMPT
 from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
@@ -46,8 +48,8 @@ class AgentGenerationResult(BaseModel):
     system_prompt: str = Field(..., description="Markdown system prompt for the agent")
     node_name: str = Field(..., description="Snake_case LangGraph node function name")
     model: str = Field(
-        default="deepseek:deepseek-chat",
-        description="LLM model identifier",
+        default="",
+        description="LLM model identifier (empty = system default)",
     )
     tools: list[str] = Field(default_factory=list, description="Tool names the agent needs")
     description: str = Field(..., description="One-sentence summary of what the agent does")
@@ -67,16 +69,23 @@ class AgentGenerationResult(BaseModel):
 # Shared LLM instance (lazy initialisation)
 # ---------------------------------------------------------------------------
 
+MAX_GENERATION_WORKERS = 4
+
 _agent_gen_llm = None
+_agent_llm_lock = threading.Lock()
 
 
 def _get_llm():
-    """Lazily create the agent generator LLM on first use."""
+    """Lazily create the agent generator LLM on first use (thread-safe)."""
     global _agent_gen_llm  # noqa: PLW0603
     if _agent_gen_llm is None:
-        from langchain.chat_models import init_chat_model
+        with _agent_llm_lock:
+            if _agent_gen_llm is None:
+                from langchain.chat_models import init_chat_model
 
-        _agent_gen_llm = init_chat_model("deepseek:deepseek-chat")
+                from src.config import DEFAULT_LLM_MODEL
+
+                _agent_gen_llm = init_chat_model(DEFAULT_LLM_MODEL, request_timeout=300)
     return _agent_gen_llm
 
 
@@ -166,13 +175,19 @@ def _generate_single_agent(
 
     Returns (artifact, error). Exactly one will be non-None.
     """
+    forced_name = slugify_gap_hyphen(gap.query)
+
     llm = _get_llm()
     structured_llm = llm.with_structured_output(AgentGenerationResult)
+
+    from src.config import DEFAULT_LLM_MODEL
 
     prompt = AGENT_GENERATOR_PROMPT.format(
         description=gap.description,
         query=gap.query,
         task_context=task_context,
+        forced_name=forced_name,
+        model_default=DEFAULT_LLM_MODEL,
     )
 
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
@@ -251,25 +266,43 @@ def _generate_single_agent(
     }
 
     if result.is_deep_agent and result.skill_content:
+        # Rewrite the frontmatter name to forced_name so the directory name
+        # matches the SKILL.md name field (DeepAgents expects these to match).
+        if result.agent_name != forced_name:
+            result.skill_content = re.sub(
+                r"(?m)^(name:\s*).+$",
+                rf"\g<1>{forced_name}",
+                result.skill_content,
+                count=1,
+            )
+
         agent_config["skill_content"] = result.skill_content
-        # Write the DeepAgent skill to disk so the DeepAgents runtime can load it
-        skill_dir = (output_dir or SKILLS_OUTPUT_DIR) / result.agent_name
+        # Write the DeepAgent skill to disk so the DeepAgents runtime can load it.
+        skill_dir = (output_dir or SKILLS_OUTPUT_DIR) / forced_name
         try:
             skill_dir.mkdir(parents=True, exist_ok=True)
             (skill_dir / "SKILL.md").write_text(result.skill_content)
         except OSError as exc:
             error_msg = (
-                f"Failed to write DeepAgent skill '{result.agent_name}' to disk: {exc}"
+                f"Failed to write DeepAgent skill '{forced_name}' to disk: {exc}"
             )
             logger.error(error_msg)
             return None, error_msg
-        logger.info("Wrote DeepAgent skill '%s' to %s", result.agent_name, skill_dir)
+        logger.info("Wrote DeepAgent skill '%s' to %s", forced_name, skill_dir)
+
+    # Use deterministic slug for the artifact metadata and disk path.
+    if result.agent_name != forced_name:
+        logger.debug(
+            "Artifact metadata uses stable slug '%s' (LLM chose '%s'; disk file unchanged)",
+            forced_name, result.agent_name,
+        )
 
     artifact = GeneratedArtifact(
-        capability_name=result.agent_name,
+        capability_name=forced_name,
         capability_type=CapabilityType.AGENT,
         agent_config=agent_config,
         description=result.description,
+        gap_query=gap.query,
     )
 
     return artifact, None
@@ -296,17 +329,44 @@ def generate_agent(
         g for g in state.classified_gaps if g.classified_type == CapabilityType.AGENT
     ]
 
+    # On retry, skip gaps already covered by passing artifacts.
+    existing_gap_queries = {a.gap_query for a in artifacts if a.gap_query is not None}
+
+    gaps_to_generate = [g for g in agent_gaps if g.query not in existing_gap_queries]
+    for skipped in agent_gaps:
+        if skipped.query in existing_gap_queries:
+            logger.info("  → skipping (already passed verification): %s", skipped.query)
+
+    logger.info("generate_agent: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(agent_gaps) - len(gaps_to_generate))
     task_context = build_task_context(state)
-    for gap in agent_gaps:
-        artifact, error = _generate_single_agent(gap, task_context)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
+        futures = {
+            pool.submit(_generate_single_agent, gap, task_context): gap
+            for gap in gaps_to_generate
+        }
+        raw_results: list[tuple[GeneratedArtifact | None, str | None]] = []
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                raw_results.append(future.result())
+            except Exception as exc:
+                gap = futures[future]
+                raw_results.append((None, f"Generation failed for agent {gap.query!r}: {exc}"))
+
+    failed_queries: list[str] = []
+    for artifact, error in raw_results:
         if artifact is not None:
-            # Replace any existing artifact with the same capability_name.
-            # On retry cycles the node re-runs all classified gaps; replacing
-            # by name prevents duplicate entries for the same capability.
             artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
         if error is not None:
             errors.append(error)
+            failed_queries.append(error[:80])
+
+    if failed_queries:
+        logger.warning(
+            "generate_agent: %d/%d gaps failed generation: %s",
+            len(failed_queries), len(gaps_to_generate), failed_queries,
+        )
 
     return Command(
         update={

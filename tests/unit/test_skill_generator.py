@@ -335,9 +335,13 @@ class TestGenerateSkillNode:
             rationale="Multi-step",
         )
 
-        # Block the target directory by creating a FILE at that path
+        # Block the target directory by creating a FILE at the forced_name path
+        # (the generator uses forced_name, not skill_name, for the directory).
         # mkdir(...) will raise NotADirectoryError (subclass of OSError)
-        blocker = tmp_path / "csv-loader"
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+
+        forced_name = slugify_gap_hyphen(gap.query)
+        blocker = tmp_path / forced_name
         blocker.write_text("not a directory")
 
         with (
@@ -468,7 +472,9 @@ class TestGenerateSingleSkill:
 
         assert error is None
         assert artifact is not None
-        assert artifact.capability_name == "csv-data-loader"
+        # Fix 5: name is now a deterministic slug, not the LLM-chosen name
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+        assert artifact.capability_name == slugify_gap_hyphen("csv-loader")
         assert artifact.capability_type == CapabilityType.SKILL
         assert artifact.skill_content is not None
 
@@ -482,7 +488,8 @@ class TestGenerateSingleSkill:
 
         assert error is None
         assert artifact is not None
-        assert artifact.capability_name == "csv-data-loader"
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+        assert artifact.capability_name == slugify_gap_hyphen("csv-loader")
 
     def test_first_llm_call_fails(self, tmp_path):
         """LLM error on first attempt returns (None, error) without raising."""
@@ -547,8 +554,9 @@ class TestGenerateSingleSkill:
 
         assert error is None
         assert artifact is not None
-        # "CSV Data Loader" → lower → "csv data loader" → replace spaces → "csv-data-loader"
-        assert artifact.capability_name == "csv-data-loader"
+        # Fix 5: name is now a deterministic slug from gap.query
+        from src.orchestrator.generators.utils import slugify_gap_hyphen
+        assert artifact.capability_name == slugify_gap_hyphen("CSV Data Loader")
 
     def test_task_context_forwarded_to_prompt(self, tmp_path):
         """task_context passed to _generate_single_skill appears in the LLM prompt."""
@@ -574,9 +582,8 @@ class TestGenerateSingleSkill:
         assert len(captured_prompts) >= 1
         assert custom_context in captured_prompts[0]
 
-    def test_all_special_char_query_returns_error(self, tmp_path):
-        """When gap.query is all special chars, derived skill_name is empty → error."""
-        # "@#$%" → "----" → collapse → "-" → strip → "" → guard triggers
+    def test_all_special_char_query_uses_forced_name(self, tmp_path):
+        """When gap.query is all special chars, forced_name (hash-based slug) is used."""
         content_no_name = "---\ndescription: Some skill.\n---\n\n# Body\n"
         gap = ClassifiedGap(
             description="Something",
@@ -598,9 +605,10 @@ class TestGenerateSingleSkill:
         ):
             artifact, error = _generate_single_skill(gap, "context", output_dir=tmp_path)
 
-        assert artifact is None
-        assert error is not None
-        assert "Cannot derive skill name" in error
+        # forced_name is a hash-based slug — always valid even for special-char queries
+        assert error is None
+        assert artifact is not None
+        assert artifact.capability_name  # non-empty slug from slugify_gap_hyphen
 
 
 # ---------------------------------------------------------------------------

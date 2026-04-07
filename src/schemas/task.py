@@ -16,7 +16,7 @@ class TaskStatus(StrEnum):
     CLASSIFYING = "classifying"
     GENERATING = "generating"
     VERIFYING = "verifying"
-    EXECUTING = "executing"
+    EXECUTING = "executing"  # reserved for future use (not set by current pipeline)
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -60,7 +60,7 @@ class SubTask(BaseModel):
 
     description: str = Field(..., description="What this sub-task needs to accomplish")
     required_capabilities: list[str] = Field(
-        ..., description="Capability names or queries needed for this sub-task"
+        ..., min_length=1, description="Capability names or queries needed for this sub-task"
     )
     depends_on: list[int] = Field(
         default_factory=list, description="Indices of sub-tasks this one depends on"
@@ -104,6 +104,18 @@ class GeneratedArtifact(BaseModel):
         default=None, description="Generated SKILL.md content (for skills)"
     )
     agent_config: dict | None = Field(default=None, description="Agent configuration (for agents)")
+    gap_query: str | None = Field(
+        default=None,
+        description=(
+            "The gap query string that produced this artifact. "
+            "Set at generation time to enable skip logic on retry — "
+            "gaps whose query matches an existing passing artifact are skipped."
+        ),
+    )
+    pip_packages: list[str] = Field(
+        default_factory=list,
+        description="PyPI package names declared by the generator (e.g. ['pyyaml', 'scikit-learn'])",
+    )
     generated_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="When this artifact was generated",

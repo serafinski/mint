@@ -24,8 +24,9 @@ from src.schemas.verification import Severity, VerificationFinding, Verification
 # Regex patterns
 # ---------------------------------------------------------------------------
 
+# "sample" intentionally excluded — false-positives on legitimate random.sample() calls.
 _MOCK_NAMES = re.compile(
-    r"(mock|fake|sample|dummy|placeholder|DEMO|TEST_DATA)",
+    r"\b(mock|fake|dummy|placeholder|DEMO|TEST_DATA)\b",
     re.IGNORECASE,
 )
 
@@ -85,14 +86,29 @@ def _run_skill_precheck(
 # ---------------------------------------------------------------------------
 
 def _check_hardcoded_return(node: ast.AST, findings: list[VerificationFinding]) -> None:
-    """Detect literal lists/dicts of >=3 items returned from a function body."""
+    """Detect literal lists/dicts of >=3 items returned from a function body.
+
+    Also follows one level of variable indirection (B1.2): if the return value
+    is a Name, resolves it to the first assignment in the function scope.
+    """
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return
+
+    # Collect variable assignments in this function scope (first assignment wins).
+    assignments: dict[str, ast.expr] = {}
+    for stmt in ast.walk(node):
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and target.id not in assignments:
+                    assignments[target.id] = stmt.value
 
     for child in ast.walk(node):
         if not isinstance(child, ast.Return) or child.value is None:
             continue
         val = child.value
+        # Follow one level of variable indirection.
+        if isinstance(val, ast.Name):
+            val = assignments.get(val.id, val)
         if isinstance(val, ast.List) and len(val.elts) >= 3:
             if all(isinstance(e, ast.Constant) for e in val.elts):
                 findings.append(
@@ -134,10 +150,27 @@ def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> 
         return
 
     body = node.body
-    # Check if the body is effectively silent: only `pass`, or empty
+    # Check if the body is effectively silent: only `pass`, `return None`,
+    # `return {}`, `return "..."`, or similar swallowed-exception patterns.
     has_reraise = False
     has_logging = False
     is_only_pass = len(body) == 1 and isinstance(body[0], ast.Pass)
+    is_silent_return = False
+
+    if len(body) == 1 and isinstance(body[0], ast.Return):
+        ret_val = body[0].value
+        # return None (explicit or implicit)
+        if ret_val is None:
+            is_silent_return = True
+        elif isinstance(ret_val, ast.Constant) and ret_val.value is None:
+            is_silent_return = True
+        # return {}, return [], return "", return 0, return False, etc.
+        elif isinstance(ret_val, ast.Constant):
+            is_silent_return = True
+        elif isinstance(ret_val, ast.Dict) and len(ret_val.keys) == 0:
+            is_silent_return = True
+        elif isinstance(ret_val, ast.List) and len(ret_val.elts) == 0:
+            is_silent_return = True
 
     for child in ast.walk(node):
         if isinstance(child, ast.Raise):
@@ -153,8 +186,15 @@ def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> 
             if isinstance(func, ast.Name) and func.id in ("print", "logging"):
                 has_logging = True
 
-    if (is_bare or is_only_pass) and not has_reraise and not has_logging:
-        label = "bare except" if is_bare else "except Exception: pass"
+    if (is_bare or is_only_pass or is_silent_return) and not has_reraise and not has_logging:
+        if is_bare:
+            label = "bare except"
+        elif is_only_pass:
+            label = "except Exception: pass"
+        elif is_silent_return:
+            label = "except Exception: return <default>"
+        else:
+            label = "silent except"
         findings.append(
             VerificationFinding(
                 tier=1,
@@ -204,15 +244,26 @@ def _check_missing_external_calls(
 # ---------------------------------------------------------------------------
 
 def _check_mock_artifacts(source_code: str, findings: list[VerificationFinding]) -> None:
-    """Detect mock/demo variable names and string literals."""
+    """Detect mock/demo variable names and string literals.
+
+    Reports at most one CRITICAL finding per distinct indicator word to avoid
+    flooding the report (a single match is sufficient to reject).
+    """
+    seen_indicators: set[str] = set()
+    positions: list[str] = []
     for m in _MOCK_NAMES.finditer(source_code):
+        word = m.group().lower()
+        if word not in seen_indicators:
+            seen_indicators.add(word)
+            positions.append(f"'{m.group()}' at position {m.start()}")
+    if seen_indicators:
         findings.append(
             VerificationFinding(
                 tier=1,
                 category="mock_artifact",
                 severity=Severity.CRITICAL,
-                message=f"Mock/demo indicator '{m.group()}' at position {m.start()}",
-                location=f"position {m.start()}",
+                message=f"Mock/demo indicator(s): {'; '.join(positions)}",
+                location="multiple" if len(positions) > 1 else positions[0],
             )
         )
 
@@ -270,31 +321,35 @@ def scan(
             )
 
     # --- Tier 1: AST + regex ---
-    try:
-        tree = ast.parse(source_code)
-    except SyntaxError as exc:
-        findings.append(
-            VerificationFinding(
-                tier=1,
-                category="syntax",
-                severity=Severity.CRITICAL,
-                message=f"SyntaxError: {exc.msg} at line {exc.lineno}",
-                location=f"line {exc.lineno}",
+    # AST checks only apply to MCP_TOOL (Python source).  SKILL (YAML/markdown)
+    # and AGENT (JSON config) are not valid Python — skip AST entirely for them
+    # to avoid spurious SyntaxError findings.
+    if capability_type == CapabilityType.MCP_TOOL:
+        try:
+            tree = ast.parse(source_code)
+        except SyntaxError as exc:
+            findings.append(
+                VerificationFinding(
+                    tier=1,
+                    category="syntax",
+                    severity=Severity.CRITICAL,
+                    message=f"SyntaxError: {exc.msg} at line {exc.lineno}",
+                    location=f"line {exc.lineno}",
+                )
             )
-        )
-        return VerificationReport(
-            capability_name=capability_name,
-            findings=findings,
-            overall_passed=False,
-            tier_reached=1,
-        )
+            return VerificationReport(
+                capability_name=capability_name,
+                findings=findings,
+                overall_passed=False,
+                tier_reached=1,
+            )
 
-    # AST checks
-    for node in ast.walk(tree):
-        _check_hardcoded_return(node, findings)
-        _check_silent_except(node, findings)
+        # AST checks
+        for node in ast.walk(tree):
+            _check_hardcoded_return(node, findings)
+            _check_silent_except(node, findings)
 
-    _check_missing_external_calls(tree, source_code, findings)
+        _check_missing_external_calls(tree, source_code, findings)
 
     # Regex checks
     _check_mock_artifacts(source_code, findings)
@@ -308,26 +363,6 @@ def scan(
         tier_reached=1,
     )
 
-
-def scan_text_only(text: str, capability_name: str) -> VerificationReport:
-    """Run regex-only Tier 1 checks on non-Python text (SKILL.md, JSON configs).
-
-    Skips AST parsing entirely — only runs the mock-artifact and synthetic-data
-    regex patterns.  Used by the gate for SKILL and AGENT artifacts whose content
-    is not valid Python.
-
-    Returns a ``VerificationReport`` with ``tier_reached=1``.
-    """
-    findings: list[VerificationFinding] = []
-    _check_mock_artifacts(text, findings)
-    _check_synthetic_comments(text, findings)
-    has_critical = any(f.severity == Severity.CRITICAL for f in findings)
-    return VerificationReport(
-        capability_name=capability_name,
-        findings=findings,
-        overall_passed=not has_critical,
-        tier_reached=1,
-    )
 
 
 def should_proceed_to_tier2(report: VerificationReport) -> bool:

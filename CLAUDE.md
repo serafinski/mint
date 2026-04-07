@@ -1,10 +1,10 @@
-# JIT Capability Synthesis for Self-Developing Multi-Agent Systems
+# MINT — Model-driven Instantiation of Novel Tools
 
 **Master's Thesis Project - February 2026**
 
 ## Overview
 
-This project explores just-in-time capability synthesis in multi-agent systems. The goal is to build a system that can generate, verify, and optimize its own capabilities on-demand.
+This project explores just-in-time capability synthesis in multi-agent systems. The goal is to build a system that can generate, verify, and optimize its own capabilities on-demand. The user-facing CLI is `uv run mint`.
 
 **Research question:** How can we balance autonomy vs correctness, specificity vs generality, and context economy in self-developing multi-agent systems?
 
@@ -20,9 +20,9 @@ See `docs/thesis_proposal.md` for full details.
 
 - **LangGraph** - Multi-agent orchestration and pipeline graphs
 - **DeepAgents** (`deepagents` package) - Agent harness with built-in planning (`write_todos`), file system context management, subagent spawning, and conversation summarization. Used for task decomposition (Pillar 1) and adversarial probing (Pillar 2).
-- **LLM Provider** - DeepSeek via `langchain-deepseek` for cost efficiency. Provider-agnostic via `init_chat_model("provider:model")`.
-  - `deepseek-chat` (DeepSeek-V3.2) — for all LLM tasks including DeepAgents and plain LangGraph nodes
-  - `deepseek-reasoner` (thinking mode) — **not usable with DeepAgents** due to missing `tool_choice` support; reserved for direct LLM calls without tool use
+- **LLM Provider** - Provider-agnostic via `init_chat_model("provider:model")`.
+  - `openai:gpt-5-mini` — unified default for all components, centralized in `src/config.py` as `DEFAULT_LLM_MODEL`. Override via `JIT_LLM_MODEL` environment variable for experiments.
+  - **Environment:** Requires `OPENAI_API_KEY` in `.env`
 - **Claude Code** - Code generation (development tool only, not part of the runtime system)
 - **MCP SDK** - Tool serving (Python, FastMCP pattern)
 - **ChromaDB** - Skill registry (semantic search with hierarchical embeddings)
@@ -37,16 +37,16 @@ DeepAgents (`create_deep_agent()`) return a `CompiledStateGraph` — a complete 
 
 | Component | Implementation | Model | Why |
 |---|---|---|---|
-| Task decomposition | **DeepAgent** (invoked from node) | `deepseek-chat` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
-| Capability classifier | Plain LangGraph node | `deepseek-chat` | LLM classification with structured output (`temperature=0`) — single-step |
-| MCP tool generator | Plain LangGraph node | `deepseek-chat` | Single-pass code generation with retry on failure |
-| Skill generator | Plain LangGraph node | `deepseek-chat` | Structured text generation targeting DeepAgents skill format |
-| Agent generator | Plain LangGraph node | `deepseek-chat` | System prompt + config generation |
+| Task decomposition | **DeepAgent** (invoked from node) | `openai:gpt-5-mini` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
+| Capability classifier | Plain LangGraph node | `openai:gpt-5-mini` | LLM classification with structured output (`temperature=0`) — single-step |
+| MCP tool generator | Plain LangGraph node | `openai:gpt-5-mini` | Single-pass code generation with retry on failure |
+| Skill generator | Plain LangGraph node | `openai:gpt-5-mini` | Structured text generation targeting DeepAgents skill format |
+| Agent generator | Plain LangGraph node | `openai:gpt-5-mini` | System prompt + config generation |
 | Tier 1 static scanner | Plain Python (no LLM) | — | AST + regex, deterministic |
-| Tier 2 behavioral testing | Plain LangGraph node | `deepseek-chat` | Test input generation + execution |
-| Tier 3 adversarial probing | **DeepAgent** (invoked from node) | `deepseek-chat` | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
-| Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | `deepseek-chat` | Multi-step investigation of why capabilities fail |
-| Granularity operations | Plain LangGraph node | `deepseek-chat` | Metrics-driven decisions, mostly deterministic |
+| Tier 2 behavioral testing | Plain LangGraph node | `openai:gpt-5-mini` | Test input generation + execution |
+| Tier 3 adversarial probing | **DeepAgent** (invoked from node) | `openai:gpt-5-mini` | Multi-step reasoning: plan attacks via `write_todos`, execute in sandbox via `execute` tool, write findings to files, iterate |
+| Failure analysis (optimizer) | **DeepAgent** (optional, invoked from node) | `openai:gpt-5-mini` | Multi-step investigation of why capabilities fail |
+| Granularity operations | Plain LangGraph node | `openai:gpt-5-mini` | Metrics-driven decisions, mostly deterministic |
 
 ### DeepAgents Skill Ecosystem
 
@@ -64,32 +64,42 @@ The skill generator (`src/orchestrator/generators/skill.py`) must produce skills
 
 ```
 src/
-├── orchestrator/       # Pillar 1: pipeline orchestration (LangGraph)
+├── config.py               # Centralized constants (model, sandbox, thresholds)
+├── cli/                    # MINT CLI (Typer + Rich)
+│   ├── app.py              # Command definitions (run, plan, retry, list, inspect, ...)
+│   ├── runner.py           # Pipeline execution, file handling, output auto-save
+│   └── display.py          # Rich progress display, output quality detection
+├── orchestrator/           # Pillar 1: pipeline orchestration (LangGraph)
 │   ├── decomposition.py    # Task decomposition (DeepAgent, invoked from node)
 │   ├── classifier.py       # Capability classification
 │   ├── gap_detection.py    # Skill gap detection
 │   ├── pipeline.py         # Main LangGraph pipeline graph
 │   ├── tool_loader.py      # Dynamic MCP tool loading (importlib, not subprocess servers)
+│   ├── loading_node.py     # Dynamic loading + registration (all 3 types)
+│   ├── verification_node.py # Retry loop orchestration
+│   ├── tracing.py          # LangFuse event emission helpers
+│   ├── prompts/            # All LLM prompt templates
 │   └── generators/         # Capability generators
 │       ├── mcp_tool.py
 │       ├── skill.py
 │       └── agent.py
 ├── registry/           # Skill registry (ChromaDB) and metrics (DuckDB)
 │   ├── store.py            # ChromaDB-backed registry
-│   └── metrics.py          # DuckDB metrics store
+│   ├── metrics.py          # DuckDB metrics store
+│   └── evaluation_store.py # DuckDB evaluation records
 ├── verification/       # Pillar 2: three-tier verification
 │   ├── static_scanner.py   # Tier 1: AST + regex
-│   ├── behavioral.py       # Tier 2: edge-case probing
+│   ├── behavioral.py       # Tier 2: edge-case probing (5 test categories)
 │   ├── adversarial.py      # Tier 3: red-team agent (DeepAgent, invoked from node)
-│   └── gate.py             # Verification gate (combines all tiers)
+│   ├── gate.py             # Verification gate (combines all tiers)
+│   └── sandbox_tool.py     # Docker execution + dependency resolution
 ├── optimizer/          # Pillar 3: granularity optimizer
 │   ├── utility.py          # Utility function computation
 │   ├── operations.py       # Split, merge, prune
 │   ├── loop.py             # Optimization loop
 │   └── simulation.py       # Simulation harness
 ├── schemas/            # Shared Pydantic state schemas (single source of truth)
-├── mcp_tools/          # Generated & hand-built MCP tools
-└── agents/             # Agent configs & system prompts
+└── mcp_tools/          # Generated & hand-built MCP tools
 
 .deepagents/
 └── skills/             # Generated skills runtime location — DeepAgents loads from here automatically
@@ -98,10 +108,23 @@ tools/                  # Development & validation utilities
 ├── quick_validate.py       # DeepAgents skill validator (structural checks)
 └── init_skill.py           # DeepAgents skill scaffolding script
 
+scripts/                # Evaluation runners + integration tests
+├── run_pilot.py            # Evaluation runner (18 tasks × 4 conditions × N runs)
+├── run_longitudinal.py     # Longitudinal optimizer test (40+ tasks, no reset)
+├── run_task.py             # Legacy CLI runner
+├── analyze_results.py      # Statistical analysis (CIs, Fisher's exact)
+├── backfill_token_costs.py # LangFuse → DuckDB token cost extraction
+├── analyze_context_utilization.py  # Context window utilization from LangFuse
+├── test_pipeline.py        # Integration test: full pipeline (Pillar 1)
+├── test_verification.py    # Integration test: three-tier gate (Pillar 2)
+├── test_split_merge.py     # Integration test: optimizer operations (Pillar 3)
+├── test_auto_optimizer.py  # Integration test: CLI auto-optimizer
+└── test_mint.py            # MINT CLI smoke test (all types + formats)
+
 tests/
-├── unit/               # Fast, no I/O, no external services
+├── unit/               # 814+ tests, no I/O, no external services
 ├── integration/        # Docker, ChromaDB, DuckDB, MCP servers
-└── evaluation/         # Thesis evaluation harnesses and baselines
+└── evaluation/         # Harness, tasks, snapshots, fixtures
 ```
 
 ## Skills
@@ -143,70 +166,21 @@ uv sync
 
 ## Observability with LangFuse
 
-LangFuse is used for tracing LLM calls, agent execution, and debugging workflows.
-
-### Integration with LangChain/LangGraph
-
-LangFuse integrates via the `CallbackHandler`:
-
-```python
-from langfuse.langchain import CallbackHandler
-
-# Initialize handler
-langfuse_handler = CallbackHandler()
-
-# Add to LangGraph/LangChain invocation
-response = agent.invoke(
-    {"messages": [...]},
-    config={"callbacks": [langfuse_handler]}
-)
-```
-
-### Environment Variables
-
-```bash
-LANGFUSE_PUBLIC_KEY=pk-lf-...
-LANGFUSE_SECRET_KEY=sk-lf-...
-LANGFUSE_HOST=http://localhost:3000  # or https://cloud.langfuse.com
-```
+LangFuse traces LLM calls via `langfuse.langchain.CallbackHandler` passed as `config={"callbacks": [langfuse_handler]}`. Required env vars: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`. See `langfuse-tracing` skill for full patterns.
 
 ## Development Guidelines
 
 ### State Management
 
-Use **structured state schemas** (Pydantic BaseModel) instead of conversation histories for agent handoffs. This reduces token costs and prevents hallucination. See the `pydantic-schemas` skill for conventions.
-
-**Example:**
-```python
-from pydantic import BaseModel, Field
-from typing import Optional
-
-class TaskState(BaseModel):
-    task_description: str
-    subtasks: list[dict] = Field(default_factory=list)
-    errors: list[str] = Field(default_factory=list)
-```
+Use **Pydantic BaseModel** for all inter-node state (see `pydantic-schemas` skill). Never pass raw dicts between nodes.
 
 ### LangGraph Patterns
 
-Use the **Command API** for routing (return `Command(update={...}, goto="next_node")` instead of separate conditional edge functions). Use **Send** for parallel fan-out/fan-in. Use `interrupt()` for human-in-the-loop gates. See the `langgraph-architect` skill and its `references/` directory for detailed patterns.
+Use **Command API** for routing: `Command(update={...}, goto="next_node")`. Use **Send** for parallel fan-out. Use `interrupt()` for HITL. See `langgraph-architect` skill.
 
 ### LLM Initialization
 
-Use `init_chat_model()` for provider-agnostic LLM access. Never hardcode a provider import:
-
-```python
-from langchain.chat_models import init_chat_model
-
-# For plain nodes (fast, single-step)
-llm = init_chat_model("deepseek:deepseek-chat")
-
-# For DeepAgents (also deepseek-chat — reasoner lacks tool_choice support)
-agent_llm = init_chat_model("deepseek:deepseek-chat")
-
-# Switch provider without changing code
-llm = init_chat_model("anthropic:claude-sonnet-4-5-20250929")
-```
+Import `DEFAULT_LLM_MODEL` from `src.config` and use `init_chat_model(DEFAULT_LLM_MODEL)` for all LLM-calling components. Never hardcode `"openai:gpt-5-mini"` directly — use the config constant so the model can be changed in one place (or via `JIT_LLM_MODEL` env var).
 
 ### DeepAgents Integration
 
@@ -243,11 +217,11 @@ Every DeepAgent invocation (`create_deep_agent()`) must respect these constraint
 
 | Constraint | Value | Notes |
 |---|---|---|
-| `recursion_limit` (decomposition) | 35 | ~17 logical steps; each tool call = 2 graph steps |
-| `recursion_limit` (adversarial probing) | 35 | Needs more exploration room |
+| `recursion_limit` (decomposition) | 50 | ~25 logical steps; typical usage is 2-3 steps |
+| `recursion_limit` (adversarial probing) | 50 | Typical usage is 3-5 steps; timeout (300s) is the binding constraint, not step count |
 | `recursion_limit` (failure analysis) | 25 | Focused investigation |
 | Node-level timeout (decomposition) | 120s | Prevents pipeline hang |
-| Node-level timeout (adversarial) | 180s | Allows sandbox execution |
+| Node-level timeout (adversarial) | 300s | Allows sandbox execution |
 | Initialization | Fresh every invocation | No state carried between calls |
 | Output contract | `response_format=PydanticModel` | Structured output, not free-text |
 | Fallback on timeout/max_steps | Return partial results with error flag | Pipeline continues degraded |
@@ -301,120 +275,106 @@ For the thesis prototype, use `importlib` dynamic imports + sandbox execution ra
 
 Full MCP server deployment is production future work (Chapter 7).
 
-### Minimum Viable Scope
+### Dynamic Sandbox Dependencies
 
-If timeline pressure forces scope reduction:
+The sandbox resolves dependencies dynamically at runtime — no hardcoded package lists. The Dockerfile installs only `mcp` and `pydantic` (required by the FastMCP tool pattern). All other packages are resolved via two methods:
 
-| Pillar | Full | Minimum | What You Lose |
-|---|---|---|---|
-| **1 (Pipeline)** | MCP tools + Skills + Agents | MCP tools only | Classification trivial, less diversity |
-| **2 (Verification)** | Tier 1 + 2 + 3 | Tier 1 + 2 only | Lose adversarial DeepAgent; discuss theoretically |
-| **3 (Optimizer)** | Prune + Split + Merge | Prune only + formal framework | Demonstrate framework theoretically; simulation still shows convergence |
+**Primary (generator-declared):** The MCP tool generator includes a `pip_packages` field in its structured output (`GeneratedToolCode.pip_packages`). The LLM declares exact PyPI names (e.g., `pyyaml` not `yaml`) at generation time. These are stored on `GeneratedArtifact.pip_packages` and used directly at execution — no import resolution needed.
 
-### Critique Checkpoints
+**Fallback (LLM-based resolution):** For old artifacts or non-generator code paths (behavioral testing, adversarial probing):
 
-| When | Question |
-|---|---|
-| After Iteration 2 | Are generated capabilities good enough for verification to work with? |
-| After Iteration 5 | Does evaluation design produce thesis data? |
+1. `extract_imports()` — AST-based import extraction from generated source
+2. `sys.stdlib_module_names` — filters out stdlib (no hardcoded list)
+3. `_resolve_imports_via_llm()` — asks the LLM to map import names to PyPI names; cached per session
+4. On LLM failure, falls back to identity mapping (import name = pip name)
 
-## What's Built
+**Execution:** Two-phase Docker execution: Phase 1 runs `pip install` with network access and commits to an ephemeral image; Phase 2 runs code with `--network none`. Binary files (xlsx, parquet) are transferred into the sandbox via base64 encoding. The ephemeral image is cleaned up after execution.
 
-### Iteration 0 (Complete)
+## Current State (April 2026)
 
-- **`src/orchestrator/pipeline.py`** — 3-node LangGraph graph (`intake` → `gap_detection` → `report`) using Command API for routing. Classifies registry matches vs. gaps based on similarity threshold.
-- **`src/mcp_tools/fibonacci.py`** — Hand-written FastMCP tool with `Annotated[int, Field()]` for flat MCP parameter schema, tool annotations (`readOnlyHint`, `idempotentHint`, etc.), async implementation.
-- **`demo.py`** — End-to-end demo showing both paths (capability found + MCP call, gap detected). Wired with LangFuse `CallbackHandler` via `config={"callbacks": [...]}`.
-- **`sandbox/Dockerfile`** — Minimal Python 3.11-slim container, non-root `sandbox` user, no network access.
-- **`Makefile`** — Convenience targets: `test`, `lint`, `format` (all via `uv run`).
+**All iterations (0–5) are complete.** Current phase: **Iteration 6 — Evaluation & Analysis.**
 
-### Iteration 1 (Complete)
+All core infrastructure is built and tested (814 unit tests pass). The MINT CLI (`uv run mint`) is implemented. A comprehensive code audit on 2026-04-06 resolved 33 internal contradictions. **All prior evaluation data is stale** — a full re-run (18 tasks × 4 conditions × 5 runs = 360 records) is required before thesis figures can be produced.
 
-- **`src/schemas/`** — 14 Pydantic models across 4 files, all with `extra="forbid"`, `Field(description=...)`, StrEnum:
-  - `capability.py`: `CapabilityType`, `CapabilityDescriptor` (expanded with `input_schema`, `output_schema`, `tags`, `domain`, `is_active`, `metadata`)
-  - `task.py`: `TaskStatus`, `SubTask`, `ClassifiedGap`, `GeneratedArtifact`, `TaskState` (expanded with subtasks, classified_gaps, generated_artifacts, verification_results, status, errors, trace_id), `GapItem`, `MatchItem`
-  - `verification.py`: `Severity`, `VerificationFinding`, `VerificationReport`
-  - `metrics.py`: `InvocationRecord`, `GranularityMetrics`
-- **`src/registry/store.py`** — Production ChromaDB registry with hierarchical embeddings (`{domain} > {type} > {name}: {description}`), full CRUD (`get`, `update`, `deactivate`, `delete`, `list_all`), `min_confidence` filtering, 8 seeded capabilities across 3 types and 5 domains.
-- **`src/registry/metrics.py`** — DuckDB metrics store tracking invocations and capability lifecycle events. Computes four granularity metrics: `reuse_rate`, `success_rate`, `avg_token_cost`, `maintenance_burden`. Supports `compute_granularity_metrics()` aggregate and persistence to disk.
-- **Tests** — 115 passing: 57 schema tests, 29 registry tests, 17 metrics tests, 6 pipeline tests, 4 fibonacci tests, 2 integration tests.
+### What was built per iteration
 
-### Iteration 2 Phase A (Complete)
+- **Iter 0**: Pipeline skeleton, sandbox Dockerfile, fibonacci reference tool
+- **Iter 1**: 18 Pydantic schemas, ChromaDB registry, DuckDB metrics
+- **Iter 2**: Full 9-node generator pipeline (sequential chaining, few-shot + repair)
+- **Iter 3**: Three-tier verification gate, `__name__ = "not_main"` sandbox fix, 18 bypass findings
+- **Iter 4**: Granularity optimizer (utility function, prune/split/merge, optimization loop, simulation)
+- **Iter 5**: Performance fixes (Fix 0–7), SKILL/AGENT execution, evaluation harness, MINT CLI
 
-- **`src/orchestrator/decomposition.py`** — DeepAgent (`create_deep_agent`) wrapped in a LangGraph node. Uses `deepseek-chat` (reasoner lacks `tool_choice`), `response_format=DecompositionResult`, 120s timeout via `ThreadPoolExecutor`, `recursion_limit=35`. Falls back to treating the whole task as one subtask on error.
-- **`src/orchestrator/classifier.py`** — LLM-only classification with `temperature=0` and `with_structured_output(ClassificationResult)`. Shared LLM instance via lazy singleton. Falls back to `MCP_TOOL` with 0.3 confidence on LLM failure.
-- **`src/orchestrator/prompts/`** — Prompt package with `decomposition.py`, `classifier.py`, `mcp_tool_generator.py`, `skill_generator.py`, `agent_generator.py`. All generator prompts include complete few-shot examples.
-- **`src/schemas/task.py`** — Added `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `GeneratorInput` (18 total schema types across 4 files).
-- **Tests** — 143 unit + 7 integration (3 decomposition, 4 classifier) = 150 passing.
+### Evaluation testbed
 
-### Iteration 2 Phase B (Complete)
+18 tasks (T01–T18), 4 baseline conditions (static, no_verification, no_optimization, full), 5 runs each. Balanced: 8 MCP_TOOL (3 retrieval + 5 synthesis), 5 SKILL (2 retrieval + 3 synthesis), 5 AGENT. 5 tasks have seeded capabilities (T01-T03 as MCP_TOOL, T05/T09 as SKILL). 32 fixture files across 7 formats (CSV, JSON, TXT, YAML, XML, Excel, TSV). See `tests/evaluation/tasks.py` for definitions and `docs/system_overview.md` for full evaluation design.
 
-- **`src/orchestrator/generators/mcp_tool.py`** — Plain LangGraph node. Generates FastMCP Python tools from `ClassifiedGap`. Validates syntax + FastMCP structure (`FastMCP`, `@mcp.tool`, `async def`). One-shot repair pass on failure. LangFuse tracing.
-- **`src/orchestrator/generators/skill.py`** — Plain LangGraph node. Generates SKILL.md files from `ClassifiedGap`. Validates with `tools/quick_validate.py` + non-empty body check. Repair pass. Writes to `.deepagents/skills/<name>/SKILL.md`. LangFuse tracing.
-- **`src/orchestrator/generators/agent.py`** — Plain LangGraph node. Generates system prompts + LangGraph node configs. Detects DeepAgent vs. plain agent. For DeepAgent-type, generates SKILL.md content AND writes it to `.deepagents/skills/<agent-name>/SKILL.md`. Repair pass. LangFuse tracing.
-- **`src/orchestrator/tool_loader.py`** — `ToolLoader` class. Loads generated MCP tools via `importlib` dynamic import. Executes in sandboxed subprocess. `register_tool()` registers loaded tools in `SkillRegistry`. Cleanup on exit via `atexit`.
-- **Tests** — 304 total (280 unit + 24 integration). All pass with `DEEPSEEK_API_KEY` set. Integration `_node` tests for generators had stale `goto == "__end__"` assertions (fixed post Phase C: mcp_tool → "generate_skill", skill → "generate_agent", agent → "loading_node"). 24 integration tests: 5 agent-generator, 4 classifier, 3 decomposition, 2 fibonacci, 3 mcp-tool-generator, 4 pipeline-e2e, 3 skill-generator.
+### Key findings (pre-audit, directional only)
 
-### Iteration 2 Phase C (Complete)
+- JIT synthesis ~73% vs static ~14% on synthesis tasks (p<0.001)
+- Verification hurts success by ~9pp due to false positives, adds ~2.3x tokens
+- Optimizer cold-start in snapshot-reset evaluation, but converges to 100% in longitudinal test (40 tasks)
+- Type selection critical for complex tasks (T17: AGENT 100% vs SKILL 9%)
 
-- **`src/orchestrator/gap_detection.py`** — Pure Python LangGraph node wrapping `registry.detect_gaps()`. Converts raw registry output to `MatchItem` / `GapItem` lists. Routes to `"classifier_node"`.
-- **`src/orchestrator/loading_node.py`** — Loads and registers `MCP_TOOL` artifacts via `ToolLoader`. Smoke-tests each tool with empty inputs (warning on failure, continues). Skills/agents already on disk — no loading needed. Sets `FAILED` if gaps existed but no artifacts were generated; `COMPLETED` otherwise.
-- **`src/orchestrator/pipeline.py`** (rewritten) — Full Iteration 2 pipeline. `create_pipeline(registry, loader)` builds: `START → decomposition_node → gap_detection → classifier_node → generate_mcp_tool → generate_skill → generate_agent → loading_node → END`. Registry and loader injected via closures.
-- **Generator `goto` updates** — All four chaining nodes updated: `classifier_node → generate_mcp_tool`, `generate_mcp_tool → generate_skill`, `generate_skill → generate_agent`, `generate_agent → loading_node`.
-- **Tests** — 297 unit tests pass (0 skipped). 4 integration tests in `tests/integration/test_pipeline_e2e.py` (skip without `DEEPSEEK_API_KEY`). Total: 321 tests (297 unit + 24 integration).
+All numbers pending confirmation after full re-run with post-audit code.
 
-### ✅ Decision: Generator chaining strategy → sequential (not Send fan-out)
+### What remains
 
-The three generator nodes (`generate_mcp_tool`, `generate_skill`, `generate_agent`) are chained sequentially. Each node filters by `classified_type`, processes its gaps, and hands off to the next node via `Command(goto=...)`.
-
-**Why not Send fan-out:** Parallel fan-out requires Annotated reducers on `TaskState` list fields and refactored generator signatures accepting `GeneratorInput` instead of `TaskState`. Sequential chaining is simpler, avoids schema changes, and is sufficient for the thesis — generation latency is not a bottleneck. Send-based parallelism is documented as future work.
-
-### Iteration 3 Pre-work (Complete)
-
-- **`src/schemas/task.py`** — Added `attempt_count: int = 0` (ge=0) to `TaskState`. Tracks generation+verification retry cycles for the 3-strike system. 4 new unit tests (324 unit total).
-- **`.claude/skills/verification-patterns/SKILL.md`** — New skill covering: 5 Tier 1 contamination categories with AST patterns, Tier 2 signature-based input extraction, `sandbox_execute` Docker design (must use Docker, never `sys.executable`), 3-strike retry loop, tiered cost gate, updated Iteration 3 pipeline topology.
-
-### Iteration 3 Foundation (Complete — pre-team start)
-
-- **`src/schemas/verification.py`** — `VerificationFinding.tier` constraint corrected to `ge=0` (was `ge=1`). Tier 0 findings (structural pre-check from `quick_validate.py`) require tier=0 to be valid.
-- **`src/orchestrator/verification_node.py`** — Stub verification node with correct retry logic: runs `gate_fn` per artifact, increments `attempt_count`, removes failed artifacts on retry (routes to `"generate_mcp_tool"`), fails open at `MAX_ATTEMPTS=3`. 19 unit tests.
-- **`src/verification/sandbox_tool.py`** — `sandbox_execute(code, timeout=10) -> dict` runs Python inside `docker run --rm --network none`. Always returns, never raises. 13 unit tests + 4 integration.
-- **`src/orchestrator/pipeline.py`** — `verification_node` wired between generator chain and `loading_node`.
-
-### Iteration 3 (Complete)
-
-- **`src/verification/static_scanner.py`** — Tier 1 static scanner (pure Python, no LLM). Five contamination categories: hardcoded data (CRITICAL), silent exceptions (HIGH), mock/demo artifacts (CRITICAL), synthetic data indicators (HIGH), missing external calls (MEDIUM). For skills: Tier 0 `quick_validate.py` structural pre-check before Tier 1. Also exposes `scan_text_only(text, name)` for non-Python content (SKILL.md, JSON configs). `should_proceed_to_tier2(report)` cost gate. 53 unit tests.
-- **`src/verification/behavioral.py`** — Tier 2 behavioural testing node (no LLM). Parses parameter schema from source AST (`input_schema` is empty by design). Four test categories via Docker sandbox: nonexistent entity, consistency, boundary, latency. Returns `list[VerificationFinding]` with tier=2. `_build_sandbox_code` prepends `__name__ = "not_main"` before the inlined source to prevent the `if __name__ == "__main__": mcp.run()` guard from firing (generated tools always include this block; without the override, `mcp.run()` would block before `asyncio.run(_run())` executes, causing all behavioral tests to silently no-op). 28 unit tests.
-- **`src/verification/adversarial.py`** — Tier 3 adversarial probing DeepAgent. `probe(artifact) -> VerificationReport`. Runs 3 attack patterns: hidden demo/sample mode, network-disconnect behavioral change, ground-truth comparison. `deepseek-chat`, `recursion_limit=35`, timeout=180s. Pydantic `AdversarialFindings` structured output. Fails open on timeout/error. LangFuse tracing. 17 unit tests + 1 integration.
-- **`src/verification/gate.py`** — Verification gate. `verify(artifact) -> VerificationReport`. Orchestrates Tier 0→1→2→3 with fail-fast: Tier 1 CRITICAL → stop, Tier 2 CRITICAL/HIGH → stop. SKILL type: Tier 0 quick_validate + regex-only Tier 1 (no AST on YAML). AGENT type: regex-only on JSON config. `verify()` wraps `_verify_inner()` in a top-level try/except to enforce "never raises" — unexpected exceptions (e.g. filesystem errors in `_run_skill_precheck`) return a MEDIUM gate_error finding (fail open). 17 unit tests.
-- **`src/orchestrator/pipeline.py`** — Updated: `gate_fn=gate_verify` now wired into `verification_node` closure. Real three-tier gate active.
-- **`src/verification/sandbox_tool.py`** — Fixed: `except Exception` added so Docker-unavailable errors (`FileNotFoundError`, `OSError`) are captured in the return dict rather than raised. 13 unit tests.
-- **`sandbox/Dockerfile`** — Fixed: added `pip install mcp pydantic` at build time so generated MCP tools can be imported inside the sandbox. Without this, Tier 2 behavioral testing silently no-ops because `from mcp.server.fastmcp import FastMCP` raises `ModuleNotFoundError`.
-- **`src/orchestrator/generators/utils.py`** — Added `build_task_context(state)` helper. On retry (`attempt_count > 0`), appends CRITICAL/HIGH findings from failed `VerificationReport`s to `task_context` so generators know what to fix. All three generator nodes now use this instead of passing `state.task_description` directly.
-- **Tests** — 480 unit (0 skipped) + 24 integration = 504 total.
-- **Devil's advocate findings** — 18 bypasses documented in `docs/iteration_plan.md` → "Devil's Advocate Findings (Post-Implementation Review)". 6 HIGH-risk: variable-indirection hardcoding (B1.2), parameterless tool bypass (B2.1), input-independent consistency bypass (B2.3), network-fallback bypass (B3.3), 3-strike fail-open with no feedback (B4.3), "clean enough" cross-tier pattern (B5.1).
-
-### Iteration 4 (Complete)
-
-- **`src/optimizer/utility.py`** — Utility function U(c) = α·reuse(c)·success(c) − β·token_cost(c) − γ·maintenance(c). Pulls metrics from DuckDB via `MetricsStore`. `compute_utility()` and `compute_all_utilities()`. Configurable weights (α=1.0, β=0.1, γ=0.1).
-- **`src/optimizer/operations.py`** — Three evolutionary operations with type constraints:
-  - `prune(registry, metrics_store, window_days=30)` — deactivates zero-invocation capabilities. All types.
-  - `split(registry, metrics_store, capability_id)` — LLM-based split into 2 specialized variants. SKILL and AGENT only; raises `ValueError` for MCP_TOOL.
-  - `merge(registry, metrics_store, capability_ids)` — LLM-based merge of low-reuse instruction sets. SKILL only; raises `ValueError` for MCP_TOOL or AGENT.
-- **`src/optimizer/loop.py`** — LangGraph optimization loop: `compute_metrics → identify_candidates → apply_operations → END`. KL divergence between consecutive utility distributions (scipy). `OptimizerState` Pydantic schema. `create_optimization_loop(registry, metrics_store)`.
-- **`src/optimizer/simulation.py`** — Simulation harness: `SimConfig`/`SimResult` schemas, `generate_synthetic_registry()` (40% MCP_TOOL / 35% SKILL / 25% AGENT), `run_simulation(config, with_optimization)`, `plot_results()` (4 academic-style matplotlib plots to `docs/figures/`), `compare_baselines()`.
-- **`src/registry/metrics.py`** — Added `invocations_since(capability_id, cutoff)` method (needed by prune).
-- **`src/orchestrator/pipeline.py`** — Updated `create_pipeline(registry, loader, *, run_optimizer=False, metrics_store=None)`. When `run_optimizer=True`, appends `optimizer_node` after `loading_node` (invokes the compiled optimization loop; non-fatal on failure).
-- **Tests** — 555 unit tests passing (64 new from initial impl + 10 from post-review passes: 8 utility + 18 operations + 12 loop + 27 simulation + 2 pipeline + 6 post-review Pass 3 + others). Post-review fixes: missing try/except in merge candidate loop (loop.py), repair passes + few-shot examples + LangFuse tracing in split()/merge() (operations.py), broken test for merge loop fix corrected (was hitting compute_metrics error path, not merge loop), dead `reuse_rate_mean` field removed from SimConfig.
-- **Known architectural note**: KL divergence in `loop.py` (`_compute_kl_divergence`) treats raw utility scores as probability mass points. KL divergence in `simulation.py` (`_kl_divergence`) uses histograms of scores. Both track convergence but measure different things — thesis should clarify which is "the" convergence metric.
-
-## Current Iteration
-
-**Iteration 5: Integration & End-to-End Testing.** Wire all three pillars together. Build evaluation infrastructure and baselines.
-
-- All three pillars are now active: JIT pipeline + three-tier verification gate + granularity optimizer
-- Next: full pipeline wiring, testbed setup (Business Analytics Pipeline), evaluation harness, 4 baseline conditions
-- See `docs/iteration_plan.md` → Iteration 5 for full spec
+- [x] Run code audits and contradiction checks (9 passes complete, diminishing returns)
+- [ ] Baseline verification (~5 min):
+  - [ ] `uv run pytest tests/unit/` — confirm 814+ tests still pass after audit fixes
+  - [ ] `docker build -t jit-sandbox sandbox/` — rebuild sandbox image if Dockerfile changed
+- [ ] Targeted pre-eval checks (~10 min):
+  - [ ] Prompt review — read all prompts in `src/orchestrator/prompts/` for consistency with current implementation (catches LLM-told vs system-does mismatches)
+  - [ ] Snapshot integrity — verify `tests/evaluation/snapshots/` has correct seeded capabilities (T01-T03 MCP_TOOL, T05/T09 SKILL)
+  - [ ] Fixture file audit — verify all 32 fixtures in `tests/evaluation/tasks.py` exist and are valid
+- [ ] Purge stale data (no eval DuckDB exists, but stale runtime state remains):
+  - [ ] `rm -rf data/chroma/` — old ChromaDB vectors
+  - [ ] `rm -rf data/cli_chroma/` — old CLI ChromaDB
+  - [ ] `rm -rf .deepagents/skills/` — 10 generated skills from old runs
+  - [ ] `rm data/logs/longitudinal_20260319_011101.log` — old log
+  - [ ] `rm data/context_utilization.csv` — old metrics (optional)
+- [ ] Pre-eval integration sanity checks (~$0.20, ~15 min):
+  - [ ] `uv run scripts/test_pipeline.py` — full 9-node pipeline (~$0.15, ~5 min)
+  - [ ] `uv run scripts/test_verification.py` — three-tier gate with Docker/LLM (~$0.02, ~3 min)
+  - [ ] `uv run scripts/test_mint.py --quick` — CLI format detection ($0, ~30s)
+  - [ ] `uv run scripts/test_auto_optimizer.py` — prune/split/merge (~$0.01, ~1 min)
+  - [ ] `uv run scripts/test_split_merge.py` — optimizer operations (~$0.01, ~2 min)
+- [ ] Pre-eval pilot spot-check (~$0.50, ~30 min):
+  - [ ] `uv run scripts/run_pilot.py --tasks T04,T07,T14 --all-conditions --n-runs 1` — 12 runs, check outputs
+  - [ ] `uv run scripts/test_mint.py` — full CLI smoke test, all 3 types + 6 formats (~$0.20, ~15 min)
+  - [ ] Spot-check any failures in LangFuse — distinguish code bugs from LLM generation issues
+  - [ ] Pilot validation checklist (after 12 runs complete):
+    - [ ] Verify exactly 12 records written to `data/evaluation.duckdb` (not fewer = silent data loss)
+    - [ ] Open 2-3 LangFuse traces, skim actual LLM inputs/outputs — catch "works but for wrong reason"
+    - [ ] Check success rates aren't suspiciously uniform across conditions (= evaluation bias)
+    - [ ] Compare `no_verification` vs `full` — if nearly identical, the gate isn't doing anything
+    - [ ] Check token costs are being recorded (not all zeros)
+- [ ] Full evaluation re-run (~$5, ~26h sequential / ~13h with 2 conditions parallel):
+  - [ ] `rm data/evaluation.duckdb` — purge pilot records before full run (pilot contamination)
+  - [ ] `uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5` (18 × 4 × 5 = 360 records)
+  - [ ] Cost breakdown: static ~$0 (0.1h), no_verification ~$0.37 (5h), no_optimization ~$2.21 (10h), full ~$2.32 (11h)
+  - [ ] Adversarial probing is 83% of cost (~$0.025/run); pipeline direct is ~$0.005/run
+- [ ] Re-validate longitudinal optimizer test (~$1.50, ~3h):
+  - [ ] Restore clean state first: `rm -rf data/chroma/ .deepagents/skills/` (full eval leaves dirty state)
+  - [ ] `uv run scripts/run_longitudinal.py` (40 tasks, sequential, optimizer enabled)
+  - [ ] Longitudinal validation checklist:
+    - [ ] Verify 40 records in `data/longitudinal.duckdb`
+    - [ ] Check convergence: success rate of last 10 tasks > first 10 tasks
+    - [ ] Verify `data/longitudinal_optimizer_log.json` exists and shows prune/split/merge events
+    - [ ] Check optimizer actually fired (not 0 operations across 40 tasks)
+- [ ] Post-eval analysis (~$0, ~5 min):
+  - [ ] `uv run scripts/backfill_token_costs.py --write` — LangFuse → DuckDB token costs
+  - [ ] `uv run scripts/analyze_results.py --csv` — statistical analysis + CSV export
+  - [ ] `uv run scripts/analyze_context_utilization.py --csv` — context window metrics
+- [ ] Post-eval sanity checks (spot hidden issues audits can't catch):
+  - [ ] Token cost sanity: spot-check 3-4 runs in LangFuse, compare actual trace costs vs what `backfill_token_costs.py` attributed — look for mismatches
+  - [ ] Verify 360 records in `data/evaluation.duckdb` (not fewer)
+  - [ ] Check no condition has suspiciously uniform success rates (= evaluation bias or bug that helps/hurts uniformly)
+  - [ ] Compare `no_verification` vs `full` success rates — if nearly identical, verification gate may not be working
+  - [ ] Compare `no_optimization` vs `full` — if identical, optimizer isn't firing (expected for snapshot-reset, but confirm)
+  - [ ] Look for tasks that are 100% or 0% across ALL conditions — may indicate task definition issue, not system issue
+- [ ] Produce thesis figures and analysis
 
 ## Stable Interfaces
 
@@ -424,24 +384,37 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/optimizer/operations.py`** — `prune(registry, metrics_store, window_days) -> list[str]`, `split(registry, metrics_store, capability_id, llm_model) -> list[str]` (SKILL/AGENT only), `merge(registry, metrics_store, capability_ids, llm_model) -> str` (SKILL only)
 - **`src/optimizer/loop.py`** — `create_optimization_loop(registry, metrics_store, ...) -> CompiledStateGraph`, `OptimizerState`
 - **`src/optimizer/simulation.py`** — `SimConfig`, `SimResult`, `generate_synthetic_registry()`, `run_simulation(config, with_optimization) -> list[SimResult]`, `plot_results()`, `compare_baselines()`
-- **`src/schemas/`** — All 18 types: `CapabilityType`, `CapabilityDescriptor`, `TaskState` (now includes `attempt_count: int = 0`), `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact`, `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`
+- **`src/config.py`** — Centralized constants: `DEFAULT_LLM_MODEL` (env: `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env: `JIT_SANDBOX_IMAGE`), `DOCKER_PREINSTALLED`, `FILE_SIZE_LIMIT_BYTES`, `BINARY_EXTENSIONS`, `AUTO_OPTIMIZER_THRESHOLD`
+- **`src/schemas/`** — 18 core types (`CapabilityType`, `CapabilityDescriptor`, `TaskState` (now includes `attempt_count: int = 0`), `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact` (now includes `pip_packages: list[str]`), `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`) + 5 evaluation types (`BaselineCondition`, `EvaluationRecord`, `FailureReason`, `HumanLabel`, `TaskTier`)
 - **`src/orchestrator/decomposition.py`** — `decomposition_node()` (DeepAgent-backed task decomposition)
 - **`src/orchestrator/classifier.py`** — `classify_gap()`, `classifier_node()` (LLM-based classification)
 - **`src/orchestrator/prompts/`** — All prompt constants for decomposition, classification, and all three generators
-- **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry)` (detects registry gaps, always routes to `"classifier_node"`)
-- **`src/orchestrator/loading_node.py`** — `loading_node(state, loader, registry)` (loads + registers MCP_TOOL artifacts, sets terminal status)
-- **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader, *, run_optimizer=False, metrics_store=None)` (9-node pipeline; real three-tier gate wired via `gate_fn=gate_verify` closure; optional `optimizer_node` appended after `loading_node` when `run_optimizer=True`)
+- **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry, metrics_store=None)` (detects registry gaps, records match invocations, always routes to `"classifier_node"`)
+- **`src/orchestrator/loading_node.py`** — `loading_node(state, loader, registry)` (loads MCP_TOOL via importlib, registers all 3 types in ChromaDB with source_code/skill_content/agent_config metadata, sets terminal status)
+- **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader, *, run_optimizer=False, metrics_store=None, verification_enabled=True)` (9-node pipeline; real three-tier gate wired via `gate_fn=gate_verify` closure; `verification_enabled=False` bypasses gate for no_verification baseline; optional `optimizer_node` appended after `loading_node` when `run_optimizer=True`)
 - **`src/orchestrator/verification_node.py`** — `verification_node(state, gate_fn=None)` (retry + artifact replacement logic; real gate wired in pipeline.py)
 - **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` (LangGraph nodes; chained sequentially to `verification_node`)
-- **`src/verification/static_scanner.py`** — `scan(source_code, capability_name, capability_type) -> VerificationReport`, `scan_text_only(text, name) -> VerificationReport`, `should_proceed_to_tier2(report) -> bool`
+- **`src/verification/static_scanner.py`** — `scan(source_code, capability_name, capability_type) -> VerificationReport`, `should_proceed_to_tier2(report) -> bool`
 - **`src/verification/behavioral.py`** — `run(artifact) -> list[VerificationFinding]`, `extract_parameter_schema(source_code) -> dict`
 - **`src/verification/adversarial.py`** — `probe(artifact) -> VerificationReport` (DeepAgent, never raises), `AdversarialFinding`, `AdversarialFindings`
 - **`src/verification/gate.py`** — `verify(artifact) -> VerificationReport` (tiered cost gate, wired as `gate_fn` in pipeline)
-- **`src/verification/sandbox_tool.py`** — `sandbox_execute(code, timeout=10) -> dict` (Docker isolation; use for all adversarial/behavioral probing)
+- **`src/verification/sandbox_tool.py`** — `sandbox_execute(code, timeout=10, extra_packages=None) -> dict` (Docker isolation with dynamic dependency resolution; use for all adversarial/behavioral probing), `extract_imports(source_code) -> set[str]`, `resolve_extra_packages(source_code) -> list[str]`
 - **`src/orchestrator/tool_loader.py`** — `ToolLoader` (load, execute, register_tool, cleanup), `LoadedTool`, `ToolResult`
 - **`src/registry/store.py`** — `SkillRegistry` (full CRUD + hierarchical search), `seed_registry()`
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + 4 granularity metric queries)
+- **`src/registry/evaluation_store.py`** — `EvaluationStore` (evaluation_runs DuckDB table, success rates, failure breakdown)
+- **`src/schemas/evaluation.py`** — `EvaluationRecord` (18 fields, `success` property)
 - **`src/mcp_tools/fibonacci.py`** — Reference MCP tool implementation
+- **`tests/evaluation/tasks.py`** — `TaskDefinition`, `ALL_TASKS`, `PILOT_TASKS`, `get_task()`
+- **`tests/evaluation/snapshots.py`** — `take_clean_snapshot()`, `restore_clean_snapshot()`, `snapshot_exists()`
+- **`tests/evaluation/harness.py`** — `EvaluationHarness`, `HarnessConfig`, `_run_static_implementation()`
+- **`tests/evaluation/execution.py`** — `execute_skill_artifact()`, `execute_agent_artifact()`, `_read_fixture_contents()` (DeepAgent-based SKILL/AGENT execution)
+- **`scripts/run_pilot.py`** — Evaluation runner: `uv run scripts/run_pilot.py [--condition] [--all-tasks] [--all-conditions] [--n-runs N]`
+- **`scripts/test_mint.py`** — MINT CLI smoke test: `uv run scripts/test_mint.py [--quick] [--mcp-only] [--skill-only] [--agent-only]`. Tests all 3 capability types + 6 file formats (CSV, JSON, YAML, XML, Excel, TSV). Logs to `data/logs/`.
+- **`src/cli/app.py`** — MINT CLI entry point (Typer): `run`, `plan`, `retry`, `list`, `inspect`, `history`, `prune`, `seed`, `reset`, `disable`, `enable`
+- **`src/cli/runner.py`** — Pipeline execution with streaming progress, file metadata augmentation, AST-based parameter matching, auto-save output to `data/mint_output/` (timestamped), `--output-dir` override
+- **`src/cli/display.py`** — Rich formatting (progress table, verification findings, capability list/inspect/history, output quality detection)
+- **`scripts/run_task.py`** — User-facing CLI: `uv run scripts/run_task.py "task" [--file PATH] [--param K=V] [--dry-run] [--list] [--skip-verification] [--enable-optimizer] [--no-optimizer] [--timeout SECONDS] [--output-format json|human]`. Optimizer auto-enables after 20+ invocations. Persists capabilities (ChromaDB) and invocation metrics (`data/cli_metrics.duckdb`) across runs.
 
 ## Notes for AI Agents
 
@@ -465,7 +438,6 @@ When working on this project:
 - **LangGraph llms.txt**: https://docs.langchain.com/llms.txt
 - **DeepAgents docs**: https://docs.langchain.com/oss/python/deepagents/overview/
 - **DeepAgents PyPI**: https://pypi.org/project/deepagents/
-- **DeepSeek API docs**: https://api-docs.deepseek.com/
 - **DeepAgents skill spec**: See `tools/quick_validate.py` and `tools/init_skill.py` for format rules
 - **uv docs**: https://docs.astral.sh/uv/
 - **MCP specification**: https://modelcontextprotocol.io/
@@ -474,4 +446,4 @@ When working on this project:
 
 ---
 
-**Last updated:** March 2026
+**Last updated:** April 2026

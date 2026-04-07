@@ -17,13 +17,14 @@ On each call the node:
    classified gaps; the replace-by-name logic in each generator ensures that
    re-generated artifacts overwrite the old versions rather than accumulating.
 
-**Stub gate (Iteration 2 default):** ``gate_fn=None`` uses ``_stub_gate``,
-which always returns a passing ``VerificationReport``.  In Iteration 3 this
-parameter will be replaced with the real ``gate.verify`` function.
+**No-verification baseline:** ``gate_fn=None`` uses ``_stub_gate``, which
+always returns a passing ``VerificationReport``.  The real ``gate.verify``
+is wired as the default in ``pipeline.py``.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 from collections.abc import Callable
 from typing import Literal
@@ -33,11 +34,12 @@ from langgraph.types import Command
 from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType  # noqa: F401 — available for gate impls
 from src.schemas.task import GeneratedArtifact, TaskState, TaskStatus
-from src.schemas.verification import Severity, VerificationReport
+from src.schemas.verification import Severity, VerificationFinding, VerificationReport
 
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
+MAX_VERIFICATION_WORKERS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -94,20 +96,49 @@ def verification_node(
     failed_artifacts: list[GeneratedArtifact] = []
     new_reports: list[VerificationReport] = []
 
-    for artifact in state.generated_artifacts:
-        report = gate_fn(artifact)
-        new_reports.append(report)
-        if report.overall_passed:
-            passed_artifacts.append(artifact)
-        else:
-            failed_artifacts.append(artifact)
-            # Surface Critical and High findings as pipeline errors so they
-            # appear in state.errors and are visible to downstream nodes.
-            for finding in report.findings:
-                if finding.severity in (Severity.CRITICAL, Severity.HIGH):
-                    errors.append(
-                        f"[{artifact.capability_name}] {finding.category}: {finding.message}"
-                    )
+    logger.info(
+        "verification_node: verifying %d artifact(s) (attempt %d)",
+        len(state.generated_artifacts),
+        new_attempt_count,
+    )
+
+    # Run gate_fn in parallel — each call is independent (isolated Docker sandbox).
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_VERIFICATION_WORKERS) as pool:
+        future_to_artifact = {
+            pool.submit(gate_fn, artifact): artifact
+            for artifact in state.generated_artifacts
+        }
+        for future in concurrent.futures.as_completed(future_to_artifact):
+            artifact = future_to_artifact[future]
+            try:
+                report = future.result()
+            except Exception as exc:
+                logger.error(
+                    "gate_fn raised unexpectedly for '%s': %s — treating as "
+                    "verification failure (fail-safe)",
+                    artifact.capability_name, exc,
+                )
+                report = VerificationReport(
+                    capability_name=artifact.capability_name,
+                    findings=[VerificationFinding(
+                        tier=1,
+                        category="gate_error",
+                        severity=Severity.HIGH,
+                        message=f"Verification gate raised exception: {exc}",
+                    )],
+                    overall_passed=False,
+                    tier_reached=0,
+                )
+            new_reports.append(report)
+            if report.overall_passed:
+                passed_artifacts.append(artifact)
+            else:
+                failed_artifacts.append(artifact)
+                for finding in report.findings:
+                    if finding.severity in (Severity.CRITICAL, Severity.HIGH):
+                        errors.append(
+                            f"[{artifact.capability_name}] {finding.category}: {finding.message}"
+                        )
 
     all_passed = len(failed_artifacts) == 0
 

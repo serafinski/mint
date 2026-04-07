@@ -1,0 +1,195 @@
+{
+  "T01": {
+    "row_count": 50,
+    "column_names": [
+      "id",
+      "name",
+      "age",
+      "city"
+    ]
+  },
+  "T02": {
+    "expected_error_count": 3,
+    "expected_errors": [
+      "database.port: 'not-a-number' is not of type 'integer'",
+      "cache.ttl: -5 is less than the minimum of 0",
+      "logging.level: 'VERBOSE' is not one of ['DEBUG', 'INFO', 'WARNING', 'ERROR']"
+    ]
+  },
+  "T03": {
+    "word_count": 154,
+    "word_count_tolerance_pct": 2,
+    "readability_score": 0.0,
+    "readability_range": [
+      0,
+      100
+    ]
+  },
+  "T04": {
+    "product_count": 10,
+    "items_below_threshold": 7,
+    "total_reorder_cost": 33785.1,
+    "min_days_of_stock": 14
+  },
+  "T05": {
+    "input_row_count": 54,
+    "expected_max_output_row_count": 40
+  },
+  "T06": {
+    "n_rows": 100,
+    "columns": [
+      "feature_a",
+      "feature_b",
+      "feature_c",
+      "feature_d"
+    ],
+    "expected_variances": {
+      "feature_a": 86.3384,
+      "feature_b": 93.6455,
+      "feature_c": 84.2698,
+      "feature_d": 106.2409
+    },
+    "variance_tolerance_pct": 10
+  },
+  "T07": {
+    "left_row_count": 15,
+    "right_row_count": 15,
+    "expected_join_count": 12
+  },
+  "T08": {
+    "n_rows": 100,
+    "n_columns": 6,
+    "total_quality_issues": 31,
+    "null_ages": 14,
+    "null_salaries": 9,
+    "invalid_dates": 5,
+    "salary_outliers": 3,
+    "valid_departments": [
+      "Engineering",
+      "Sales",
+      "Marketing",
+      "Support",
+      "HR"
+    ]
+  },
+  "T09": {
+    "required_keys": [
+      "summary",
+      "stats_table",
+      "anomalies"
+    ],
+    "expected_anomaly_count": 5
+  },
+  "T10": {
+    "n_weeks": 52,
+    "trend_direction": "upward",
+    "avg_first_4_weeks": 1080.63,
+    "avg_last_4_weeks": 1902.1,
+    "has_seasonality": true,
+    "n_forecast_weeks": 4
+  },
+  "T11": {
+    "summary_row_count": 4,
+    "region_revenues": {
+      "North": 19031.32,
+      "East": 15019.57,
+      "West": 15060.55,
+      "South": 14742.55
+    },
+    "regions_meeting_target": 2,
+    "revenue_tolerance_pct": 5
+  },
+  "T12": {
+    "input_row_count": 80,
+    "clean_row_count": 60,
+    "violations_found": 20,
+    "rules_applied": 3
+  },
+  "T13": {
+    "anomaly_count": 5,
+    "planted_anomalies": [
+      {
+        "timestamp": "2024-06-01 00:45:00",
+        "metric": "memory_mb",
+        "value": 15134.607
+      },
+      {
+        "timestamp": "2024-06-01 11:15:00",
+        "metric": "memory_mb",
+        "value": 18518.638
+      },
+      {
+        "timestamp": "2024-06-01 18:45:00",
+        "metric": "cpu_usage",
+        "value": 244.754
+      },
+      {
+        "timestamp": "2024-06-01 22:15:00",
+        "metric": "memory_mb",
+        "value": 19215.307
+      },
+      {
+        "timestamp": "2024-06-01 23:30:00",
+        "metric": "error_rate",
+        "value": 0.203
+      }
+    ],
+    "metrics_analyzed": 4
+  },
+  "T14": {
+    "department_count": 5,
+    "department_spending": {
+      "Marketing": 159709.47,
+      "Support": 204328.86,
+      "Sales": 208081.43,
+      "Engineering": 250839.04,
+      "HR": 210255.8
+    },
+    "spending_tolerance_pct": 5,
+    "over_budget_count": 2,
+    "flagged_transactions": 18
+  },
+  "T15": {
+    "n_days": 7,
+    "metrics_aggregated": 4,
+    "alert_days": 7
+  },
+  "T16": {
+    "root_cause_metric": "db_connections",
+    "cascade_chain": [
+      "db_connections",
+      "query_latency_ms",
+      "request_queue_depth",
+      "error_rate"
+    ],
+    "incident_start_row": 60,
+    "n_metrics": 5
+  },
+  "T17": {
+    "total_alerts": 20,
+    "high_severity_alerts": 15,
+    "true_fraud_count": 15,
+    "fraud_customer_ids": [
+      1,
+      3,
+      5
+    ],
+    "fraud_customer_names": [
+      "Alice",
+      "Carol",
+      "Eve"
+    ]
+  },
+  "T18": {
+    "total_rows": 67,
+    "unique_count": 50,
+    "duplicate_count": 17,
+    "key_columns": [
+      "order_id",
+      "customer",
+      "product",
+      "quantity",
+      "price"
+    ]
+  }
+}

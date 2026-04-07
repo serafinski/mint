@@ -28,7 +28,7 @@ matplotlib.use("Agg")  # non-interactive backend for headless environments
 # ---------------------------------------------------------------------------
 
 
-class SimConfig(BaseModel, extra="forbid"):
+class SimConfig(BaseModel):
     """Configuration for a simulation run."""
 
     n_capabilities: int = Field(default=20, description="Starting registry size")
@@ -44,9 +44,10 @@ class SimConfig(BaseModel, extra="forbid"):
     )
     seed: int = Field(default=42, description="Random seed for reproducibility")
     output_dir: str = Field(default="docs/figures", description="Where to save plots")
+    model_config = {"extra": "forbid"}
 
 
-class SimResult(BaseModel, extra="forbid"):
+class SimResult(BaseModel):
     """Result of a single simulation cycle."""
 
     cycle: int = Field(..., description="Cycle number (0-indexed)")
@@ -61,6 +62,7 @@ class SimResult(BaseModel, extra="forbid"):
     n_split: int = Field(default=0, description="Capabilities split this cycle")
     n_merged: int = Field(default=0, description="Capabilities merged this cycle")
     converged: bool = Field(default=False, description="Whether convergence was detected")
+    model_config = {"extra": "forbid"}
 
 
 # ---------------------------------------------------------------------------
@@ -96,15 +98,15 @@ def _kl_divergence(p: np.ndarray, q: np.ndarray, epsilon: float = 1e-10) -> floa
 def _scores_to_histogram(scores: list[float], n_bins: int = 20) -> np.ndarray:
     """Convert utility scores to a histogram for KL computation.
 
-    Uses a fixed wide range (-200.0, 5.0) that covers extreme utility values.
-    With default weights (beta=0.1) and max token_cost=1000 the minimum
-    possible score is roughly -100; the -200 lower bound provides a safe margin.
-    A consistent range is required so histograms from consecutive cycles
-    are over the same support and KL divergence is meaningful.
+    Uses an adaptive range with floor (-200.0, 5.0) that expands to cover
+    extreme utility values if present.  This ensures no scores are clipped
+    while maintaining a consistent baseline range across cycles.
     """
     if not scores:
         return np.ones(n_bins) / n_bins
-    hist, _ = np.histogram(scores, bins=n_bins, range=(-200.0, 5.0))
+    lo = min(min(scores), -200.0)
+    hi = max(max(scores), 5.0)
+    hist, _ = np.histogram(scores, bins=n_bins, range=(lo, hi))
     return hist.astype(np.float64)
 
 
@@ -117,17 +119,23 @@ def generate_synthetic_registry(
     config: SimConfig,
     registry: SkillRegistry,
     metrics_store: MetricsStore,
-) -> None:
+) -> dict[str, float]:
     """Populate registry with N synthetic capabilities and invocation history.
 
     Creates a mix of MCP_TOOL, SKILL, and AGENT capabilities with varied
     reuse/success rates and token costs, seeded for reproducibility.
+
+    Returns:
+        Mapping of capability name → per-capability success rate (used by
+        ``run_simulation`` to maintain consistent rates across cycles).
     """
     rng = np.random.default_rng(config.seed)
 
     type_weights = [0.4, 0.35, 0.25]  # MCP_TOOL, SKILL, AGENT
     types = rng.choice(len(_CAPABILITY_TYPES), size=config.n_capabilities, p=type_weights)
     domains = rng.choice(len(_DOMAINS), size=config.n_capabilities)
+
+    cap_success_rates: dict[str, float] = {}
 
     for i in range(config.n_capabilities):
         cap_type = _CAPABILITY_TYPES[int(types[i])]
@@ -147,6 +155,7 @@ def generate_synthetic_registry(
         n_invocations = int(rng.integers(5, 31))
         cap_success_rate = float(np.clip(rng.normal(config.success_rate_mean, 0.15), 0.1, 1.0))
         cap_token_cost = float(np.clip(rng.normal(config.token_cost_mean, 30.0), 10.0, 500.0))
+        cap_success_rates[name] = cap_success_rate
 
         base_time = datetime.now(UTC) - timedelta(days=30)
         for j in range(n_invocations):
@@ -160,6 +169,8 @@ def generate_synthetic_registry(
             )
             metrics_store.record_invocation(record)
 
+    return cap_success_rates
+
 
 # ---------------------------------------------------------------------------
 # Utility computation (local helper, exposed for direct testing)
@@ -167,8 +178,8 @@ def generate_synthetic_registry(
 
 
 def _compute_utility(
-    metrics_store: MetricsStore,
     capability_id: str,
+    metrics_store: MetricsStore,
     *,
     alpha: float = 1.0,
     beta: float = 0.1,
@@ -196,6 +207,9 @@ def run_simulation(
     config: SimConfig,
     *,
     with_optimization: bool = True,
+    split_reuse_threshold: float = 0.6,
+    split_success_threshold: float = 0.7,
+    merge_reuse_threshold: float = 0.05,
 ) -> list[SimResult]:
     """Run the simulation for config.n_cycles cycles.
 
@@ -203,6 +217,9 @@ def run_simulation(
         config: Simulation configuration.
         with_optimization: If True, apply prune/split/merge operations each cycle.
             If False, only generate invocations (baseline).
+        split_reuse_threshold: Reuse rate above which a capability is a split candidate.
+        split_success_threshold: Success rate below which a high-reuse capability is split.
+        merge_reuse_threshold: Reuse rate below which a SKILL is a merge candidate.
 
     Returns:
         List of SimResult, one per cycle.
@@ -212,12 +229,13 @@ def run_simulation(
     registry = SkillRegistry(collection_name=collection_name)
     metrics_store = MetricsStore(db_path=":memory:")
 
-    generate_synthetic_registry(config, registry, metrics_store)
+    _cap_success_rates = generate_synthetic_registry(config, registry, metrics_store)
 
     if with_optimization:
         from src.optimizer import operations as ops
 
     rng = np.random.default_rng(config.seed + 1000)  # different seed from generation
+    base_time = datetime.now(UTC) - timedelta(days=30)  # deterministic baseline for timestamps
 
     results: list[SimResult] = []
     prev_histogram: np.ndarray | None = None
@@ -250,9 +268,10 @@ def run_simulation(
                 record = InvocationRecord(
                     capability_id=cap_name,
                     task_id=task_id,
-                    success=bool(rng.random() < config.success_rate_mean),
+                    success=bool(rng.random() < _cap_success_rates.get(cap_name, config.success_rate_mean)),
                     token_cost=int(np.clip(rng.normal(config.token_cost_mean, 30.0), 1, 1000)),
                     latency_ms=float(np.clip(rng.normal(200.0, 80.0), 10.0, 2000.0)),
+                    invoked_at=base_time + timedelta(days=cycle, hours=_t),
                 )
                 metrics_store.record_invocation(record)
 
@@ -271,14 +290,15 @@ def run_simulation(
             except Exception:
                 pass
 
-            # Split candidates: SKILL/AGENT with reuse > 0.6 and success < 0.7.
+            # Split candidates: SKILL/AGENT with high reuse and mediocre success.
+            # Thresholds match loop.py defaults (parameterised for consistency).
             # Requires LLM call; silently skipped without a valid API key.
             active_caps = registry.list_all(is_active=True)
             for cap in active_caps:
                 if cap.capability_type not in (CapabilityType.SKILL, CapabilityType.AGENT):
                     continue
                 m = metrics_store.compute_granularity_metrics(cap.name)
-                if m.reuse_rate > 0.6 and m.success_rate < 0.7:
+                if m.reuse_rate > split_reuse_threshold and m.success_rate < split_success_threshold:
                     try:
                         new_ids = ops.split(registry, metrics_store, cap.name)
                         if new_ids:
@@ -286,7 +306,7 @@ def run_simulation(
                     except Exception:
                         pass
 
-            # Merge candidates: SKILL pairs with reuse < 0.05 AND high embedding
+            # Merge candidates: SKILL pairs with low reuse AND high embedding
             # similarity (score >= 0.5).  Uses registry.search() to find partners,
             # matching the strategy in loop.py identify_candidates_node.
             # Requires LLM call; silently skipped without a valid API key.
@@ -296,7 +316,7 @@ def run_simulation(
                 if cap.capability_type != CapabilityType.SKILL:
                     continue
                 m = metrics_store.compute_granularity_metrics(cap.name)
-                if m.reuse_rate < 0.05:
+                if m.reuse_rate < merge_reuse_threshold:
                     low_reuse_skills.append(cap.name)
 
             low_reuse_set = set(low_reuse_skills)
@@ -341,7 +361,7 @@ def run_simulation(
                 score = _real_compute_utility(cap.name, metrics_store)
                 utility_scores.append(float(score))
             except Exception:
-                utility_scores.append(_compute_utility(metrics_store, cap.name))
+                utility_scores.append(_compute_utility(cap.name, metrics_store))
 
         # 4. Compute KL divergence vs previous cycle
         current_histogram = _scores_to_histogram(utility_scores)

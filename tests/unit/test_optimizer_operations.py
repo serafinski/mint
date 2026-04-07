@@ -92,6 +92,51 @@ class TestPrune:
         # Cutoff should be ~7 days ago
         assert (now - cutoff).days in (6, 7)
 
+    def test_prune_skips_pinned_capability(self):
+        """Pinned capabilities are never pruned, even with zero invocations."""
+        pinned_cap = _make_cap("csv-parser")
+        pinned_cap = pinned_cap.model_copy(update={"metadata": {"pinned": "true"}})
+        registry = MagicMock()
+        registry.list_all.return_value = [pinned_cap]
+        store = MagicMock()
+        store.invocations_since.return_value = 0
+
+        result = prune(registry, store, window_days=30)
+
+        assert result == []
+        registry.deactivate.assert_not_called()
+
+    def test_prune_deactivates_unpinned_zero_invocation(self):
+        """Unpinned capabilities with zero invocations are still pruned (regression)."""
+        registry = MagicMock()
+        registry.list_all.return_value = [_make_cap("ephemeral")]
+        store = MagicMock()
+        store.invocations_since.return_value = 0
+
+        result = prune(registry, store, window_days=30)
+
+        assert result == ["ephemeral"]
+        registry.deactivate.assert_called_once_with("ephemeral")
+
+    def test_prune_mixed_registry_only_deactivates_unpinned(self):
+        """Mixed registry: pinned survives, active-with-invocations survives, idle-unpinned pruned."""
+        pinned = _make_cap("pinned-cap")
+        pinned = pinned.model_copy(update={"metadata": {"pinned": "true"}})
+        active = _make_cap("active-cap")
+        idle = _make_cap("idle-cap")
+
+        registry = MagicMock()
+        registry.list_all.return_value = [pinned, active, idle]
+        store = MagicMock()
+        # pinned is skipped before invocations_since is called
+        # active has invocations, idle has none
+        store.invocations_since.side_effect = [5, 0]
+
+        result = prune(registry, store, window_days=30)
+
+        assert result == ["idle-cap"]
+        registry.deactivate.assert_called_once_with("idle-cap")
+
 
 class TestSplit:
     def test_rejects_mcp_tool(self):
@@ -245,8 +290,8 @@ class TestSplit:
         assert mock_structured.invoke.call_count == 2
 
     @patch("src.optimizer.operations.init_chat_model")
-    def test_split_skips_variant_if_name_already_exists(self, mock_init):
-        """split(): if a variant name already exists in the registry, it is skipped."""
+    def test_split_aborts_if_any_variant_name_collides(self, mock_init):
+        """split(): if any variant name already exists, abort entirely (all-or-nothing)."""
         cap = _make_cap("data-workflow", cap_type=CapabilityType.SKILL, domain="data", tags=["etl"])
 
         existing = _make_cap("data-workflow-small", cap_type=CapabilityType.SKILL)
@@ -274,13 +319,12 @@ class TestSplit:
             ],
         )
 
-        result = split(registry, store, "data-workflow")
+        with pytest.raises(ValueError, match="already exists in registry"):
+            split(registry, store, "data-workflow")
 
-        # Only the non-colliding variant is registered
-        assert result == ["data-workflow-large"]
-        assert registry.add.call_count == 1
-        # Parent deactivated because at least one variant was added
-        registry.deactivate.assert_called_once_with("data-workflow")
+        # All-or-nothing: no variants registered, parent not deactivated
+        assert registry.add.call_count == 0
+        registry.deactivate.assert_not_called()
 
     @patch("src.optimizer.operations.init_chat_model")
     def test_split_does_not_deactivate_parent_when_all_variants_collide(self, mock_init):
@@ -309,9 +353,9 @@ class TestSplit:
             ],
         )
 
-        result = split(registry, store, "data-workflow")
+        with pytest.raises(ValueError, match="already exists in registry"):
+            split(registry, store, "data-workflow")
 
-        assert result == []
         registry.add.assert_not_called()
         registry.deactivate.assert_not_called()
 

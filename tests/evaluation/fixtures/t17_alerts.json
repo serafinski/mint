@@ -1,0 +1,142 @@
+[
+  {
+    "alert_id": "ALT-0003",
+    "txn_id": 3,
+    "customer_id": 1,
+    "reason": "unusual_merchant",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0004",
+    "txn_id": 4,
+    "customer_id": 3,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0007",
+    "txn_id": 7,
+    "customer_id": 3,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0012",
+    "txn_id": 12,
+    "customer_id": 3,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0014",
+    "txn_id": 14,
+    "customer_id": 3,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0018",
+    "txn_id": 18,
+    "customer_id": 3,
+    "reason": "high_amount",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0020",
+    "txn_id": 20,
+    "customer_id": 1,
+    "reason": "high_amount",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0046",
+    "txn_id": 46,
+    "customer_id": 5,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0058",
+    "txn_id": 58,
+    "customer_id": 3,
+    "reason": "high_amount",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0070",
+    "txn_id": 70,
+    "customer_id": 3,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0086",
+    "txn_id": 86,
+    "customer_id": 1,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0088",
+    "txn_id": 88,
+    "customer_id": 5,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0089",
+    "txn_id": 89,
+    "customer_id": 5,
+    "reason": "high_amount",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0090",
+    "txn_id": 90,
+    "customer_id": 3,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0098",
+    "txn_id": 98,
+    "customer_id": 3,
+    "reason": "velocity_spike",
+    "severity": "high"
+  },
+  {
+    "alert_id": "ALT-0092",
+    "txn_id": 92,
+    "customer_id": 12,
+    "reason": "amount_threshold",
+    "severity": "low"
+  },
+  {
+    "alert_id": "ALT-0084",
+    "txn_id": 84,
+    "customer_id": 13,
+    "reason": "amount_threshold",
+    "severity": "low"
+  },
+  {
+    "alert_id": "ALT-0024",
+    "txn_id": 24,
+    "customer_id": 11,
+    "reason": "amount_threshold",
+    "severity": "low"
+  },
+  {
+    "alert_id": "ALT-0076",
+    "txn_id": 76,
+    "customer_id": 14,
+    "reason": "amount_threshold",
+    "severity": "low"
+  },
+  {
+    "alert_id": "ALT-0021",
+    "txn_id": 21,
+    "customer_id": 10,
+    "reason": "amount_threshold",
+    "severity": "low"
+  }
+]

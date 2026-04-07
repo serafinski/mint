@@ -19,6 +19,7 @@ from src.optimizer.utility import compute_all_utilities
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
 from src.schemas.capability import CapabilityType
+from src.schemas.metrics import GranularityMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ class OptimizerState(BaseModel):
 def _compute_kl_divergence(
     prev_scores: dict[str, float], curr_scores: dict[str, float]
 ) -> float:
-    """Compute KL(prev || curr) between two capability utility score distributions.
+    """Compute KL(curr || prev) between two capability utility score distributions.
 
     Each capability's raw utility score is treated as a point mass; both
     distributions are shifted to be non-negative, epsilon-smoothed, and
@@ -77,7 +78,9 @@ def _compute_kl_divergence(
     measure different aspects of convergence (see ``_kl_divergence`` there).
     """
     if not prev_scores or not curr_scores:
-        return 0.0
+        # Empty distribution signals catastrophic failure (e.g. all pruned),
+        # NOT convergence.  Return inf to prevent false convergence.
+        return float("inf") if (prev_scores and not curr_scores) else 0.0
 
     # Use union of keys so distributions are comparable
     all_keys = sorted(set(prev_scores) | set(curr_scores))
@@ -98,7 +101,8 @@ def _compute_kl_divergence(
     prev = prev / prev.sum()
     curr = curr / curr.sum()
 
-    return float(entropy(prev, curr))
+    # KL(curr || prev): measures surprise of new data given old expectations
+    return float(entropy(curr, prev))
 
 
 def create_optimization_loop(
@@ -109,7 +113,7 @@ def create_optimization_loop(
     split_reuse_threshold: float = 0.6,
     split_success_threshold: float = 0.7,
     merge_reuse_threshold: float = 0.05,
-    llm_model: str = "deepseek:deepseek-chat",
+    llm_model: str = "",
 ) -> Any:
     """Build the LangGraph optimization loop.
 
@@ -144,9 +148,13 @@ def create_optimization_loop(
         split_cands: list[str] = []
         merge_cands: list[tuple[str, str]] = []
 
+        # Cache metrics to avoid redundant DuckDB queries for merge candidates
+        metrics_cache: dict[str, GranularityMetrics] = {}
+
         for cap_id in state.capabilities_snapshot:
             try:
                 m = metrics_store.compute_granularity_metrics(cap_id)
+                metrics_cache[cap_id] = m
                 cap = registry.get(cap_id)
                 if cap is None:
                     continue
@@ -170,10 +178,8 @@ def create_optimization_loop(
             cap = registry.get(cap_id)
             if cap is None or cap.capability_type != CapabilityType.SKILL:
                 continue
-            try:
-                m = metrics_store.compute_granularity_metrics(cap_id)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Failed to compute metrics for '%s' (merge): %s", cap_id, e)
+            m = metrics_cache.get(cap_id)
+            if m is None:
                 continue
             if m.reuse_rate < merge_reuse_threshold:
                 low_reuse_skills.append(cap_id)
@@ -201,7 +207,7 @@ def create_optimization_loop(
                         partner_id != skill_id
                         and partner_id in low_reuse_set  # only active caps are in low_reuse_set
                         and partner_id not in paired
-                        and similar_cap.is_active  # defensive: search() does not filter by is_active
+                        and similar_cap.is_active
                         and score >= 0.5  # meaningful semantic similarity
                     ):
                         merge_cands.append((skill_id, partner_id))
@@ -263,15 +269,24 @@ def create_optimization_loop(
             except Exception as e:  # noqa: BLE001
                 errors.append(f"merge {pair} failed: {e}")
 
+        # Filter utility_scores to only include capabilities that are still
+        # active after prune/split/merge, so pipeline.py carries accurate
+        # scores for the next cycle's KL divergence calculation.
+        active_caps = {cap.name for cap in registry.list_all(is_active=True)}
+        filtered_scores = {
+            k: v for k, v in state.utility_scores.items() if k in active_caps
+        }
+
         return Command(
             update={
                 "pruned": pruned,
                 "split_results": split_results,
                 "merge_results": merge_results,
                 "errors": errors,
-                # Stored for reference only — cross-pipeline persistence is via
-                # _prev_optimizer_scores in pipeline.py, not this field.
-                "previous_utility_scores": state.utility_scores,
+                # Explicitly return filtered utility_scores so pipeline.py can
+                # reliably read result["utility_scores"] for cross-cycle KL.
+                "utility_scores": filtered_scores,
+                "previous_utility_scores": filtered_scores,
             },
             goto=END,
         )

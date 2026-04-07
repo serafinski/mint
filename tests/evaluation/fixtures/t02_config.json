@@ -1,0 +1,14 @@
+{
+  "database": {
+    "host": "localhost",
+    "port": "not-a-number",
+    "name": "analytics_db"
+  },
+  "cache": {
+    "ttl": -5,
+    "backend": "redis"
+  },
+  "logging": {
+    "level": "VERBOSE"
+  }
+}

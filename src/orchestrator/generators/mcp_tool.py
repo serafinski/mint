@@ -11,14 +11,16 @@ code generation task.
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import logging
 import re
+import threading
 from typing import Literal
 
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from src.orchestrator.generators.utils import build_task_context
+from src.orchestrator.generators.utils import build_task_context, slugify_gap
 from src.orchestrator.prompts.mcp_tool_generator import (
     MCP_TOOL_REPAIR_PROMPT,
     MCP_TOOL_SYSTEM_PROMPT,
@@ -42,6 +44,15 @@ class GeneratedToolCode(BaseModel):
     tool_name: str = Field(..., description="Snake_case name for the tool function")
     source_code: str = Field(..., description="Complete Python source file for the MCP tool")
     description: str = Field(..., description="Brief description of what the tool does")
+    pip_packages: list[str] = Field(
+        default_factory=list,
+        description=(
+            "PyPI package names required by this tool (e.g. ['pyyaml', 'scikit-learn', 'openpyxl']). "
+            "Use the pip install name, NOT the Python import name "
+            "(e.g. 'pyyaml' not 'yaml', 'scikit-learn' not 'sklearn', 'Pillow' not 'PIL'). "
+            "Omit stdlib and packages already in the base image (mcp, pydantic)."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -50,16 +61,27 @@ class GeneratedToolCode(BaseModel):
 # Shared LLM instance (lazy initialisation)
 # ---------------------------------------------------------------------------
 
+MAX_GENERATION_WORKERS = 4
+
 _generator_llm = None
+_llm_lock = threading.Lock()
 
 
 def _get_llm():
-    """Lazily create the generator LLM on first use."""
+    """Lazily create the generator LLM on first use (thread-safe).
+
+    The returned instance is shared across threads (MAX_GENERATION_WORKERS=4).
+    LangChain chat model objects backed by ``httpx`` are thread-safe.
+    """
     global _generator_llm  # noqa: PLW0603
     if _generator_llm is None:
-        from langchain.chat_models import init_chat_model
+        with _llm_lock:
+            if _generator_llm is None:
+                from langchain.chat_models import init_chat_model
 
-        _generator_llm = init_chat_model("deepseek:deepseek-chat")
+                from src.config import DEFAULT_LLM_MODEL
+
+                _generator_llm = init_chat_model(DEFAULT_LLM_MODEL, request_timeout=300)
     return _generator_llm
 
 
@@ -169,6 +191,8 @@ def generate_single_tool(
     Returns:
         (artifact, None) on success, (None, error_message) on failure.
     """
+    forced_name = slugify_gap(gap.query)
+
     llm = _get_llm()
     structured_llm = llm.with_structured_output(GeneratedToolCode)
 
@@ -181,6 +205,7 @@ def generate_single_tool(
         description=gap.description,
         query=gap.query,
         task_context=task_context or "No additional context",
+        forced_name=forced_name,
     )
 
     messages = [
@@ -201,13 +226,20 @@ def generate_single_tool(
     _name_err = _validate_tool_name(result.tool_name)
     validation_error = "; ".join(e for e in [_code_err, _name_err] if e) or None
     if validation_error is None:
-        # Success on first attempt
+        # Success on first attempt — override whatever name the LLM chose
+        if result.tool_name != forced_name:
+            logger.debug(
+                "Overriding LLM name '%s' with stable slug '%s'",
+                result.tool_name, forced_name,
+            )
         return (
             GeneratedArtifact(
-                capability_name=result.tool_name,
+                capability_name=forced_name,
                 capability_type=CapabilityType.MCP_TOOL,
                 source_code=result.source_code,
                 description=result.description,
+                pip_packages=result.pip_packages,
+                gap_query=gap.query,
             ),
             None,
         )
@@ -280,10 +312,12 @@ def generate_single_tool(
 
     return (
         GeneratedArtifact(
-            capability_name=repaired.tool_name,
+            capability_name=forced_name,
             capability_type=CapabilityType.MCP_TOOL,
             source_code=repaired.source_code,
             description=repaired.description,
+            pip_packages=repaired.pip_packages,
+            gap_query=gap.query,
         ),
         None,
     )
@@ -312,17 +346,50 @@ def generate_mcp_tool(
     artifacts: list[GeneratedArtifact] = list(state.generated_artifacts)
     errors: list[str] = list(state.errors)
 
+    # On retry, state.generated_artifacts contains only passing artifacts
+    # (verification_node strips failed ones). Skip any gap already covered.
+    existing_gap_queries = {a.gap_query for a in artifacts if a.gap_query is not None}
+
+    # Filter before submitting — don't waste a thread on a gap already covered
+    gaps_to_generate = [g for g in mcp_gaps if g.query not in existing_gap_queries]
+    for skipped in mcp_gaps:
+        if skipped.query in existing_gap_queries:
+            logger.info("  → skipping (already passed verification): %s", skipped.query)
+
+    logger.info("generate_mcp_tool: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(mcp_gaps) - len(gaps_to_generate))
     task_context = build_task_context(state)
-    for gap in mcp_gaps:
-        artifact, error = generate_single_tool(gap, task_context=task_context)
+
+    # Parallel generation — collect results then merge sequentially
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
+        futures = {
+            pool.submit(generate_single_tool, gap, task_context=task_context): gap
+            for gap in gaps_to_generate
+        }
+        raw_results: list[tuple[GeneratedArtifact | None, str | None]] = []
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                raw_results.append(future.result())
+            except Exception as exc:
+                gap = futures[future]
+                raw_results.append((None, f"Generation failed for {gap.query!r}: {exc}"))
+
+    # Merge after pool closes — sequential, no concurrent mutation
+    n_succeeded = 0
+    failed_queries: list[str] = []
+    for artifact, error in raw_results:
         if artifact is not None:
-            # Replace any existing artifact with the same capability_name.
-            # On retry cycles the node re-runs all classified gaps; replacing
-            # by name prevents duplicate entries for the same capability.
             artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
+            n_succeeded += 1
         if error is not None:
             errors.append(error)
+            failed_queries.append(error[:80])
+
+    if failed_queries:
+        logger.warning(
+            "generate_mcp_tool: %d/%d gaps failed generation: %s",
+            len(failed_queries), len(gaps_to_generate), failed_queries,
+        )
 
     return Command(
         update={

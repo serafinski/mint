@@ -7,12 +7,15 @@ This is a plain Python node — no LLM calls.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Literal
 
 from langgraph.types import Command
 
+from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
+from src.schemas.metrics import InvocationRecord
 from src.schemas.task import GapItem, MatchItem, TaskState, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -21,6 +24,7 @@ logger = logging.getLogger(__name__)
 def gap_detection_node(
     state: TaskState,
     registry: SkillRegistry,
+    metrics_store: MetricsStore | None = None,
 ) -> Command[Literal["classifier_node"]]:
     """Search the registry for each required capability.
 
@@ -47,8 +51,7 @@ def gap_detection_node(
     ]
     gaps = []
     for query, reason in gaps_raw:
-        logger.debug("Capability gap: %r — %s", query, reason)
-        gaps.append(GapItem(description=query, query=query))
+        gaps.append(GapItem(description=reason or query, query=query))
 
     logger.info(
         "Gap detection: %d matches, %d gaps from %d required capabilities",
@@ -56,6 +59,22 @@ def gap_detection_node(
         len(gaps),
         len(state.required_capabilities),
     )
+    for m in matches:
+        logger.info("  ✓ matched: %s (score=%.2f)", m.capability.name, m.score)
+    for g in gaps:
+        logger.info("  ✗ gap: %s", g.description)
+
+    # Record matched capabilities as invocations so they're not pruned as idle.
+    # token_cost=0, latency_ms=0.0 are intentional: matches are not executions.
+    if metrics_store is not None:
+        for m in matches:
+            metrics_store.record_invocation(InvocationRecord(
+                capability_id=m.capability.name,
+                task_id=hashlib.sha256(state.task_description.encode()).hexdigest()[:16],
+                success=True,
+                token_cost=0,
+                latency_ms=0.0,
+            ))
 
     return Command(
         update={

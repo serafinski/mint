@@ -12,7 +12,7 @@ For each gap you produce:
 2. **system_prompt** — A detailed markdown system prompt that instructs the agent
    on its role, capabilities, constraints, and expected behavior.
 3. **node_name** — A Python-valid snake_case function name for the LangGraph node.
-4. **model** — The LLM model identifier (default: "deepseek:deepseek-chat").
+4. **model** — The LLM model identifier (use the system default).
 5. **tools** — A list of tool names the agent needs access to.
 6. **description** — A one-sentence summary of what the agent does.
 7. **is_deep_agent** — Whether this agent requires multi-step autonomous reasoning
@@ -48,7 +48,7 @@ Output:
     - Report findings as structured JSON
     - Flag critical issues with severity levels
 - node_name: "data_quality_monitor_node"
-- model: "deepseek:deepseek-chat"
+- model: "{model_default}"
 - tools: ["read_dataset", "compute_statistics", "check_schema"]
 - description: "Monitors data quality metrics and flags anomalies in datasets."
 - is_deep_agent: false
@@ -87,7 +87,7 @@ Output:
     - Document each investigation step
     - Provide confidence levels for root cause hypotheses
 - node_name: "pipeline_failure_investigator_node"
-- model: "deepseek:deepseek-chat"
+- model: "{model_default}"
 - tools: ["read_logs", "inspect_stage", "check_config", "write_report"]
 - description: "Investigates pipeline failures through multi-step root cause analysis."
 - is_deep_agent: true
@@ -123,6 +123,9 @@ Output:
 Gap description: "{description}"
 Search query: "{query}"
 Task context: "{task_context}"
+
+The `agent_name` field MUST be exactly `{forced_name}` (hyphen-case). \
+Do not choose a different name.
 
 Generate a complete agent configuration. Be specific in the system prompt — \
 include concrete instructions, constraints, and expected behavior. Choose tools \

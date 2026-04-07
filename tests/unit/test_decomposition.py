@@ -263,3 +263,81 @@ class TestDecompositionNode:
         caps = cmd.update["required_capabilities"]
         assert caps.count("shared-cap") == 1
         assert set(caps) == {"shared-cap", "cap-a", "cap-b"}
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker tests (Fix 1)
+# ---------------------------------------------------------------------------
+
+
+class TestCircuitBreaker:
+    """Tests for the two-stage decomposition circuit breaker."""
+
+    @pytest.fixture
+    def state(self):
+        return TaskState(task_description="Complex task")
+
+    def test_caps_under_warn_limit_pass_through_unchanged(self, state):
+        """3 caps (below WARN_CAPS=5) pass through with no warning."""
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(description="A", required_capabilities=["c1", "c2", "c3"]),
+            ]
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        caps = cmd.update["required_capabilities"]
+        assert len(caps) == 3
+        assert set(caps) == {"c1", "c2", "c3"}
+
+    def test_over_warn_limit_logs_warning_but_does_not_truncate(self, state):
+        """6 caps triggers a warning but all 6 are returned."""
+        cap_names = [f"cap-{i}" for i in range(6)]
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(description="A", required_capabilities=cap_names[:3]),
+                SubTaskItem(description="B", required_capabilities=cap_names[3:]),
+            ]
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        caps = cmd.update["required_capabilities"]
+        assert len(caps) == 6
+        assert set(caps) == set(cap_names)
+
+    def test_hard_truncation_at_max_caps(self, state):
+        """10 caps triggers hard truncation to MAX_CAPS_HARD=8."""
+        cap_names = [f"cap-{i}" for i in range(10)]
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(description="A", required_capabilities=cap_names[:5]),
+                SubTaskItem(description="B", required_capabilities=cap_names[5:]),
+            ]
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                with patch("src.orchestrator.decomposition.emit_langfuse_event") as mock_emit:
+                    cmd = decomposition_node(state)
+
+        caps = cmd.update["required_capabilities"]
+        assert len(caps) == 8
+        # Verify the truncation event was emitted
+        truncation_calls = [
+            c for c in mock_emit.call_args_list
+            if c[0][1] == "decomposition.hard_truncation"
+        ]
+        assert len(truncation_calls) == 1
+        meta = truncation_calls[0][0][3]
+        assert meta["original_count"] == 10
+        assert meta["truncated_to"] == 8
+        assert len(meta["dropped"]) == 2

@@ -196,8 +196,8 @@ Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in th
    - Invoked from within a LangGraph node function (DeepAgents are complete graphs, not nodes)
    - Use `response_format` for structured output (Pydantic model with subtasks)
    - System prompt instructs the agent to plan decomposition, produce subtasks with capability annotations, and write results to files
-   - Use `deepseek-chat` as the model (`deepseek-reasoner` lacks `tool_choice` support required by DeepAgents)
-   - **Operational boundaries:** `recursion_limit=35` (~17 logical steps; each tool call = 2 graph steps), timeout at node level (120s), fresh initialization per invocation
+   - Use `openai:gpt-5-mini` as the model (unified across all components since March 2026; originally `deepseek-chat`)
+   - **Operational boundaries:** `recursion_limit=50` (~17 logical steps; each tool call = 2 graph steps), timeout at node level (120s), fresh initialization per invocation
    - Trace with LangFuse via callback handler
 
 2. **Capability classifier** (`src/orchestrator/classifier.py`)
@@ -209,7 +209,7 @@ Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in th
 3. **MCP tool generator** (`src/orchestrator/generators/mcp_tool.py`)
    - Plain LangGraph node
    - Given a capability description + I/O schema, generate a Python MCP tool
-   - Use Claude API (or DeepSeek) for code generation
+   - Use `openai:gpt-5-mini` for code generation (configurable via `src/config.py`)
    - **Few-shot prompting required:** include a complete valid MCP tool example in the prompt
    - **Repair pass:** if Pydantic validation fails on the response, send raw output + validation error back to the model once
    - Output: Python function + FastMCP server wrapper + basic test harness
@@ -275,9 +275,9 @@ use the existing schemas from src/schemas/.
 
 The three generator nodes are chained sequentially: `generate_mcp_tool` → `generate_skill` → `generate_agent`. Each node filters by `classified_type` and hands off via `Command(goto=...)`. No `TaskState` schema changes (no Annotated reducers) are required. Send-based parallel fan-out is future work.
 
-### ✅ Decision: `DECOMPOSITION_RECURSION_LIMIT` raised to 35
+### ✅ Decision: `DECOMPOSITION_RECURSION_LIMIT` raised to 50
 
-Integration tests confirmed `recursion_limit=25` was too low for the DeepAgent to complete real tasks. Raised to 35 (~17 logical steps). The production fallback (return partial results with error flag) remains in place.
+Integration tests confirmed `recursion_limit=25` was too low for the DeepAgent to complete real tasks. Raised to 50 (~25 logical steps). The production fallback (return partial results with error flag) remains in place.
 
 *Phase C (single session):* ✅ COMPLETE
 
@@ -389,7 +389,7 @@ Assessment: Generated capabilities are structurally valid and executable (344/34
    - Writes intermediate analysis to files (context management)
    - Tests network-disconnected behavior
    - Uses `response_format=AdversarialFindings` for structured output
-   - **Operational boundaries:** `recursion_limit=35`, timeout at node level (180s), fresh initialization
+   - **Operational boundaries:** `recursion_limit=50`, timeout at node level (180s), fresh initialization
    - **Only runs if Tier 2 passes**
    - **Focused on 3 specific attack patterns:** (1) hidden demo/sample mode detection, (2) network-disconnect behavioral change, (3) ground-truth comparison where available
    - Trace with LangFuse
@@ -436,7 +436,7 @@ Create an agent team with 4 teammates:
   Implement as a DeepAgent (create_deep_agent with sandbox backend). The agent
   uses write_todos for planning, execute tool for running probes, file system
   for intermediate analysis. Use response_format for structured findings.
-  recursion_limit=35, timeout=180s. Focus on 3 attack patterns: hidden demo mode,
+  recursion_limit=50, timeout=180s. Focus on 3 attack patterns: hidden demo mode,
   network-disconnect behavior change, ground-truth comparison.
   Trace with LangFuse. See the deep-agents skill for patterns. Write tests.
 - "devil" teammate: after the other 3 finish, review all tiers and find ways a
@@ -549,7 +549,7 @@ This section documents ways a malicious or lazy LLM code generator could produce
 
 **B3.2: The DeepAgent is only as smart as its LLM**
 - **Attack:** Craft a tool that subtly returns plausible but wrong results. For example, a unit conversion tool that is off by 5%. The ground-truth comparison attack pattern relies on the DeepAgent writing a reference implementation -- if the agent doesn't think to verify the specific conversion factor, it passes.
-- **Root cause:** The adversarial agent uses `deepseek-chat`, which may not catch subtle numerical errors in domains it doesn't deeply understand.
+- **Root cause:** The adversarial agent uses a general-purpose LLM (`openai:gpt-5-mini`), which may not catch subtle numerical errors in domains it doesn't deeply understand.
 - **Suggested mitigation:** For deterministic tools, consider a separate automated ground-truth check (outside the DeepAgent) that compares against known test vectors. The DeepAgent adds value for non-deterministic tools.
 - **Risk level:** MEDIUM. The ground-truth attack pattern is the weakest of the three because it relies entirely on the LLM's domain knowledge.
 
@@ -663,6 +663,7 @@ Implement these as part of Iteration 5 pre-work (before wiring evaluation harnes
 **Bucket 2 — Document as future work (Chapter 7):**
 HIGH/MEDIUM risk but architecturally constrained or requiring significant new machinery.
 
+- ~~**Dynamic sandbox dependencies**~~ — **IMPLEMENTED (Iteration 5).** LLM-based import→PyPI resolution via `resolve_extra_packages()`. Two-phase Docker execution (pip install with network → run without network). Dockerfile stripped to minimal base (`mcp` + `pydantic` only).
 - B1.1 (hardcoded data below 3-item threshold) — threshold tuning is a research problem
 - B1.3 (unrecognized mock synonyms) — finite keyword list, LLM vocabulary is unbounded
 - B3.3 (network fallback bypasses network-disconnect check) — requires semantic analysis of error handling
@@ -751,9 +752,180 @@ Wait for both to finish, then wire the optimization loop into the main pipeline.
 
 ---
 
-## Iteration 5: Integration & End-to-End Testing (Weeks 9–11)
+## Iteration 5: Integration & End-to-End Testing (Weeks 9–11) ✅ COMPLETE
 
 **Goal:** Wire all three pillars together. Build evaluation infrastructure and baselines.
+
+### Infrastructure (792 unit tests pass)
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/schemas/evaluation.py` | ✅ | `EvaluationRecord` (18 fields), separate from `InvocationRecord` |
+| `src/registry/evaluation_store.py` | ✅ | DuckDB `EvaluationStore`, `evaluation_runs` table |
+| `tests/evaluation/fixtures/` | ✅ | 32 fixture files for 18 tasks, programmatic generation (seed=42), `expected_values.json` |
+| `tests/evaluation/tasks.py` | ✅ | T01–T18 `TaskDefinition` with validators. Distribution: 8 MCP (3 retrieval + 5 synthesis), 5 SKILL (2 retrieval + 3 synthesis), 5 AGENT |
+| `tests/evaluation/execution.py` | ✅ | SKILL/AGENT execution via DeepAgent; T04/T08/T10-T17 response models |
+| `tests/evaluation/snapshots.py` | ✅ | `take_clean_snapshot` / `restore_clean_snapshot` (ChromaDB + mcp_tools + skills) |
+| `tests/evaluation/harness.py` | ✅ | Full run loop; `MetricsStore` per-run; `prepare()` auto-cleans before snapshot; per-task LangFuse tagging; static implementations for T01/T02/T03/T05/T09 |
+| `src/orchestrator/pipeline.py` | ✅ | Added `verification_enabled` for no_verification baseline |
+| `src/orchestrator/loading_node.py` | ✅ | Registers tools even when host import fails (source_code in metadata) |
+| `scripts/run_task.py` | ✅ | User-facing CLI; auto-optimizer after 20+ invocations; verification findings in output |
+| `scripts/run_pilot.py` | ✅ | Evaluation runner; all conditions + task selection |
+| Bucket 1 bypass fixes (B1.2, B2.1, B2.3) | ✅ | Committed pre-Iteration-5 |
+| Integration tests | ✅ | `test_pipeline.py` (Pillar 1, 3 types), `test_verification.py` (Pillar 2, 5 scenarios), `test_split_merge.py` (Pillar 3, full loop), `test_auto_optimizer.py` (all 3 operations via pipeline) |
+| Logging improvements | ✅ | Gate fail-open message, package resolution context, generator summaries, ChromaDB/LangFuse debug logs |
+| deepagents upgrade | ✅ | 0.4.1 → 0.4.12; timeouts: adversarial 300s, SKILL 240s, AGENT 300s |
+| Testbed rebalancing | ✅ | T04→SKILL (inventory reorder), T08→AGENT (data quality), T10→AGENT (trend forecasting), T18 added (hash dedup MCP). Synthesis split: 5/5/5 |
+
+### Pilot run findings (2026-03-11)
+
+First pilot run completed (T01, T07, T10 under `full` condition). **3/3 tasks succeeded** but total runtime was **2+ hours** — unacceptable for evaluation (target: ~15-25 min).
+
+**Model change:** Switched DeepAgent components (task decomposition + adversarial probing) from `deepseek:deepseek-chat` to `openai:gpt-5-mini`. Decomposition improved from ~120s to ~30s, but model speed was a red herring — architectural issues dominated runtime. Only `OPENAI_API_KEY` is required (DeepSeek key no longer needed after full unification).
+
+**Root cause analysis:** Six compounding architectural bottlenecks identified. Full investigation in `docs/archive/investigation_pipeline_bottlenecks.md`:
+
+| Issue | Impact | Root cause |
+|---|---|---|
+| Over-decomposition | +60-70 min/task | Prompt says "smallest meaningful subtasks"; T07 → 14 caps instead of 1-2 |
+| Full regeneration on retry | +30-40 min/task | Generators iterate all `classified_gaps`, not just failed ones |
+| Sequential verification | +40-50 min/task | `for artifact in artifacts: gate_fn(artifact)` — no parallelism |
+| Optimizer prunes seeded caps | +20-30 min (T01, T10) | `prune()` kills all zero-invocation caps; registry matches not tracked |
+| Sequential generation | +10-15 min/task | Sequential loop over gaps, ~25s each |
+| Artifact accumulation | +5-10 min/task | LLM name non-determinism → duplicates across retries |
+| Sandbox missing pandas | Hard fail | Generated tools importing pandas fail Tier 2 unconditionally |
+
+**Fix plan:** 8 fixes documented in `docs/archive/plan.md` (Fix 0–7). Implementation order accounts for dependencies (e.g., Fix 5 deterministic naming must precede Fix 4 skip-on-retry). Expected outcome: pilot runtime → ~15-25 min, zero test breakage, ~27 new tests.
+
+### Pilot run findings (2026-03-12) — post-fix re-run
+
+After implementing Fix 0–7 and the classifier prompt rewrite (Single-Capability Rule), the pilot was re-run (T01, T07, T10 under `full` condition):
+
+| Task | Result | gate_passed | output_in_range | Notes |
+|---|---|---|---|---|
+| T01 | ✅ success | n/a (registry match) | True | Seeded `csv-parser` matched directly |
+| T07 | ❌ output_rejected | True | False | Generated MCP_TOOL fuzzy-join; `row_count=12` correct, `null_count_on_key=3` wrong (expected 0) |
+| T10 | ✅ success | True | True | Generated MCP_TOOL log parser; passed all tiers on attempt 1 |
+
+**Success rate: 66.7% (2/3). Gate pass rate: 100% (3/3).**
+
+**Classifier fix worked:** T07 and T10 now correctly classified as MCP_TOOL (previously misclassified as SKILL). The Single-Capability Rule in the classifier prompt biases toward MCP_TOOL when decomposition produces a single gap. This is legitimate per MCP guidance ("consolidate tools"), Voyager's all-executable skill library, and SkillsBench's finding that self-generated skills provide no benefit over direct tool use.
+
+**Key finding — semantic correctness gap:** The 100% gate pass rate vs 66.7% success rate exposes a fundamental limitation: the three-tier verification gate catches structural issues (Tier 1 AST/regex), behavioral edge cases (Tier 2 sandbox testing), and adversarial deception (Tier 3 red-team probing), but **does not verify business logic correctness**. T07's fuzzy-join tool produces the correct number of rows (12) but reports 3 null keys instead of 0 — likely implementing a left outer join instead of inner join, or miscounting nulls after the join. The verification gate has no way to detect this because it lacks task-specific acceptance criteria.
+
+**Approaches for future work (not Iteration 5):**
+
+1. **Task-level acceptance tests** — Attach expected input/output pairs to each task definition. Run the generated tool against these after Tier 3 passes. Highest impact but requires ground-truth data for every task.
+2. **Retry with output feedback** — After execution, compare output against the validator. If rejected, feed the actual vs expected output back to the generator as context for a retry. Leverages the existing retry loop (`attempt_count`).
+3. **Human-in-the-loop gate** — Use LangGraph's `interrupt()` to pause after execution and present results to a human for approval. Appropriate for high-stakes tasks where automated validation is insufficient.
+
+**Decision:** Defer semantic correctness verification past Iteration 5 evaluation runs. The gap between gate_pass_rate and success_rate is itself valuable thesis data — it quantifies what structural/behavioral/adversarial verification can and cannot catch. Document as an honest limitation (Chapter 4) and propose approaches 1–2 as future work (Chapter 7).
+
+### Still needed
+
+- [x] Implement Fix 0–7 per `docs/archive/plan.md`
+- [x] Rebuild sandbox Docker image after Fix 0
+- [x] Re-run pilot after fixes (classifier fix + Single-Capability Rule)
+- [x] Run 4 baseline conditions across T01-T10 (n_runs=5) — results stale, need re-run post-fixes
+- [x] SKILL/AGENT execution in harness + T11-T13 tasks
+- [x] Harness execution fixes: dynamic deps, extra_inputs, error logging, registry match (2026-03-15)
+- [x] Re-run full evaluation with 13 tasks × 4 conditions × 5 runs (2026-03-16/17)
+- [ ] Critique checkpoint (see exit criteria below)
+
+### Full evaluation results (2026-03-16/17) — post-fix, 13 tasks
+
+260 records total (13 tasks × 4 conditions × 5 runs).
+
+| Condition | Success | Gate Pass | Pre-fix (10 tasks) |
+|---|---|---|---|
+| **no_optimization** | **52/65 (80.0%)** | 64/65 (98.5%) | 52.0% |
+| **no_verification** | 50/65 (76.9%) | 65/65 (100%) | 62.0% |
+| **full** | 47/65 (72.3%) | 62/65 (95.4%) | 58.0% |
+| **static** | 25/65 (38.5%) | 25/65 (38.5%) | 50.0% |
+
+Per-task breakdown across JIT conditions:
+
+| Task | full | no_verif | no_opt | static | Type | Notes |
+|---|---|---|---|---|---|---|
+| T01 | 5/5 | 5/5 | 5/5 | 5/5 | mcp_tool | Registry match |
+| T02 | 5/5 | 5/5 | 5/5 | 5/5 | mcp_tool | Registry match |
+| T03 | 5/5 | 5/5 | 5/5 | 5/5 | mcp_tool | Registry match |
+| T04 | 3/5 | 5/5 | 4/5 | 0/5 | mcp_tool | Tier1 rejections in full |
+| T05 | 3/5 | 3/5 | 3/5 | 5/5 | skill/mcp | Classifier oscillation |
+| T06 | 0/5 | 0/5 | 0/5 | 0/5 | mcp_tool | Semantic gap (see below) |
+| T07 | 4/5 | 3/5 | 4/5 | 0/5 | mcp_tool | Stochastic |
+| T08 | 5/5 | 5/5 | 5/5 | 0/5 | mcp_tool | extra_inputs fix worked |
+| T09 | 1/5 | 0/5 | 1/5 | 5/5 | mcp_tool | JSON mismatch (see below) |
+| T10 | 5/5 | 5/5 | 5/5 | 0/5 | mcp_tool | Consistent |
+| T11 | 4/5 | 5/5 | 5/5 | 0/5 | skill | Multi-source integration |
+| T12 | 2/5 | 4/5 | 5/5 | 0/5 | skill | Verification variance |
+| T13 | 5/5 | 5/5 | 5/5 | 0/5 | agent | Anomaly investigation |
+
+**Static dropped from 50% to 38.5%** — expected arithmetic: same 5 covered tasks but denominator grew from 10 to 13 (5/13 = 38.5%). All 3 JIT conditions improved significantly despite harder task mix (+3 SKILL/AGENT tasks).
+
+**All three capability types confirmed working end-to-end:** MCP_TOOL (T01–T10), SKILL (T05, T11, T12), AGENT (T13). This validates the thesis's three-pillar architecture claim.
+
+#### Finding 1: Optimizer hurts performance (80% no_opt vs 72.3% full)
+
+`no_optimization` is the best JIT condition — the optimizer's pruning removes freshly-generated capabilities (zero invocations in 30 days) within each pipeline run. Pinned seeded capabilities are correctly protected (Fix 2 working), but pruning generated artifacts changes the registry state mid-run, affecting gap detection and classification for subsequent tasks. With `no_optimization`, the registry stays stable and generation is more consistent.
+
+**Thesis implication:** The optimizer needs invocation history to add value. In a single-run evaluation with no repeat queries, the optimizer lacks the data to make good decisions. This is a valid finding about optimizer maturity — it would likely improve with longitudinal deployment where capabilities accumulate invocation data over time. Document as honest limitation (Chapter 4) and note that evaluation conditions (fresh snapshot per run) don't give the optimizer its intended operating environment.
+
+#### Finding 2: T12 degradation under full condition (2/5 vs 5/5 no_opt)
+
+T12 failures in `full` condition:
+- 1× tier1 static scanner rejection (CRITICAL finding in generated skill)
+- 1× output validation failure (semantic bug in generated skill)
+- 1× skill execution timeout (120s limit)
+
+In `no_optimization`, T12 was 5/5. The optimizer modifying registry state within the run introduces variance in classification and generation quality. Combined with the stochastic nature of skill generation at n=5, this produces the observed degradation. Not a bug — expected variance amplified by optimizer side-effects.
+
+#### Finding 3: T06 = 0% everywhere — semantic correctness gap
+
+T06 (KNN imputation) has `has_static_coverage=False`, so static = 0% (generation_failed by design — no hand-coded implementation).
+
+All JIT conditions: gate passes 100% but output fails 100%. Generated tools produce variance values ~10-18% off from expected (e.g., `feature_c` expected 111.33, got 91.77 = -17.6%, exceeding ±10% tolerance). The LLM generates syntactically correct KNN code that successfully imputes nulls (`null_count=0` ✓) but with subtle math errors — likely sample vs population variance formula, improper neighbor weighting, or edge-case handling.
+
+**Thesis implication:** This is the strongest evidence for the semantic correctness gap. Gate_pass=100%, success=0% — a 100 percentage-point gap. The three-tier verification gate catches structural issues, behavioral edge cases, and adversarial deception, but has no mechanism to verify mathematical correctness of the output. Documenting this as the core limitation (Chapter 4) is more valuable than fixing it with prompt engineering.
+
+#### Finding 4: T09 = 5/5 static but ~0% JIT — prompt specificity tradeoff
+
+The T09 fixture (`t09_report_data.json`) is a nested dict: `{"title": "...", "period": {...}, "records": [{...}, ...]}`. The static implementation correctly accesses `data.get("records", [])`. But LLM-generated tools consistently guess wrong — they look for `data["revenues"]`, `data["data"]`, or expect a flat list. Log errors: `"Error: JSON data must be a list of records"`, `"Error: No valid revenue data found"`.
+
+The task prompt says "generate an analytics report from the data at [path]" but doesn't describe the JSON structure. The LLM has no way to know `records` is the key containing the data. One run out of ~15 happened to guess correctly.
+
+**Thesis implication:** This demonstrates the **prompt specificity vs generality tradeoff**. Adding fixture schema hints to the prompt would fix T09 but would make the evaluation less realistic — real-world tasks often arrive with incomplete specifications. The JIT system's value depends on how well it handles ambiguity. T09 shows that for complex nested data structures, the LLM needs explicit schema information. Document as a finding about the boundary conditions of JIT generation (Chapter 4) and propose schema inference as future work (Chapter 7).
+
+### Pilot details
+
+**Runner:** `uv run scripts/run_pilot.py`
+
+| Task | Tier | What it tests | Expected outcome |
+|---|---|---|---|
+| T01 | Trivial | Seeded retrieval (csv-parser is in registry — no JIT needed) | Succeeds in all 4 conditions; validates happy path and static baseline |
+| T07 | Moderate | Fuzzy join across two CSVs (no seeded capability — JIT required) | Succeeds in full/no_verify/no_optimize; fails in static (no static coverage) |
+| T10 | Complex | Server log analysis, 200-line log (complex JIT generation) | May fail even in full — failure modes are thesis data |
+
+**What to check after the pilot:**
+- T01 succeeds in `full` condition (gate_passed=True, output_in_range=True)
+- T07 generates an MCP_TOOL or SKILL artifact that passes verification
+- LangFuse shows complete lifecycle traces for T07/T10 (decomposition DeepAgent + generation + gate + adversarial DeepAgent)
+- No pipeline hangs (DeepAgent timeout fallbacks working)
+
+**Full evaluation commands:**
+```bash
+# Pilot (3 tasks, full condition, 1 run)
+uv run scripts/run_pilot.py
+
+# Static baseline only (fast, no LLM, ~2 seconds)
+caffeinate -dims uv run scripts/run_pilot.py --condition static --all-tasks --n-runs 5 2>&1 | tee evaluation_run_static.log
+
+# Single condition (e.g., no_optimization)
+caffeinate -dims uv run scripts/run_pilot.py --condition no_optimization --all-tasks --n-runs 5 2>&1 | tee evaluation_run_no_opt.log
+
+# Full evaluation (all 4 conditions, 13 tasks, 5 runs each — ~9-10h)
+caffeinate -dims uv run scripts/run_pilot.py --all-conditions --all-tasks --n-runs 5 2>&1 | tee evaluation_run.log
+```
 
 ### Testbed: Business Analytics Pipeline
 
@@ -779,23 +951,29 @@ Design 10–15 tasks spanning multiple difficulty levels:
    - **JIT without verification** — Pillar 1 only, bypass Pillar 2
    - **JIT without optimization** — Pillars 1 + 2, bypass Pillar 3
    - **Full system** — all three pillars active
+   - **Longitudinal** — same as full, but 40 sequential tasks without snapshot reset (tests optimizer convergence over time)
 
 5. **Integration tests** — Full lifecycle, capability reuse, evolutionary operations
 
 6. **Error handling** — Generation failure, sandbox timeout, server crash, corrupted registry. Use Command API loop-back for recoverable errors, RetryPolicy for transient failures (see `langgraph-architect` skill error handling section).
 
-### Agent Teams usage
-**3-teammate team for baselines:**
+### ✅ Decision: No agent team — baselines are condition flags, not separate codebases
 
-```
-Create an agent team with 3 teammates:
-- "static-baseline": hand-curated skill library, wired to evaluation harness.
-- "no-verify-baseline": pipeline with Pillar 2 bypassed (no verification gate,
-  no adversarial DeepAgent). Wired to harness.
-- "no-optimize-baseline": pipeline with Pillar 3 bypassed (no granularity
-  operations). Wired to harness.
-All baselines must output metrics to the same DuckDB schema via the shared harness.
-```
+The original plan called for a 3-teammate agent team to build three separate baseline implementations. During harness design, it became clear that all five conditions share the same run loop (restore snapshot → seed registry → invoke pipeline → validate output → record to DB). The only differences are two boolean flags:
+
+- `verification_enabled=False` for the no-verification condition
+- `run_optimizer=False` for the no-optimization condition
+- `_run_static()` instead of `_run_jit()` for the static condition
+
+Building separate codebases would have duplicated the entire run loop and created three divergent harnesses that could drift apart. A single `EvaluationHarness` with a `condition` parameter is simpler, less error-prone, and ensures all conditions produce records in exactly the same schema.
+
+**Why the original plan assumed separate codebases:** The plan was written before the harness was designed. At planning time, "baselines" implied different pipelines. Once the harness abstracted the run loop, the baselines reduced to parameter choices within it.
+
+| Planned teammate | What it would have built | What we have instead |
+|---|---|---|
+| `static-baseline` | Hand-curated skill library | `_run_static` + 5 implementations in `harness.py` |
+| `no-verify-baseline` | Pipeline with gate bypassed | `verification_enabled=False` in `create_pipeline` |
+| `no-optimize-baseline` | Pipeline without optimizer | `run_optimizer=False` (already the default) |
 
 ### Exit criteria
 - Full system runs 10+ tasks end-to-end
@@ -810,19 +988,35 @@ Before starting Iteration 6, assess: Does the evaluation design actually produce
 
 ---
 
-## Iteration 6: Evaluation & Analysis (Weeks 11–13)
+## Iteration 6: Evaluation & Analysis (Weeks 11–13) 🔄 IN PROGRESS
 
 **Goal:** Run formal evaluation, collect data, produce thesis figures.
 
-### Tasks
+### Completed
 
-1. **Run all baselines** — ≥5 runs per condition for statistical significance
-2. **Collect metrics** — success rate, contamination rate, reuse distribution (Gini), token cost, time-to-first-correct, convergence
-3. **Manual audit** — 20–30 generated capabilities, classify: correct / contaminated / partial
-4. **DeepAgent analysis** — Separately measure: how many tool calls do DeepAgents make per invocation? Does the adversarial agent's multi-step probing catch things a single-pass approach misses? Token cost of DeepAgent nodes vs. plain nodes?
-5. **Verification cost analysis** — How often does Tier 1 reject immediately (saving Tier 2/3 cost)? What's the token cost distribution across tiers?
-6. **Figures** — success comparison, contamination rates, registry evolution, convergence curve, token breakdown, reuse distribution, DeepAgent analysis, verification tier cost distribution
-7. **Statistical analysis** — significance tests for key comparisons
+| Task | Status | Notes |
+|---|---|---|
+| Run all baselines (pre-rebalance) | ✅ | 340 records (T01-T17, March 18+20). Stale — replaced by April re-run. |
+| Statistical analysis script | ✅ | `scripts/analyze_results.py` — Clopper-Pearson CIs, Fisher's exact per task, gate vs output separation |
+| Token cost backfill | ✅ | `scripts/backfill_token_costs.py` — LangFuse REST API, per-task attribution (tagged traces) |
+| Context window analysis | ✅ | `scripts/analyze_context_utilization.py` — 1,255 traces, max 28.8% utilization. System is cost-bound. |
+| Longitudinal optimizer test | ✅ | `scripts/run_longitudinal.py` — 40 tasks, 69.2%→100%, prune only. `data/longitudinal.duckdb` |
+| Model unification | ✅ | All LLM calls unified to `openai:gpt-5-mini` (was hybrid DeepSeek/GPT-5-mini) |
+| MINT CLI | ✅ | `uv run mint` — Typer + Rich. 11 subcommands. See `src/cli/` and `docs/plan_cli_upgrade.md`. |
+| Re-run batch 1 | ✅ | 180 records: no_verification (76.7% success) + static (27.8%). 2026-04-05, ~2h. |
+
+### In progress
+
+- **Re-run batch 2** — no_optimization + full conditions (18 tasks × 5 runs each = 180 records). Running with verification enabled. Expected ~8-12h.
+
+### Remaining
+
+1. **Collect metrics** — success rate, token cost, time-to-first-correct, convergence (after re-run completes)
+2. **Manual audit** — 20–30 generated capabilities, classify: correct / contaminated / partial
+3. **DeepAgent analysis** — tool call counts, planning steps, token cost per agent type (data exists in LangFuse traces)
+4. **Verification cost analysis** — Tier 1 rejection rate, token distribution across tiers (data exists in evaluation logs)
+5. **Figures** — success comparison, registry evolution, convergence curve, token breakdown, context utilization
+6. **Statistical analysis** — significance tests for key comparisons (script exists, re-run after new data)
 
 ### Agent Teams usage
 **2-teammate team:**
@@ -876,6 +1070,17 @@ Create an agent team with 3 teammates:
   scales. Flag anything misleading.
 ```
 
+### Future work topics for Chapter 7
+
+**Pydantic Monty for two-tier execution (sandboxed orchestration):**
+The current architecture uses Docker for all sandboxed execution (`sandbox_execute`) and DeepAgent for SKILL/AGENT orchestration. Pydantic Monty (`pydantic-monty`) — a Rust-based Python interpreter with microsecond startup — could replace the orchestration tier. Two-tier model:
+- **Monty tier**: LLM-generated coordination code (fan-out, conditionals, glue logic between pipeline stages). No Docker needed, ~4μs startup. External functions bridge to the Docker tier.
+- **Docker tier**: Generated MCP tools that need third-party libraries (pandas, numpy, sklearn). Full CPython environment, ~195ms startup.
+
+Benefits: eliminates DeepAgent overhead for SKILL execution (currently ~20-55s per invocation), enables `asyncio.gather` for parallel tool calls in one LLM round-trip (vs sequential tool-call loop), and type-checks LLM-generated orchestration code before execution. Limitation: Monty cannot run third-party libraries, so generated MCP tools still require Docker.
+
+Skill documentation available at `.claude/skills/monty/SKILL.md`.
+
 ### Exit criteria
 - Complete thesis draft
 - All figures embedded and referenced
@@ -890,8 +1095,8 @@ DeepAgents are powerful but expensive and unpredictable. These constraints apply
 
 | Constraint | Value | Rationale |
 |---|---|---|
-| `recursion_limit` (decomposition) | 35 | ~17 logical steps; each tool call = 2 graph steps |
-| `recursion_limit` (adversarial) | 35 | Adversarial probing needs more exploration room |
+| `recursion_limit` (decomposition) | 50 | ~25 logical steps; each tool call = 2 graph steps |
+| `recursion_limit` (adversarial) | 50 | Adversarial probing needs more exploration room |
 | `recursion_limit` (failure analysis) | 25 | Failure analysis is focused investigation |
 | Node-level timeout (decomposition) | 120s | Prevents pipeline hang if agent loops |
 | Node-level timeout (adversarial) | 180s | Longer for sandbox execution |
@@ -976,7 +1181,7 @@ These are full feasibility reviews, not just exit criteria checks. Budget 1–2 
 | Dynamic MCP tool loading flaky | Start with importlib (Option B); upgrade to subprocess if needed |
 | Agent Teams overhead too high | Start with 2 teammates; scale up only when justified |
 | Generated skills don't conform to format | Validate with `tools/quick_validate.py` in gate |
-| DeepSeek output malformed | Few-shot examples, repair pass, LangFuse logging |
+| LLM output malformed | Few-shot examples, repair pass, LangFuse logging |
 | Scope creep | Exit criteria per iteration, minimum viable scope defined |
 | Timeline overrun | Minimum viable scope per pillar, critique checkpoints catch problems early |
 

@@ -10,7 +10,7 @@ Graph topology (without optimizer)::
       → generate_skill          # LLM: SKILL gaps → SKILL.md artifacts
       → generate_agent          # LLM: AGENT gaps → agent config artifacts
       → verification_node       # Gate: verify artifacts; retry up to 3× on failure
-      → loading_node            # Pure Python: load + smoke-test + register MCP tools
+      → loading_node            # Pure Python: load MCP tools + register all types
       → END
 
 With ``run_optimizer=True`` the graph gains one additional node::
@@ -62,6 +62,7 @@ def create_pipeline(
     *,
     run_optimizer: bool = False,
     metrics_store: MetricsStore | None = None,
+    verification_enabled: bool = True,
 ) -> StateGraph:
     """Build the JIT capability pipeline (Iterations 2–4).
 
@@ -74,6 +75,9 @@ def create_pipeline(
             loading node.  Requires *metrics_store* to be provided.
         metrics_store: DuckDB metrics store required when *run_optimizer* is ``True``.
             Ignored when *run_optimizer* is ``False``.
+        verification_enabled: When ``False``, the verification gate is bypassed
+            (``gate_fn=None`` → stub always passes).  Used for the no_verification
+            evaluation baseline.
 
     Returns:
         An uncompiled ``StateGraph[TaskState]`` ready to be compiled and invoked.
@@ -87,15 +91,18 @@ def create_pipeline(
     builder.add_node("generate_skill", generate_skill)
     builder.add_node("generate_agent", generate_agent)
     # verification_node wired with the real three-tier gate (Iteration 3).
+    # When verification_enabled=False (no_verification baseline), gate_fn=None
+    # causes the stub gate to pass all artifacts unconditionally.
+    _gate_fn = gate_verify if verification_enabled else None
     builder.add_node(
         "verification_node",
-        lambda state: verification_node(state, gate_fn=gate_verify),
+        lambda state: verification_node(state, gate_fn=_gate_fn),
     )
 
     # --- Nodes with injected dependencies (closures) ---
     builder.add_node(
         "gap_detection",
-        lambda state: gap_detection_node(state, registry),
+        lambda state: gap_detection_node(state, registry, metrics_store=metrics_store),
     )
 
     if run_optimizer and metrics_store is None:

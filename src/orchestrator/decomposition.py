@@ -5,7 +5,7 @@ The agent uses ``write_todos`` for planning and ``response_format`` for
 structured subtask output.
 
 Operational boundaries (from CLAUDE.md):
-- ``recursion_limit=35`` (max steps)
+- ``recursion_limit=50`` (max steps)
 - Node-level timeout: 120 s
 - Graph is a stateless CompiledStateGraph; state is fresh per ``.invoke()`` call
 - On timeout / error: return partial results with error flag
@@ -33,7 +33,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DECOMPOSITION_TIMEOUT_S = 120
-DECOMPOSITION_RECURSION_LIMIT = 35
+DECOMPOSITION_RECURSION_LIMIT = 50
+
+# Two-stage circuit breaker for capability count.
+# WARN: emit visibility signal but proceed intact — genuine 6-7 step tasks survive.
+# TRUNCATE: pathological 14-step decompositions are caught before they explode
+#           generation and verification time.
+WARN_CAPS = 5
+MAX_CAPS_HARD = 8
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +56,10 @@ def _get_agent():
     No state carried between calls").  ``create_deep_agent()`` compiles a
     LangGraph graph without making any API calls, so the overhead is minimal.
     """
+    from src.config import DEFAULT_LLM_MODEL
+
     return create_deep_agent(
-        model="deepseek:deepseek-chat",
+        model=DEFAULT_LLM_MODEL,
         system_prompt=DECOMPOSITION_SYSTEM_PROMPT,
         response_format=DecompositionResult,
         name="task-decomposer",
@@ -67,7 +76,7 @@ def decomposition_node(
 ) -> Command[Literal["gap_detection"]]:
     """Decompose a task into subtasks using a DeepAgent.
 
-    The agent is invoked with a 120 s timeout and a recursion limit of 35.
+    The agent is invoked with a 120 s timeout and a recursion limit of 50.
     On timeout or error the node returns partial results (empty subtasks)
     with the error recorded in ``state.errors``.
     """
@@ -77,7 +86,8 @@ def decomposition_node(
     try:
         langfuse_handler = LangFuseCallbackHandler()
         callbacks = [langfuse_handler]
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
         callbacks = []
 
     config = {
@@ -161,9 +171,44 @@ def decomposition_node(
     # duplicates wastes tokens and can produce duplicate artifacts.
     required_caps = list(dict.fromkeys(required_caps))
 
-    # Fallback: if no subtasks were produced, treat the whole task as one subtask
+    # Two-stage circuit breaker: warn at WARN_CAPS, hard truncate at MAX_CAPS_HARD.
+    if len(required_caps) > WARN_CAPS:
+        logger.warning(
+            "Decomposition produced %d required capabilities (warn threshold %d). "
+            "Prompt constraints may not have been followed.",
+            len(required_caps), WARN_CAPS,
+        )
+        emit_langfuse_event(
+            langfuse_handler,
+            "decomposition.over_warn_limit",
+            "WARNING",
+            {"cap_count": len(required_caps), "warn_limit": WARN_CAPS, "caps": required_caps},
+        )
+
+    if len(required_caps) > MAX_CAPS_HARD:
+        logger.error(
+            "Decomposition produced %d capabilities — truncating to %d (hard limit). "
+            "This is a pathological decomposition; the prompt may not be working.",
+            len(required_caps), MAX_CAPS_HARD,
+        )
+        emit_langfuse_event(
+            langfuse_handler,
+            "decomposition.hard_truncation",
+            "CRITICAL",
+            {
+                "original_count": len(required_caps),
+                "truncated_to": MAX_CAPS_HARD,
+                "dropped": required_caps[MAX_CAPS_HARD:],
+            },
+        )
+        required_caps = required_caps[:MAX_CAPS_HARD]
+
+    # Fallback: if no subtasks were produced, use the first sentence of the task
+    # description as a capability query (the full description is too long for
+    # effective semantic search in the registry).
     if not subtasks:
-        required_caps = [state.task_description]
+        first_sentence = state.task_description.split(".")[0].strip()
+        required_caps = [first_sentence[:200] if first_sentence else state.task_description[:200]]
 
     return Command(
         update={

@@ -73,13 +73,22 @@ if __name__ == "__main__":
 ## Rules
 
 - The tool function MUST be async (use `async def`)
-- Use only Python standard library imports plus `mcp` and `pydantic`
-- Do NOT import external packages beyond `mcp` and `pydantic`
+- You may import ANY PyPI package — the sandbox resolves and installs \
+dependencies automatically. Use the best library for the job (pandas, \
+scikit-learn, scipy, requests, beautifulsoup4, etc.)
 - Parameter types must be simple: str, int, float, bool, list[str], etc.
 - Return type should be a simple type (str, int, float, bool, dict, list)
-- Tool name should be hyphen-case in FastMCP() and snake_case for the function
+- Tool name should be snake_case for both FastMCP() and the function
 - Include appropriate `annotations` for tool hints
-- The tool must be self-contained — no dependencies on external state or files\
+- The tool must be self-contained — no dependencies on external state or files
+- All non-file parameters (thresholds, limits, flags, etc.) MUST have sensible \
+default values so the tool can be called with just the data inputs. Only file \
+path parameters should be required (no default).
+- In the `pip_packages` field, list ALL non-stdlib PyPI packages your code \
+imports. Use the **pip install name**, not the Python import name. Common \
+mappings: yaml → pyyaml, sklearn → scikit-learn, cv2 → opencv-python, \
+PIL → Pillow, bs4 → beautifulsoup4. If you only use stdlib + mcp + pydantic, \
+leave pip_packages empty.\
 """
 
 MCP_TOOL_USER_PROMPT = """\
@@ -89,9 +98,11 @@ Description: {description}
 Search query: {query}
 Task context: {task_context}
 
+The tool function MUST be named exactly `{forced_name}` (snake_case). \
+Do not choose a different name.
+
 Generate a complete, working Python file following the FastMCP pattern shown \
-in the system prompt. The tool must be async, use Annotated parameters with \
-Field descriptions, and include a docstring.\
+in the system prompt.\
 """
 
 MCP_TOOL_REPAIR_PROMPT = """\

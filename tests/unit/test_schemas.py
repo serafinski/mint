@@ -283,9 +283,9 @@ def test_generated_artifact_agent():
     art = GeneratedArtifact(
         capability_name="analyst",
         capability_type=CapabilityType.AGENT,
-        agent_config={"system_prompt": "You are a data analyst.", "model": "deepseek-chat"},
+        agent_config={"system_prompt": "You are a data analyst.", "model": "gpt-5-mini"},
     )
-    assert art.agent_config["model"] == "deepseek-chat"
+    assert art.agent_config["model"] == "gpt-5-mini"
 
 
 def test_generated_artifact_rejects_extra():

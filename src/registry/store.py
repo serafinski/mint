@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import chromadb
 
+from src.config import DEFAULT_LLM_MODEL
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 
 
@@ -173,7 +174,7 @@ class SkillRegistry:
         Args:
             capability_type: Filter by type (MCP_TOOL, SKILL, AGENT).
             domain: Filter by domain string.
-            is_active: Filter by active status. None to include all.
+            is_active: Filter by active status (default True = active only). Pass None to include all.
         """
         where_conditions: list[dict] = []
         if capability_type is not None:
@@ -206,6 +207,7 @@ class SkillRegistry:
         n_results: int = 3,
         *,
         min_confidence: float = 0.0,
+        is_active: bool | None = True,
     ) -> list[tuple[CapabilityDescriptor, float]]:
         """Semantic search. Returns (capability, score) pairs sorted by relevance.
 
@@ -215,6 +217,9 @@ class SkillRegistry:
             query: Natural-language search query.
             n_results: Maximum number of results to return.
             min_confidence: Minimum similarity score to include in results.
+            is_active: Filter by active status. ``True`` (default) returns only
+                active capabilities; ``False`` returns only inactive
+                capabilities; ``None`` returns all regardless of status.
         """
         results = self._collection.query(query_texts=[query], n_results=n_results)
 
@@ -231,11 +236,13 @@ class SkillRegistry:
             if score < min_confidence:
                 continue
             descriptor = self._descriptor_from_metadata(name, meta)
+            if is_active is not None and descriptor.is_active != is_active:
+                continue
             pairs.append((descriptor, score))
         return pairs
 
     def detect_gaps(
-        self, queries: list[str], *, threshold: float = 0.3
+        self, queries: list[str], *, threshold: float = 0.5
     ) -> tuple[list[tuple[CapabilityDescriptor, float, str]], list[tuple[str, str]]]:
         """For each query, search the registry and classify as match or gap.
 
@@ -247,19 +254,25 @@ class SkillRegistry:
         gaps: list[tuple[str, str]] = []
 
         for query in queries:
+            # search() filters out is_active=False, so also query unfiltered
+            # to detect deactivated capabilities and produce accurate gap reasons.
             results = self.search(query, n_results=1)
-            # A deactivated capability does not fulfil the requirement — treat it as
-            # a gap so the pipeline generates a replacement.
-            if results and results[0][1] >= threshold and results[0][0].is_active:
+            unfiltered = self.search(query, n_results=1, is_active=None)
+
+            if results and results[0][1] >= threshold:
                 cap, score = results[0]
                 matches.append((cap, score, query))
             else:
-                best_score = results[0][1] if results else 0.0
-                reason = (
-                    f"capability '{results[0][0].name}' is deactivated"
-                    if results and results[0][1] >= threshold and not results[0][0].is_active
-                    else f"best score {best_score:.2f} below threshold {threshold:.2f}"
-                )
+                # Check whether a deactivated capability would have matched.
+                if (
+                    unfiltered
+                    and unfiltered[0][1] >= threshold
+                    and not unfiltered[0][0].is_active
+                ):
+                    reason = f"capability '{unfiltered[0][0].name}' is deactivated"
+                else:
+                    best_score = results[0][1] if results else 0.0
+                    reason = f"best score {best_score:.2f} below threshold {threshold:.2f}"
                 gaps.append((query, reason))
 
         return matches, gaps
@@ -282,11 +295,22 @@ def seed_registry(registry: SkillRegistry) -> None:
         capability_type: CapabilityType,
         domain: str = "general",
         tags: list[str] | None = None,
+        source_code: str | None = None,
+        skill_content: str | None = None,
+        agent_config: str | None = None,
     ) -> CapabilityDescriptor:
+        metadata: dict = {"pinned": "true"}  # all seeded caps are pinned
+        if source_code is not None:
+            metadata["source_code"] = source_code
+        if skill_content is not None:
+            metadata["skill_content"] = skill_content
+        if agent_config is not None:
+            metadata["agent_config"] = agent_config
         kwargs: dict = {
             "name": name,
             "description": description,
             "capability_type": capability_type,
+            "metadata": metadata,
         }
         if has_domain:
             kwargs["domain"] = domain
@@ -302,6 +326,24 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.MCP_TOOL,
             domain="mathematics",
             tags=["math", "computation", "sequence"],
+            source_code=(
+                "from typing import Annotated\n"
+                "from mcp.server.fastmcp import FastMCP\n"
+                "from pydantic import Field\n"
+                'mcp = FastMCP("fibonacci_mcp")\n'
+                "@mcp.tool()\n"
+                "async def fibonacci(\n"
+                "    n: Annotated[int, Field(description="
+                '"Index into the Fibonacci sequence", ge=0, le=1000)],\n'
+                ") -> int:\n"
+                '    """Compute the nth Fibonacci number (0-indexed)."""\n'
+                "    a, b = 0, 1\n"
+                "    for _ in range(n):\n"
+                "        a, b = b, a + b\n"
+                "    return a\n"
+                'if __name__ == "__main__":\n'
+                "    mcp.run()\n"
+            ),
         ),
         _cap(
             "csv-parser",
@@ -309,6 +351,21 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.MCP_TOOL,
             domain="data-processing",
             tags=["csv", "parsing", "data-ingestion"],
+            source_code=(
+                'from typing import Annotated\n'
+                'from mcp.server.fastmcp import FastMCP\n'
+                'mcp = FastMCP("csv-parser")\n'
+                '@mcp.tool()\n'
+                'async def csv_parser(file_path: Annotated[str, "Path to the CSV file"]) -> dict:\n'
+                '    """Parse a CSV file and return row_count and column_names."""\n'
+                '    import csv\n'
+                '    with open(file_path) as f:\n'
+                '        reader = csv.DictReader(f)\n'
+                '        rows = list(reader)\n'
+                '        return {"row_count": len(rows), "column_names": list(reader.fieldnames or [])}\n'
+                'if __name__ == "__main__":\n'
+                '    mcp.run()\n'
+            ),
         ),
         _cap(
             "date-formatter",
@@ -326,6 +383,25 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.MCP_TOOL,
             domain="data-processing",
             tags=["json", "validation", "schema"],
+            source_code=(
+                "from typing import Annotated\n"
+                "from mcp.server.fastmcp import FastMCP\n"
+                'mcp = FastMCP("json-validator")\n'
+                "@mcp.tool()\n"
+                "async def json_validator(\n"
+                '    config_path: Annotated[str, "Path to JSON config"],\n'
+                '    schema_path: Annotated[str, "Path to JSON Schema"],\n'
+                ") -> dict:\n"
+                '    """Validate JSON data against a JSON Schema and return errors."""\n'
+                "    import json, jsonschema\n"
+                "    config = json.loads(open(config_path).read())\n"
+                "    schema = json.loads(open(schema_path).read())\n"
+                "    validator = jsonschema.Draft7Validator(schema)\n"
+                "    errors = [e.message for e in validator.iter_errors(config)]\n"
+                '    return {"errors": errors}\n'
+                'if __name__ == "__main__":\n'
+                "    mcp.run()\n"
+            ),
         ),
         _cap(
             "text-statistics",
@@ -336,6 +412,27 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.MCP_TOOL,
             domain="text-analysis",
             tags=["text", "statistics", "nlp", "readability"],
+            source_code=(
+                'from typing import Annotated\n'
+                'from mcp.server.fastmcp import FastMCP\n'
+                'import re\n'
+                'mcp = FastMCP("text-statistics")\n'
+                '@mcp.tool()\n'
+                'async def text_statistics(file_path: Annotated[str, "Path to text file"]) -> dict:\n'
+                '    """Compute word count and Flesch readability score."""\n'
+                '    text = open(file_path).read()\n'
+                '    words = re.findall(r"\\b\\w+\\b", text)\n'
+                '    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]\n'
+                '    def syllables(w):\n'
+                '        return max(len(re.findall(r"[aeiouAEIOU]+", w)), 1)\n'
+                '    n_w = len(words)\n'
+                '    n_s = max(len(sentences), 1)\n'
+                '    n_syl = sum(syllables(w) for w in words)\n'
+                '    score = round(max(0.0, min(100.0, 206.835 - 1.015*(n_w/n_s) - 84.6*(n_syl/max(n_w,1)))), 2)\n'
+                '    return {"word_count": n_w, "readability_score": score}\n'
+                'if __name__ == "__main__":\n'
+                '    mcp.run()\n'
+            ),
         ),
         # SKILL type
         _cap(
@@ -348,6 +445,27 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.SKILL,
             domain="data-processing",
             tags=["data-cleaning", "etl", "workflow", "preprocessing"],
+            skill_content=(
+                "---\n"
+                "name: data-cleaning-workflow\n"
+                "description: Multi-step data cleaning workflow\n"
+                "---\n\n"
+                "# Data Cleaning Workflow\n\n"
+                "## Steps\n\n"
+                "1. **Load data** — Read the input CSV/JSON file\n"
+                "2. **Remove nulls** — Drop rows where all values "
+                "are null; flag rows with partial nulls\n"
+                "3. **Deduplicate** — Remove exact duplicate rows, "
+                "keeping the first occurrence\n"
+                "4. **Type coercion** — Convert numeric strings to "
+                "numbers, parse date columns\n"
+                "5. **Outlier flagging** — Flag values beyond 3 "
+                "standard deviations from the mean\n\n"
+                "## Output\n\n"
+                "Return a dict with: `clean_row_count`, "
+                "`removed_nulls`, `removed_duplicates`, "
+                "`outliers_flagged`, and `type_errors`.\n"
+            ),
         ),
         _cap(
             "report-generation",
@@ -359,6 +477,26 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.SKILL,
             domain="reporting",
             tags=["report", "visualization", "summary", "documentation"],
+            skill_content=(
+                "---\n"
+                "name: report-generation\n"
+                "description: Generate analysis reports from data\n"
+                "---\n\n"
+                "# Report Generation\n\n"
+                "## Steps\n\n"
+                "1. **Compute summary statistics** — mean, median, "
+                "std, min, max for numeric columns\n"
+                "2. **Build stats table** — Format as a dict of "
+                "column → statistics\n"
+                "3. **Identify anomalies** — Find the top 5 outlier "
+                "records by z-score on the primary metric\n"
+                "4. **Generate summary** — One-paragraph executive "
+                "summary describing key findings\n\n"
+                "## Output\n\n"
+                "Return a dict with: `summary` (str), "
+                "`stats_table` (dict), and `anomalies` (list of "
+                "top 5 records).\n"
+            ),
         ),
         # AGENT type
         _cap(
@@ -371,6 +509,24 @@ def seed_registry(registry: SkillRegistry) -> None:
             CapabilityType.AGENT,
             domain="analytics",
             tags=["analysis", "eda", "profiling", "insights", "autonomous"],
+            agent_config=(
+                '{"system_prompt": "You are a data analysis agent. '
+                "Given a dataset, perform exploratory data analysis:\\n"
+                "1. Profile the data (row count, column types, "
+                "missing values)\\n"
+                "2. Compute summary statistics for numeric columns\\n"
+                "3. Identify correlations between variables\\n"
+                "4. Detect patterns and anomalies\\n"
+                "5. Generate actionable insights\\n\\n"
+                "Use the sandbox_execute tool to run Python code "
+                "for analysis. Write findings to files for context "
+                'management.", '
+                '"node_config": {"name": "data_analysis_node", '
+                f'"model": "{DEFAULT_LLM_MODEL}", '
+                '"tools": ["sandbox_execute"], '
+                '"description": "Autonomous EDA agent"}, '
+                '"is_deep_agent": true}'
+            ),
         ),
     ]
     for cap in seeds:
