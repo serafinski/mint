@@ -6,7 +6,7 @@ Tier structure (cheapest first, fail-fast):
   1  MCP_TOOL    : AST + regex static scan                           (~0 cost)
      SKILL/AGENT : regex-only scan (not Python — AST does not apply)
   2  MCP_TOOL    : Behavioural testing in Docker sandbox    (moderate cost)
-     SKILL/AGENT : skipped (no executable source_code)
+     SKILL/AGENT : delegated to behavioral.run() which returns INFO (no source_code)
   3  All          : Adversarial DeepAgent probing              (high cost)
 
 Gate rules:
@@ -90,26 +90,28 @@ def verify(artifact: GeneratedArtifact) -> VerificationReport:
     name = artifact.capability_name
     all_findings: list[VerificationFinding] = []
 
+    # Track the current tier so the error handler can report accurately.
+    current_tier = [1]  # mutable container for closure access
     try:
-        return _verify_inner(artifact, name, all_findings)
+        return _verify_inner(artifact, name, all_findings, current_tier)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "Verification gate error for '%s': %s — PASSING (fail-open policy). "
+            "Verification gate error for '%s' at tier %d: %s — PASSING (fail-open policy). "
             "Artifact was NOT verified; it passed by default due to a gate error.",
-            name, exc,
+            name, current_tier[0], exc,
         )
         return VerificationReport(
             capability_name=name,
             findings=[
                 VerificationFinding(
-                    tier=1,
+                    tier=current_tier[0],
                     category="gate_error",
                     severity=Severity.MEDIUM,
-                    message=f"Verification gate raised an unexpected exception: {exc}",
+                    message=f"Verification gate raised an unexpected exception at tier {current_tier[0]}: {exc}",
                 )
             ],
             overall_passed=True,  # fail open — don't block on gate bugs
-            tier_reached=1,
+            tier_reached=current_tier[0],
         )
 
 
@@ -117,11 +119,13 @@ def _verify_inner(
     artifact: GeneratedArtifact,
     name: str,
     all_findings: list[VerificationFinding],
+    current_tier: list[int],
 ) -> VerificationReport:
     """Inner implementation of verify() — called by the public wrapper."""
     # ------------------------------------------------------------------
     # Tier 0 + 1: Static scan (zero cost)
     # ------------------------------------------------------------------
+    current_tier[0] = 1
     t1_report = _static_scan(artifact)
     all_findings.extend(t1_report.findings)
 
@@ -140,6 +144,7 @@ def _verify_inner(
     # ------------------------------------------------------------------
     # Tier 2: Behavioural testing (moderate cost)
     # ------------------------------------------------------------------
+    current_tier[0] = 2
     logger.debug("Running Tier 2 behavioural tests on %s", name)
     t2_findings = behavioral.run(artifact)
     all_findings.extend(t2_findings)
@@ -162,6 +167,7 @@ def _verify_inner(
     # ------------------------------------------------------------------
     # Tier 3: Adversarial probing (high cost)
     # ------------------------------------------------------------------
+    current_tier[0] = 3
     logger.debug("Running Tier 3 adversarial probe on %s", name)
     t3_report = adversarial.probe(artifact)
     all_findings.extend(t3_report.findings)

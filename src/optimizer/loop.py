@@ -286,7 +286,7 @@ def create_optimization_loop(
                 # Explicitly return filtered utility_scores so pipeline.py can
                 # reliably read result["utility_scores"] for cross-cycle KL.
                 "utility_scores": filtered_scores,
-                "previous_utility_scores": state.utility_scores,
+                "previous_utility_scores": filtered_scores,
             },
             goto=END,
         )

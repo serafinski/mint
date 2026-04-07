@@ -44,7 +44,7 @@ def compute_all_utilities(
     """Compute utility scores for all active capabilities in the registry.
 
     Returns:
-        Mapping of capability_id to utility score.
+        Mapping of capability name to utility score.
     """
     capabilities = registry.list_all(is_active=True)
     return {

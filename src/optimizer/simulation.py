@@ -28,7 +28,7 @@ matplotlib.use("Agg")  # non-interactive backend for headless environments
 # ---------------------------------------------------------------------------
 
 
-class SimConfig(BaseModel, extra="forbid"):
+class SimConfig(BaseModel):
     """Configuration for a simulation run."""
 
     n_capabilities: int = Field(default=20, description="Starting registry size")
@@ -44,9 +44,10 @@ class SimConfig(BaseModel, extra="forbid"):
     )
     seed: int = Field(default=42, description="Random seed for reproducibility")
     output_dir: str = Field(default="docs/figures", description="Where to save plots")
+    model_config = {"extra": "forbid"}
 
 
-class SimResult(BaseModel, extra="forbid"):
+class SimResult(BaseModel):
     """Result of a single simulation cycle."""
 
     cycle: int = Field(..., description="Cycle number (0-indexed)")
@@ -61,6 +62,7 @@ class SimResult(BaseModel, extra="forbid"):
     n_split: int = Field(default=0, description="Capabilities split this cycle")
     n_merged: int = Field(default=0, description="Capabilities merged this cycle")
     converged: bool = Field(default=False, description="Whether convergence was detected")
+    model_config = {"extra": "forbid"}
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +235,7 @@ def run_simulation(
         from src.optimizer import operations as ops
 
     rng = np.random.default_rng(config.seed + 1000)  # different seed from generation
+    base_time = datetime.now(UTC) - timedelta(days=30)  # deterministic baseline for timestamps
 
     results: list[SimResult] = []
     prev_histogram: np.ndarray | None = None
@@ -268,6 +271,7 @@ def run_simulation(
                     success=bool(rng.random() < _cap_success_rates.get(cap_name, config.success_rate_mean)),
                     token_cost=int(np.clip(rng.normal(config.token_cost_mean, 30.0), 1, 1000)),
                     latency_ms=float(np.clip(rng.normal(200.0, 80.0), 10.0, 2000.0)),
+                    invoked_at=base_time + timedelta(days=cycle, hours=_t),
                 )
                 metrics_store.record_invocation(record)
 

@@ -37,19 +37,17 @@ def loading_node(
     loader: ToolLoader,
     registry: SkillRegistry,
 ) -> Command[Literal["__end__"]]:
-    """Load and register all MCP_TOOL artifacts produced by the generators.
+    """Load MCP_TOOL artifacts and register all artifact types in the registry.
 
-    Skills and agents are skipped — they are written to disk during generation
-    and the DeepAgents runtime picks them up from ``.deepagents/skills/``
-    automatically.
+    MCP_TOOL: dynamically loaded via importlib, smoke-tested, then registered.
+    SKILL/AGENT: already written to disk during generation — registered in the
+    capability registry here so ``gap_detection`` can find them on future runs.
 
     Sets ``status`` to:
     - ``COMPLETED`` — no gaps were detected (all capabilities matched), or at
-      least one capability was successfully deployed: an MCP tool was registered
-      OR a skill/agent artifact was written to disk during generation.
-    - ``FAILED`` — gaps were detected but nothing was deployed: either no
-      artifacts were generated at all, or all MCP tool load/register attempts
-      failed and no skill/agent artifacts exist.
+      least one capability was successfully registered in the registry.
+    - ``FAILED`` — gaps were detected but no artifacts were registered (either
+      none were generated, or all register attempts failed).
 
     Errors from individual tool loads/registrations are recorded in
     ``state.errors`` but do not abort the node — remaining tools continue.

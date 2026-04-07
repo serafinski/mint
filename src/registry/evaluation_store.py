@@ -11,7 +11,12 @@ from datetime import UTC, datetime
 
 import duckdb
 
-from src.schemas.evaluation import EvaluationRecord
+from src.schemas.evaluation import (
+    BaselineCondition,
+    EvaluationRecord,
+    FailureReason,
+    TaskTier,
+)
 
 _INIT_SQL = """
 CREATE TABLE IF NOT EXISTS evaluation_runs (
@@ -234,9 +239,9 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         timestamp = timestamp.replace(tzinfo=UTC)
     return EvaluationRecord(
         run_id=run_id,
-        condition=condition,
+        condition=BaselineCondition(condition),
         task_id=task_id,
-        task_tier=task_tier,
+        task_tier=TaskTier(task_tier),
         attempt_count=attempt_count,
         capability_type=capability_type,
         verification_tier_reached=verification_tier_reached,
@@ -244,7 +249,7 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         output_in_range=output_in_range,
         token_cost=token_cost,
         attempt_latency_ms=attempt_latency_ms,
-        failure_reason=failure_reason,
+        failure_reason=FailureReason(failure_reason),
         registry_snapshot_id=registry_snapshot_id,
         invocation_record_id=invocation_record_id,
         seed=seed,

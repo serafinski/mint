@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
 
 from pydantic import BaseModel, Field
+
+from src.schemas.capability import CapabilityType
 
 
 class BaselineCondition(StrEnum):
@@ -70,7 +71,7 @@ class EvaluationRecord(BaseModel):
     attempt_count: int = Field(
         ..., ge=0, description="Number of generation+verification cycles"
     )
-    capability_type: Literal["mcp_tool", "skill", "agent"] | None = Field(
+    capability_type: CapabilityType | None = Field(
         None, description="Type of generated capability; None for static baseline"
     )
     verification_tier_reached: int | None = Field(

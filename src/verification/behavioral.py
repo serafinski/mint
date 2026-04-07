@@ -215,6 +215,7 @@ def _test_parameterless_smoke(source_code: str, func_name: str, _sandbox=sandbox
                     f"Parameterless tool returned non-empty output: {result_val!r} — "
                     "may be returning hardcoded/canned data"
                 ),
+                location="parameterless_smoke",
             )
         ]
     return []
@@ -263,6 +264,7 @@ def _test_output_variation(
                         "Tool succeeds for one input but crashes for another — "
                         "may not handle diverse inputs robustly"
                     ),
+                    location="output_variation",
                 )
             )
         elif (
@@ -280,6 +282,7 @@ def _test_output_variation(
                         f"Tool returned identical output for very different inputs: "
                         f"{parsed_a.get('result')!r} — may be ignoring parameters"
                     ),
+                    location="output_variation",
                 )
             )
 
@@ -301,9 +304,22 @@ def _test_nonexistent_entity(
 
     parsed = _parse_sandbox_output(result)
     if parsed is None and not result.get("success"):
-        # The tool crashed outright — that's acceptable for invalid input.
-        # But if it returned success=True with no output, that's suspicious.
+        # The tool crashed outright — acceptable for invalid input.
         pass
+    elif parsed is None and result.get("success"):
+        # Sandbox returned success (exit 0) but output is unparseable — suspicious.
+        findings.append(
+            VerificationFinding(
+                tier=2,
+                category="nonexistent_entity",
+                severity=Severity.MEDIUM,
+                message=(
+                    "Sandbox succeeded but produced unparseable output for "
+                    "nonexistent entity inputs — tool may be silently failing"
+                ),
+                location="nonexistent_entity",
+            )
+        )
     elif parsed and parsed.get("error") is None and parsed.get("result") in ("None", "''", '""'):
         findings.append(
             VerificationFinding(
@@ -314,6 +330,7 @@ def _test_nonexistent_entity(
                     "Tool returned empty/None for nonexistent entity inputs "
                     "without raising an error — may silently swallow invalid input"
                 ),
+                location="nonexistent_entity",
             )
         )
 
@@ -359,6 +376,7 @@ def _test_consistency(
                         "Tool returned different results for identical inputs: "
                         f"run1={parsed1.get('result')!r} vs run2={parsed2.get('result')!r}"
                     ),
+                    location="consistency",
                 )
             )
         if parsed1.get("error") != parsed2.get("error"):
@@ -371,6 +389,7 @@ def _test_consistency(
                         "Tool raised different errors for identical inputs: "
                         f"run1={parsed1.get('error')!r} vs run2={parsed2.get('error')!r}"
                     ),
+                    location="consistency",
                 )
             )
 
@@ -404,6 +423,17 @@ def _test_boundary(
                         category="boundary",
                         severity=Severity.HIGH,
                         message=f"Tool timed out on {label} boundary inputs: {inputs}",
+                        location=f"boundary/{label}",
+                    )
+                )
+            else:
+                findings.append(
+                    VerificationFinding(
+                        tier=2,
+                        category="boundary",
+                        severity=Severity.MEDIUM,
+                        message=f"Tool crashed on {label} boundary inputs: {stderr[:200] or '(no stderr)'}",
+                        location=f"boundary/{label}",
                     )
                 )
 
@@ -436,6 +466,7 @@ def _test_latency(
                 category="latency",
                 severity=Severity.MEDIUM,
                 message=f"Tool execution took {elapsed:.2f}s (threshold: {LATENCY_THRESHOLD_S}s)",
+                location="latency",
             )
         )
 

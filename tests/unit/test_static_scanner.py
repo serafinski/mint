@@ -12,7 +12,7 @@ Tests cover all five contamination categories plus:
 from __future__ import annotations
 
 from src.schemas.verification import Severity
-from src.verification.static_scanner import scan, scan_text_only, should_proceed_to_tier2
+from src.verification.static_scanner import scan, should_proceed_to_tier2
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -576,28 +576,29 @@ def fetch_data():
 
 
 # ===================================================================
-# scan_text_only — regex-only scan for non-Python content
+# scan with non-MCP types — regex-only scan for non-Python content
+# (formerly scan_text_only, now handled by scan() with capability_type)
 # ===================================================================
 
-class TestScanTextOnly:
+class TestScanNonMcpTypes:
     def test_clean_text_returns_empty_findings(self):
         text = "---\nname: my-skill\ndescription: Loads CSV data from disk.\n---\n\n## Overview\n\nThis skill reads files.\n"
-        report = scan_text_only(text, "my-skill")
+        report = scan(text, "my-skill", "skill")
         assert report.findings == []
         assert report.overall_passed is True
         assert report.tier_reached == 1
 
     def test_mock_indicator_detected_as_critical(self):
         text = "---\nname: my-skill\ndescription: Loads data.\n---\n\nThis is a mock of the real API.\n"
-        report = scan_text_only(text, "my-skill")
+        report = scan(text, "my-skill", "skill")
         mock_findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert len(mock_findings) >= 1
         assert all(f.severity.value == "critical" for f in mock_findings)
         assert report.overall_passed is False
 
     def test_synthetic_comment_detected_as_high(self):
-        text = "# TODO: implement real data fetching\nUse this skill for analysis.\n"
-        report = scan_text_only(text, "todo-skill")
+        text = "# TODO: implement real data fetching\nUse this for analysis.\n"
+        report = scan(text, "todo-agent", "agent")
         synthetic = [f for f in report.findings if f.category == "synthetic_data"]
         assert len(synthetic) >= 1
         assert all(f.severity.value == "high" for f in synthetic)
@@ -605,27 +606,27 @@ class TestScanTextOnly:
     def test_no_ast_syntax_error_for_non_python(self):
         """YAML/markdown content must not produce a syntax error finding."""
         yaml_text = "---\nname: test-skill\ndescription: A skill.\n---\n\n## Body\n\nSome markdown content.\n"
-        report = scan_text_only(yaml_text, "test-skill")
+        report = scan(yaml_text, "test-skill", "skill")
         syntax_findings = [f for f in report.findings if f.category == "syntax"]
         assert len(syntax_findings) == 0
 
     def test_tier_reached_is_1(self):
-        report = scan_text_only("some plain text", "text-cap")
+        report = scan("some plain text", "text-cap", "agent")
         assert report.tier_reached == 1
 
     def test_capability_name_in_report(self):
-        report = scan_text_only("content", "cap-name")
+        report = scan("content", "cap-name", "agent")
         assert report.capability_name == "cap-name"
 
     def test_json_config_with_mock_detected(self):
         """JSON agent config containing 'mock' is caught by regex scan."""
         import json
         config = json.dumps({"system_prompt": "You are a mock testing agent."})
-        report = scan_text_only(config, "agent-cap")
+        report = scan(config, "agent-cap", "agent")
         assert report.overall_passed is False
         assert any(f.category == "mock_artifact" for f in report.findings)
 
     def test_empty_text_returns_clean_report(self):
-        report = scan_text_only("", "empty-cap")
+        report = scan("", "empty-cap", "agent")
         assert report.findings == []
         assert report.overall_passed is True

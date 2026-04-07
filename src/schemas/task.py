@@ -16,7 +16,7 @@ class TaskStatus(StrEnum):
     CLASSIFYING = "classifying"
     GENERATING = "generating"
     VERIFYING = "verifying"
-    EXECUTING = "executing"
+    EXECUTING = "executing"  # reserved for future use (not set by current pipeline)
     COMPLETED = "completed"
     FAILED = "failed"
 

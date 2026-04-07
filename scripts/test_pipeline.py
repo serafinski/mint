@@ -5,7 +5,7 @@ intermediate state: decomposition -> gap detection -> classification
 -> generation -> verification -> loading -> registration.
 
 Tests all three capability types:
-- MCP_TOOL: T04 (pipe-delimited CSV parsing)
+- MCP_TOOL: T05 (dirty CSV cleaning)
 - SKILL: multi-source data integration (T11-like)
 - AGENT: anomaly investigation (T13-like)
 

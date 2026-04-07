@@ -24,6 +24,7 @@ from src.schemas.verification import Severity, VerificationFinding, Verification
 # Regex patterns
 # ---------------------------------------------------------------------------
 
+# "sample" intentionally excluded — false-positives on legitimate random.sample() calls.
 _MOCK_NAMES = re.compile(
     r"\b(mock|fake|dummy|placeholder|DEMO|TEST_DATA)\b",
     re.IGNORECASE,
@@ -323,7 +324,7 @@ def scan(
     # AST checks only apply to MCP_TOOL (Python source).  SKILL (YAML/markdown)
     # and AGENT (JSON config) are not valid Python — skip AST entirely for them
     # to avoid spurious SyntaxError findings.
-    if capability_type == CapabilityType.MCP_TOOL or capability_type == "mcp_tool":
+    if capability_type == CapabilityType.MCP_TOOL:
         try:
             tree = ast.parse(source_code)
         except SyntaxError as exc:
@@ -362,26 +363,6 @@ def scan(
         tier_reached=1,
     )
 
-
-def scan_text_only(text: str, capability_name: str) -> VerificationReport:
-    """Run regex-only Tier 1 checks on non-Python text (SKILL.md, JSON configs).
-
-    Skips AST parsing entirely — only runs the mock-artifact and synthetic-data
-    regex patterns.  Used by the gate for SKILL and AGENT artifacts whose content
-    is not valid Python.
-
-    Returns a ``VerificationReport`` with ``tier_reached=1``.
-    """
-    findings: list[VerificationFinding] = []
-    _check_mock_artifacts(text, findings)
-    _check_synthetic_comments(text, findings)
-    has_critical = any(f.severity == Severity.CRITICAL for f in findings)
-    return VerificationReport(
-        capability_name=capability_name,
-        findings=findings,
-        overall_passed=not has_critical,
-        tier_reached=1,
-    )
 
 
 def should_proceed_to_tier2(report: VerificationReport) -> bool:

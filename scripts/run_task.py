@@ -574,6 +574,24 @@ def main() -> int:
 
     from src.schemas.task import TaskState
 
+    # Determine whether to run the optimizer early — needed by LangFuse tagging
+    # and the full pipeline below.
+    # --enable-optimizer forces on, --no-optimizer forces off,
+    # otherwise auto-enable after 20+ invocations.
+    from src.config import AUTO_OPTIMIZER_THRESHOLD
+    if args.no_optimizer:
+        run_optimizer = False
+    elif args.enable_optimizer:
+        run_optimizer = True
+    else:
+        invocation_count = metrics_store.invocation_count_total()
+        run_optimizer = invocation_count >= AUTO_OPTIMIZER_THRESHOLD
+        if run_optimizer:
+            print(
+                f"Optimizer auto-enabled ({invocation_count} invocations recorded).",
+                file=sys.stderr,
+            )
+
     # Optional LangFuse tracing — use config["metadata"]["langfuse_*"] keys
     # (the convention LangFuse's LangChain integration reads from LangGraph).
     invoke_config: dict = {}
@@ -668,24 +686,8 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Full pipeline
     # ------------------------------------------------------------------
-    # Determine whether to run the optimizer:
-    # --enable-optimizer forces on, --no-optimizer forces off,
-    # otherwise auto-enable after 20+ invocations (enough history for
-    # meaningful prune decisions, avoids cold-start waste).
-    from src.config import AUTO_OPTIMIZER_THRESHOLD
+    # run_optimizer was already determined above (before LangFuse tracing).
     from src.orchestrator.pipeline import create_pipeline
-    if args.no_optimizer:
-        run_optimizer = False
-    elif args.enable_optimizer:
-        run_optimizer = True
-    else:
-        invocation_count = metrics_store.invocation_count_total()
-        run_optimizer = invocation_count >= AUTO_OPTIMIZER_THRESHOLD
-        if run_optimizer:
-            print(
-                f"Optimizer auto-enabled ({invocation_count} invocations recorded).",
-                file=sys.stderr,
-            )
 
     # Always pass metrics_store so gap_detection records registry matches
     # as invocations (builds history for future optimizer runs).

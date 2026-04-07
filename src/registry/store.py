@@ -174,7 +174,7 @@ class SkillRegistry:
         Args:
             capability_type: Filter by type (MCP_TOOL, SKILL, AGENT).
             domain: Filter by domain string.
-            is_active: Filter by active status. None to include all.
+            is_active: Filter by active status (default True = active only). Pass None to include all.
         """
         where_conditions: list[dict] = []
         if capability_type is not None:

@@ -10,7 +10,7 @@ Graph topology (without optimizer)::
       → generate_skill          # LLM: SKILL gaps → SKILL.md artifacts
       → generate_agent          # LLM: AGENT gaps → agent config artifacts
       → verification_node       # Gate: verify artifacts; retry up to 3× on failure
-      → loading_node            # Pure Python: load + smoke-test + register MCP tools
+      → loading_node            # Pure Python: load MCP tools + register all types
       → END
 
 With ``run_optimizer=True`` the graph gains one additional node::

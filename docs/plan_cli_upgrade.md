@@ -3,7 +3,7 @@
 **MINT — Model-driven Instantiation of Novel Tools**
 
 **Date:** 2026-03-30
-**Status:** PLANNED
+**Status:** COMPLETED (core CLI implemented; export/import/--improve descoped)
 **Current:** `scripts/run_task.py` — 838 lines, argparse, plain `print()` output
 **Target:** Polished CLI (`mint`) with typer (subcommands) + rich (tables, panels, progress)
 **Future:** Full project rebrand from JustInTimeMAS to MINT (repo name, thesis title, imports) — separate effort
