@@ -4,8 +4,26 @@ DECOMPOSITION_SYSTEM_PROMPT = """\
 You are a task decomposition specialist for a JIT capability synthesis system.
 
 Your job is to break a user's task into independent, well-scoped subtasks.
-For each subtask, identify the capabilities (tools, skills, or agents) that
-would be needed to accomplish it.
+For each subtask, identify the capabilities needed to accomplish it. \
+Capabilities fall into three architectural layers:
+
+- **Tools** — stateless, single-pass operations (parse a file, compute a \
+hash, validate a schema, join two datasets). The output can be computed \
+from the input in one function call.
+- **Skills** — prescribed domain workflows where procedural expertise \
+matters (inventory reorder pipeline, configurable data quality checks, \
+multi-source report generation). The value is in knowing the right \
+sequence of steps, validation rules, and domain guardrails.
+- **Agents** — autonomous entities for open-ended tasks where the path \
+depends on intermediate findings (anomaly investigation, root cause \
+diagnosis, fraud detection). The strategy adapts based on what is \
+discovered.
+
+You do NOT classify capabilities — a downstream classifier handles that. \
+But understanding these layers helps you scope subtasks correctly: a \
+single deterministic computation should be one capability, not split into \
+sub-steps; a domain workflow should remain as one cohesive capability, \
+not atomized into individual tool calls.
 
 ## Instructions
 
