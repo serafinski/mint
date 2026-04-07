@@ -51,7 +51,6 @@ class AgentGenerationResult(BaseModel):
         default="",
         description="LLM model identifier (empty = system default)",
     )
-    tools: list[str] = Field(default_factory=list, description="Tool names the agent needs")
     description: str = Field(..., description="One-sentence summary of what the agent does")
     is_deep_agent: bool = Field(
         default=False,
@@ -255,7 +254,6 @@ def _generate_single_agent(
     node_config = {
         "name": result.node_name,
         "model": result.model,
-        "tools": result.tools,
         "description": result.description,
     }
 

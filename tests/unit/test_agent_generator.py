@@ -43,7 +43,7 @@ def _valid_plain_result() -> AgentGenerationResult:
         system_prompt="# Data Quality Monitor\n\nYou monitor data quality.",
         node_name="data_quality_monitor_node",
         model="openai:gpt-5-mini",
-        tools=["read_dataset", "compute_statistics"],
+
         description="Monitors data quality metrics and flags anomalies.",
         is_deep_agent=False,
         skill_content=None,
@@ -57,7 +57,7 @@ def _valid_deep_agent_result() -> AgentGenerationResult:
         system_prompt="# Test Investigator\n\nYou investigate failures.",
         node_name="test_investigator_node",
         model="openai:gpt-5-mini",
-        tools=["read_logs", "inspect_stage"],
+
         description="Investigates failures through multi-step analysis.",
         is_deep_agent=True,
         skill_content=VALID_SKILL_CONTENT,
@@ -328,7 +328,7 @@ class TestGenerateAgentNode:
             agent_config={
                 "system_prompt": "# Monitor",
                 "node_config": {"name": "monitor_node", "model": "openai:gpt-5-mini",
-                                "tools": [], "description": "Monitors data quality."},
+                                "description": "Monitors data quality."},
                 "is_deep_agent": False,
             },
         )
@@ -375,7 +375,7 @@ class TestGenerateAgentNode:
             agent_config={
                 "system_prompt": "# Monitor",
                 "node_config": {"name": "monitor_node", "model": "openai:gpt-5-mini",
-                                "tools": [], "description": "Monitors data quality."},
+                                "description": "Monitors data quality."},
                 "is_deep_agent": False,
             },
         )
@@ -418,7 +418,7 @@ class TestGenerateAgentNode:
             system_prompt="You are a test deep agent.",
             node_name="test_deep_agent",
             model="openai:gpt-5-mini",
-            tools=[],
+    
             description="A test deep agent.",
             is_deep_agent=True,
             skill_content=valid_skill_content,
@@ -477,7 +477,7 @@ class TestGenerateSingleAgent:
         system_prompt="You are a monitor agent.",
         node_name="monitor_node",
         model="openai:gpt-5-mini",
-        tools=[],
+
         description="Monitors data quality.",
         is_deep_agent=False,
         skill_content=None,
@@ -487,7 +487,7 @@ class TestGenerateSingleAgent:
         system_prompt="You are a data quality monitor.",
         node_name="data_quality_monitor_node",
         model="openai:gpt-5-mini",
-        tools=[],
+
         description="Monitors data quality metrics.",
         is_deep_agent=False,
         skill_content=None,
@@ -655,7 +655,7 @@ class TestGenerateSingleAgent:
             system_prompt="You investigate failures.",
             node_name="test_investigator_node",
             model="openai:gpt-5-mini",
-            tools=[],
+    
             description="Investigates failures.",
             is_deep_agent=True,
             skill_content=VALID_SKILL_CONTENT,

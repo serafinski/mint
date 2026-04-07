@@ -236,6 +236,22 @@ Generated MCP tools are loaded via `importlib` dynamic import in a sandboxed sub
 
 Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in the project root. DeepAgents loads project-level skills from this path automatically — no copy or symlink step needed. `src/skills/` does not exist and should not be used. User-level `~/.deepagents/<agent>/skills/` is reserved for stable, hand-curated skills only.
 
+### Generated Agent Tool Scope (Deliberate Limitation)
+
+Generated agents execute as DeepAgents with `tools=[sandbox_execute]` plus built-in file/planning tools (`write_todos`, `read_file`, `write_file`, `edit_file`, `ls`, `glob`, `grep`). Two built-in DeepAgent tools are **non-functional by design**:
+
+- **`execute`** (shell commands) — requires a `SandboxBackendProtocol` backend, which we don't pass. Intentional: `sandbox_execute` provides Docker-isolated execution instead; the built-in `execute` would run on the host with no isolation.
+- **`task`** (subagent delegation) — requires `subagents=` parameter, which we don't pass. Generated agents work solo.
+
+This means the system can only generate **single-agent, sandbox-based** capabilities. It cannot generate agents that delegate to subagents or compose with other generated capabilities from the registry.
+
+**Why this scope:** Evaluation tractability. The 18-task testbed was designed for single-agent completion. Adding compositional agents would change evaluation results in ways hard to attribute.
+
+**Thesis implications:**
+- **Chapter 4**: Acknowledge the single-agent-with-sandbox pattern as a deliberate simplification.
+- **Chapter 6**: This limits the complexity of tasks generated agents can handle. Real-world deployments would benefit from agents that leverage registry capabilities or delegate to subagents.
+- **Chapter 7 (Future Work)**: Compositional capability synthesis — generated agents that use other generated capabilities (MCP tools from registry as tools, other agents as subagents). The `create_deep_agent()` API already supports `subagents=` and `backend=`, so this is an execution-layer change, not an architectural one.
+
 ### Verification Gate: Tiered Cost Optimization
 
 The verification layer uses fail-fast to avoid wasting tokens:
@@ -321,9 +337,9 @@ All numbers pending confirmation after full re-run with post-audit code.
 ### What remains
 
 - [x] Run code audits and contradiction checks (9 passes complete, diminishing returns)
-- [ ] Baseline verification (~5 min):
-  - [ ] `uv run pytest tests/unit/` — confirm 814+ tests still pass after audit fixes
-  - [ ] `docker build -t jit-sandbox sandbox/` — rebuild sandbox image if Dockerfile changed
+- [x] Baseline verification (~5 min):
+  - [x] `uv run pytest tests/unit/` — 814 passed (2026-04-07)
+  - [x] `docker build -t jit-sandbox sandbox/` — rebuilt successfully (2026-04-07)
 - [ ] Targeted pre-eval checks (~10 min):
   - [ ] Prompt review — read all prompts in `src/orchestrator/prompts/` for consistency with current implementation (catches LLM-told vs system-does mismatches)
   - [ ] Snapshot integrity — verify `tests/evaluation/snapshots/` has correct seeded capabilities (T01-T03 MCP_TOOL, T05/T09 SKILL)

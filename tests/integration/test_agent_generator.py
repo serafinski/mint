@@ -130,11 +130,7 @@ class TestAgentGeneratorLive:
         node_config = artifact.agent_config["node_config"]
         assert "name" in node_config
         assert "model" in node_config
-        assert "tools" in node_config
         assert "description" in node_config
-
-        # node_config["tools"] must be a list (not just present)
-        assert isinstance(node_config["tools"], list)
 
         # node_config["name"] is the LangGraph node function name — must be snake_case
         assert re.match(r"^[a-z_][a-z0-9_]*$", node_config["name"]), (
