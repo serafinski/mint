@@ -38,7 +38,7 @@ DeepAgents (`create_deep_agent()`) return a `CompiledStateGraph` — a complete 
 | Component | Implementation | Model | Why |
 |---|---|---|---|
 | Task decomposition | **DeepAgent** (invoked from node) | `openai:gpt-5-mini` | Multi-step planning with `write_todos`, file-based context for large task descriptions |
-| Capability classifier | Plain LangGraph node | `openai:gpt-5-mini` | LLM classification with structured output (`temperature=0`) — single-step |
+| Capability classifier | Plain LangGraph node | `openai:gpt-5-mini` | **Task-level** LLM classification with structured output (`temperature=0`) — one classification per task, not per gap |
 | MCP tool generator | Plain LangGraph node | `openai:gpt-5-mini` | Single-pass code generation with retry on failure |
 | Skill generator | Plain LangGraph node | `openai:gpt-5-mini` | Structured text generation targeting DeepAgents skill format |
 | Agent generator | Plain LangGraph node | `openai:gpt-5-mini` | System prompt + config generation |
@@ -287,6 +287,8 @@ The verification layer uses fail-fast to avoid wasting tokens:
 
 Never run Tier 2/3 on a capability that Tier 1 has already condemned as Critical.
 
+**Tier 1 is scoped to MCP_TOOL Python source.** AST checks (`_check_hardcoded_return`, `_check_silent_except`, `_check_missing_external_calls`) and regex checks (`_check_mock_artifacts`, `_check_synthetic_comments`) only run when `capability_type == MCP_TOOL`. SKILL.md (markdown/YAML) and AGENT JSON config are natural-language artifacts where words like `mock` or `placeholder` appear legitimately in instructions ("do not leave placeholder values"); applying the regex to prose produced false positives that blocked otherwise-valid skills (T04 reproducer, 2026-04-08). Skills still get Tier 0 (`quick_validate.py`) for structural checks; skills and agents still get Tier 2 (behavioral) and Tier 3 (adversarial probing) for semantic verification — Tier 1 is just the cheap static pre-check that doesn't apply to non-Python content. **Methodology note for thesis Chapter 4/6**: this scoping is a Pillar 2 refinement applied mid-iteration; report pre/post Tier 1 false-positive rates if the full eval re-run shows a meaningful skill/agent success delta.
+
 ### Pillar 3: Type-Scoped Operations
 
 Evolutionary operations are scoped by artifact type:
@@ -358,6 +360,37 @@ All core infrastructure is built and tested (814 unit tests pass). The MINT CLI 
 
 All numbers pending confirmation after full re-run with post-audit code.
 
+### Finding: Task-specification ambiguity as a silent failure mode (T16, 2026-04-08)
+
+**Discovered during the 3-task pilot spot-check** (`T01,T04,T16 --condition full --n-runs 1`) after the task-level classifier rewrite. The generated T16 agent produced `output_in_range=True` but the actual cascade chain was partially wrong — positions 1 and 2 swapped:
+
+- **Produced**: `[db_connections, request_queue_depth, query_latency_ms, error_rate]`
+- **Expected**: `[db_connections, query_latency_ms, request_queue_depth, error_rate]`
+
+**Root cause**: the T16 task prompt in `tests/evaluation/tasks.py:785-787` says *"Identify which metric **changed FIRST** (the root cause) ... the one that **deviated from normal** earliest"*. The words "changed" and "deviated" are direction-agnostic. The LLM reasonably interpreted this as symmetric deviation (any large change, up or down) and wrote a dual-criterion detector (z-score OR |relative change|). The relative-change criterion caught transient noise **dips** in `query_latency_ms` and `request_queue_depth` at onset, firing before the real upward spikes, which corrupted the cascade ordering.
+
+**The ground truth in `expected_values.json` was generated with a single-directional upward z-score method** (verified by replaying both methods against the raw CSV — z-score alone produces the ground-truth order, dual-criterion produces the agent's order). This methodology was never surfaced in the task prompt, so the agent had to guess it.
+
+**Why this is a thesis-relevant finding, not a bug**:
+1. Nothing in `src/` is wrong — our pipeline classified, generated, verified, and executed correctly
+2. The generated code is internally consistent and locally plausible
+3. Tier 1-3 verification cannot catch it — none of the tiers have access to ground truth; they only check internal consistency and adversarial robustness
+4. The validator `_validate_t16` deliberately does not check cascade ordering (only `root_cause_metric` exact match + `len(chain) >= 2`), so the failure is invisible in `output_in_range`
+5. This is a distinct failure mode from "compile error" or "crash" — it's **"correct by policy, wrong by ground truth"**, which is the most dangerous class of LLM failure because it looks like success
+
+**Validator leniency vs exact match**: the current evaluation reports `output_in_range` as the primary success metric. Adding a secondary `exact_match` column (dict-equal to `expected_values.json`) would expose this class of failure in Chapter 6. For the 3-task pilot: validator pass = 3/3, strict exact match = 2/3 (T16 would drop).
+
+**To verify reproducibility** (critical — is this convergent or stochastic?):
+- Run `uv run scripts/run_pilot.py --tasks T16 --condition full --n-runs 5` before the full eval
+- Diff the 5 generated SKILL.md files — do they all use the dual-criterion heuristic?
+- Diff the 5 `cascade_chain` outputs — all wrong, or some correct?
+- **Convergent failure** (N/5 wrong) → strong thesis finding: prompt ambiguity systematically defeats the system
+- **Stochastic failure** (mixed) → reliability story: verification gate cannot provide correctness guarantees on ambiguously-specified tasks
+
+**Optional follow-up ablation**: disambiguate the T16 prompt to *"identify which metric **spiked upward** first"* and re-run. If disambiguation flips the result to correct, that's a clean causal demonstration of the finding for Chapter 6.
+
+**Important**: do NOT modify the T16 prompt before the full 360-record evaluation run. The ambiguity is a feature (a finding worth reporting), not a bug to fix. The disambiguation experiment belongs in a follow-up ablation after the main numbers are in.
+
 ### What remains
 
 - [x] Run code audits and contradiction checks (9 passes complete, diminishing returns)
@@ -386,6 +419,12 @@ All numbers pending confirmation after full re-run with post-audit code.
     - [ ] Check success rates aren't suspiciously uniform across conditions (= evaluation bias)
     - [ ] Compare `no_verification` vs `full` — if nearly identical, the gate isn't doing anything
     - [ ] Check token costs are being recorded (not all zeros)
+- [ ] T16 ambiguity reproducibility check (~$0.15, ~15 min) — see "Finding: Task-specification ambiguity as a silent failure mode" above:
+  - [ ] `uv run scripts/run_pilot.py --tasks T16 --condition full --n-runs 5` — 5 runs of T16
+  - [ ] Diff the 5 generated SKILL.md files in `data/eval/skills/` — heuristic stability check
+  - [ ] Compare the 5 `cascade_chain` outputs against ground truth `[db_connections, query_latency_ms, request_queue_depth, error_rate]` — count exact matches
+  - [ ] Record convergent-vs-stochastic conclusion in the finding section
+  - [ ] **Do NOT modify the T16 task prompt before the full 360-record eval** — the ambiguity is a feature (a finding worth reporting), disambiguation experiment is a follow-up ablation
 - [x] Fix LangFuse tag propagation — all sub-component traces (decomposition, adversarial, skill/agent execution, emit_langfuse_event) now inherit pipeline tags via get_config(), module-level metadata, or explicit params (2026-04-08)
 - [x] Replace `pip` with `uv` in sandbox Dockerfile — `uv pip install` cuts package installation from ~40s to ~6s per sandbox call (2026-04-08)
 - [ ] Full evaluation re-run (~$5, ~26h sequential / ~13h with 2 conditions parallel):
@@ -425,9 +464,9 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/config.py`** — Centralized constants: `DEFAULT_LLM_MODEL` (env: `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env: `JIT_SANDBOX_IMAGE`), `DOCKER_PREINSTALLED`, `FILE_SIZE_LIMIT_BYTES`, `BINARY_EXTENSIONS`, `AUTO_OPTIMIZER_THRESHOLD`
 - **`src/schemas/`** — 18 core types (`CapabilityType`, `CapabilityDescriptor`, `TaskState` (now includes `attempt_count: int = 0`), `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact` (now includes `pip_packages: list[str]`), `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`) + 5 evaluation types (`BaselineCondition`, `EvaluationRecord`, `FailureReason`, `HumanLabel`, `TaskTier`)
 - **`src/orchestrator/decomposition.py`** — `decomposition_node()` (DeepAgent-backed task decomposition)
-- **`src/orchestrator/classifier.py`** — `classify_gap()`, `classifier_node()` (LLM-based classification)
+- **`src/orchestrator/classifier.py`** — `classify_task(task_description, required_capabilities)`, `classifier_node()` (task-level LLM classification — one classification per task, not per gap)
 - **`src/orchestrator/prompts/`** — All prompt constants for decomposition, classification, and all three generators
-- **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry, metrics_store=None)` (detects registry gaps, records match invocations, always routes to `"classifier_node"`)
+- **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry, metrics_store=None)` (per-capability registry matching populates `state.matches` and records match invocations; produces at most ONE placeholder `GapItem` when any capability is unmatched, signaling the task-level classifier to run; always routes to `"classifier_node"`)
 - **`src/orchestrator/loading_node.py`** — `loading_node(state, loader, registry)` (loads MCP_TOOL via importlib, registers all 3 types in ChromaDB with source_code/skill_content/agent_config metadata, sets terminal status)
 - **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader, *, run_optimizer=False, metrics_store=None, verification_enabled=True)` (9-node pipeline; real three-tier gate wired via `gate_fn=gate_verify` closure; `verification_enabled=False` bypasses gate for no_verification baseline; optional `optimizer_node` appended after `loading_node` when `run_optimizer=True`)
 - **`src/orchestrator/verification_node.py`** — `verification_node(state, gate_fn=None)` (retry + artifact replacement logic; real gate wired in pipeline.py)
