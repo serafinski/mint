@@ -8,15 +8,15 @@
 
 ## The Bootstrapping Problem
 
-The ambition behind self-developing MAS is that agents don't merely execute plans - they build the *infrastructure* to execute those plans. Given a complex task (e.g., a business analytics pipeline requiring ML training and inference), the system must analyze the task, generate an action plan, identify what skills, tools, agents, and MCP servers are required, detect the gaps between what already exists and what's needed, and then generate the missing capabilities on the fly.
+The ambition behind self-developing MAS is that agents don't merely execute plans — they build the *infrastructure* to execute those plans. Given a complex task (e.g., a business analytics pipeline requiring ML training and inference), the system must analyze the task, generate an action plan, identify what skills, tools, agents, and MCP servers are required, detect the gaps between what already exists and what's needed, and then generate the missing capabilities on the fly.
 
 This creates a bootstrapping loop: the system must be capable enough to *build the capabilities it doesn't yet have*. Three fundamental tensions emerge from this loop:
 
-**Autonomy vs. correctness.** LLM agents optimize for immediate functionality - silently injecting mocks, hardcoding responses, creating fallback paths that mask failures. The more autonomous the generation, the harder it is to guarantee the generated artifacts actually work in production.
+**Autonomy vs. correctness.** LLM agents optimize for immediate functionality — silently injecting mocks, hardcoding responses, creating fallback paths that mask failures. The more autonomous the generation, the harder it is to guarantee the generated artifacts actually work in production.
 
 **Specificity vs. generality.** A highly specific skill (e.g., "parse semicolon-delimited SAP CSV exports into Pandas DataFrames") is reliable but gets invoked once. A general skill (e.g., "handle data ingestion") is reusable but hallucinates on edge cases. Every practitioner navigates this tradeoff intuitively; no principled framework exists for optimizing it.
 
-**Context economy.** In a MAS where agents pass context to each other, naive approaches (full conversation history) hit token limits and introduce noise. But aggressive compression loses critical details. The system needs context engineering that preserves exactly the information each downstream agent requires - no more, no less.
+**Context economy.** In a MAS where agents pass context to each other, naive approaches (full conversation history) hit token limits and introduce noise. But aggressive compression loses critical details. The system needs context engineering that preserves exactly the information each downstream agent requires — no more, no less.
 
 This thesis proposes an architecture that addresses all three tensions through a unified three-pillar design.
 
@@ -66,7 +66,7 @@ This thesis proposes an architecture that addresses all three tensions through a
 
 ### Problem
 
-When a self-developing MAS encounters a task requiring a capability it doesn't possess, it currently has two options: fail, or ask a human. Neither scales. A third option - generating the capability at runtime - is feasible with modern code-generation models but raises questions about what form the generated capability should take and how it integrates with the existing system.
+When a self-developing MAS encounters a task requiring a capability it doesn't possess, it currently has two options: fail, or ask a human. Neither scales. A third option — generating the capability at runtime — is feasible with modern code-generation models but raises questions about what form the generated capability should take and how it integrates with the existing system.
 
 ### Approach
 
@@ -74,7 +74,7 @@ The pipeline operates in five stages:
 
 1. **Task decomposition.** An orchestrator agent (using a deep-thinking model with a large token budget) breaks the input task into subtasks, each annotated with the capabilities required to complete it.
 
-2. **Skill gap detection.** Each required capability is matched against a skill registry - a semantically indexed library of existing tools, skills, and agents. Gaps are identified as subtasks with no match above a confidence threshold. The registry uses hierarchical embeddings (domain → capability → specific skill) to prevent both false positives (superficial keyword matches) and false negatives (semantically equivalent but differently named skills).
+2. **Skill gap detection.** Each required capability is matched against a skill registry — a semantically indexed library of existing tools, skills, and agents. Gaps are identified as subtasks with no match above a confidence threshold. The registry uses hierarchical embeddings (domain → capability → specific skill) to prevent both false positives (superficial keyword matches) and false negatives (semantically equivalent but differently named skills).
 
 3. **Capability classification.** Each gap is classified to determine what *kind* of artifact should be generated:
    - **Deterministic + stateless** → Generate an **MCP tool** (a Python/TypeScript function wrapped in an MCP server interface, exposing typed input/output schemas via JSON-RPC)
@@ -85,7 +85,7 @@ The pipeline operates in five stages:
 
 4. **Generation.** A code-generation agent (Claude Code or equivalent) produces the artifact. For MCP tools, this means writing the function, the server wrapper, and a test harness. For Skills, it produces the SKILL.md with YAML frontmatter and the instruction body. For agents, it generates the system prompt and configuration entry.
 
-5. **Sandboxed integration.** The generated artifact is deployed into an isolated environment - a sandboxed MCP server, a skill folder, or a contained agent session - and connected to the orchestrator for immediate use.
+5. **Sandboxed integration.** The generated artifact is deployed into an isolated environment — a sandboxed MCP server, a skill folder, or a contained agent session — and connected to the orchestrator for immediate use.
 
 ### Structured State Communication
 
@@ -116,7 +116,7 @@ These patterns are especially dangerous in a JIT pipeline because the generated 
 
 Every generated capability must pass all three tiers before entering the production skill registry.
 
-**Tier 1 - Static Analysis (Pattern Detection)**
+**Tier 1 — Static Analysis (Pattern Detection)**
 
 A zero-dependency scanner runs regex-based and AST-based pattern detection across the generated code. It checks for:
 
@@ -130,7 +130,7 @@ A zero-dependency scanner runs regex-based and AST-based pattern detection acros
 
 The scanner produces a severity-ranked report. Any "Critical" finding blocks deployment immediately — the capability is rejected without proceeding to Tier 2 or Tier 3, which are significantly more expensive. "High" findings require Tier 2 clearance. This tiered cost structure is a deliberate design choice: static analysis is near-zero cost, behavioral testing requires LLM invocations and sandbox execution, and adversarial probing requires multi-step autonomous reasoning. Running all three tiers on every artifact regardless of Tier 1 results would waste compute on capabilities that can be rejected deterministically.
 
-**Tier 2 - Behavioral Testing (Edge-Case Probing)**
+**Tier 2 — Behavioral Testing (Edge-Case Probing)**
 
 A verifier agent generates a suite of test inputs designed to expose mock contamination:
 
@@ -139,7 +139,7 @@ A verifier agent generates a suite of test inputs designed to expose mock contam
 - **Boundary tests:** Provide inputs at extreme edges (empty strings, maximum-length values, special characters). Legitimate tools have defined behavior; shortcuts tend to break or reveal default responses.
 - **Latency analysis:** Measure response time distribution. Hardcoded responses are suspiciously fast and uniform; real API calls show network-characteristic variance.
 
-**Tier 3 - Adversarial Probing (Red-Team Agent)**
+**Tier 3 — Adversarial Probing (Red-Team Agent)**
 
 A dedicated red-team agent attempts to make the generated capability produce incorrect but plausible output. It:
 
