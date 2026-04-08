@@ -39,6 +39,17 @@ logger = logging.getLogger(__name__)
 ADVERSARIAL_RECURSION_LIMIT = 50
 ADVERSARIAL_TIMEOUT_S = 300
 
+# Module-level LangFuse metadata, set by verification_node before
+# spawning the ThreadPoolExecutor. probe() reads this since
+# get_config() is thread-local and doesn't work in worker threads.
+_langfuse_metadata: dict = {}
+
+
+def set_langfuse_metadata(metadata: dict) -> None:
+    """Set LangFuse metadata for adversarial probing threads."""
+    global _langfuse_metadata  # noqa: PLW0603
+    _langfuse_metadata = metadata
+
 # ---------------------------------------------------------------------------
 # Pydantic models for structured DeepAgent output
 # ---------------------------------------------------------------------------
@@ -277,7 +288,15 @@ def probe(artifact: GeneratedArtifact) -> VerificationReport:
         f"## Source code:\n```python\n{source_code}\n```"
     )
 
-    config = {
+    # Inherit LangFuse tags from the pipeline config (must extract before
+    # entering ThreadPoolExecutor — get_config() is thread-local).
+    # Inherit LangFuse metadata. probe() runs inside a ThreadPoolExecutor
+    # spawned by verification_node, so get_config() won't work (thread-local).
+    # Instead, read from the module-level _langfuse_metadata set by
+    # set_langfuse_metadata() before the thread pool starts.
+    langfuse_metadata: dict = dict(_langfuse_metadata)
+
+    config: dict = {
         "recursion_limit": ADVERSARIAL_RECURSION_LIMIT,
     }
 
@@ -288,6 +307,9 @@ def probe(artifact: GeneratedArtifact) -> VerificationReport:
         config["callbacks"] = [LangFuseCallbackHandler()]
     except Exception as exc:  # noqa: BLE001
         logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
+
+    if langfuse_metadata:
+        config["metadata"] = langfuse_metadata
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:

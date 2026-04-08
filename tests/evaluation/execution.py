@@ -199,16 +199,23 @@ def execute_skill_artifact(
     artifact: Any,
     task: Any,
     fixture_contents: dict[str, str],
+    *,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
 ) -> dict:
     """Execute a SKILL artifact via constrained LLM with tool calling.
 
-    Uses ``bind_tools([sandbox_execute])`` with a hard cap of 3 tool calls.
+    Uses ``bind_tools([sandbox_execute])`` with a hard cap of 5 tool calls.
     No DeepAgent, no ``write_todos``, no planning loop, no file-based context.
 
     Never raises — returns ``{}`` on any failure.
     """
     try:
-        return _execute_skill_inner(artifact, task, fixture_contents)
+        return _execute_skill_inner(
+            artifact, task, fixture_contents,
+            langfuse_tags=langfuse_tags,
+            langfuse_session_id=langfuse_session_id,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Skill execution failed for %s: %s", getattr(task, "task_id", "?"), exc)
         return {}
@@ -218,6 +225,9 @@ def _execute_skill_inner(
     artifact: Any,
     task: Any,
     fixture_contents: dict[str, str],
+    *,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
 ) -> dict:
     from langchain.chat_models import init_chat_model
     from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -247,14 +257,23 @@ def _execute_skill_inner(
         HumanMessage(content=user_message),
     ]
 
-    # LangFuse tracing
+    # LangFuse tracing with inherited tags
     callbacks: list = []
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
         callbacks = [LangFuseCallbackHandler()]
     except Exception:  # noqa: BLE001
         pass
-    invoke_config = {"callbacks": callbacks} if callbacks else {}
+    invoke_config: dict = {}
+    if callbacks:
+        invoke_config["callbacks"] = callbacks
+        lf_meta: dict = {}
+        if langfuse_tags:
+            lf_meta["langfuse_tags"] = langfuse_tags
+        if langfuse_session_id:
+            lf_meta["langfuse_session_id"] = langfuse_session_id
+        if lf_meta:
+            invoke_config["metadata"] = lf_meta
 
     def _run_skill_loop() -> dict:
         """Inner loop — runs in a thread for timeout control."""
@@ -422,6 +441,9 @@ def execute_agent_artifact(
     artifact: Any,
     task: Any,
     fixture_contents: dict[str, str],
+    *,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
 ) -> dict:
     """Execute an AGENT artifact via DeepAgent with progressive skill disclosure.
 
@@ -432,7 +454,11 @@ def execute_agent_artifact(
     Never raises — returns ``{}`` on any failure.
     """
     try:
-        return _execute_agent_inner(artifact, task, fixture_contents)
+        return _execute_agent_inner(
+            artifact, task, fixture_contents,
+            langfuse_tags=langfuse_tags,
+            langfuse_session_id=langfuse_session_id,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent execution failed for %s: %s", getattr(task, "task_id", "?"), exc)
         return {}
@@ -442,6 +468,9 @@ def _execute_agent_inner(
     artifact: Any,
     task: Any,
     fixture_contents: dict[str, str],
+    *,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
 ) -> dict:
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
@@ -496,12 +525,21 @@ def _execute_agent_inner(
         f"Input data:\n{_format_fixture_message(fixture_contents)}"
     )
 
-    config = {"recursion_limit": _RECURSION_LIMIT}
+    config: dict = {"recursion_limit": _RECURSION_LIMIT}
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
         config["callbacks"] = [LangFuseCallbackHandler()]
     except Exception as exc:  # noqa: BLE001
         logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
+
+    # Inherit LangFuse tags from caller
+    lf_meta: dict = {}
+    if langfuse_tags:
+        lf_meta["langfuse_tags"] = langfuse_tags
+    if langfuse_session_id:
+        lf_meta["langfuse_session_id"] = langfuse_session_id
+    if lf_meta:
+        config["metadata"] = lf_meta
 
     invoke_input: dict = {"messages": [{"role": "user", "content": user_message}]}
     if skill_files:

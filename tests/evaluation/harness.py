@@ -441,7 +441,14 @@ class EvaluationHarness:
                 "attempt_count": 0,
             }
 
-        return _extract_result(final_state, task, loader)
+        # Pass LangFuse tags to execution functions so sub-traces
+        # (skill/agent execution) are tagged consistently.
+        _lf_meta = invoke_config.get("metadata", {})
+        return _extract_result(
+            final_state, task, loader,
+            langfuse_tags=_lf_meta.get("langfuse_tags"),
+            langfuse_session_id=_lf_meta.get("langfuse_session_id"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +460,9 @@ def _extract_result(
     state: TaskState,
     task: TaskDefinition,
     loader: ToolLoader,
+    *,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
 ) -> dict:
     """Extract EvaluationRecord fields from a completed TaskState."""
     # pipeline.invoke() returns a dict, not a TaskState instance
@@ -535,9 +545,13 @@ def _extract_result(
     # Execute the artifact against fixture data to check output_in_range
     output_in_range = False
     if gate_passed and artifacts:
-        artifact = artifacts[-1]
+        # artifact already set by priority sort above (artifacts[0])
         try:
-            output = _execute_artifact(artifact, task, loader)
+            output = _execute_artifact(
+                artifact, task, loader,
+                langfuse_tags=langfuse_tags,
+                langfuse_session_id=langfuse_session_id,
+            )
             output_in_range = task.validator(output)
             if gate_passed and not output_in_range:
                 failure_reason = "output_rejected"
@@ -603,7 +617,11 @@ def _extract_result(
                     skill_content=matched_skill,
                     agent_config=matched_agent_config,
                 )
-                output = _execute_artifact(proxy_artifact, task, loader)
+                output = _execute_artifact(
+                    proxy_artifact, task, loader,
+                    langfuse_tags=langfuse_tags,
+                    langfuse_session_id=langfuse_session_id,
+                )
                 output_in_range = task.validator(output)
                 if not output_in_range:
                     failure_reason = "output_rejected"
@@ -641,13 +659,15 @@ def _extract_result(
     }
 
 
-def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -> dict:
-    """Execute a generated MCP tool artifact with fixture data and return its output.
-
-    For SKILL/AGENT artifacts, returns a structural proxy (empty dict)
-    since these cannot be auto-executed — output_in_range will be False,
-    which is acceptable for thesis purposes (discussed in limitations).
-    """
+def _execute_artifact(
+    artifact: Any,
+    task: TaskDefinition,
+    loader: ToolLoader,
+    *,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
+) -> dict:
+    """Execute a generated artifact with fixture data and return its output."""
     from src.schemas.capability import CapabilityType
 
     cap_type = artifact.capability_type
@@ -655,12 +675,20 @@ def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -
         from tests.evaluation.execution import _read_fixture_contents, execute_skill_artifact
 
         fixture_contents = _read_fixture_contents(task)
-        return execute_skill_artifact(artifact, task, fixture_contents)
+        return execute_skill_artifact(
+            artifact, task, fixture_contents,
+            langfuse_tags=langfuse_tags,
+            langfuse_session_id=langfuse_session_id,
+        )
     elif cap_type == CapabilityType.AGENT:
         from tests.evaluation.execution import _read_fixture_contents, execute_agent_artifact
 
         fixture_contents = _read_fixture_contents(task)
-        return execute_agent_artifact(artifact, task, fixture_contents)
+        return execute_agent_artifact(
+            artifact, task, fixture_contents,
+            langfuse_tags=langfuse_tags,
+            langfuse_session_id=langfuse_session_id,
+        )
     elif cap_type != CapabilityType.MCP_TOOL:
         logger.debug("Unknown artifact type: %s", cap_type)
         return {}

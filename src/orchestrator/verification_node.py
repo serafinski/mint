@@ -102,6 +102,22 @@ def verification_node(
         new_attempt_count,
     )
 
+    # Pass LangFuse metadata to adversarial prober (runs in worker threads
+    # where get_config() is unavailable). Must be set before the pool starts.
+    try:
+        from langgraph.config import get_config as _get_langgraph_config
+        from src.verification.adversarial import set_langfuse_metadata
+
+        parent_config = _get_langgraph_config()
+        parent_meta = (parent_config or {}).get("metadata", {})
+        lf_meta = {
+            k: v for k, v in parent_meta.items()
+            if k.startswith("langfuse_") or k in ("task_id", "condition", "run_id", "tier")
+        }
+        set_langfuse_metadata(lf_meta)
+    except Exception:  # noqa: BLE001
+        pass
+
     # Run gate_fn in parallel — each call is independent (isolated Docker sandbox).
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_VERIFICATION_WORKERS) as pool:
         future_to_artifact = {

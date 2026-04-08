@@ -82,7 +82,25 @@ def decomposition_node(
     """
     agent = _get_agent()
 
+    # Inherit LangFuse tags from the pipeline config so the decomposition
+    # DeepAgent trace is tagged with task_id, condition, tier, etc.
+    # Must extract BEFORE entering the ThreadPoolExecutor (get_config()
+    # only works in the LangGraph execution thread).
     langfuse_handler = None
+    langfuse_metadata: dict = {}
+    try:
+        from langgraph.config import get_config as _get_langgraph_config
+
+        parent_config = _get_langgraph_config()
+        parent_meta = (parent_config or {}).get("metadata", {})
+        langfuse_metadata = {
+            k: v for k, v in parent_meta.items()
+            if k.startswith("langfuse_") or k in ("task_id", "condition", "run_id", "tier")
+        }
+        logger.debug("Inherited LangFuse metadata: %s", langfuse_metadata)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not inherit LangFuse metadata: %s", exc)
+
     try:
         langfuse_handler = LangFuseCallbackHandler()
         callbacks = [langfuse_handler]
@@ -90,10 +108,12 @@ def decomposition_node(
         logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
         callbacks = []
 
-    config = {
+    config: dict = {
         "recursion_limit": DECOMPOSITION_RECURSION_LIMIT,
         "callbacks": callbacks,
     }
+    if langfuse_metadata:
+        config["metadata"] = langfuse_metadata
 
     subtasks: list[SubTask] = []
     required_caps: list[str] = []
