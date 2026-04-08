@@ -382,8 +382,13 @@ def test_skill_syntax_error_not_reported_as_critical(mock_behavioral, mock_adver
 
 @patch("src.verification.gate.adversarial.probe")
 @patch("src.verification.gate.behavioral.run")
-def test_skill_mock_indicator_in_content_detected(mock_behavioral, mock_adversarial):
-    contaminated_skill = """\
+def test_skill_with_mock_word_in_prose_passes_tier1(mock_behavioral, mock_adversarial):
+    """Words like 'mock' inside SKILL.md prose must NOT block verification.
+    Skills are natural-language instructions where these words appear
+    legitimately. Mock-artifact detection is scoped to MCP_TOOL Python
+    source only — see static_scanner._check_mock_artifacts.
+    """
+    skill_with_mock_word = """\
 ---
 name: demo-skill
 description: A skill that uses mock data for demonstration
@@ -396,15 +401,14 @@ This skill uses mock_result to show sample data.
     artifact = _make_artifact(
         cap_type=CapabilityType.SKILL,
         source_code=None,
-        skill_content=contaminated_skill,
+        skill_content=skill_with_mock_word,
     )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
 
     report = verify(artifact)
 
-    assert report.overall_passed is False
-    assert any(f.category == "mock_artifact" for f in report.findings)
-    mock_behavioral.assert_not_called()
-    mock_adversarial.assert_not_called()
+    assert [f for f in report.findings if f.category == "mock_artifact"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -435,17 +439,21 @@ def test_agent_clean_config_passes(mock_behavioral, mock_adversarial):
 
 @patch("src.verification.gate.adversarial.probe")
 @patch("src.verification.gate.behavioral.run")
-def test_agent_mock_in_config_detected(mock_behavioral, mock_adversarial):
+def test_agent_with_mock_word_in_config_passes_tier1(mock_behavioral, mock_adversarial):
+    """Agent system prompts referencing 'mock' as a domain term must NOT
+    block verification. Mock-artifact detection is MCP_TOOL only.
+    """
     artifact = _make_artifact(
         cap_type=CapabilityType.AGENT,
         source_code=None,
         agent_config={"system_prompt": "You are a mock agent for testing purposes."},
     )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
 
     report = verify(artifact)
 
-    assert report.overall_passed is False
-    assert any(f.category == "mock_artifact" for f in report.findings)
+    assert [f for f in report.findings if f.category == "mock_artifact"] == []
 
 
 # ---------------------------------------------------------------------------

@@ -351,9 +351,11 @@ def scan(
 
         _check_missing_external_calls(tree, source_code, findings)
 
-    # Regex checks
-    _check_mock_artifacts(source_code, findings)
-    _check_synthetic_comments(source_code, findings)
+        # Regex checks (MCP_TOOL only — skills/agents are natural-language
+        # prose where words like "placeholder" or "mock" appear legitimately
+        # in instructions and would produce false positives).
+        _check_mock_artifacts(source_code, findings)
+        _check_synthetic_comments(source_code, findings)
 
     has_critical = any(f.severity == Severity.CRITICAL for f in findings)
     return VerificationReport(

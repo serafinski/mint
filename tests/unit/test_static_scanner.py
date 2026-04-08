@@ -588,20 +588,29 @@ class TestScanNonMcpTypes:
         assert report.overall_passed is True
         assert report.tier_reached == 1
 
-    def test_mock_indicator_detected_as_critical(self):
+    def test_mock_word_in_skill_prose_not_flagged(self):
+        """Words like 'mock' / 'placeholder' inside SKILL.md prose must NOT be
+        flagged as mock_artifact findings. Skills are natural-language
+        instructions where these words appear legitimately (e.g., "do not
+        leave placeholder values", "this is not a mock implementation").
+        Mock detection is scoped to MCP_TOOL Python source only.
+        """
         text = "---\nname: my-skill\ndescription: Loads data.\n---\n\nThis is a mock of the real API.\n"
         report = scan(text, "my-skill", "skill")
         mock_findings = [f for f in report.findings if f.category == "mock_artifact"]
-        assert len(mock_findings) >= 1
-        assert all(f.severity.value == "critical" for f in mock_findings)
-        assert report.overall_passed is False
+        assert mock_findings == []
+        assert report.overall_passed is True
 
-    def test_synthetic_comment_detected_as_high(self):
+    def test_todo_comment_in_agent_prose_not_flagged(self):
+        """`# TODO` in agent config text must NOT be flagged. Agent system
+        prompts and JSON config are not Python source, so the synthetic-data
+        regex (which targets `# TODO` / `# FIXME` code comments) does not
+        apply.
+        """
         text = "# TODO: implement real data fetching\nUse this for analysis.\n"
         report = scan(text, "todo-agent", "agent")
         synthetic = [f for f in report.findings if f.category == "synthetic_data"]
-        assert len(synthetic) >= 1
-        assert all(f.severity.value == "high" for f in synthetic)
+        assert synthetic == []
 
     def test_no_ast_syntax_error_for_non_python(self):
         """YAML/markdown content must not produce a syntax error finding."""
@@ -618,15 +627,66 @@ class TestScanNonMcpTypes:
         report = scan("content", "cap-name", "agent")
         assert report.capability_name == "cap-name"
 
-    def test_json_config_with_mock_detected(self):
-        """JSON agent config containing 'mock' is caught by regex scan."""
+    def test_json_agent_config_with_mock_word_not_flagged(self):
+        """JSON agent config containing the word 'mock' in the system_prompt
+        must NOT be flagged. Agent prompts can legitimately reference mocking
+        as a domain concept (e.g., "you are a testing agent that creates
+        mock responses for review"). Mock detection is MCP_TOOL only.
+        """
         import json
         config = json.dumps({"system_prompt": "You are a mock testing agent."})
         report = scan(config, "agent-cap", "agent")
-        assert report.overall_passed is False
-        assert any(f.category == "mock_artifact" for f in report.findings)
+        assert report.overall_passed is True
+        assert [f for f in report.findings if f.category == "mock_artifact"] == []
 
     def test_empty_text_returns_clean_report(self):
         report = scan("", "empty-cap", "agent")
         assert report.findings == []
         assert report.overall_passed is True
+
+    def test_skill_with_placeholder_in_instructions_passes(self):
+        """Regression for T04 false positive: skills routinely use the word
+        'placeholder' in their instructions (e.g., "do not leave placeholder
+        values in the output"). The Tier 1 mock-artifact regex was firing on
+        these legitimate prose uses and rejecting otherwise-valid skills.
+        """
+        skill = (
+            "---\n"
+            "name: inventory-reorder\n"
+            "description: Build an inventory reorder pipeline.\n"
+            "---\n\n"
+            "## Instructions\n\n"
+            "Compute reorder quantities. Do not leave placeholder values in\n"
+            "the output. Replace any placeholder fields with real computed\n"
+            "values before returning.\n"
+        )
+        report = scan(skill, "inventory-reorder", "skill")
+        assert report.overall_passed is True
+        assert [f for f in report.findings if f.category == "mock_artifact"] == []
+
+    def test_skill_with_mock_word_in_instructions_passes(self):
+        """Regression for T04: 'mock' as a domain term in skill prose must
+        not block verification. Skills often reference mocking as a concept
+        (e.g., "this is not a mock — call the real API")."""
+        skill = (
+            "---\n"
+            "name: data-fetcher\n"
+            "description: Fetch real data from the source.\n"
+            "---\n\n"
+            "## Important\n\n"
+            "This skill must call the real API. Do not return mock data.\n"
+        )
+        report = scan(skill, "data-fetcher", "skill")
+        assert report.overall_passed is True
+        assert [f for f in report.findings if f.category == "mock_artifact"] == []
+
+    def test_mcp_tool_mock_detection_still_works(self):
+        """Sanity check: the MCP_TOOL path still flags mock literals.
+        Scoping the regex to MCP_TOOL must not regress mock detection on
+        actual Python source.
+        """
+        code = 'def get_data():\n    return "placeholder"\n'
+        report = scan(code, "fake-tool", "mcp_tool")
+        mock_findings = [f for f in report.findings if f.category == "mock_artifact"]
+        assert len(mock_findings) >= 1
+        assert mock_findings[0].severity.value == "critical"
