@@ -1,12 +1,16 @@
-"""SKILL and AGENT artifact execution via DeepAgent.
+"""SKILL and AGENT artifact execution — three distinct backends.
 
-Follows the same invocation pattern as ``src/verification/adversarial.py``:
-create a fresh DeepAgent per invocation, invoke in a ThreadPoolExecutor with
-timeout, extract structured_response, never raise.
+Each capability type uses a different execution backend:
 
-The SKILL.md content is passed as the DeepAgent's *system_prompt* so the
-skill instructions carry maximum weight.  For AGENT artifacts, the agent's
-own ``system_prompt`` from ``agent_config`` is used.
+- **MCP Tool**: sandbox code execution, no LLM at runtime (handled in harness.py)
+- **SKILL**: constrained LLM with ``sandbox_execute`` tool calling (max 3 calls,
+  no planning loop, no ``write_todos``). Prescribed workflow execution.
+- **AGENT**: full DeepAgent with ``sandbox_execute`` + native ``skills=`` parameter
+  for progressive disclosure. Adaptive autonomous reasoning.
+
+The skill/agent distinction is intentional — skills follow prescribed steps
+with limited retry, while agents plan, adapt, and iterate freely. This makes
+the classifier's routing decision have measurable runtime consequences.
 """
 
 from __future__ import annotations
@@ -26,8 +30,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SKILL_EXECUTION_TIMEOUT_S = 240
-AGENT_EXECUTION_TIMEOUT_S = 300
-_RECURSION_LIMIT = 50
+AGENT_EXECUTION_TIMEOUT_S = 480
+_RECURSION_LIMIT = 100
 
 # ---------------------------------------------------------------------------
 # Response models (harness-internal, not pipeline state)
@@ -146,19 +150,49 @@ def _format_fixture_message(fixture_contents: dict[str, str]) -> str:
 # SKILL execution
 # ---------------------------------------------------------------------------
 
-_SKILL_SYSTEM_PREAMBLE = """\
-You are a skill executor. You receive input data files and must process them
-according to the skill instructions below.
+def _extract_last_sandbox_json(messages: list) -> dict | None:
+    """Try to extract JSON from the last successful sandbox_execute result."""
+    for msg in reversed(messages):
+        # ToolMessage contains sandbox_execute results
+        content = getattr(msg, "content", None)
+        if not content or not isinstance(content, str):
+            continue
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict) and parsed.get("success") and parsed.get("stdout"):
+                # Parse the stdout — the tool prints JSON there
+                stdout = parsed["stdout"].strip()
+                # Take the last line (in case of debug output before it)
+                last_line = stdout.splitlines()[-1] if stdout else ""
+                result = json.loads(last_line)
+                if isinstance(result, dict):
+                    return result
+        except (json.JSONDecodeError, IndexError, KeyError):
+            continue
+    return None
 
-Use the sandbox_execute tool to run Python code for any computation. When using
-sandbox_execute, write the data files to /tmp/ inside the sandbox first, then
-process them. The sandbox has pandas and numpy available.
 
-Return your result in the required structured output format. Be precise with
-numbers — round floats to 2 decimal places where appropriate.
+_SKILL_EXECUTION_SYSTEM_PROMPT = """\
+You are a skill executor. You receive a task with input data and must follow \
+the skill instructions below to produce the required output.
 
---- SKILL INSTRUCTIONS ---
+You have ONE tool available: sandbox_execute(code, timeout=10, extra_packages=None).
+It runs Python code in an isolated Docker container and returns \
+{"stdout": str, "stderr": str, "exit_code": int, "success": bool}.
+
+## Rules
+- Follow the skill instructions precisely — do not deviate or improvise.
+- The input data is provided in the user message below. Embed it directly \
+in your Python code as string literals, then write to /tmp/ files inside \
+the code using Python's open()/write() before processing.
+- Print your final result as JSON to stdout.
+- Declare any non-stdlib packages via extra_packages (e.g., extra_packages=["pandas"]).
+- Use the pip install name, not the Python import name (e.g., "pyyaml" not "yaml").
+- You have at most 3 tool calls. Do not plan — just execute the prescribed steps.
 """
+
+# Maximum sandbox_execute calls in the skill execution loop.
+_SKILL_MAX_TOOL_CALLS = 3
 
 
 def execute_skill_artifact(
@@ -166,7 +200,10 @@ def execute_skill_artifact(
     task: Any,
     fixture_contents: dict[str, str],
 ) -> dict:
-    """Execute a SKILL artifact by invoking a DeepAgent with the skill as system prompt.
+    """Execute a SKILL artifact via constrained LLM with tool calling.
+
+    Uses ``bind_tools([sandbox_execute])`` with a hard cap of 3 tool calls.
+    No DeepAgent, no ``write_todos``, no planning loop, no file-based context.
 
     Never raises — returns ``{}`` on any failure.
     """
@@ -182,23 +219,19 @@ def _execute_skill_inner(
     task: Any,
     fixture_contents: dict[str, str],
 ) -> dict:
-    from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
+    from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
     from src.config import DEFAULT_LLM_MODEL
     from src.verification.sandbox_tool import sandbox_execute
 
     skill_content = getattr(artifact, "skill_content", None) or ""
-    system_prompt = _SKILL_SYSTEM_PREAMBLE + skill_content
-
     result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
 
-    agent = create_deep_agent(
-        model=init_chat_model(DEFAULT_LLM_MODEL),
-        tools=[sandbox_execute],
-        system_prompt=system_prompt,
-        response_format=result_model,
-        name="skill-executor",
+    system_prompt = (
+        _SKILL_EXECUTION_SYSTEM_PROMPT
+        + "\n\n--- SKILL INSTRUCTIONS ---\n"
+        + skill_content
     )
 
     user_message = (
@@ -206,40 +239,91 @@ def _execute_skill_inner(
         f"Input data:\n{_format_fixture_message(fixture_contents)}"
     )
 
-    config = {"recursion_limit": _RECURSION_LIMIT}
+    llm = init_chat_model(DEFAULT_LLM_MODEL)
+    tool_calling_llm = llm.bind_tools([sandbox_execute])
+
+    messages: list = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_message),
+    ]
+
+    # LangFuse tracing
+    callbacks: list = []
     try:
         from langfuse.langchain import CallbackHandler as LangFuseCallbackHandler
-        config["callbacks"] = [LangFuseCallbackHandler()]
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
+        callbacks = [LangFuseCallbackHandler()]
+    except Exception:  # noqa: BLE001
+        pass
+    invoke_config = {"callbacks": callbacks} if callbacks else {}
+
+    def _run_skill_loop() -> dict:
+        """Inner loop — runs in a thread for timeout control."""
+        tool_calls_made = 0
+
+        # *2 iterations: each iteration is one LLM turn + tool results
+        for _ in range(_SKILL_MAX_TOOL_CALLS * 2):
+            response = tool_calling_llm.invoke(messages, config=invoke_config)
+            messages.append(response)
+
+            if not response.tool_calls:
+                break  # LLM is done
+
+            for tool_call in response.tool_calls:
+                tool_calls_made += 1
+                result = sandbox_execute(**tool_call["args"])
+                messages.append(ToolMessage(
+                    content=json.dumps(result),
+                    tool_call_id=tool_call["id"],
+                ))
+
+            if tool_calls_made >= _SKILL_MAX_TOOL_CALLS:
+                break
+
+        # Extract structured result. First, try to parse JSON directly from
+        # the last successful sandbox stdout (cheapest — no LLM call needed).
+        # Fall back to a structured output LLM call if parsing fails.
+        last_sandbox_output = _extract_last_sandbox_json(messages)
+        if last_sandbox_output is not None:
+            if result_model is not GenericResult:
+                try:
+                    return result_model.model_validate(last_sandbox_output).model_dump()
+                except Exception:  # noqa: BLE001
+                    pass  # fall through to LLM extraction
+            else:
+                return last_sandbox_output
+
+        # LLM extraction fallback — use function_calling method to avoid
+        # OpenAI's strict schema requirements for structured output.
+        structured_llm = llm.with_structured_output(result_model, method="function_calling")
+        messages.append(HumanMessage(content=(
+            "Based on the sandbox execution results above, extract the final "
+            "answer in the required format."
+        )))
+        structured = structured_llm.invoke(messages, config=invoke_config)
+        return structured.model_dump() if hasattr(structured, "model_dump") else dict(structured)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        future = pool.submit(
-            agent.invoke,
-            {"messages": [{"role": "user", "content": user_message}]},
-            config,
-        )
-        result = future.result(timeout=SKILL_EXECUTION_TIMEOUT_S)
+        future = pool.submit(_run_skill_loop)
+        output = future.result(timeout=SKILL_EXECUTION_TIMEOUT_S)
         pool.shutdown(wait=False)
-
-        structured = result.get("structured_response")
-        if structured is not None:
-            output = structured.model_dump() if hasattr(structured, "model_dump") else dict(structured)
-            logger.info("Skill execution for %s returned: %s", task.task_id, str(output)[:300])
-            return output
-
-        logger.warning("Skill executor returned no structured_response for %s", task.task_id)
-        return {}
+        task_id = getattr(task, "task_id", "?")
+        logger.info("Skill execution for %s returned: %s", task_id, str(output)[:300])
+        return output
 
     except concurrent.futures.TimeoutError:
         pool.shutdown(wait=False)
-        logger.error("Skill execution timed out after %ds for %s", SKILL_EXECUTION_TIMEOUT_S, task.task_id)
+        task_id = getattr(task, "task_id", "?")
+        logger.error(
+            "Skill execution timed out after %ds for %s",
+            SKILL_EXECUTION_TIMEOUT_S, task_id,
+        )
         return {}
 
     except Exception as exc:  # noqa: BLE001
         pool.shutdown(wait=False)
-        logger.exception("Skill execution error for %s: %s", task.task_id, exc)
+        task_id = getattr(task, "task_id", "?")
+        logger.exception("Skill execution error for %s: %s", task_id, exc)
         return {}
 
 
@@ -252,12 +336,86 @@ You are an autonomous data analysis agent. You receive input data and must
 investigate it, make decisions about what to analyze, and return structured
 findings.
 
-Use the sandbox_execute tool to run Python code for any computation. When using
-sandbox_execute, write the data files to /tmp/ inside the sandbox first, then
-process them. The sandbox has pandas and numpy available.
+You have skills available that provide domain expertise for specific tasks.
+Check your available skills — if one matches your task, activate and follow it.
+
+## Tools
+
+You have two types of tools with SEPARATE filesystems:
+
+### sandbox_execute (Docker sandbox — for all computation)
+Use sandbox_execute(code, timeout=10, extra_packages=None) to run Python code
+in an isolated Docker container. The sandbox has NO access to your workspace
+files. To pass data to the sandbox, embed it directly in the Python code
+string (e.g., as inline CSV strings or JSON literals). Declare any non-stdlib
+packages via extra_packages (e.g., extra_packages=["pandas", "pyyaml"]).
+
+### Built-in workspace tools (agent memory — for planning and notes)
+write_todos, read_file, write_file, edit_file, ls, glob, grep operate on your
+in-memory workspace. Use write_file for analysis notes and intermediate
+reasoning. These files are NOT accessible inside sandbox_execute.
+
+IMPORTANT: Do NOT write data with write_file and then try to read it inside
+sandbox_execute — they are separate filesystems. Instead, take the input data
+from the user message and embed it directly in your sandbox_execute code.
 
 Return your result in the required structured output format.
 """
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _collect_skill_files(skills_dir: Path | None = None) -> dict:
+    """Read all skills from a skills directory for StateBackend.
+
+    Args:
+        skills_dir: Directory containing skill subdirectories. Defaults to
+            ``<project_root>/data/eval/skills/``.
+
+    Returns dict mapping relative file paths to ``{"content": [lines]}``
+    format required by DeepAgents ``StateBackend``.
+    """
+    skill_files: dict = {}
+    if skills_dir is None:
+        skills_dir = _PROJECT_ROOT / "data" / "eval" / "skills"
+    if not skills_dir.exists():
+        return skill_files
+    # Use the directory name as the skills= prefix for StateBackend lookup
+    skills_prefix = str(skills_dir).rstrip("/")
+    for skill_dir in skills_dir.iterdir():
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if skill_md.exists():
+            rel_path = f"{skills_prefix}/{skill_dir.name}/SKILL.md"
+            content = skill_md.read_text(encoding="utf-8")
+            skill_files[rel_path] = {"content": content.splitlines()}
+    return skill_files
+
+
+def _ensure_skill_on_disk(
+    artifact: Any,
+    skill_content: str,
+    skill_files: dict,
+    skills_dir: Path | None = None,
+) -> None:
+    """Write agent's ``skill_content`` to disk if not already present.
+
+    Also adds the skill to *skill_files* so the current invocation can
+    discover it via ``StateBackend``.
+    """
+    if skills_dir is None:
+        skills_dir = _PROJECT_ROOT / "data" / "eval" / "skills"
+    name = getattr(artifact, "capability_name", "unknown-skill")
+    skill_dir = skills_dir / name
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.exists():
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_md.write_text(skill_content, encoding="utf-8")
+    skills_prefix = str(skills_dir).rstrip("/")
+    rel_path = f"{skills_prefix}/{name}/SKILL.md"
+    if rel_path not in skill_files:
+        skill_files[rel_path] = {"content": skill_content.splitlines()}
 
 
 def execute_agent_artifact(
@@ -265,7 +423,11 @@ def execute_agent_artifact(
     task: Any,
     fixture_contents: dict[str, str],
 ) -> dict:
-    """Execute an AGENT artifact by invoking a DeepAgent with the agent's config.
+    """Execute an AGENT artifact via DeepAgent with progressive skill disclosure.
+
+    Uses ``create_deep_agent()`` with ``skills=`` parameter so the agent
+    discovers available skills via progressive disclosure (metadata first,
+    full content on activation).
 
     Never raises — returns ``{}`` on any failure.
     """
@@ -287,16 +449,36 @@ def _execute_agent_inner(
     from src.config import DEFAULT_LLM_MODEL
     from src.verification.sandbox_tool import sandbox_execute
 
-    # Extract system prompt from agent_config
     agent_config = getattr(artifact, "agent_config", None) or {}
     system_prompt = agent_config.get("system_prompt", _AGENT_SYSTEM_FALLBACK)
 
-    # If the agent has skill content, prepend it to the system prompt
+    # NOTE: skill_content is NO LONGER prepended to system_prompt.
+    # Skills are loaded via progressive disclosure through the skills= parameter.
+
+    # Determine skills directory — CLI sets SKILLS_OUTPUT_DIR, eval uses default
+    from src.orchestrator.generators.skill import SKILLS_OUTPUT_DIR
+    skills_dir = SKILLS_OUTPUT_DIR
+
+    # If agent has skill_content, ensure it's on disk and pass ONLY that skill
+    # for progressive disclosure. In evaluation, passing all skills from disk
+    # causes noise (irrelevant skills from other tasks in the same run).
+    # In CLI mode, _collect_skill_files() returns all accumulated skills,
+    # which is the intended progressive discovery behavior.
+    skill_files: dict = {}
     skill_content = getattr(artifact, "skill_content", None)
     if not skill_content and agent_config.get("is_deep_agent"):
         skill_content = agent_config.get("skill_content")
     if skill_content:
-        system_prompt = f"--- SKILL INSTRUCTIONS ---\n{skill_content}\n--- END SKILL ---\n\n{system_prompt}"
+        _ensure_skill_on_disk(artifact, skill_content, skill_files, skills_dir)
+
+    # In CLI mode (skills accumulate), discover all skills on disk.
+    # In eval mode (this agent's skill is already in skill_files), skip
+    # to avoid loading irrelevant skills from earlier tasks in the same run.
+    if not skill_files:
+        skill_files = _collect_skill_files(skills_dir)
+
+    skills_prefix = str(skills_dir).rstrip("/") + "/"
+    skills_param = [skills_prefix] if skill_files else None
 
     result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
 
@@ -304,6 +486,7 @@ def _execute_agent_inner(
         model=init_chat_model(DEFAULT_LLM_MODEL),
         tools=[sandbox_execute],
         system_prompt=system_prompt,
+        skills=skills_param,
         response_format=result_model,
         name="agent-executor",
     )
@@ -320,31 +503,41 @@ def _execute_agent_inner(
     except Exception as exc:  # noqa: BLE001
         logger.debug("LangFuse handler creation failed (tracing disabled): %s", exc)
 
+    invoke_input: dict = {"messages": [{"role": "user", "content": user_message}]}
+    if skill_files:
+        invoke_input["files"] = skill_files
+
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        future = pool.submit(
-            agent.invoke,
-            {"messages": [{"role": "user", "content": user_message}]},
-            config,
-        )
+        future = pool.submit(agent.invoke, invoke_input, config)
         result = future.result(timeout=AGENT_EXECUTION_TIMEOUT_S)
         pool.shutdown(wait=False)
 
+        task_id = getattr(task, "task_id", "?")
         structured = result.get("structured_response")
         if structured is not None:
-            output = structured.model_dump() if hasattr(structured, "model_dump") else dict(structured)
-            logger.info("Agent execution for %s returned: %s", task.task_id, str(output)[:300])
+            output = (
+                structured.model_dump()
+                if hasattr(structured, "model_dump")
+                else dict(structured)
+            )
+            logger.info("Agent execution for %s returned: %s", task_id, str(output)[:300])
             return output
 
-        logger.warning("Agent executor returned no structured_response for %s", task.task_id)
+        logger.warning("Agent executor returned no structured_response for %s", task_id)
         return {}
 
     except concurrent.futures.TimeoutError:
         pool.shutdown(wait=False)
-        logger.error("Agent execution timed out after %ds for %s", AGENT_EXECUTION_TIMEOUT_S, task.task_id)
+        task_id = getattr(task, "task_id", "?")
+        logger.error(
+            "Agent execution timed out after %ds for %s",
+            AGENT_EXECUTION_TIMEOUT_S, task_id,
+        )
         return {}
 
     except Exception as exc:  # noqa: BLE001
         pool.shutdown(wait=False)
-        logger.exception("Agent execution error for %s: %s", task.task_id, exc)
+        task_id = getattr(task, "task_id", "?")
+        logger.exception("Agent execution error for %s: %s", task_id, exc)
         return {}

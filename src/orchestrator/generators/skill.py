@@ -2,7 +2,7 @@
 
 A plain LangGraph node (no DeepAgent) that generates SKILL.md files for each
 gap classified as ``CapabilityType.SKILL``.  Each generated skill is validated
-with ``tools/quick_validate.py`` and written to ``.deepagents/skills/<name>/``.
+with ``tools/quick_validate.py`` and written to ``data/eval/skills/<name>/``.
 """
 
 from __future__ import annotations
@@ -32,7 +32,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SKILLS_OUTPUT_DIR = _PROJECT_ROOT / ".deepagents" / "skills"
+SKILLS_OUTPUT_DIR = _PROJECT_ROOT / "data" / "eval" / "skills"
+
+
+def set_skills_output_dir(path: Path) -> None:
+    """Override the directory where generated skills are written.
+
+    Used by the CLI to separate its skill storage (``data/cli/skills/``)
+    from the evaluation harness (``data/eval/skills/``).
+    Also updates ``agent.py``'s ``SKILLS_OUTPUT_DIR`` to stay in sync.
+    """
+    global SKILLS_OUTPUT_DIR  # noqa: PLW0603
+    SKILLS_OUTPUT_DIR = path
+    # Keep agent generator in sync (it mirrors this value).
+    from src.orchestrator.generators import agent as _agent_mod
+    _agent_mod.SKILLS_OUTPUT_DIR = path
 
 # ---------------------------------------------------------------------------
 # Import validate_skill from tools/quick_validate.py

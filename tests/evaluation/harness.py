@@ -25,10 +25,10 @@ Usage::
     from tests.evaluation.tasks import ALL_TASKS, PILOT_TASKS
 
     config = HarnessConfig(
-        chroma_dir=Path("data/chroma"),
+        chroma_dir=Path("data/eval/chroma"),
         mcp_tools_dir=Path("src/mcp_tools"),
-        skills_dir=Path(".deepagents/skills"),
-        db_path="data/evaluation.duckdb",
+        skills_dir=Path("data/eval/skills"),
+        db_path="data/eval/metrics.duckdb",
         n_runs=8,
         base_seed=42,
     )
@@ -471,10 +471,18 @@ def _extract_result(
     if artifacts:
         from src.schemas.capability import CapabilityType
 
-        # Sort by capability_name for deterministic selection when parallel
-        # generation produces multiple artifacts (as_completed ordering varies).
-        artifacts = sorted(artifacts, key=lambda a: a.capability_name or "")
-        artifact = artifacts[-1]
+        # When multiple artifacts exist (decomposition produced several gaps),
+        # prefer the most capable type: AGENT > SKILL > MCP_TOOL.
+        # Within the same type, sort by name for deterministic selection.
+        _TYPE_PRIORITY = {"AGENT": 0, "SKILL": 1, "MCP_TOOL": 2}
+        artifacts = sorted(
+            artifacts,
+            key=lambda a: (
+                _TYPE_PRIORITY.get(str(a.capability_type).split(".")[-1].upper(), 9),
+                a.capability_name or "",
+            ),
+        )
+        artifact = artifacts[0]
         capability_type = str(artifact.capability_type).split(".")[-1].lower()
 
         if verification_results:
@@ -570,12 +578,30 @@ def _extract_result(
                 from src.schemas.capability import CapabilityType
                 from src.schemas.task import GeneratedArtifact
 
+                # Reconstruct skill_content / agent_config from metadata
+                # so SKILL/AGENT execution backends have original instructions.
+                matched_skill = meta.get("skill_content")
+                matched_agent_config = None
+                _ac_raw = meta.get("agent_config")
+                if _ac_raw:
+                    try:
+                        import json as _json
+                        matched_agent_config = (
+                            _json.loads(_ac_raw)
+                            if isinstance(_ac_raw, str)
+                            else _ac_raw
+                        )
+                    except (ValueError, TypeError):
+                        matched_agent_config = None
+
                 proxy_artifact = GeneratedArtifact(
                     capability_name=cap.name,
                     capability_type=CapabilityType(cap.capability_type)
                     if isinstance(cap.capability_type, str)
                     else cap.capability_type,
                     source_code=matched_source,
+                    skill_content=matched_skill,
+                    agent_config=matched_agent_config,
                 )
                 output = _execute_artifact(proxy_artifact, task, loader)
                 output_in_range = task.validator(output)

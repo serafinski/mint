@@ -377,11 +377,19 @@ def _create_infra(*, seed: bool = True) -> tuple[Any, Any, Any]:
     from src.registry.store import SkillRegistry, seed_registry
 
     data = _data_dir()
-    registry = SkillRegistry(persist_directory=str(data / "cli_chroma"))
+    (data / "cli").mkdir(parents=True, exist_ok=True)
+    registry = SkillRegistry(persist_directory=str(data / "cli" / "chroma"))
     if seed:
         seed_registry(registry)
     loader = ToolLoader()
-    metrics_store = MetricsStore(db_path=str(data / "cli_metrics.duckdb"))
+    metrics_store = MetricsStore(db_path=str(data / "cli" / "metrics.duckdb"))
+
+    # CLI uses its own skill directory (separate from evaluation's data/eval/skills/)
+    cli_skills_dir = data / "cli" / "skills"
+    cli_skills_dir.mkdir(parents=True, exist_ok=True)
+    from src.orchestrator.generators.skill import set_skills_output_dir
+    set_skills_output_dir(cli_skills_dir)
+
     return registry, loader, metrics_store
 
 
@@ -398,12 +406,26 @@ def _select_artifact(state: Any) -> Any | None:
     if not artifacts:
         return None
 
-    for art in artifacts:
-        for report in verification_results:
-            if report.capability_name == art.capability_name and report.overall_passed:
-                return art
+    # Filter to artifacts that passed verification
+    passed_names = {
+        report.capability_name
+        for report in verification_results
+        if report.overall_passed
+    }
+    passed = [a for a in artifacts if a.capability_name in passed_names]
+    if not passed:
+        passed = artifacts  # fallback: nothing passed, try anyway
 
-    return artifacts[-1]
+    # Prefer AGENT > SKILL > MCP_TOOL — matches harness behavior.
+    # More capable types are better when decomposition over-splits.
+    _TYPE_PRIORITY = {"AGENT": 0, "SKILL": 1, "MCP_TOOL": 2}
+    passed.sort(
+        key=lambda a: (
+            _TYPE_PRIORITY.get(str(a.capability_type).split(".")[-1].upper(), 9),
+            a.capability_name or "",
+        ),
+    )
+    return passed[0]
 
 
 # ---------------------------------------------------------------------------
@@ -695,10 +717,23 @@ def _try_registry_match(
     if isinstance(cap_type_val, str):
         cap_type_val = CapabilityType(cap_type_val)
 
+    # Reconstruct skill_content / agent_config from registry metadata
+    # so SKILL/AGENT execution backends have the original instructions.
+    skill_content = meta.get("skill_content")
+    agent_config = None
+    agent_config_raw = meta.get("agent_config")
+    if agent_config_raw:
+        try:
+            agent_config = json.loads(agent_config_raw) if isinstance(agent_config_raw, str) else agent_config_raw
+        except (json.JSONDecodeError, TypeError):
+            agent_config = None
+
     proxy = GeneratedArtifact(
         capability_name=getattr(cap, "name", "registry-match"),
         capability_type=cap_type_val or CapabilityType.MCP_TOOL,
         source_code=source_code,
+        skill_content=skill_content,
+        agent_config=agent_config,
     )
 
     try:
