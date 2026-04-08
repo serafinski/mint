@@ -619,7 +619,13 @@ asyncio.run(_run())
 
 
 def _execute_skill_or_agent(
-    artifact: Any, task_desc: str, file_paths: list[Path], *, timeout_s: int | None = None
+    artifact: Any,
+    task_desc: str,
+    file_paths: list[Path],
+    *,
+    timeout_s: int | None = None,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
 ) -> dict:
     # Minimal task-like object for execution.py compatibility
     from dataclasses import dataclass, field
@@ -650,9 +656,17 @@ def _execute_skill_or_agent(
     try:
         cap_type = artifact.capability_type
         if cap_type == CapabilityType.SKILL:
-            raw = _exec_mod.execute_skill_artifact(artifact, cli_task, fixture_contents)
+            raw = _exec_mod.execute_skill_artifact(
+                artifact, cli_task, fixture_contents,
+                langfuse_tags=langfuse_tags,
+                langfuse_session_id=langfuse_session_id,
+            )
         else:
-            raw = _exec_mod.execute_agent_artifact(artifact, cli_task, fixture_contents)
+            raw = _exec_mod.execute_agent_artifact(
+                artifact, cli_task, fixture_contents,
+                langfuse_tags=langfuse_tags,
+                langfuse_session_id=langfuse_session_id,
+            )
     finally:
         _exec_mod.SKILL_EXECUTION_TIMEOUT_S = _orig_skill_timeout
         _exec_mod.AGENT_EXECUTION_TIMEOUT_S = _orig_agent_timeout
@@ -690,6 +704,9 @@ def _try_registry_match(
     params: dict[str, str],
     task_prompt: str,
     timeout_s: int | None,
+    *,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
 ) -> tuple[Any | None, dict | None]:
     """Attempt to execute a registry-matched capability."""
     _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
@@ -741,7 +758,12 @@ def _try_registry_match(
             output = _execute_mcp_tool(proxy, file_paths, params) or None
         else:
             output = (
-                _execute_skill_or_agent(proxy, task_prompt, file_paths, timeout_s=timeout_s) or None
+                _execute_skill_or_agent(
+                    proxy, task_prompt, file_paths,
+                    timeout_s=timeout_s,
+                    langfuse_tags=langfuse_tags,
+                    langfuse_session_id=langfuse_session_id,
+                ) or None
             )
     except Exception as exc:
         err_console.print(f"[yellow]Execution error: {exc}[/yellow]")
@@ -1191,24 +1213,30 @@ def execute_task(
                             daemon=True,
                         )
                         t.start()
+                        _lf_meta = invoke_config.get("metadata", {})
                         output = (
                             _execute_skill_or_agent(
                                 artifact,
                                 task_prompt,
                                 file_paths,
                                 timeout_s=timeout,
+                                langfuse_tags=_lf_meta.get("langfuse_tags"),
+                                langfuse_session_id=_lf_meta.get("langfuse_session_id"),
                             )
                             or None
                         )
                         exec_stop.set()
                         t.join(timeout=1)
                 else:
+                    _lf_meta = invoke_config.get("metadata", {})
                     output = (
                         _execute_skill_or_agent(
                             artifact,
                             task_prompt,
                             file_paths,
                             timeout_s=timeout,
+                            langfuse_tags=_lf_meta.get("langfuse_tags"),
+                            langfuse_session_id=_lf_meta.get("langfuse_session_id"),
                         )
                         or None
                     )
@@ -1218,8 +1246,11 @@ def execute_task(
 
     # Registry match fallback
     if artifact is None and not output:
+        _lf_meta_match = invoke_config.get("metadata", {})
         proxy, match_output = _try_registry_match(
-            final_state, file_paths, parsed_params, task_prompt, timeout
+            final_state, file_paths, parsed_params, task_prompt, timeout,
+            langfuse_tags=_lf_meta_match.get("langfuse_tags"),
+            langfuse_session_id=_lf_meta_match.get("langfuse_session_id"),
         )
         if proxy:
             artifact = proxy
