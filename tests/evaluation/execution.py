@@ -146,12 +146,48 @@ def _format_fixture_message(fixture_contents: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
+def _fixtures_to_workspace_files(fixture_contents: dict[str, str]) -> dict:
+    """Convert fixtures to DeepAgents ``StateBackend`` workspace-file format.
+
+    Each fixture becomes an entry keyed by its bare filename (no path prefix)
+    with ``{"content": [lines]}`` — the format DeepAgents' ``read_file`` tool
+    expects when reading from the in-memory workspace.
+
+    This is the fix for the AGENT execution filesystem-isolation bug: before,
+    fixtures were only embedded as strings in the user message, so when the
+    generated SKILL.md told the agent to ``read_file("t16_system_metrics.csv")``,
+    the workspace had no such file and ``read_file`` errored out. With this
+    helper, fixtures are placed in the workspace alongside the SKILL.md, and
+    ``read_file`` works as the skill instructs. The user message still contains
+    inline copies too (for LLMs that prefer inline context), which makes the
+    agent robust to either access pattern.
+    """
+    files: dict = {}
+    for filename, content in fixture_contents.items():
+        # StateBackend expects splitlines for content. Use keepends=False
+        # (default) so the lines don't carry trailing newlines — matches
+        # how ``_collect_skill_files`` writes skills.
+        files[filename] = {"content": content.splitlines()}
+    return files
+
+
 # ---------------------------------------------------------------------------
 # SKILL execution
 # ---------------------------------------------------------------------------
 
 def _extract_last_sandbox_json(messages: list) -> dict | None:
-    """Try to extract JSON from the last successful sandbox_execute result."""
+    """Try to extract JSON from the last successful sandbox_execute result.
+
+    Tries three strategies in order:
+    1. Parse the entire stdout as JSON (handles pretty-printed multi-line
+       ``json.dumps(result, indent=2)`` output, which is common).
+    2. Parse the last non-empty line of stdout as JSON (handles the case
+       where the skill's code prints debug info before a final single-line
+       JSON result).
+    3. Scan stdout for the last ``{...}`` JSON object via brace matching
+       (handles mixed debug + JSON output when the JSON isn't on its own
+       line).
+    """
     for msg in reversed(messages):
         # ToolMessage contains sandbox_execute results
         content = getattr(msg, "content", None)
@@ -159,16 +195,94 @@ def _extract_last_sandbox_json(messages: list) -> dict | None:
             continue
         try:
             parsed = json.loads(content)
-            if isinstance(parsed, dict) and parsed.get("success") and parsed.get("stdout"):
-                # Parse the stdout — the tool prints JSON there
-                stdout = parsed["stdout"].strip()
-                # Take the last line (in case of debug output before it)
-                last_line = stdout.splitlines()[-1] if stdout else ""
-                result = json.loads(last_line)
+        except json.JSONDecodeError:
+            continue
+        if not (isinstance(parsed, dict) and parsed.get("success") and parsed.get("stdout")):
+            continue
+        stdout = parsed["stdout"].strip()
+        if not stdout:
+            continue
+
+        # Strategy 1: whole stdout is JSON (pretty-printed or single-line)
+        try:
+            result = json.loads(stdout)
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: last non-empty line is JSON (debug + final line)
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        if lines:
+            try:
+                result = json.loads(lines[-1])
                 if isinstance(result, dict):
                     return result
-        except (json.JSONDecodeError, IndexError, KeyError):
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 3: last {...} object via brace matching
+        last_obj = _extract_last_json_object(stdout)
+        if last_obj is not None:
+            return last_obj
+
+    return None
+
+
+def _extract_last_json_object(text: str) -> dict | None:
+    """Find the last balanced ``{...}`` JSON object in ``text`` and parse it.
+
+    Uses a simple brace counter scanning backwards from the last ``}``.
+    Returns ``None`` if no valid JSON object is found.
+    """
+    end = text.rfind("}")
+    if end == -1:
+        return None
+    depth = 0
+    for i in range(end, -1, -1):
+        ch = text[i]
+        if ch == "}":
+            depth += 1
+        elif ch == "{":
+            depth -= 1
+            if depth == 0:
+                candidate = text[i : end + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _extract_last_ai_json(messages: list) -> dict | None:
+    """Fallback: parse the final AI message content as JSON.
+
+    Used when the skill's sandbox output cannot be parsed but the LLM wrote
+    the answer directly in its final AIMessage content as a JSON string.
+    """
+    for msg in reversed(messages):
+        msg_type = getattr(msg, "type", None)
+        if msg_type != "ai":
             continue
+        content = getattr(msg, "content", None)
+        if not content or not isinstance(content, str):
+            continue
+        stripped = content.strip()
+        if not stripped:
+            continue
+        # Try parsing the whole content as JSON first
+        try:
+            result = json.loads(stripped)
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+        # Fall back to brace-matched extraction
+        result = _extract_last_json_object(stripped)
+        if result is not None:
+            return result
     return None
 
 
@@ -298,9 +412,16 @@ def _execute_skill_inner(
             if tool_calls_made >= _SKILL_MAX_TOOL_CALLS:
                 break
 
-        # Extract structured result. First, try to parse JSON directly from
-        # the last successful sandbox stdout (cheapest — no LLM call needed).
-        # Fall back to a structured output LLM call if parsing fails.
+        # Extract structured result. Tiered fallback chain, cheapest first:
+        #   1. Parse JSON from the last sandbox_execute stdout (free)
+        #   2. Parse JSON from the final AIMessage content (free — handles
+        #      cases where the LLM wrote the answer as its final text reply)
+        #   3. Only if both fail, do a structured-output LLM call
+        #
+        # For GenericResult (CLI path, no task_id), the LLM extraction has no
+        # useful schema to guide it and will produce an empty dict — so we
+        # skip it entirely and return whatever the non-LLM fallbacks found,
+        # even if that's an empty dict.
         last_sandbox_output = _extract_last_sandbox_json(messages)
         if last_sandbox_output is not None:
             if result_model is not GenericResult:
@@ -311,8 +432,27 @@ def _execute_skill_inner(
             else:
                 return last_sandbox_output
 
-        # LLM extraction fallback — use function_calling method to avoid
-        # OpenAI's strict schema requirements for structured output.
+        last_ai_output = _extract_last_ai_json(messages)
+        if last_ai_output is not None:
+            if result_model is not GenericResult:
+                try:
+                    return result_model.model_validate(last_ai_output).model_dump()
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                return last_ai_output
+
+        # Structured-output LLM fallback is only useful for task-specific
+        # models (T04Result, T11Result, etc.) where the LLM has schema to
+        # fill. For GenericResult, this produces {"result": {}} — worse than
+        # returning the raw sandbox output — so we skip it.
+        if result_model is GenericResult:
+            logger.warning(
+                "Skill execution produced no extractable JSON output "
+                "(CLI path, GenericResult); returning empty dict"
+            )
+            return {}
+
         structured_llm = llm.with_structured_output(result_model, method="function_calling")
         messages.append(HumanMessage(content=(
             "Based on the sandbox execution results above, extract the final "
@@ -520,9 +660,40 @@ def _execute_agent_inner(
         name="agent-executor",
     )
 
+    # Build the workspace files dict: skills (for progressive disclosure) +
+    # fixtures (so `read_file("filename")` works from the agent's workspace).
+    # Without the fixtures in the workspace, any generated SKILL.md that
+    # tells the agent to `read_file(...)` the input files will fail —
+    # previously the agent sometimes recovered by falling back to
+    # `sandbox_execute` with inline data, but that was LLM non-determinism,
+    # not correct behavior (see T16 MINT CLI failure on 2026-04-08).
+    workspace_files: dict = dict(skill_files)  # start with skills
+    fixture_workspace = _fixtures_to_workspace_files(fixture_contents)
+    for filename, entry in fixture_workspace.items():
+        # Don't clobber a skill with the same name (unlikely but safe).
+        if filename not in workspace_files:
+            workspace_files[filename] = entry
+
+    # Update the user message to explicitly list the workspace filenames so
+    # the LLM knows exactly what to pass to `read_file`. Inline copies of the
+    # file contents are still included below for LLMs that prefer inline
+    # context or that want to skip the read_file round-trip.
+    fixture_filenames = list(fixture_contents.keys())
+    if fixture_filenames:
+        workspace_note = (
+            "The following input files are available in your workspace "
+            "(readable via `read_file(\"<filename>\")`):\n"
+            + "\n".join(f"  - {name}" for name in fixture_filenames)
+            + "\n\nInline copies of the files are also provided below for "
+            "convenience."
+        )
+    else:
+        workspace_note = ""
+
     user_message = (
         f"Task: {getattr(task, 'task_prompt', '')}\n\n"
-        f"Input data:\n{_format_fixture_message(fixture_contents)}"
+        + (f"{workspace_note}\n\n" if workspace_note else "")
+        + f"Input data:\n{_format_fixture_message(fixture_contents)}"
     )
 
     config: dict = {"recursion_limit": _RECURSION_LIMIT}
@@ -542,8 +713,8 @@ def _execute_agent_inner(
         config["metadata"] = lf_meta
 
     invoke_input: dict = {"messages": [{"role": "user", "content": user_message}]}
-    if skill_files:
-        invoke_input["files"] = skill_files
+    if workspace_files:
+        invoke_input["files"] = workspace_files
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
