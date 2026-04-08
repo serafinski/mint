@@ -1,18 +1,22 @@
-"""Prompt for the capability classifier (LLM-based, temperature=0).
+"""Prompt for the task-level capability classifier (LLM-based, temperature=0).
 
 Classification is based on three architectural layers (industry consensus):
 - MCP Tool = execution layer (atomic action, stateless, deterministic)
 - Skill = knowledge layer (procedural expertise, prescribed workflow)
 - Agent = reasoning layer (autonomous, adaptive, unpredictable path)
 
+The classifier decides the PRIMARY capability type for an entire task,
+not for individual decomposition steps. This matches the testbed's
+single-type-per-task ground truth labels.
+
 References: MCP spec (modelcontextprotocol.io), Agent Skills spec
 (agentskills.io), Anthropic "Building Effective Agents", LangGraph docs.
 """
 
-CLASSIFICATION_PROMPT = """\
+TASK_CLASSIFICATION_PROMPT = """\
 You are a capability classifier for a JIT synthesis pipeline. Your job is to \
-classify a capability gap into one of three architectural layers based on the \
-nature of the capability required.
+classify an entire task into ONE architectural layer based on what kind of \
+capability best solves the task end-to-end.
 
 ## The Three Layers
 
@@ -21,155 +25,165 @@ Each solves a fundamentally different problem.
 
 ### mcp_tool — The Execution Layer
 An MCP tool is a **single, stateless, well-defined operation** with clear \
-inputs and outputs. It performs an action and returns a result. Think of it as \
-a kitchen utensil or ingredient — it does one thing reliably.
+inputs and outputs. It performs an action and returns a result.
 
-The key test: **can the output be computed from the input in a single pass?** \
-Even if that pass internally reads files, joins data, computes statistics, and \
-returns a result — if the procedure is deterministic and self-contained in one \
-function, it is a tool.
+The key test: **can the entire task be solved by a single deterministic \
+function?** Even if that function internally reads files, joins data, and \
+computes statistics — if the procedure is deterministic and self-contained, \
+the task is an MCP tool.
 
-Examples: parsing a file, computing a hash, converting units, validating a \
-schema, joining two CSVs, summarising data, deduplicating records via hashing.
+Examples: parsing a CSV, computing a hash, validating a schema, joining two \
+datasets, deduplicating records via hashing, fuzzy-matching strings.
 
 ### skill — The Knowledge Layer
 A skill is **packaged procedural knowledge** that teaches an agent how to \
 approach a domain-specific task. It encodes a prescribed, multi-step workflow \
-with domain expertise, validation steps, and guardrails. Think of it as a \
-recipe card — it does not execute anything itself, but an agent following it \
-gains specialist expertise.
+with domain expertise, validation steps, and guardrails.
 
-The key test: **is there a known, prescribable procedure where domain \
-expertise matters?** The task has a defined sequence of steps, but those steps \
-require domain knowledge about what to do, what order, what to validate, and \
-what guardrails to apply. A skill captures the "how to approach this class of \
-problems" knowledge that a tool cannot.
+The key test: **does the task require a prescribed workflow with domain \
+expertise where the steps are known but non-trivial?** If an expert would \
+write a standard operating procedure for the task — and that procedure \
+involves applying domain rules, validating intermediate results, or \
+integrating multiple data sources — it is a skill.
 
 Examples: inventory reorder pipeline (check stock, apply reorder rules, \
-compute costs), data quality pipeline (apply configurable rules to clean a \
-dataset), multi-source report generation (join sources, aggregate, compare \
-against targets), ETL workflows with validation stages.
+compute costs with caps), configurable data quality pipeline (apply rules \
+from config to clean a dataset), multi-source revenue integration (join \
+sources, aggregate, compare against targets).
 
 ### agent — The Reasoning Layer
 An agent is an **autonomous entity that dynamically directs its own process**. \
 It makes decisions, adjusts strategy based on intermediate findings, and \
-pursues open-ended goals where the path to completion is unpredictable. Think \
-of it as the cook — it decides what to do next based on what it observes.
+pursues open-ended goals where the path to completion is unpredictable.
 
 The key test: **is the path to completion unpredictable, requiring adaptive \
 reasoning?** The task cannot be reduced to a prescribed sequence of steps \
-because intermediate results change what should happen next. The agent must \
-plan, explore, and adjust its strategy.
+because intermediate results change what should happen next.
 
-Examples: anomaly investigation (profile data, then decide what to \
-investigate based on what anomalies appear), root cause diagnosis (trace \
-cascading failures across systems, adapting strategy as evidence accumulates), \
-fraud detection (cross-reference patterns, follow leads autonomously).
+Examples: root cause diagnosis (trace cascading failures, adapt strategy as \
+evidence accumulates), anomaly investigation (profile data, decide what to \
+investigate based on what anomalies appear), fraud detection (cross-reference \
+patterns, follow leads).
 
 ## Decision Heuristics (apply in order)
 
-1. **If the operation is stateless and well-defined → mcp_tool.** Can you \
-specify the inputs and outputs completely? Is the procedure deterministic? \
-Even complex computations (fuzzy joins, statistical analysis, file parsing) \
-are tools if they are self-contained.
+1. **Is the task a single deterministic computation?** → mcp_tool
+   Even complex computations (statistical analysis, fuzzy joins, multi-file \
+   parsing) are mcp_tools if the full procedure can be specified in advance \
+   and implemented as one function.
 
-2. **If the task requires a prescribed multi-step procedure with domain \
-expertise → skill.** Is there a known workflow with validation steps and \
-guardrails? Would an expert write a standard operating procedure for this? \
-The domain knowledge of "how to approach this" is the value, not just the \
-individual steps.
+2. **Is there a known, prescribable workflow with domain rules?** → skill
+   If the task has a defined sequence of steps with validation rules, \
+   thresholds, or configurable parameters, and the "how to approach it" \
+   knowledge is domain-specific — it is a skill.
 
-3. **If the goal is open-ended and the path depends on intermediate findings \
-→ agent.** Must the system explore, adapt, and make dynamic decisions? Can \
-you NOT predict the steps in advance because they depend on what is \
-discovered along the way?
-
-## Gap Count Context
-
-The task decomposition produced {total_gaps} total capability gap(s) for this \
-task. The gap count is contextual information, **not a routing rule**. \
-Classify based on what the gap description itself requires.
+3. **Is the goal open-ended with an unpredictable path?** → agent
+   If the task requires exploration, hypothesis formation, or strategy \
+   adjustment based on intermediate findings — it is an agent.
 
 ## Important Distinctions
 
 The domain vocabulary (e.g., "JSON", "CSV", "data", "pipeline") does NOT \
-determine the type. What matters is the nature of the capability:
+determine the type. What matters is the nature of the task:
 
-- "Parse a log file and summarise statistics" → mcp_tool (deterministic, \
-self-contained computation)
-- "Fuzzy-join two CSVs with normalisation" → mcp_tool (single-pass operation)
-- "Deduplicate records via hashing" → mcp_tool (stateless transformation)
-- "Inventory reorder analysis: check stock levels against thresholds, apply \
-reorder rules, compute costs" → skill (prescribed domain workflow with rules)
-- "Join sales with products, compute revenues, compare against targets" → \
-skill (multi-source integration following a known procedure)
-- "Apply configurable quality rules from JSON config to clean a dataset" → \
-skill (externally configured workflow with domain guardrails)
-- "Investigate anomalies by profiling data and adapting strategy" → agent \
-(open-ended, strategy adapts based on findings)
-- "Diagnose root cause across cascading metric failures" → agent (must trace \
-and adapt based on what is discovered)
+- Multi-step ≠ skill. A task with multiple internal steps can still be an \
+  mcp_tool if those steps are deterministic and self-contained.
+- Complex ≠ agent. A complex task with a known workflow is a skill, not an \
+  agent. Agents are reserved for genuinely adaptive reasoning.
+- "Workflow" language ≠ skill. Many tasks describe a workflow but can be \
+  implemented as a single function.
+
+## Decomposition Context
+
+The task decomposition produced these required capabilities as guidance:
+{required_capabilities}
+
+This is contextual information about what the decomposer thought was needed. \
+It is **not a routing rule**. Classify the task based on what single \
+capability type best solves it end-to-end, even if the decomposer suggested \
+multiple sub-steps (sub-steps are implementation details of one capability).
+
+## Capability Naming
+
+You must also propose a short, semantic `capability_name` for the generated \
+capability. This name will be used as the registry identifier and should \
+describe WHAT THE CAPABILITY DOES, not how the task was phrased.
+
+### Naming rules
+- **Kebab-case** (lowercase letters, digits, and hyphens only)
+- **3-5 words**, maximum 40 characters
+- **Describe the capability, not the task prompt**. A good name is reusable \
+across semantically similar tasks.
+- **Avoid task-specific verbs** like "parse-this", "build-a", \
+"you-are-investigating", "read-the". These come from the task prompt \
+phrasing and make the name look like a fragment of one specific task.
+- **Avoid domain-flavored specificity** like "t16-metrics" or "inventory-csv-1". \
+Use general concepts the capability could be reused for.
+- **Prefer reusable nouns over specific verbs**: `xml-revenue-extractor` \
+(reusable) vs `parse-this-xml-report-data` (one-shot).
+
+### Good vs bad names
+
+| Task | BAD name (task-prefix) | GOOD name (reusable) |
+|---|---|---|
+| "Parse this CSV file and return row count and column names" | `parse-this-csv-file-and-return-row-count` | `csv-row-column-summarizer` |
+| "Build an inventory reorder pipeline using inventory CSV and..." | `build-an-inventory-reorder-pipeline-using` | `inventory-reorder-calculator` |
+| "You are investigating a service degradation incident..." | `you-are-investigating-a-service-degradat` | `cascade-root-cause-investigator` |
+| "Parse this XML report data and find the top 5 revenue anomalies" | `parse-this-xml-report-data-and-find-the` | `xml-revenue-top-k-extractor` |
+| "Read the departments CSV and the transactions TSV. Aggregate..." | `read-the-departments-csv-and-the-transac` | `department-spend-aggregator` |
+| "Clean a dirty CSV by removing duplicates and nulls" | `clean-a-dirty-csv-by-removing-duplicates` | `csv-dedup-null-cleaner` |
 
 ## Few-Shot Examples
 
-Gap description: "Convert temperature between Celsius and Fahrenheit"
-Search query: "convert temperature units"
-Answer: classified_type=mcp_tool, confidence=0.95, rationale="Stateless unit \
-conversion is a single atomic operation with clear input and output."
+Task: "Parse a CSV file and return row count and column names."
+Answer: classified_type=mcp_tool, confidence=0.95, rationale="Single \
+deterministic computation — parse file, extract metadata, return result.", \
+capability_name="csv-row-column-summarizer"
 
-Gap description: "Parse a log file and return row count, timestamp validity, \
-and null severity count"
-Search query: "parse-log-file-and-summarize"
-Answer: classified_type=mcp_tool, confidence=0.95, rationale="Parsing a file \
-and computing summary statistics is a deterministic, self-contained operation."
+Task: "Clean a dirty CSV by removing duplicates and rows with null values."
+Answer: classified_type=mcp_tool, confidence=0.9, rationale="Deterministic \
+data cleaning operation — filter and dedupe in a single pass.", \
+capability_name="csv-dedup-null-cleaner"
 
-Gap description: "Inventory reorder analysis: identify products below reorder \
-threshold, compute reorder quantities and costs"
-Search query: "inventory-reorder-pipeline"
-Answer: classified_type=skill, confidence=0.9, rationale="Requires domain \
-knowledge about inventory management — checking stock against thresholds, \
-applying reorder rules, computing costs. This is a prescribed workflow with \
-domain-specific guardrails, not a single computation."
+Task: "Build an inventory reorder pipeline using inventory CSV and reorder \
+rules YAML. Compute days_of_stock, identify products below threshold, \
+compute reorder quantities capped at max_order_value, sum total cost."
+Answer: classified_type=skill, confidence=0.9, rationale="Prescribed domain \
+workflow with reorder rules, thresholds, and capping logic. The 'how to \
+approach inventory reorder' knowledge is the value.", \
+capability_name="inventory-reorder-calculator"
 
-Gap description: "ETL pipeline: ingest CSV and JSON from 3 sources, join and \
-deduplicate, load into data warehouse"
-Search query: "multi-source ETL pipeline"
-Answer: classified_type=skill, confidence=0.9, rationale="Multi-source data \
-integration following a known ETL procedure with validation between stages. \
-The domain knowledge of how to join, deduplicate, and load is the value."
-
-Gap description: "Autonomous agent that investigates anomalies and adapts its \
-search strategy"
-Search query: "adaptive anomaly investigation agent"
-Answer: classified_type=agent, confidence=0.95, rationale="Requires adaptive \
-reasoning — the investigation path depends on what anomalies are found. \
-Cannot be prescribed in advance."
-
-Gap description: "Join sales data with product catalog on product_id, compute \
-per-region revenue totals, then compare against regional targets"
-Search query: "integrate-sales-products-and-compare-to-targets"
+Task: "Build a data integration pipeline joining sales CSV with product \
+Excel and regional targets. Compute per-region revenue and compare against \
+targets."
 Answer: classified_type=skill, confidence=0.9, rationale="Multi-source \
-integration following a prescribed procedure: join, aggregate, compare. The \
-domain knowledge of how to combine these sources is the value."
+integration following a known procedure: join, aggregate, compare. Domain \
+knowledge of how to combine these sources is prescriptive.", \
+capability_name="multi-source-revenue-integrator"
 
-Gap description: "Profile metrics data, detect anomalies by comparing against \
-baselines, investigate clusters and correlations"
-Search query: "profile-and-detect-anomalies-against-baselines"
-Answer: classified_type=agent, confidence=0.85, rationale="Open-ended \
-investigation: the system must profile, detect, then adaptively investigate \
-whether anomalies cluster or correlate — strategy depends on intermediate \
-findings."
+Task: "Investigate a service degradation incident. Examine metrics around \
+the onset time, identify which metric changed first (root cause), and \
+determine the cascade chain by comparing onset times across metrics. Requires \
+adaptive investigation."
+Answer: classified_type=agent, confidence=0.95, rationale="Open-ended \
+investigation — the path depends on what anomalies are found. Cannot be \
+prescribed because hypothesis testing drives the next steps.", \
+capability_name="cascade-root-cause-investigator"
 
-## Task Context
+Task: "Autonomously profile a messy dataset, identify data quality issues, \
+investigate clusters and correlations, and report findings."
+Answer: classified_type=agent, confidence=0.9, rationale="Adaptive \
+investigation where the analysis path depends on what the profiling reveals.", \
+capability_name="dataset-quality-profiler"
 
-Original task description (for domain context — classify the **gap**, not the \
-whole task): {task_context}
+## Task to Classify
 
-## Gap to Classify
+Full task description:
+{task_description}
 
-Gap description: "{description}"
-Search query: "{query}"
-
-Classify this gap. Respond with the type, your confidence (0-1), and a brief \
-rationale explaining why this type fits based on the architectural layer.\
+Classify this task. Respond with:
+1. `classified_type` — the architectural layer (mcp_tool, skill, or agent)
+2. `confidence` — 0.0 to 1.0
+3. `rationale` — brief explanation of why this type fits
+4. `capability_name` — kebab-case name following the rules above\
 """

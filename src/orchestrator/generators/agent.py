@@ -182,9 +182,7 @@ def _generate_single_agent(
     from src.config import DEFAULT_LLM_MODEL
 
     prompt = AGENT_GENERATOR_PROMPT.format(
-        description=gap.description,
-        query=gap.query,
-        task_context=task_context,
+        task_context=task_context or gap.description,
         forced_name=forced_name,
         model_default=DEFAULT_LLM_MODEL,
     )

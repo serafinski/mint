@@ -202,9 +202,7 @@ def generate_single_tool(
     # additional handler here would generate duplicate traces.
 
     user_prompt = MCP_TOOL_USER_PROMPT.format(
-        description=gap.description,
-        query=gap.query,
-        task_context=task_context or "No additional context",
+        task_context=task_context or gap.description,
         forced_name=forced_name,
     )
 
@@ -259,9 +257,7 @@ def generate_single_tool(
     )
 
     repair_prompt = MCP_TOOL_REPAIR_PROMPT.format(
-        gap_description=gap.description,
-        gap_query=gap.query,
-        task_context=task_context or "No additional context",
+        task_context=task_context or gap.description,
         tool_name=result.tool_name,
         description=result.description,
         source_code=result.source_code,

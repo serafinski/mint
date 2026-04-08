@@ -91,28 +91,29 @@ stdlib + mcp + pydantic, leave pip_packages empty.\
 """
 
 MCP_TOOL_USER_PROMPT = """\
-Generate a complete MCP tool implementation for the following capability:
+Generate a complete MCP tool implementation that solves the ENTIRE task \
+below end-to-end. Classification has already decided this task is best \
+solved by a single MCP tool — do not split it into helpers.
 
-Description: {description}
-Search query: {query}
-Task context: {task_context}
+## Task
+
+{task_context}
 
 The tool function MUST be named exactly `{forced_name}` (snake_case). \
 Do not choose a different name.
 
 Generate a complete, working Python file following the FastMCP pattern shown \
-in the system prompt.\
+in the system prompt. The tool should take the task inputs (typically file \
+paths) as parameters and return the final result in one call.\
 """
 
 MCP_TOOL_REPAIR_PROMPT = """\
 The generated MCP tool has a validation error. Fix the issues and return \
 the corrected version.
 
-## Original Request
+## Original Task
 
-Description: {gap_description}
-Search query: {gap_query}
-Task context: {task_context}
+{task_context}
 
 ## Your Previous Output
 

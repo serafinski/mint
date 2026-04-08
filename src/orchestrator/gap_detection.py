@@ -1,7 +1,12 @@
 """Gap detection — LangGraph node wrapping registry.detect_gaps().
 
-Searches the capability registry for each required capability and
-classifies results as matches (above threshold) or gaps (below threshold).
+Searches the capability registry for each required capability. Matches are
+recorded per-capability (populating ``state.matches`` and recording
+InvocationRecords for the optimizer). The gap output signals whether the
+task needs generation at all — if ANY required capability is unmatched, a
+single placeholder gap is produced. The task-level classifier downstream
+then classifies the entire task once.
+
 This is a plain Python node — no LLM calls.
 """
 
@@ -29,14 +34,19 @@ def gap_detection_node(
     """Search the registry for each required capability.
 
     Populates ``state.matches`` with capabilities found above the similarity
-    threshold and ``state.gaps`` with those below.  Always routes to
-    ``classifier_node`` — if there are no gaps the classifier produces an empty
-    ``classified_gaps`` list and all generator nodes become no-ops.
+    threshold. Produces a single placeholder ``GapItem`` in ``state.gaps`` if
+    any required capability is unmatched — this signals to the downstream
+    classifier that the task needs generation. If all required capabilities
+    are matched, ``state.gaps`` is empty and the classifier becomes a no-op.
+
+    Always routes to ``classifier_node``.
 
     Args:
         state: Current pipeline state with ``required_capabilities`` populated
             by ``decomposition_node``.
         registry: The capability registry to search.
+        metrics_store: Optional metrics store for recording match invocations
+            (keeps matched capabilities from being pruned as idle).
 
     Returns:
         Command routing to ``classifier_node`` with updated matches and gaps.
@@ -49,25 +59,6 @@ def gap_detection_node(
         MatchItem(capability=cap, score=score)
         for cap, score, _query in matches_raw
     ]
-    gaps = []
-    for query, reason in gaps_raw:
-        # Use the query as the description — it's the actual capability name
-        # from decomposition (e.g., "root-cause-cascade-investigation").
-        # The reason ("best score X below threshold Y") is registry search
-        # metadata, NOT a capability description. Passing it as description
-        # confuses the classifier into thinking the gap is a numeric comparison.
-        gaps.append(GapItem(description=query, query=query))
-
-    logger.info(
-        "Gap detection: %d matches, %d gaps from %d required capabilities",
-        len(matches),
-        len(gaps),
-        len(state.required_capabilities),
-    )
-    for m in matches:
-        logger.info("  ✓ matched: %s (score=%.2f)", m.capability.name, m.score)
-    for g in gaps:
-        logger.info("  ✗ gap: %s", g.description)
 
     # Record matched capabilities as invocations so they're not pruned as idle.
     # token_cost=0, latency_ms=0.0 are intentional: matches are not executions.
@@ -80,6 +71,33 @@ def gap_detection_node(
                 token_cost=0,
                 latency_ms=0.0,
             ))
+
+    # Produce a single placeholder gap if ANY required capability was unmatched.
+    # The task-level classifier downstream will decide the type for the whole
+    # task. If gaps_raw is empty, state.gaps stays empty and the classifier is
+    # a no-op (all capabilities already in the registry).
+    gaps: list[GapItem] = []
+    if gaps_raw:
+        gaps = [
+            GapItem(
+                description=state.task_description[:300],
+                query="task-level",
+            )
+        ]
+
+    logger.info(
+        "Gap detection: %d match(es), %d unmatched capability(ies) → %d gap(s) for classification",
+        len(matches),
+        len(gaps_raw),
+        len(gaps),
+    )
+    for m in matches:
+        logger.info("  ✓ matched: %s (score=%.2f)", m.capability.name, m.score)
+    if gaps:
+        logger.info(
+            "  → task requires generation (%d unmatched capability(ies))",
+            len(gaps_raw),
+        )
 
     return Command(
         update={

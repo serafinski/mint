@@ -132,6 +132,18 @@ class ClassificationResult(BaseModel):
     )
     confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence in the classification")
     rationale: str = Field(..., description="Brief explanation of why this type was chosen")
+    capability_name: str = Field(
+        ...,
+        description=(
+            "Short, semantic, kebab-case name for the capability (3-5 words, "
+            "max 40 chars). Must describe WHAT THE CAPABILITY DOES, not how "
+            "the task was phrased. Avoid task-specific verbs like 'parse-this', "
+            "'build-a', 'you-are-investigating'. Prefer reusable names: "
+            "'xml-revenue-extractor', 'inventory-reorder-calculator', "
+            "'cascade-root-cause-investigator', 'department-spend-aggregator'. "
+            "Lowercase letters, digits, and hyphens only."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 

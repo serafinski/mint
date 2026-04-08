@@ -2,8 +2,10 @@
 
 AGENT_GENERATOR_PROMPT = """\
 You are an agent configuration generator for a JIT capability synthesis pipeline.
-Your job is to generate a complete agent configuration for a capability gap that
-has been classified as requiring an autonomous agent.
+Your job is to generate a complete agent configuration that solves an ENTIRE
+task end-to-end. Classification has already decided this task is best solved
+by an autonomous agent — the agent you configure must handle the whole task,
+not a sub-step.
 
 ## Runtime Environment
 
@@ -70,9 +72,9 @@ with YAML frontmatter (name, description) and markdown body. Otherwise null.
 
 ### Example 1: Plain Agent (reactive, single-purpose)
 
-Gap description: "Agent that monitors data quality metrics and flags anomalies"
-Search query: "data quality monitoring agent"
-Task context: "Build a business analytics pipeline with automated quality checks"
+Task: "Build a business analytics pipeline with automated data quality \
+monitoring. The agent should evaluate datasets against quality thresholds \
+and flag anomalies in a quality report."
 
 Output:
 - agent_name: "data-quality-monitor"
@@ -107,10 +109,9 @@ Output:
 
 ### Example 2: DeepAgent (multi-step autonomous reasoning)
 
-Gap description: "Autonomous agent that investigates data pipeline failures, \
-traces root causes across multiple stages, and suggests fixes"
-Search query: "autonomous pipeline failure investigator"
-Task context: "Build a self-healing analytics pipeline"
+Task: "Build a self-healing analytics pipeline. When a stage fails, \
+autonomously investigate the failure, trace root causes across multiple \
+stages, and suggest fixes with confidence levels."
 
 Output:
 - agent_name: "pipeline-failure-investigator"
@@ -171,9 +172,7 @@ Output:
 
 ## Task
 
-Gap description: "{description}"
-Search query: "{query}"
-Task context: "{task_context}"
+{task_context}
 
 The `agent_name` field MUST be exactly `{forced_name}` (hyphen-case). \
 Do not choose a different name.

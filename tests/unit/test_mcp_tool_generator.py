@@ -735,8 +735,9 @@ class TestGenerateSingleTool:
         user_msg = next(m for m in captured_messages if m["role"] == "user")
         assert custom_context in user_msg["content"]
 
-    def test_default_task_context_no_additional(self):
-        """Empty task_context uses the 'No additional context' fallback string."""
+    def test_default_task_context_falls_back_to_gap_description(self):
+        """Empty task_context falls back to gap.description so the LLM still
+        has a task-level context string to generate against."""
         captured_messages: list = []
 
         class _MockStructuredLLM:
@@ -748,11 +749,12 @@ class TestGenerateSingleTool:
             def with_structured_output(self_, schema):
                 return _MockStructuredLLM()
 
+        gap = self._gap()
         with patch("src.orchestrator.generators.mcp_tool._get_llm", return_value=_MockLLM()):
-            generate_single_tool(self._gap())  # no task_context
+            generate_single_tool(gap)  # no task_context
 
         user_msg = next(m for m in captured_messages if m["role"] == "user")
-        assert "No additional context" in user_msg["content"]
+        assert gap.description in user_msg["content"]
 
     def test_generate_single_tool_uses_forced_name(self):
         """Fix 5: artifact uses slugify_gap(gap.query), not the LLM-chosen name."""

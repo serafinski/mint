@@ -2,16 +2,14 @@
 
 SKILL_GENERATOR_PROMPT = """\
 You are a skill generator for a multi-agent system. Your task is to generate a \
-SKILL.md file that teaches an AI agent how to perform a specific capability.
+SKILL.md file that teaches an AI agent how to perform an ENTIRE task \
+end-to-end. Classification has already decided this task is best solved by a \
+single skill — the SKILL.md you produce should cover the whole task, not a \
+sub-step.
 
-## Task Context
+## Task
 
 {task_context}
-
-## Capability to Generate
-
-Description: {description}
-Search query that found no match: {query}
 
 ## SKILL.md Format Rules
 
@@ -102,11 +100,9 @@ The SKILL.md you generated failed validation with this error:
 
 {validation_error}
 
-## Original Request
+## Original Task
 
-Description: {gap_description}
-Search query: {gap_query}
-Task context: {task_context}
+{task_context}
 
 Here is the SKILL.md content you produced:
 

@@ -236,9 +236,7 @@ def _generate_single_skill(
     # handler propagates automatically via LangChain's contextvar inheritance.
 
     prompt = SKILL_GENERATOR_PROMPT.format(
-        description=gap.description,
-        query=gap.query,
-        task_context=task_context,
+        task_context=task_context or gap.description,
         forced_name=forced_name,
     )
 
@@ -275,9 +273,7 @@ def _generate_single_skill(
         repair_prompt = SKILL_REPAIR_PROMPT.format(
             validation_error=message,
             skill_content=content,
-            gap_description=gap.description,
-            gap_query=gap.query,
-            task_context=task_context,
+            task_context=task_context or gap.description,
         )
         try:
             repair_response = llm.invoke(repair_prompt)

@@ -839,6 +839,7 @@ def test_classification_result_rejects_extra():
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.9,
             rationale="test",
+            capability_name="test-cap",
             unknown_field="oops",
         )
 

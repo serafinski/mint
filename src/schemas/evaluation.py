@@ -108,6 +108,24 @@ class EvaluationRecord(BaseModel):
         None, description="FK to operational invocations table (populated when available)"
     )
 
+    # --- Decomposition/registry analysis (Iter 6 task-level classification) ---
+    required_capability_count: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of required_capabilities produced by decomposition. "
+            "Useful for analyzing decomposition splitting behavior."
+        ),
+    )
+    matched_in_registry_count: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of required_capabilities matched in the registry. "
+            "If equal to required_capability_count, classification was skipped."
+        ),
+    )
+
     # --- Reproducibility ---
     seed: int = Field(..., description="Random seed used for task ordering in this run")
     is_pilot: bool = Field(

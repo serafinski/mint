@@ -20,25 +20,27 @@ from src.schemas.evaluation import (
 
 _INIT_SQL = """
 CREATE TABLE IF NOT EXISTS evaluation_runs (
-    id                       VARCHAR PRIMARY KEY,
-    run_id                   VARCHAR NOT NULL,
-    condition                VARCHAR NOT NULL,
-    task_id                  VARCHAR NOT NULL,
-    task_tier                VARCHAR NOT NULL,
-    attempt_count            INTEGER NOT NULL DEFAULT 0,
-    capability_type          VARCHAR,
+    id                        VARCHAR PRIMARY KEY,
+    run_id                    VARCHAR NOT NULL,
+    condition                 VARCHAR NOT NULL,
+    task_id                   VARCHAR NOT NULL,
+    task_tier                 VARCHAR NOT NULL,
+    attempt_count             INTEGER NOT NULL DEFAULT 0,
+    capability_type           VARCHAR,
     verification_tier_reached INTEGER,
-    gate_passed              BOOLEAN NOT NULL,
-    output_in_range          BOOLEAN NOT NULL,
-    token_cost               INTEGER NOT NULL DEFAULT 0,
-    attempt_latency_ms       INTEGER NOT NULL DEFAULT 0,
-    failure_reason           VARCHAR NOT NULL,
-    registry_snapshot_id     VARCHAR NOT NULL,
-    invocation_record_id     VARCHAR,
-    seed                     INTEGER NOT NULL,
-    is_pilot                 BOOLEAN NOT NULL DEFAULT FALSE,
-    human_label              VARCHAR,
-    timestamp                TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    gate_passed               BOOLEAN NOT NULL,
+    output_in_range           BOOLEAN NOT NULL,
+    token_cost                INTEGER NOT NULL DEFAULT 0,
+    attempt_latency_ms        INTEGER NOT NULL DEFAULT 0,
+    failure_reason            VARCHAR NOT NULL,
+    registry_snapshot_id      VARCHAR NOT NULL,
+    invocation_record_id      VARCHAR,
+    seed                      INTEGER NOT NULL,
+    is_pilot                  BOOLEAN NOT NULL DEFAULT FALSE,
+    human_label               VARCHAR,
+    required_capability_count INTEGER NOT NULL DEFAULT 0,
+    matched_in_registry_count INTEGER NOT NULL DEFAULT 0,
+    timestamp                 TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """
 
@@ -79,8 +81,10 @@ class EvaluationStore:
                 attempt_count, capability_type, verification_tier_reached,
                 gate_passed, output_in_range, token_cost, attempt_latency_ms,
                 failure_reason, registry_snapshot_id, invocation_record_id,
-                seed, is_pilot, human_label, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                seed, is_pilot, human_label,
+                required_capability_count, matched_in_registry_count,
+                timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 row_id,
@@ -101,6 +105,8 @@ class EvaluationStore:
                 record.seed,
                 record.is_pilot,
                 record.human_label,
+                record.required_capability_count,
+                record.matched_in_registry_count,
                 record.timestamp,
             ],
         )
@@ -138,7 +144,9 @@ class EvaluationStore:
                    capability_type, verification_tier_reached, gate_passed,
                    output_in_range, token_cost, attempt_latency_ms,
                    failure_reason, registry_snapshot_id, invocation_record_id,
-                   seed, is_pilot, human_label, timestamp
+                   seed, is_pilot, human_label,
+                   required_capability_count, matched_in_registry_count,
+                   timestamp
             FROM evaluation_runs
             {where}
             ORDER BY timestamp
@@ -232,7 +240,9 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         capability_type, verification_tier_reached, gate_passed,
         output_in_range, token_cost, attempt_latency_ms,
         failure_reason, registry_snapshot_id, invocation_record_id,
-        seed, is_pilot, human_label, timestamp,
+        seed, is_pilot, human_label,
+        required_capability_count, matched_in_registry_count,
+        timestamp,
     ) = row
     # DuckDB may return naive datetimes — normalise to UTC-aware
     if isinstance(timestamp, datetime) and timestamp.tzinfo is None:
@@ -255,5 +265,7 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         seed=seed,
         is_pilot=is_pilot,
         human_label=human_label,
+        required_capability_count=required_capability_count or 0,
+        matched_in_registry_count=matched_in_registry_count or 0,
         timestamp=timestamp,
     )

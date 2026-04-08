@@ -1,7 +1,8 @@
-"""Integration tests for the capability classifier.
+"""Integration tests for the task-level capability classifier.
 
-These tests invoke the real LLM (openai:gpt-5-mini) to verify that the classification
-prompt produces correct, reproducible results with ``temperature=0``.
+These tests invoke the real LLM (openai:gpt-5-mini) to verify that the
+classification prompt produces correct, reproducible task-level classifications
+with ``temperature=0``.
 
 Requires OPENAI_API_KEY environment variable to be set.
 """
@@ -12,9 +13,9 @@ import os
 
 import pytest
 
-from src.orchestrator.classifier import classify_gap
+from src.orchestrator.classifier import classify_task
 from src.schemas.capability import CapabilityType
-from src.schemas.task import ClassifiedGap, GapItem
+from src.schemas.task import ClassifiedGap
 
 _has_api_key = bool(os.environ.get("OPENAI_API_KEY"))
 
@@ -34,14 +35,14 @@ def _reset_classifier_llm():
     mod._classifier_llm = None
 
 
-class TestClassifyGapLive:
+class TestClassifyTaskLive:
     def test_classify_mcp_tool(self):
         """A clear atomic operation should classify as MCP_TOOL."""
-        gap = GapItem(
-            description="Parse a JSON file and extract specific fields",
-            query="parse JSON file",
+        task = (
+            "Parse a JSON configuration file and return a dictionary mapping "
+            "section names to their key-value pairs."
         )
-        result = classify_gap(gap)
+        result = classify_task(task, required_capabilities=["parse-json", "extract-sections"])
 
         assert isinstance(result, ClassifiedGap)
         assert result.classified_type == CapabilityType.MCP_TOOL
@@ -49,15 +50,21 @@ class TestClassifyGapLive:
         assert len(result.rationale) > 0
 
     def test_classify_skill(self):
-        """A multi-step workflow should classify as SKILL."""
-        gap = GapItem(
-            description=(
-                "Multi-step data cleaning pipeline for financial records"
-                " including validation, normalization, and deduplication"
-            ),
-            query="financial data cleaning pipeline",
+        """A multi-step domain workflow should classify as SKILL."""
+        task = (
+            "Build an inventory reorder pipeline using an inventory CSV and "
+            "a reorder rules YAML. Compute days of stock for each product, "
+            "identify items below the reorder threshold, compute reorder "
+            "quantities capped at max_order_value, and sum the total cost."
         )
-        result = classify_gap(gap)
+        result = classify_task(
+            task,
+            required_capabilities=[
+                "parse-inventory",
+                "apply-reorder-rules",
+                "compute-cost",
+            ],
+        )
 
         assert isinstance(result, ClassifiedGap)
         assert result.classified_type == CapabilityType.SKILL
@@ -65,16 +72,22 @@ class TestClassifyGapLive:
         assert len(result.rationale) > 0
 
     def test_classify_agent(self):
-        """An autonomous reasoning task should classify as AGENT."""
-        gap = GapItem(
-            description=(
-                "Autonomous agent that investigates anomalies in"
-                " system logs and adapts its search strategy"
-                " based on findings"
-            ),
-            query="adaptive anomaly investigation agent",
+        """An open-ended investigation task should classify as AGENT."""
+        task = (
+            "Investigate a service degradation incident. Examine metrics "
+            "around the onset time, identify which metric changed first "
+            "(root cause), and determine the cascade chain by comparing "
+            "onset times across metrics. Requires adaptive investigation "
+            "where the path depends on intermediate findings."
         )
-        result = classify_gap(gap)
+        result = classify_task(
+            task,
+            required_capabilities=[
+                "profile-metrics",
+                "root-cause-analysis",
+                "cascade-investigation",
+            ],
+        )
 
         assert isinstance(result, ClassifiedGap)
         assert result.classified_type == CapabilityType.AGENT
@@ -82,25 +95,25 @@ class TestClassifyGapLive:
         assert len(result.rationale) > 0
 
     def test_confidence_above_threshold(self):
-        """All clear-cut examples should have confidence >= 0.7."""
-        clear_cut_gaps = [
-            GapItem(
-                description="Convert temperature between Celsius and Fahrenheit",
-                query="convert temperature units",
+        """All clear-cut task examples should have confidence >= 0.7."""
+        clear_cut_tasks = [
+            "Compute the SHA-256 hash of a string and return the hex digest.",
+            (
+                "Build an ETL pipeline that extracts sales data from CSV, "
+                "transforms it with currency normalization and validation "
+                "rules, and loads it into a cleaned output file."
             ),
-            GapItem(
-                description="ETL pipeline that extracts, transforms, and loads sales data",
-                query="ETL sales data pipeline",
-            ),
-            GapItem(
-                description="Autonomous monitoring agent that detects and responds to failures",
-                query="autonomous system monitoring agent",
+            (
+                "Autonomously monitor system logs, detect failure patterns, "
+                "investigate their root causes by following leads across "
+                "related log sources, and adapt the search strategy based on "
+                "what is discovered."
             ),
         ]
-        for gap in clear_cut_gaps:
-            result = classify_gap(gap)
+        for task in clear_cut_tasks:
+            result = classify_task(task, required_capabilities=[])
             assert result.confidence >= 0.7, (
-                f"Gap {gap.query!r} classified as"
-                f" {result.classified_type} with low confidence"
-                f" {result.confidence}: {result.rationale}"
+                f"Task {task[:40]!r} classified as "
+                f"{result.classified_type} with low confidence "
+                f"{result.confidence}: {result.rationale}"
             )

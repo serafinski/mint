@@ -12,16 +12,28 @@ from src.schemas.verification import Severity
 def slugify_gap(query: str) -> str:
     """Derive a stable, collision-free snake_case name from a gap query string.
 
-    The base is a truncated slug of the query text. A 6-character sha256
-    suffix ensures two similar queries (e.g. "parse CSV file" vs "parse CSV
-    files") never collide, while the same query always produces the same name
-    across retry attempts.
+    Since the classifier now emits semantic capability names with a hash
+    suffix already (e.g., ``xml-revenue-extractor-abc123``), this function
+    primarily re-formats hyphens to underscores for Python identifier
+    compatibility. A 6-character sha256 suffix is still appended to ensure
+    collision safety if a caller passes a raw non-suffixed query.
+
+    The previous implementation truncated to 40 chars BEFORE stripping
+    trailing underscores, which could produce names with a trailing
+    underscore followed by the hash separator (e.g.,
+    ``parse_this_xml_report_data_and_find_the__6b415a`` with a double
+    underscore). This version strips underscores AFTER truncation, so the
+    output always has a single underscore before the suffix.
 
     Examples:
-        "fuzzy string matching"  ->  "fuzzy_string_matching_<hash>"
-        "parse CSV file"         ->  "parse_csv_file_<hash>"
+        "xml-revenue-extractor-abc123"  ->  "xml_revenue_extractor_abc123_<hash>"
+        "fuzzy string matching"         ->  "fuzzy_string_matching_<hash>"
+        "parse CSV file"                ->  "parse_csv_file_<hash>"
     """
-    base = re.sub(r"[^a-z0-9]+", "_", query.lower().strip()).strip("_")[:40]
+    # Normalize non-alphanumerics to underscores, truncate, THEN strip
+    # trailing underscores to avoid the double-underscore-before-suffix bug.
+    base = re.sub(r"[^a-z0-9]+", "_", query.lower().strip())
+    base = base[:40].strip("_") or "cap"
     suffix = hashlib.sha256(query.encode()).hexdigest()[:6]
     return f"{base}_{suffix}"
 

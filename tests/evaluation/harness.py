@@ -329,6 +329,8 @@ class EvaluationHarness:
             invocation_record_id=result.get("invocation_record_id"),
             seed=seed,
             is_pilot=is_pilot,
+            required_capability_count=result.get("required_capability_count", 0),
+            matched_in_registry_count=result.get("matched_in_registry_count", 0),
         )
 
     # -- condition implementations -------------------------------------------
@@ -469,6 +471,7 @@ def _extract_result(
     _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
     artifacts = _get("generated_artifacts", []) or []
     matches = _get("matches", []) or []
+    required_capabilities = _get("required_capabilities", []) or []
     verification_results = _get("verification_results", []) or []
     attempt_count = _get("attempt_count", 0)
 
@@ -656,6 +659,8 @@ def _extract_result(
         "verification_tier_reached": verification_tier_reached,
         "token_cost": 0,  # populated from LangFuse in Iteration 6
         "invocation_record_id": _get("trace_id", None),
+        "required_capability_count": len(required_capabilities),
+        "matched_in_registry_count": len(matches),
     }
 
 

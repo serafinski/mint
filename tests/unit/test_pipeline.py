@@ -152,6 +152,67 @@ def test_create_pipeline_run_optimizer_flag(seeded_registry, mock_loader):
     assert "optimizer_node" in builder.nodes
 
 
+def test_classifier_produces_at_most_one_classified_gap(seeded_registry, mock_loader):
+    """Under task-level classification, classifier_node emits ≤ 1 classified_gap.
+
+    Runs gap_detection + classifier in sequence with a mocked classify_task so
+    the only LLM call is avoided. The assertion is that the classifier produces
+    exactly one classified gap when there is at least one unmatched capability,
+    regardless of how many were required.
+    """
+    from unittest.mock import patch
+
+    from src.orchestrator.classifier import classifier_node
+    from src.orchestrator.gap_detection import gap_detection_node
+    from src.schemas.capability import CapabilityType
+    from src.schemas.task import ClassifiedGap, TaskState
+
+    # Registry with no matches for three required capabilities → three raw gaps
+    with patch.object(
+        seeded_registry,
+        "detect_gaps",
+        return_value=([], [
+            ("cap-a", "below threshold"),
+            ("cap-b", "below threshold"),
+            ("cap-c", "below threshold"),
+        ]),
+    ):
+        state = TaskState(
+            task_description="Task needing three capabilities",
+            required_capabilities=["cap-a", "cap-b", "cap-c"],
+        )
+        cmd = gap_detection_node(state, seeded_registry)
+
+    # Exactly one placeholder gap produced
+    assert len(cmd.update["gaps"]) == 1
+
+    # Hand the state through the classifier with a mocked classify_task
+    next_state = TaskState(
+        task_description="Task needing three capabilities",
+        required_capabilities=["cap-a", "cap-b", "cap-c"],
+        matches=cmd.update["matches"],
+        gaps=cmd.update["gaps"],
+    )
+
+    mock_classified = ClassifiedGap(
+        description="Task needing three capabilities",
+        query="task-needing-three-capabilities-abcdef",
+        classified_type=CapabilityType.SKILL,
+        confidence=0.9,
+        rationale="Multi-step workflow with domain rules",
+    )
+
+    with patch(
+        "src.orchestrator.classifier.classify_task",
+        return_value=mock_classified,
+    ):
+        cmd = classifier_node(next_state)
+
+    classified = cmd.update["classified_gaps"]
+    assert len(classified) == 1
+    assert classified[0].classified_type == CapabilityType.SKILL
+
+
 def test_loading_then_optimize_preserves_non_end_goto():
     """_loading_then_optimize logic: END → optimizer_node, anything else → preserved.
 

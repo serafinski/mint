@@ -1,4 +1,10 @@
-"""Unit tests for the gap detection LangGraph node."""
+"""Unit tests for the gap detection LangGraph node.
+
+Under task-level classification, gap_detection_node produces AT MOST ONE
+placeholder ``GapItem`` — not N enumerated gaps. Per-capability registry
+matching is preserved (populating ``state.matches`` for each match), only
+the gap-output format changes.
+"""
 
 from __future__ import annotations
 
@@ -31,7 +37,7 @@ def _make_registry(
 
 
 # ---------------------------------------------------------------------------
-# All matches (no gaps)
+# All matches (no gaps → empty gap list, classifier becomes no-op)
 # ---------------------------------------------------------------------------
 
 
@@ -50,7 +56,7 @@ def test_all_matches_populates_matches_empty_gaps():
     assert cmd.goto == "classifier_node"
     assert cmd.update["status"] == TaskStatus.DETECTING_GAPS
     assert len(cmd.update["matches"]) == 1
-    assert len(cmd.update["gaps"]) == 0
+    assert cmd.update["gaps"] == []
     match = cmd.update["matches"][0]
     assert isinstance(match, MatchItem)
     assert match.capability.name == "fibonacci"
@@ -58,39 +64,59 @@ def test_all_matches_populates_matches_empty_gaps():
 
 
 # ---------------------------------------------------------------------------
-# All gaps (no matches)
+# All gaps (no matches → single placeholder gap, not N enumerated)
 # ---------------------------------------------------------------------------
 
 
-def test_all_gaps_populates_gaps_empty_matches():
+def test_all_gaps_produces_single_placeholder_gap():
     registry = _make_registry(
         gaps=[("translate text to Klingon", "similarity 0.12 below threshold 0.3")],
     )
     state = TaskState(
-        task_description="translate Klingon",
+        task_description="translate text from English into Klingon",
         required_capabilities=["translate text to Klingon"],
     )
 
     cmd = gap_detection_node(state, registry)
 
     assert cmd.goto == "classifier_node"
+    # Exactly one placeholder gap, regardless of how many raw gaps there were
     assert len(cmd.update["gaps"]) == 1
     assert len(cmd.update["matches"]) == 0
     gap = cmd.update["gaps"][0]
     assert isinstance(gap, GapItem)
-    assert gap.query == "translate text to Klingon"
-    # description uses the query (capability name), not the registry search
-    # reason — the reason ("similarity X below threshold Y") confused the
-    # classifier into thinking gaps were numeric comparisons.
-    assert gap.description == "translate text to Klingon"
+    # Placeholder query
+    assert gap.query == "task-level"
+    # Description is (truncated) task description
+    assert gap.description.startswith("translate text from English into Klingon")
+
+
+def test_multiple_unmatched_capabilities_still_produce_one_placeholder():
+    """Task with N unmatched capabilities produces ONE placeholder gap, not N."""
+    registry = _make_registry(
+        gaps=[
+            ("capability-a", "below threshold"),
+            ("capability-b", "below threshold"),
+            ("capability-c", "below threshold"),
+        ],
+    )
+    state = TaskState(
+        task_description="multi-step task requiring three missing caps",
+        required_capabilities=["capability-a", "capability-b", "capability-c"],
+    )
+
+    cmd = gap_detection_node(state, registry)
+
+    assert len(cmd.update["gaps"]) == 1
+    assert cmd.update["gaps"][0].query == "task-level"
 
 
 # ---------------------------------------------------------------------------
-# Mixed (some matches, some gaps)
+# Mixed: some matches, some unmatched → matches preserved, one placeholder
 # ---------------------------------------------------------------------------
 
 
-def test_mixed_results():
+def test_mixed_results_preserves_matches_and_produces_single_gap():
     cap = _make_descriptor("csv-parser")
     registry = _make_registry(
         matches=[(cap, 0.88, "parse CSV file")],
@@ -103,10 +129,12 @@ def test_mixed_results():
 
     cmd = gap_detection_node(state, registry)
 
+    # Per-capability match still recorded
     assert len(cmd.update["matches"]) == 1
-    assert len(cmd.update["gaps"]) == 1
     assert cmd.update["matches"][0].capability.name == "csv-parser"
-    assert cmd.update["gaps"][0].query == "train ML model"
+    # Exactly one placeholder gap (not one per unmatched capability)
+    assert len(cmd.update["gaps"]) == 1
+    assert cmd.update["gaps"][0].query == "task-level"
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +253,6 @@ def test_no_metrics_store_does_not_crash():
         required_capabilities=["parse CSV"],
     )
 
-    # Should not raise
     cmd = gap_detection_node(state, registry, metrics_store=None)
     assert cmd.goto == "classifier_node"
 
@@ -242,3 +269,29 @@ def test_gaps_not_recorded_as_invocations():
     gap_detection_node(state, registry, metrics_store=metrics_store)
 
     metrics_store.record_invocation.assert_not_called()
+
+
+def test_records_multiple_match_invocations():
+    """When multiple capabilities match, each produces a distinct invocation."""
+    cap_a = _make_descriptor("parser")
+    cap_b = _make_descriptor("validator")
+    registry = _make_registry(
+        matches=[
+            (cap_a, 0.9, "parse"),
+            (cap_b, 0.85, "validate"),
+        ],
+    )
+    metrics_store = MagicMock()
+    state = TaskState(
+        task_description="parse and validate",
+        required_capabilities=["parse", "validate"],
+    )
+
+    gap_detection_node(state, registry, metrics_store=metrics_store)
+
+    assert metrics_store.record_invocation.call_count == 2
+    recorded_ids = {
+        call.args[0].capability_id
+        for call in metrics_store.record_invocation.call_args_list
+    }
+    assert recorded_ids == {"parser", "validator"}
