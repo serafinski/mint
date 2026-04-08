@@ -331,6 +331,13 @@ class EvaluationHarness:
             is_pilot=is_pilot,
             required_capability_count=result.get("required_capability_count", 0),
             matched_in_registry_count=result.get("matched_in_registry_count", 0),
+            chain_length=result.get("chain_length", 1),
+            chain_success=result.get("chain_success", False),
+            matched_and_executed_count=result.get("matched_and_executed_count", 0),
+            generated_artifact_count=result.get("generated_artifact_count", 0),
+            capability_types=result.get("capability_types", []),
+            failed_step_index=result.get("failed_step_index"),
+            failed_step_name=result.get("failed_step_name"),
         )
 
     # -- condition implementations -------------------------------------------
@@ -650,6 +657,22 @@ def _extract_result(
                 task.task_id,
             )
 
+    # Stage 1 compositional fields: defaults that match single-artifact behavior.
+    # Stage 3 CompositionalExecutor will populate these with real chain data.
+    chain_success = bool(gate_passed and output_in_range)
+    if artifacts:
+        # Generation path: one freshly-generated artifact was executed.
+        generated_artifact_count = 1
+        matched_and_executed_count = 0
+    elif matches:
+        # Registry-match path: one matched capability was executed.
+        generated_artifact_count = 0
+        matched_and_executed_count = 1
+    else:
+        generated_artifact_count = 0
+        matched_and_executed_count = 0
+    capability_types_list = [capability_type] if capability_type is not None else []
+
     return {
         "gate_passed": gate_passed,
         "output_in_range": output_in_range,
@@ -661,6 +684,13 @@ def _extract_result(
         "invocation_record_id": _get("trace_id", None),
         "required_capability_count": len(required_capabilities),
         "matched_in_registry_count": len(matches),
+        "chain_length": 1,
+        "chain_success": chain_success,
+        "matched_and_executed_count": matched_and_executed_count,
+        "generated_artifact_count": generated_artifact_count,
+        "capability_types": capability_types_list,
+        "failed_step_index": None,
+        "failed_step_name": None,
     }
 
 

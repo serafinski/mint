@@ -90,6 +90,41 @@ class TestRecordAndRetrieve:
         assert r.gate_passed is True
         assert r.output_in_range is True
 
+    def test_compositional_fields_default_on_minimal_record(self, store):
+        """Records constructed without compositional fields should round-trip
+        with the documented Stage 1 defaults."""
+        store.record_run(_record())
+        r = store.get_runs()[0]
+        assert r.chain_length == 1
+        assert r.chain_success is False
+        assert r.matched_and_executed_count == 0
+        assert r.generated_artifact_count == 0
+        assert r.capability_types == []
+        assert r.failed_step_index is None
+        assert r.failed_step_name is None
+
+    def test_compositional_fields_roundtrip(self, store):
+        """All Stage 1 compositional fields round-trip via DuckDB."""
+        original = _record(
+            capability_type="skill",
+            chain_length=3,
+            chain_success=False,
+            matched_and_executed_count=2,
+            generated_artifact_count=1,
+            capability_types=["mcp_tool", "skill", "agent"],
+            failed_step_index=2,
+            failed_step_name="agent-final-step",
+        )
+        store.record_run(original)
+        r = store.get_runs()[0]
+        assert r.chain_length == 3
+        assert r.chain_success is False
+        assert r.matched_and_executed_count == 2
+        assert r.generated_artifact_count == 1
+        assert r.capability_types == ["mcp_tool", "skill", "agent"]
+        assert r.failed_step_index == 2
+        assert r.failed_step_name == "agent-final-step"
+
 
 class TestSuccessRate:
     def test_all_succeed(self, store):

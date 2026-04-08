@@ -3,6 +3,8 @@ import pytest
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.metrics import GranularityMetrics, InvocationRecord
 from src.schemas.task import (
+    CapabilityReference,
+    ChainResult,
     ClassificationResult,
     ClassifiedGap,
     DecompositionResult,
@@ -896,3 +898,113 @@ def test_generator_input_roundtrip():
     roundtripped = GeneratorInput.model_validate_json(gi.model_dump_json())
     assert roundtripped.gap.classified_type == CapabilityType.SKILL
     assert roundtripped.task_context == "Build analytics"
+
+
+# --- CapabilityReference (Stage 1 compositional) ---
+
+
+def test_capability_reference_registry_source():
+    ref = CapabilityReference(
+        source="registry",
+        capability_name="csv-parser",
+        capability_type=CapabilityType.MCP_TOOL,
+        score=0.87,
+    )
+    assert ref.source == "registry"
+    assert ref.capability_name == "csv-parser"
+    assert ref.score == 0.87
+
+
+def test_capability_reference_generated_source_default_score():
+    ref = CapabilityReference(
+        source="generated",
+        capability_name="freshly-built-thing",
+        capability_type=CapabilityType.SKILL,
+    )
+    assert ref.source == "generated"
+    assert ref.score is None
+
+
+def test_capability_reference_rejects_invalid_source():
+    with pytest.raises(ValueError):
+        CapabilityReference(
+            source="cached",  # not in Literal["registry", "generated"]
+            capability_name="x",
+            capability_type=CapabilityType.MCP_TOOL,
+        )
+
+
+def test_capability_reference_rejects_extra():
+    with pytest.raises(ValueError):
+        CapabilityReference(
+            source="registry",
+            capability_name="x",
+            capability_type=CapabilityType.MCP_TOOL,
+            bonus="bad",
+        )
+
+
+def test_capability_reference_roundtrip():
+    ref = CapabilityReference(
+        source="registry",
+        capability_name="weather-fetcher",
+        capability_type=CapabilityType.MCP_TOOL,
+        score=0.42,
+    )
+    roundtripped = CapabilityReference.model_validate_json(ref.model_dump_json())
+    assert roundtripped.source == "registry"
+    assert roundtripped.capability_name == "weather-fetcher"
+    assert roundtripped.score == 0.42
+
+
+# --- ChainResult (Stage 1 compositional) ---
+
+
+def test_chain_result_minimal_success():
+    cr = ChainResult(chain_length=1, chain_success=True)
+    assert cr.chain_length == 1
+    assert cr.chain_success is True
+    assert cr.step_results == []
+    assert cr.failed_step_index is None
+    assert cr.failed_step_name is None
+
+
+def test_chain_result_failure_with_step_info():
+    cr = ChainResult(
+        chain_length=3,
+        chain_success=False,
+        step_results=[{"name": "step-a", "ok": True}, {"name": "step-b", "ok": False}],
+        failed_step_index=1,
+        failed_step_name="step-b",
+    )
+    assert cr.chain_length == 3
+    assert cr.chain_success is False
+    assert cr.failed_step_index == 1
+    assert cr.failed_step_name == "step-b"
+    assert len(cr.step_results) == 2
+
+
+def test_chain_result_chain_length_must_be_at_least_one():
+    with pytest.raises(ValueError):
+        ChainResult(chain_length=0, chain_success=False)
+
+
+def test_chain_result_rejects_extra():
+    with pytest.raises(ValueError):
+        ChainResult(
+            chain_length=1,
+            chain_success=True,
+            unknown_field="oops",
+        )
+
+
+def test_chain_result_roundtrip():
+    cr = ChainResult(
+        chain_length=2,
+        chain_success=True,
+        step_results=[{"name": "a", "ok": True}, {"name": "b", "ok": True}],
+    )
+    roundtripped = ChainResult.model_validate_json(cr.model_dump_json())
+    assert roundtripped.chain_length == 2
+    assert roundtripped.chain_success is True
+    assert len(roundtripped.step_results) == 2

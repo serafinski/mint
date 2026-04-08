@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -235,5 +236,35 @@ class TaskState(BaseModel):
             "Used to enforce the 3-strike limit before failing open."
         ),
     )
+
+    model_config = {"extra": "forbid"}
+
+
+class CapabilityReference(BaseModel):
+    """Pointer to either a registry-matched or freshly-generated capability.
+
+    Used by Stage 3 CompositionalExecutor to resolve a subtask's
+    required_capability to a concrete artifact at execution time.
+    """
+
+    source: Literal["registry", "generated"]
+    capability_name: str
+    capability_type: CapabilityType
+    score: float | None = Field(
+        default=None,
+        description="Similarity score (registry matches only); None for generated.",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class ChainResult(BaseModel):
+    """Result of a compositional execution chain."""
+
+    chain_length: int = Field(..., ge=1)
+    chain_success: bool
+    step_results: list[dict] = Field(default_factory=list)
+    failed_step_index: int | None = None
+    failed_step_name: str | None = None
 
     model_config = {"extra": "forbid"}

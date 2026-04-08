@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
@@ -32,6 +33,27 @@ from src.schemas.verification import Severity, VerificationFinding, Verification
 from src.verification import adversarial, behavioral, static_scanner
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Code-fence extraction (layered Tier 1 for SKILL/AGENT)
+# ---------------------------------------------------------------------------
+
+# Match ```python ... ``` blocks. DOTALL so `.` matches newlines.
+_PYTHON_FENCE = re.compile(r"```python\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_python_fences(text: str) -> list[str]:
+    """Extract Python code blocks from a markdown-formatted string.
+
+    Returns the body of each ```python ... ``` block in document order.
+    Used for the layered Tier 1 scan: SKILL/AGENT prose stays untouched
+    (no false positives from words like "placeholder" in instructions),
+    but fenced Python code is scanned with the same AST checks as MCP_TOOL.
+    """
+    if not text:
+        return []
+    return [m.group(1) for m in _PYTHON_FENCE.finditer(text)]
 
 
 # ---------------------------------------------------------------------------
@@ -61,19 +83,56 @@ def _static_scan(artifact: GeneratedArtifact) -> VerificationReport:
     if artifact.capability_type == CapabilityType.SKILL:
         # Tier 0 (quick_validate) + Tier 1 (regex-only — AST is skipped for
         # non-MCP_TOOL types inside static_scanner.scan()).
-        return static_scanner.scan(
+        report = static_scanner.scan(
             source_code=artifact.skill_content or "",
             capability_name=name,
             capability_type="skill",
         )
+        # Layered check: extract Python fences from SKILL.md and run the
+        # full MCP_TOOL AST + regex scan on each. Prose stays untouched
+        # (no T04-style false positives), but fenced code is scrutinised.
+        for idx, snippet in enumerate(_extract_python_fences(artifact.skill_content or "")):
+            fence_report = static_scanner.scan(
+                source_code=snippet,
+                capability_name=f"{name}#fence{idx}",
+                capability_type="mcp_tool",
+            )
+            for f in fence_report.findings:
+                f.location = f"code_fence[{idx}]:{f.location or 'unknown'}"
+                report.findings.append(f)
+        # Re-evaluate overall_passed in case fence findings introduced criticals.
+        has_critical = any(f.severity == Severity.CRITICAL for f in report.findings)
+        report.overall_passed = not has_critical
+        return report
 
     # AGENT: regex-only scan on the JSON-serialised config (AST skipped).
-    config_str = json.dumps(artifact.agent_config) if artifact.agent_config else ""
-    return static_scanner.scan(
+    config = artifact.agent_config or {}
+    config_str = json.dumps(config) if config else ""
+    report = static_scanner.scan(
         source_code=config_str,
         capability_name=name,
         capability_type="agent",
     )
+    # Layered check: extract Python fences from system_prompt and any
+    # embedded skill_content, run AST + regex scan on each.
+    sources_to_scan: list[tuple[str, str]] = []
+    if isinstance(config.get("system_prompt"), str):
+        sources_to_scan.append(("system_prompt", config["system_prompt"]))
+    if isinstance(config.get("skill_content"), str):
+        sources_to_scan.append(("skill_content", config["skill_content"]))
+    for source_label, text in sources_to_scan:
+        for idx, snippet in enumerate(_extract_python_fences(text)):
+            fence_report = static_scanner.scan(
+                source_code=snippet,
+                capability_name=f"{name}#{source_label}#fence{idx}",
+                capability_type="mcp_tool",
+            )
+            for f in fence_report.findings:
+                f.location = f"{source_label}/code_fence[{idx}]:{f.location or 'unknown'}"
+                report.findings.append(f)
+    has_critical = any(f.severity == Severity.CRITICAL for f in report.findings)
+    report.overall_passed = not has_critical
+    return report
 
 
 # ---------------------------------------------------------------------------

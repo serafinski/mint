@@ -690,3 +690,147 @@ class TestScanNonMcpTypes:
         mock_findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert len(mock_findings) >= 1
         assert mock_findings[0].severity.value == "critical"
+
+
+# ===================================================================
+# A1: Mock library imports (CRITICAL)
+# ===================================================================
+
+class TestMockImports:
+    def test_import_unittest_mock(self):
+        code = "import unittest.mock\n"
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "mock_import"]
+        assert len(findings) >= 1
+        assert findings[0].severity == Severity.CRITICAL
+        assert "unittest.mock" in findings[0].message
+
+    def test_from_unittest_mock(self):
+        code = "from unittest.mock import MagicMock\n"
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "mock_import"]
+        assert len(findings) >= 1
+        assert findings[0].severity == Severity.CRITICAL
+
+    def test_import_mock_root(self):
+        code = "import mock\n"
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "mock_import"]
+        assert len(findings) >= 1
+
+    def test_import_faker(self):
+        code = "import faker\n"
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "mock_import"]
+        assert len(findings) >= 1
+        assert findings[0].severity == Severity.CRITICAL
+
+    def test_from_faker_import(self):
+        code = "from faker import Faker\n"
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "mock_import"]
+        assert len(findings) >= 1
+
+    def test_legitimate_import_not_flagged(self):
+        code = "import requests\nimport json\n"
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "mock_import"]
+        assert len(findings) == 0
+
+    def test_mock_import_blocks_overall_pass(self):
+        code = "import unittest.mock\n"
+        report = scan(code, "tool")
+        assert report.overall_passed is False
+
+
+# ===================================================================
+# A1: random.seed(<literal>) determinism artifact (HIGH)
+# ===================================================================
+
+class TestRandomSeed:
+    def test_random_seed_literal(self):
+        code = '''\
+import random
+def get_value():
+    random.seed(42)
+    return random.randint(0, 100)
+'''
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "determinism_artifact"]
+        assert len(findings) >= 1
+        assert findings[0].severity == Severity.HIGH
+
+    def test_np_random_seed_literal(self):
+        code = '''\
+import numpy as np
+def get_value():
+    np.random.seed(7)
+    return np.random.rand()
+'''
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "determinism_artifact"]
+        assert len(findings) >= 1
+
+    def test_numpy_random_seed_literal(self):
+        code = '''\
+import numpy
+def get_value():
+    numpy.random.seed(7)
+    return numpy.random.rand()
+'''
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "determinism_artifact"]
+        assert len(findings) >= 1
+
+    def test_random_seed_dynamic_not_flagged(self):
+        code = '''\
+import random
+import time
+def get_value():
+    random.seed(time.time())
+    return random.randint(0, 100)
+'''
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "determinism_artifact"]
+        assert len(findings) == 0
+
+    def test_no_seed_call_not_flagged(self):
+        code = '''\
+import random
+def get_value():
+    return random.randint(0, 100)
+'''
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "determinism_artifact"]
+        assert len(findings) == 0
+
+
+# ===================================================================
+# A1: Lorem ipsum placeholder text (HIGH)
+# ===================================================================
+
+class TestLoremIpsum:
+    def test_lorem_ipsum_in_string_literal(self):
+        code = 'def get_text():\n    return "Lorem ipsum dolor sit amet"\n'
+        report = scan(code, "tool")
+        findings = [f for f in report.findings if f.category == "synthetic_data"]
+        # At least one finding should mention lorem ipsum
+        assert any("Lorem ipsum" in f.message or "lorem ipsum" in f.message.lower() for f in findings)
+
+    def test_lorem_ipsum_case_insensitive(self):
+        code = 'def get_text():\n    return "LOREM IPSUM"\n'
+        report = scan(code, "tool")
+        findings = [
+            f for f in report.findings
+            if f.category == "synthetic_data" and "lorem" in f.message.lower()
+        ]
+        assert len(findings) >= 1
+
+    def test_legitimate_text_not_flagged_for_lorem(self):
+        code = 'def get_text():\n    return "Hello world"\n'
+        report = scan(code, "tool")
+        findings = [
+            f for f in report.findings
+            if f.category == "synthetic_data" and "lorem" in f.message.lower()
+        ]
+        assert len(findings) == 0

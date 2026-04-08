@@ -6,6 +6,7 @@ outcomes across the five baseline conditions for thesis analysis.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
 
@@ -40,9 +41,32 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     human_label               VARCHAR,
     required_capability_count INTEGER NOT NULL DEFAULT 0,
     matched_in_registry_count INTEGER NOT NULL DEFAULT 0,
+    chain_length              INTEGER NOT NULL DEFAULT 1,
+    chain_success             BOOLEAN NOT NULL DEFAULT FALSE,
+    matched_and_executed_count INTEGER NOT NULL DEFAULT 0,
+    generated_artifact_count  INTEGER NOT NULL DEFAULT 0,
+    capability_types          VARCHAR NOT NULL DEFAULT '[]',
+    failed_step_index         INTEGER,
+    failed_step_name          VARCHAR,
     timestamp                 TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """
+
+# Idempotent migrations for upgrading existing DBs to the Stage 1
+# compositional schema. DuckDB does NOT support `ADD COLUMN ... NOT NULL
+# DEFAULT ...` via ALTER (Parser Error: "Adding columns with constraints
+# not yet supported"), so the ALTER variants omit constraints. New rows
+# inserted via record_run() always supply explicit values, and old rows
+# with NULL are coerced to safe defaults in _row_to_record().
+_MIGRATIONS = [
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS chain_length INTEGER",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS chain_success BOOLEAN",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS matched_and_executed_count INTEGER",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS generated_artifact_count INTEGER",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS capability_types VARCHAR",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_index INTEGER",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_name VARCHAR",
+]
 
 
 class EvaluationStore:
@@ -51,6 +75,9 @@ class EvaluationStore:
     def __init__(self, *, db_path: str | None = None) -> None:
         self._conn = duckdb.connect(db_path or ":memory:")
         self._conn.execute(_INIT_SQL)
+        # Idempotent ALTERs so existing DBs gain the Stage 1 compositional columns.
+        for stmt in _MIGRATIONS:
+            self._conn.execute(stmt)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -83,8 +110,11 @@ class EvaluationStore:
                 failure_reason, registry_snapshot_id, invocation_record_id,
                 seed, is_pilot, human_label,
                 required_capability_count, matched_in_registry_count,
+                chain_length, chain_success, matched_and_executed_count,
+                generated_artifact_count, capability_types,
+                failed_step_index, failed_step_name,
                 timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 row_id,
@@ -107,6 +137,13 @@ class EvaluationStore:
                 record.human_label,
                 record.required_capability_count,
                 record.matched_in_registry_count,
+                record.chain_length,
+                record.chain_success,
+                record.matched_and_executed_count,
+                record.generated_artifact_count,
+                json.dumps(record.capability_types),
+                record.failed_step_index,
+                record.failed_step_name,
                 record.timestamp,
             ],
         )
@@ -146,6 +183,9 @@ class EvaluationStore:
                    failure_reason, registry_snapshot_id, invocation_record_id,
                    seed, is_pilot, human_label,
                    required_capability_count, matched_in_registry_count,
+                   chain_length, chain_success, matched_and_executed_count,
+                   generated_artifact_count, capability_types,
+                   failed_step_index, failed_step_name,
                    timestamp
             FROM evaluation_runs
             {where}
@@ -242,11 +282,18 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         failure_reason, registry_snapshot_id, invocation_record_id,
         seed, is_pilot, human_label,
         required_capability_count, matched_in_registry_count,
+        chain_length, chain_success, matched_and_executed_count,
+        generated_artifact_count, capability_types,
+        failed_step_index, failed_step_name,
         timestamp,
     ) = row
     # DuckDB may return naive datetimes — normalise to UTC-aware
     if isinstance(timestamp, datetime) and timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
+    try:
+        capability_types_list = json.loads(capability_types) if capability_types else []
+    except (ValueError, TypeError):
+        capability_types_list = []
     return EvaluationRecord(
         run_id=run_id,
         condition=BaselineCondition(condition),
@@ -267,5 +314,12 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         human_label=human_label,
         required_capability_count=required_capability_count or 0,
         matched_in_registry_count=matched_in_registry_count or 0,
+        chain_length=chain_length if chain_length is not None else 1,
+        chain_success=bool(chain_success) if chain_success is not None else False,
+        matched_and_executed_count=matched_and_executed_count or 0,
+        generated_artifact_count=generated_artifact_count or 0,
+        capability_types=capability_types_list,
+        failed_step_index=failed_step_index,
+        failed_step_name=failed_step_name,
         timestamp=timestamp,
     )

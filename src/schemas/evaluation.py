@@ -126,6 +126,42 @@ class EvaluationRecord(BaseModel):
         ),
     )
 
+    # --- Compositional execution (Stage 1: defaults; Stage 3: real values) ---
+    chain_length: int = Field(
+        default=1,
+        ge=1,
+        description="Number of steps in the executed compositional chain (1 = single artifact)",
+    )
+    chain_success: bool = Field(
+        default=False,
+        description=(
+            "Did the full chain execute successfully? "
+            "Equals (gate_passed AND output_in_range) for chain_length=1."
+        ),
+    )
+    matched_and_executed_count: int = Field(
+        default=0,
+        ge=0,
+        description="How many registry-matched capabilities were actually executed in the chain.",
+    )
+    generated_artifact_count: int = Field(
+        default=0,
+        ge=0,
+        description="How many newly-generated artifacts were executed in the chain.",
+    )
+    capability_types: list[str] = Field(
+        default_factory=list,
+        description="Capability types executed in the chain, in order.",
+    )
+    failed_step_index: int | None = Field(
+        default=None,
+        description="Zero-based index of the step that failed (None on success).",
+    )
+    failed_step_name: str | None = Field(
+        default=None,
+        description="Name of the failed step (None on success).",
+    )
+
     # --- Reproducibility ---
     seed: int = Field(..., description="Random seed used for task ordering in this run")
     is_pilot: bool = Field(

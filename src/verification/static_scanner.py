@@ -46,6 +46,9 @@ _EXTERNAL_FN_NAMES = re.compile(
     re.IGNORECASE,
 )
 
+# Lorem ipsum placeholder text — never legitimate in real code/data
+_LOREM_IPSUM = re.compile(r"\blorem ipsum\b", re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Tier 0: Skill structural pre-check via quick_validate.py
@@ -282,6 +285,82 @@ def _check_synthetic_comments(source_code: str, findings: list[VerificationFindi
         )
 
 
+def _check_lorem_ipsum(source_code: str, findings: list[VerificationFinding]) -> None:
+    """Detect lorem ipsum placeholder text in string literals."""
+    for m in _LOREM_IPSUM.finditer(source_code):
+        findings.append(
+            VerificationFinding(
+                tier=1,
+                category="synthetic_data",
+                severity=Severity.HIGH,
+                message=f"Lorem ipsum placeholder text found at position {m.start()}",
+                location=f"position {m.start()}",
+            )
+        )
+
+
+def _check_mock_imports(tree: ast.Module, findings: list[VerificationFinding]) -> None:
+    """Detect imports of mocking libraries (unittest.mock, mock, faker)."""
+    BANNED = {"unittest.mock", "mock", "faker"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                full = alias.name
+                root = full.split(".")[0]
+                if full in BANNED or root in BANNED:
+                    findings.append(
+                        VerificationFinding(
+                            tier=1,
+                            category="mock_import",
+                            severity=Severity.CRITICAL,
+                            message=f"Imports mocking library: {alias.name}",
+                            location=f"line {node.lineno}",
+                        )
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            root = mod.split(".")[0]
+            if mod in BANNED or root in BANNED:
+                findings.append(
+                    VerificationFinding(
+                        tier=1,
+                        category="mock_import",
+                        severity=Severity.CRITICAL,
+                        message=f"Imports from mocking library: {mod}",
+                        location=f"line {node.lineno}",
+                    )
+                )
+
+
+def _check_random_seed(tree: ast.Module, findings: list[VerificationFinding]) -> None:
+    """Detect ``random.seed(<literal>)`` — fake-determinism for stable mock outputs.
+
+    Also catches ``np.random.seed(<literal>)`` and ``numpy.random.seed(<literal>)``.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_seed = False
+        if isinstance(func, ast.Attribute) and func.attr == "seed":
+            # random.seed(...) or np.random.seed(...)
+            if isinstance(func.value, ast.Name) and func.value.id in ("random", "np"):
+                is_seed = True
+            # numpy.random.seed(...) — func.value is Attribute(attr='random', value=Name('numpy'))
+            elif isinstance(func.value, ast.Attribute) and func.value.attr == "random":
+                is_seed = True
+        if is_seed and node.args and isinstance(node.args[0], ast.Constant):
+            findings.append(
+                VerificationFinding(
+                    tier=1,
+                    category="determinism_artifact",
+                    severity=Severity.HIGH,
+                    message=f"random.seed() called with literal {node.args[0].value!r} at line {node.lineno}",
+                    location=f"line {node.lineno}",
+                )
+            )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -350,12 +429,15 @@ def scan(
             _check_silent_except(node, findings)
 
         _check_missing_external_calls(tree, source_code, findings)
+        _check_mock_imports(tree, findings)
+        _check_random_seed(tree, findings)
 
         # Regex checks (MCP_TOOL only — skills/agents are natural-language
         # prose where words like "placeholder" or "mock" appear legitimately
         # in instructions and would produce false positives).
         _check_mock_artifacts(source_code, findings)
         _check_synthetic_comments(source_code, findings)
+        _check_lorem_ipsum(source_code, findings)
 
     has_critical = any(f.severity == Severity.CRITICAL for f in findings)
     return VerificationReport(

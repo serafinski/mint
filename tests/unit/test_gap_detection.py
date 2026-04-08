@@ -220,12 +220,18 @@ def test_empty_errors_when_none_prior():
 
 
 # ---------------------------------------------------------------------------
-# MetricsStore invocation tracking (Fix 3)
+# MetricsStore is NOT touched by gap_detection (Stage 1 compositional refactor)
+#
+# Previously this node wrote fake InvocationRecords for every match (token=0,
+# latency=0) so matches wouldn't be pruned as idle. That inflated reuse counts
+# (e.g., csv-parser in T14) without any real execution. Stage 1 of the
+# compositional refactor strips those writes — honest invocations are now
+# recorded by the Stage 3 CompositionalExecutor after real chain execution.
 # ---------------------------------------------------------------------------
 
 
-def test_records_match_invocations_when_metrics_store_provided():
-    """Matched capabilities should be recorded as invocations in MetricsStore."""
+def test_metrics_store_is_not_called_for_matches():
+    """gap_detection must NOT record fake invocations for matched capabilities."""
     cap = _make_descriptor("csv-parser")
     registry = _make_registry(matches=[(cap, 0.9, "parse CSV")])
     metrics_store = MagicMock()
@@ -236,12 +242,7 @@ def test_records_match_invocations_when_metrics_store_provided():
 
     gap_detection_node(state, registry, metrics_store=metrics_store)
 
-    metrics_store.record_invocation.assert_called_once()
-    record = metrics_store.record_invocation.call_args[0][0]
-    assert record.capability_id == "csv-parser"
-    assert record.success is True
-    assert record.token_cost == 0
-    assert record.latency_ms == 0.0
+    metrics_store.record_invocation.assert_not_called()
 
 
 def test_no_metrics_store_does_not_crash():
@@ -271,8 +272,8 @@ def test_gaps_not_recorded_as_invocations():
     metrics_store.record_invocation.assert_not_called()
 
 
-def test_records_multiple_match_invocations():
-    """When multiple capabilities match, each produces a distinct invocation."""
+def test_metrics_store_not_called_for_multiple_matches():
+    """Even with multiple matches, no fake invocations are recorded."""
     cap_a = _make_descriptor("parser")
     cap_b = _make_descriptor("validator")
     registry = _make_registry(
@@ -287,11 +288,8 @@ def test_records_multiple_match_invocations():
         required_capabilities=["parse", "validate"],
     )
 
-    gap_detection_node(state, registry, metrics_store=metrics_store)
+    cmd = gap_detection_node(state, registry, metrics_store=metrics_store)
 
-    assert metrics_store.record_invocation.call_count == 2
-    recorded_ids = {
-        call.args[0].capability_id
-        for call in metrics_store.record_invocation.call_args_list
-    }
-    assert recorded_ids == {"parser", "validator"}
+    metrics_store.record_invocation.assert_not_called()
+    # Matches still populate state.matches, just not the metrics store.
+    assert len(cmd.update["matches"]) == 2

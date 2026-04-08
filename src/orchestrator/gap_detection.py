@@ -1,18 +1,19 @@
 """Gap detection — LangGraph node wrapping registry.detect_gaps().
 
-Searches the capability registry for each required capability. Matches are
-recorded per-capability (populating ``state.matches`` and recording
-InvocationRecords for the optimizer). The gap output signals whether the
+Searches the capability registry for each required capability and populates
+``state.matches`` per matched capability. The gap output signals whether the
 task needs generation at all — if ANY required capability is unmatched, a
 single placeholder gap is produced. The task-level classifier downstream
 then classifies the entire task once.
 
-This is a plain Python node — no LLM calls.
+This is a plain Python node — no LLM calls. As of Stage 1 of the
+compositional refactor, matches are NO LONGER recorded as fake invocations
+here; honest invocation records are written by the Stage 3 compositional
+executor after real chain execution.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from typing import Literal
 
@@ -20,7 +21,6 @@ from langgraph.types import Command
 
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
-from src.schemas.metrics import InvocationRecord
 from src.schemas.task import GapItem, MatchItem, TaskState, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -45,12 +45,14 @@ def gap_detection_node(
         state: Current pipeline state with ``required_capabilities`` populated
             by ``decomposition_node``.
         registry: The capability registry to search.
-        metrics_store: Optional metrics store for recording match invocations
-            (keeps matched capabilities from being pruned as idle).
+        metrics_store: Currently unused. Reserved for future use; the Stage 3
+            compositional executor records honest invocation records after
+            real chain execution. Kept on the signature for caller stability.
 
     Returns:
         Command routing to ``classifier_node`` with updated matches and gaps.
     """
+    del metrics_store  # Stage 1: matches are no longer recorded as fake invocations.
     errors: list[str] = list(state.errors)
 
     matches_raw, gaps_raw = registry.detect_gaps(state.required_capabilities)
@@ -60,17 +62,10 @@ def gap_detection_node(
         for cap, score, _query in matches_raw
     ]
 
-    # Record matched capabilities as invocations so they're not pruned as idle.
-    # token_cost=0, latency_ms=0.0 are intentional: matches are not executions.
-    if metrics_store is not None:
-        for m in matches:
-            metrics_store.record_invocation(InvocationRecord(
-                capability_id=m.capability.name,
-                task_id=hashlib.sha256(state.task_description.encode()).hexdigest()[:16],
-                success=True,
-                token_cost=0,
-                latency_ms=0.0,
-            ))
+    # Stage 1 of the compositional refactor: matches are NOT recorded as
+    # InvocationRecords here. Doing so inflated reuse counts (e.g., csv-parser
+    # in T14) without any real execution. The Stage 3 CompositionalExecutor
+    # writes honest invocation records after the chain actually runs.
 
     # Produce a single placeholder gap if ANY required capability was unmatched.
     # The task-level classifier downstream will decide the type for the whole

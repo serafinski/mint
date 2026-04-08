@@ -139,6 +139,18 @@ def validate_skill(skill_path):
                 ),
             )
 
+    # Tier 0 prose checks: hard-fail on patterns that are never legitimate
+    # in skill bodies. Deliberately literal — broad patterns like 'placeholder'
+    # would re-introduce the T04 false positive.
+    body_match = re.match(r"^---\n.*?\n---\n?(.*)$", content, re.DOTALL)
+    body = body_match.group(1) if body_match else content
+    if re.search(r"\blorem ipsum\b", body, re.IGNORECASE):
+        return False, "Skill body contains lorem ipsum placeholder text"
+    if "TODO: implement" in body:
+        return False, "Skill body contains literal 'TODO: implement' marker"
+    if "# placeholder return" in body:
+        return False, "Skill body contains literal '# placeholder return' marker"
+
     return True, "Skill is valid!"
 
 

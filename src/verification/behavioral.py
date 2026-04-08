@@ -3,16 +3,18 @@
 Generates edge-case test inputs, executes them in the Docker sandbox,
 and detects behavioral contamination. No LLM calls — pure Python.
 
-Five test categories:
+Six test categories:
   - Nonexistent entity: empty / missing / invalid inputs
   - Consistency: same input twice must produce same output
   - Boundary: min/max values, zero, negative, empty strings
-  - Latency: execution must complete within a reasonable bound
+  - Timeout: execution must complete within a reasonable timeout (5s)
+  - Latency (variance): mock-smell detection — very fast AND very uniform
   - Output variation: different inputs should produce different outputs
 """
 
 import ast
 import json
+import statistics
 import textwrap
 import time
 from functools import partial
@@ -22,7 +24,7 @@ from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import Severity, VerificationFinding
 from src.verification.sandbox_tool import resolve_extra_packages, sandbox_execute
 
-LATENCY_THRESHOLD_S = 5.0
+TIMEOUT_THRESHOLD_S = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -440,10 +442,10 @@ def _test_boundary(
     return findings
 
 
-def _test_latency(
+def _test_timeout(
     source_code: str, func_name: str, schema: dict[str, dict], _sandbox=sandbox_execute
 ) -> list[VerificationFinding]:
-    """Check that execution completes within a reasonable time."""
+    """Check that execution completes within a reasonable timeout (5s)."""
     findings: list[VerificationFinding] = []
     if not schema:
         return findings
@@ -459,13 +461,81 @@ def _test_latency(
     # Use the tool-reported elapsed if available, otherwise wall time
     elapsed = parsed.get("elapsed", wall_time) if parsed else wall_time
 
-    if elapsed > LATENCY_THRESHOLD_S:
+    if elapsed > TIMEOUT_THRESHOLD_S:
+        findings.append(
+            VerificationFinding(
+                tier=2,
+                category="timeout",
+                severity=Severity.MEDIUM,
+                message=f"Tool execution took {elapsed:.2f}s (timeout threshold: {TIMEOUT_THRESHOLD_S}s)",
+                location="timeout",
+            )
+        )
+
+    return findings
+
+
+def _test_latency(
+    source_code: str, func_name: str, schema: dict[str, dict], _sandbox=sandbox_execute
+) -> list[VerificationFinding]:
+    """Detect mock-smell timing: very fast AND very uniform across varied inputs.
+
+    Real computation has timing that varies with input. Constant lookup tables /
+    hash tricks have near-zero variance and very low mean. We flag only when
+    BOTH conditions hold to keep false positives near zero (proposal: section 4).
+    """
+    findings: list[VerificationFinding] = []
+    if not schema:
+        return findings
+
+    # Collect 3 distinct input variants. Dedup by repr (dicts aren't hashable
+    # so we can't use a set directly).
+    candidates = [
+        _generate_boundary_inputs(schema),
+        _generate_negative_inputs(schema),
+        _generate_large_inputs(schema),
+    ]
+    seen: set[str] = set()
+    distinct_inputs: list[dict] = []
+    for c in candidates:
+        key = repr(sorted(c.items()))
+        if key not in seen:
+            seen.add(key)
+            distinct_inputs.append(c)
+
+    if len(distinct_inputs) < 2:
+        return findings  # Cannot compute variance with < 2 samples
+
+    elapsed_samples: list[float] = []
+    for inputs in distinct_inputs:
+        code = _build_sandbox_code(source_code, func_name, inputs)
+        result = _sandbox(code, timeout=15)
+        parsed = _parse_sandbox_output(result)
+        if parsed is None or parsed.get("error") is not None:
+            continue
+        elapsed = parsed.get("elapsed")
+        if isinstance(elapsed, (int, float)):
+            elapsed_samples.append(float(elapsed))
+
+    if len(elapsed_samples) < 2:
+        return findings  # Not enough successful runs to compute variance
+
+    mean = statistics.mean(elapsed_samples)
+    stdev = statistics.stdev(elapsed_samples)
+    cv = (stdev / mean) if mean > 0 else 0.0
+
+    # Two-condition gate: very fast AND very uniform.
+    if mean < 0.001 and cv < 0.10:
         findings.append(
             VerificationFinding(
                 tier=2,
                 category="latency",
                 severity=Severity.MEDIUM,
-                message=f"Tool execution took {elapsed:.2f}s (threshold: {LATENCY_THRESHOLD_S}s)",
+                message=(
+                    f"Tool execution is suspiciously fast and uniform: "
+                    f"mean={mean*1000:.3f}ms, cv={cv:.3f} across {len(elapsed_samples)} inputs "
+                    "— may be returning a constant lookup instead of computing"
+                ),
                 location="latency",
             )
         )
@@ -479,11 +549,11 @@ def _test_latency(
 
 
 def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
-    """Run all five behavioral test categories on an MCP_TOOL artifact.
+    """Run all six behavioral test categories on an MCP_TOOL artifact.
 
-    Categories: nonexistent entity, consistency, boundary, latency,
-    and output variation.  SKILL/AGENT artifacts have no ``source_code``
-    and are skipped with an INFO finding.
+    Categories: nonexistent entity, consistency, boundary, timeout,
+    latency (variance), and output variation.  SKILL/AGENT artifacts
+    have no ``source_code`` and are skipped with an INFO finding.
 
     Returns a list of ``VerificationFinding`` objects (tier=2).
     """
@@ -522,6 +592,7 @@ def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
     findings.extend(_test_nonexistent_entity(source_code, func_name, schema, _sandbox))
     findings.extend(_test_consistency(source_code, func_name, schema, _sandbox))
     findings.extend(_test_boundary(source_code, func_name, schema, _sandbox))
+    findings.extend(_test_timeout(source_code, func_name, schema, _sandbox))
     findings.extend(_test_latency(source_code, func_name, schema, _sandbox))
     findings.extend(_test_output_variation(source_code, func_name, schema, _sandbox))
 
