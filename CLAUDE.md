@@ -53,7 +53,7 @@ DeepAgents (`create_deep_agent()`) return a `CompiledStateGraph` — a complete 
 Generated skills (Pillar 1) target the DeepAgents runtime skill format. Key details:
 
 - **Skill structure**: `SKILL.md` (required) + optional `scripts/`, `references/`, `assets/` directories
-- **Skill locations**: DeepAgents loads skills from `~/.deepagents/<agent>/skills/` (user) and `.deepagents/skills/` (project), with project skills taking precedence
+- **Skill locations**: DeepAgents loads skills from `~/.deepagents/<agent>/skills/` (user) and project-level directories. In this project, skills are stored in `data/eval/skills/` (evaluation) or `data/cli/skills/` (CLI), configured via `set_skills_output_dir()`
 - **Frontmatter**: YAML with `name` and `description` (required). Allowed keys: `name`, `description`, `license`, `compatibility`, `allowed-tools`, `metadata`
 - **Validation utilities**: `tools/quick_validate.py` validates skill structure; `tools/init_skill.py` scaffolds new skills. Both from the DeepAgents ecosystem.
 - **Naming**: hyphen-case, max 64 characters. Description max 1024 characters, no angle brackets.
@@ -234,7 +234,11 @@ Generated MCP tools are loaded via `importlib` dynamic import in a sandboxed sub
 
 ### Generated Skills Landing Path
 
-Generated SKILL.md files are written to `.deepagents/skills/<skill-name>/` in the project root. DeepAgents loads project-level skills from this path automatically — no copy or symlink step needed. `src/skills/` does not exist and should not be used. User-level `~/.deepagents/<agent>/skills/` is reserved for stable, hand-curated skills only.
+Generated SKILL.md files are written to a configurable skills directory:
+- **Evaluation:** `data/eval/skills/<skill-name>/` (snapshot-controlled)
+- **CLI:** `data/cli/skills/<skill-name>/` (accumulates across runs)
+
+The path is set by `set_skills_output_dir()` in `src/orchestrator/generators/skill.py`. The CLI calls this during `_create_infra()`. The evaluation harness uses the default. `src/skills/` does not exist and should not be used.
 
 ### Generated Agent Tool Scope (Deliberate Limitation)
 
@@ -251,6 +255,26 @@ This means the system can only generate **single-agent, sandbox-based** capabili
 - **Chapter 4**: Acknowledge the single-agent-with-sandbox pattern as a deliberate simplification.
 - **Chapter 6**: This limits the complexity of tasks generated agents can handle. Real-world deployments would benefit from agents that leverage registry capabilities or delegate to subagents.
 - **Chapter 7 (Future Work)**: Compositional capability synthesis — generated agents that use other generated capabilities (MCP tools from registry as tools, other agents as subagents). The `create_deep_agent()` API already supports `subagents=` and `backend=`, so this is an execution-layer change, not an architectural one.
+
+### Three Distinct Execution Backends
+
+Each capability type executes via a genuinely different backend, making the classifier's routing decision have measurable runtime consequences:
+
+| Type | Backend | LLM at runtime | Character |
+|---|---|---|---|
+| **MCP_TOOL** | `sandbox_execute()` — Docker, no LLM | No (0 calls) | Deterministic code execution |
+| **SKILL** | Constrained LLM with `bind_tools([sandbox_execute])`, max 3 tool calls | Yes (1-3 calls) | Prescribed workflow, limited retry |
+| **AGENT** | Full DeepAgent with `skills=` parameter for progressive disclosure | Yes (5-15+ calls) | Adaptive reasoning, planning loop |
+
+**Skill execution** (`tests/evaluation/execution.py`): Uses `init_chat_model().bind_tools([sandbox_execute])` with a tight tool-calling loop. No `write_todos`, no file-based context management, no DeepAgent middleware. System prompt = `_SKILL_EXECUTION_SYSTEM_PROMPT` + SKILL.md content. Structured output extracted from sandbox JSON or via follow-up `with_structured_output(method="function_calling")` call.
+
+**Agent execution** (`tests/evaluation/execution.py`): Uses `create_deep_agent()` with `skills=` parameter pointing to the skills directory. Skills are passed via `StateBackend` (`invoke(files={...})`). The agent discovers skills via progressive disclosure (metadata first, full content on activation). Agent sees only its own skill to avoid noise from other tasks in the same evaluation run. In CLI mode, agents discover all accumulated skills.
+
+**Filesystem isolation**: Built-in DeepAgent tools (`write_file`, `read_file`, etc.) operate on the agent's in-memory workspace (`StateBackend`), NOT on the Docker sandbox filesystem. Files written with `write_file` are NOT accessible inside `sandbox_execute`. All prompts (agent generator, skill generator, execution system prompts) document this distinction explicitly.
+
+**Data path separation**:
+- Evaluation: `data/eval/chroma/`, `data/eval/metrics.duckdb`, `data/eval/skills/`, `data/eval/longitudinal.duckdb`
+- CLI: `data/cli/chroma/`, `data/cli/metrics.duckdb`, `data/cli/skills/`
 
 ### Verification Gate: Tiered Cost Optimization
 
@@ -345,11 +369,7 @@ All numbers pending confirmation after full re-run with post-audit code.
   - [ ] Snapshot integrity — verify `tests/evaluation/snapshots/` has correct seeded capabilities (T01-T03 MCP_TOOL, T05/T09 SKILL)
   - [ ] Fixture file audit — verify all 32 fixtures in `tests/evaluation/tasks.py` exist and are valid
 - [ ] Purge stale data (no eval DuckDB exists, but stale runtime state remains):
-  - [ ] `rm -rf data/chroma/` — old ChromaDB vectors
-  - [ ] `rm -rf data/cli_chroma/` — old CLI ChromaDB
-  - [ ] `rm -rf .deepagents/skills/` — 10 generated skills from old runs
-  - [ ] `rm data/logs/longitudinal_20260319_011101.log` — old log
-  - [ ] `rm data/context_utilization.csv` — old metrics (optional)
+  - [x] Old data paths cleaned (2026-04-08) — migrated to `data/eval/` and `data/cli/` subdirectories
 - [ ] Pre-eval integration sanity checks (~$0.20, ~15 min):
   - [ ] `uv run scripts/test_pipeline.py` — full 9-node pipeline (~$0.15, ~5 min)
   - [ ] `uv run scripts/test_verification.py` — three-tier gate with Docker/LLM (~$0.02, ~3 min)
@@ -361,18 +381,20 @@ All numbers pending confirmation after full re-run with post-audit code.
   - [ ] `uv run scripts/test_mint.py` — full CLI smoke test, all 3 types + 6 formats (~$0.20, ~15 min)
   - [ ] Spot-check any failures in LangFuse — distinguish code bugs from LLM generation issues
   - [ ] Pilot validation checklist (after 12 runs complete):
-    - [ ] Verify exactly 12 records written to `data/evaluation.duckdb` (not fewer = silent data loss)
+    - [ ] Verify exactly 12 records written to `data/eval/metrics.duckdb` (not fewer = silent data loss)
     - [ ] Open 2-3 LangFuse traces, skim actual LLM inputs/outputs — catch "works but for wrong reason"
     - [ ] Check success rates aren't suspiciously uniform across conditions (= evaluation bias)
     - [ ] Compare `no_verification` vs `full` — if nearly identical, the gate isn't doing anything
     - [ ] Check token costs are being recorded (not all zeros)
+- [ ] Fix LangFuse tag propagation — sub-component traces (adversarial, decomposition, skill/agent execution) create their own `CallbackHandler()` without inheriting pipeline-level tags (task_id, condition, tier). Must propagate before full eval or traces will be uncorrelatable.
+- [ ] Replace `pip` with `uv` in sandbox Dockerfile — agent tasks spend ~180s on `pip install` per run (3 sandbox calls × ~60s each). Adding `uv` to the Dockerfile and using `uv pip install` in `sandbox_tool.py` would cut this to ~15s. Two files: `sandbox/Dockerfile`, `src/verification/sandbox_tool.py`.
 - [ ] Full evaluation re-run (~$5, ~26h sequential / ~13h with 2 conditions parallel):
-  - [ ] `rm data/evaluation.duckdb` — purge pilot records before full run (pilot contamination)
+  - [ ] `rm -rf data/eval/` — purge pilot records before full run (pilot contamination)
   - [ ] `uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5` (18 × 4 × 5 = 360 records)
   - [ ] Cost breakdown: static ~$0 (0.1h), no_verification ~$0.37 (5h), no_optimization ~$2.21 (10h), full ~$2.32 (11h)
   - [ ] Adversarial probing is 83% of cost (~$0.025/run); pipeline direct is ~$0.005/run
 - [ ] Re-validate longitudinal optimizer test (~$1.50, ~3h):
-  - [ ] Restore clean state first: `rm -rf data/chroma/ .deepagents/skills/` (full eval leaves dirty state)
+  - [ ] Restore clean state first: `rm -rf data/eval/` (full eval leaves dirty state)
   - [ ] `uv run scripts/run_longitudinal.py` (40 tasks, sequential, optimizer enabled)
   - [ ] Longitudinal validation checklist:
     - [ ] Verify 40 records in `data/longitudinal.duckdb`
@@ -385,7 +407,7 @@ All numbers pending confirmation after full re-run with post-audit code.
   - [ ] `uv run scripts/analyze_context_utilization.py --csv` — context window metrics
 - [ ] Post-eval sanity checks (spot hidden issues audits can't catch):
   - [ ] Token cost sanity: spot-check 3-4 runs in LangFuse, compare actual trace costs vs what `backfill_token_costs.py` attributed — look for mismatches
-  - [ ] Verify 360 records in `data/evaluation.duckdb` (not fewer)
+  - [ ] Verify 360 records in `data/eval/metrics.duckdb` (not fewer)
   - [ ] Check no condition has suspiciously uniform success rates (= evaluation bias or bug that helps/hurts uniformly)
   - [ ] Compare `no_verification` vs `full` success rates — if nearly identical, verification gate may not be working
   - [ ] Compare `no_optimization` vs `full` — if identical, optimizer isn't firing (expected for snapshot-reset, but confirm)
@@ -424,13 +446,13 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`tests/evaluation/tasks.py`** — `TaskDefinition`, `ALL_TASKS`, `PILOT_TASKS`, `get_task()`
 - **`tests/evaluation/snapshots.py`** — `take_clean_snapshot()`, `restore_clean_snapshot()`, `snapshot_exists()`
 - **`tests/evaluation/harness.py`** — `EvaluationHarness`, `HarnessConfig`, `_run_static_implementation()`
-- **`tests/evaluation/execution.py`** — `execute_skill_artifact()`, `execute_agent_artifact()`, `_read_fixture_contents()` (DeepAgent-based SKILL/AGENT execution)
+- **`tests/evaluation/execution.py`** — `execute_skill_artifact()` (constrained LLM + sandbox, max 3 tool calls), `execute_agent_artifact()` (DeepAgent + progressive disclosure via `skills=`), `_read_fixture_contents()`, `_collect_skill_files()`, `_ensure_skill_on_disk()`
 - **`scripts/run_pilot.py`** — Evaluation runner: `uv run scripts/run_pilot.py [--condition] [--all-tasks] [--all-conditions] [--n-runs N]`
 - **`scripts/test_mint.py`** — MINT CLI smoke test: `uv run scripts/test_mint.py [--quick] [--mcp-only] [--skill-only] [--agent-only]`. Tests all 3 capability types + 6 file formats (CSV, JSON, YAML, XML, Excel, TSV). Logs to `data/logs/`.
 - **`src/cli/app.py`** — MINT CLI entry point (Typer): `run`, `plan`, `retry`, `list`, `inspect`, `history`, `prune`, `seed`, `reset`, `disable`, `enable`
 - **`src/cli/runner.py`** — Pipeline execution with streaming progress, file metadata augmentation, AST-based parameter matching, auto-save output to `data/mint_output/` (timestamped), `--output-dir` override
 - **`src/cli/display.py`** — Rich formatting (progress table, verification findings, capability list/inspect/history, output quality detection)
-- **`scripts/run_task.py`** — User-facing CLI: `uv run scripts/run_task.py "task" [--file PATH] [--param K=V] [--dry-run] [--list] [--skip-verification] [--enable-optimizer] [--no-optimizer] [--timeout SECONDS] [--output-format json|human]`. Optimizer auto-enables after 20+ invocations. Persists capabilities (ChromaDB) and invocation metrics (`data/cli_metrics.duckdb`) across runs.
+- **`scripts/run_task.py`** — User-facing CLI: `uv run scripts/run_task.py "task" [--file PATH] [--param K=V] [--dry-run] [--list] [--skip-verification] [--enable-optimizer] [--no-optimizer] [--timeout SECONDS] [--output-format json|human]`. Optimizer auto-enables after 20+ invocations. Persists capabilities (ChromaDB) and invocation metrics (`data/cli/metrics.duckdb`) across runs.
 
 ## Notes for AI Agents
 

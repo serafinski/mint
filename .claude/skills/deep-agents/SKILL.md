@@ -61,7 +61,19 @@ These come for free with every DeepAgent — no configuration needed:
 - **Subagent spawning**: `task` tool delegates work with context isolation — requires `subagents=` parameter. **None of our current invocations pass subagents**, so `task` is non-functional in this project.
 - **Conversation summarization**: Auto-compresses old messages at 85% context usage
 
-The `tools` parameter in `create_deep_agent()` is **optional** — it adds custom tools on top of the built-ins. If the agent only needs planning and file operations (e.g., task decomposition), omit it entirely. In this project, we pass `tools=[sandbox_execute]` when the agent needs Docker-isolated Python execution (adversarial probing, skill/agent evaluation).
+The `tools` parameter in `create_deep_agent()` is **optional** — it adds custom tools on top of the built-ins. If the agent only needs planning and file operations (e.g., task decomposition), omit it entirely. In this project, we pass `tools=[sandbox_execute]` when the agent needs Docker-isolated Python execution (adversarial probing, agent evaluation).
+
+**IMPORTANT: Filesystem isolation.** The built-in file tools (`read_file`, `write_file`, `ls`, etc.) operate on the agent's in-memory workspace (`StateBackend`), NOT on the Docker sandbox filesystem. Files written with `write_file` are NOT accessible inside `sandbox_execute`. Data for sandbox execution must be embedded directly in the Python code string.
+
+### Execution Backends (Three Types)
+
+Each capability type uses a different execution backend in `tests/evaluation/execution.py`:
+
+- **MCP_TOOL**: `sandbox_execute()` runs generated code directly. No LLM at runtime.
+- **SKILL**: Constrained LLM with `bind_tools([sandbox_execute])`, max 3 tool calls. No DeepAgent, no `write_todos`. Prescribed workflow.
+- **AGENT**: Full DeepAgent with `skills=` parameter for progressive disclosure. Agent discovers skills via `StateBackend` (`invoke(files={...})`). Adaptive reasoning.
+
+Skills are NOT executed via DeepAgent — they use a simpler tool-calling loop. Only AGENT artifacts use DeepAgent.
 
 ## Integration Pattern: DeepAgent Inside a LangGraph Node
 

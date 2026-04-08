@@ -3,6 +3,7 @@
 **Date:** 2026-04-07
 **Branch:** `iter/6-execution-backends`
 **Parent:** `iter/6-evaluation`
+**Status:** IMPLEMENTED (2026-04-08) — all backends verified via eval pilot and CLI smoke tests
 
 ---
 
