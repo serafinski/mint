@@ -122,7 +122,7 @@ scripts/                # Evaluation runners + integration tests
 └── test_mint.py            # MINT CLI smoke test (all types + formats)
 
 tests/
-├── unit/               # 814+ tests, no I/O, no external services
+├── unit/               # 887+ tests, no I/O, no external services
 ├── integration/        # Docker, ChromaDB, DuckDB, MCP servers
 └── evaluation/         # Harness, tasks, snapshots, fixtures
 ```
@@ -336,7 +336,7 @@ The sandbox resolves dependencies dynamically at runtime — no hardcoded packag
 
 **All iterations (0–5) are complete.** Current phase: **Iteration 6 — Evaluation & Analysis.**
 
-All core infrastructure is built and tested (814 unit tests pass). The MINT CLI (`uv run mint`) is implemented. A comprehensive code audit on 2026-04-06 resolved 33 internal contradictions. **All prior evaluation data is stale** — a full re-run (18 tasks × 4 conditions × 5 runs = 360 records) is required before thesis figures can be produced.
+All core infrastructure is built and tested (887 unit tests pass as of 2026-04-09). The MINT CLI (`uv run mint`) is implemented. A comprehensive code audit on 2026-04-06 resolved 33 internal contradictions. **All prior evaluation data is stale** — a full re-run (18 tasks × 4 conditions × 5 runs = 360 records) is required before thesis figures can be produced.
 
 ### What was built per iteration
 
@@ -395,7 +395,7 @@ All numbers pending confirmation after full re-run with post-audit code.
 
 - [x] Run code audits and contradiction checks (9 passes complete, diminishing returns)
 - [x] Baseline verification (~5 min):
-  - [x] `uv run pytest tests/unit/` — 814 passed (2026-04-07)
+  - [x] `uv run pytest tests/unit/` — 887 passed (2026-04-09)
   - [x] `docker build -t jit-sandbox sandbox/` — rebuilt successfully (2026-04-07)
 - [ ] Targeted pre-eval checks (~10 min):
   - [x] Prompt review — rewrote classifier (three-layer model), agent generator (real tools, filesystem isolation), decomposition (agent example, anti-split), skill generator (filesystem isolation), MCP tool generator (removed hardcoded pip mappings) (2026-04-07/08)

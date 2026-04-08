@@ -2,11 +2,23 @@
 
 **Source of truth:** `docs/proposal_vs_implementation.md`. This file is a focused extract of every 🔴 Drift and ❌ Missing item, organised by what blocks what. Cross-reference the main doc for full justifications.
 
+**Execution plan:** For the ordered sequence of work and phase-level validation gates, see `docs/pre_eval_execution_plan.md`. This file is the "what is on the list"; the execution plan is the "in what order and why".
+
 Legend:
 - 🔴 **Drift** — diverges from proposal, needs an explicit decision
 - ❌ **Missing** — proposed item not implemented at all
 - **DECIDED** — decision is made; just needs scheduling
 - **OPEN** — decision still needs to be made
+
+---
+
+## Status updates since the last pass
+
+- **C1 (compositional sequencing)** — ✅ **DECIDED**: ship the full compositional plan (`docs/compositional_synthesis_plan.md`, Stages 1+2+3) before the eval. Grounded in LangFuse trace evidence showing three of Pillar 1's five stages diverge from the proposal text. See the execution plan for sequencing.
+- **C2 (KL headline metric)** — ✅ DECIDED: Option C (point-mass primary, histogram sensitivity check). Bundled into item D3 with a small function rename.
+- **B1 (AGENT-type coverage adequacy)** — re-scoped: the armchair verdict ("thin") was unsupported by evidence; the correct B1 check is an empirical pilot run on the post-Stage-3 pipeline. Sequenced for after Stage 3 lands.
+- **CLI display bugs** (`-1 artifact(s)`, `0.0s Tier 3`, `0.0s Classifying gaps`, phantom `268.3s` on `generate_agent`) — ✅ **already fixed** in commit `781dc4e`. Regression-guarded by 12 unit tests in `tests/unit/test_cli_runner_gen_stage.py`. No further work needed.
+- **Phase 0 baseline verification** — ✅ **complete** (2026-04-09): 887 unit tests pass (73 more than CLAUDE.md's old 814 baseline), Docker sandbox rebuilds cleanly, working tree is clean of code changes. Phase 1 of `docs/pre_eval_execution_plan.md` is unblocked.
 
 ---
 
@@ -70,17 +82,18 @@ Legend:
 
 ## B. Pre-eval check (no code, ~30 min, $0)
 
-### B1. AGENT-type coverage adequacy (decision-table item #11)
+### B1. AGENT-type coverage adequacy (decision-table item #11) — **re-scoped**
 
-**Status:** OPEN — pre-eval check.
+**Status:** OPEN, but re-scoped. Original plan was a pre-eval armchair analysis ("could a SKILL plausibly solve each AGENT task?"). That analysis was attempted but the verdict was evidence-weak — it used loose interpretation of "plausibly", ignored AGENT's planning/file-state affordances, and was built on stale pre-audit numbers.
 
-**Question:** does the existing AGENT-type coverage (5 of 18 tasks, including T17) actually exercise the AGENT type's *distinguishing* features (multi-step planning, file-based context, iterative sandbox use)? Or are they linear workflows that a constrained-LLM SKILL backend could plausibly solve?
+**New procedure (post-Stage-3 empirical pilot):** under the compositional pipeline, B1 becomes "do any subtasks in the eval actually require AGENT, or could SKILL handle them?". This is an empirical measurement on the new architecture, not an analytical guess on the old one.
 
-**Procedure:**
-1. Open `tests/evaluation/tasks.py`, find the 5 AGENT-classified tasks
-2. For each, ask: "could a constrained-LLM SKILL backend (max 5 tool calls, no `write_todos`, no file context) plausibly solve this?"
-3. If yes for ≥3/5 → AGENT coverage is thin → flag as Ch 6 limitation + Ch 7 future work
-4. If no for ≥3/5 → AGENT tasks genuinely require multi-step planning → testbed is fine → AGENT classification claim holds
+1. After Stage 3 lands, run `uv run scripts/run_pilot.py --tasks T08,T10,T13,T16,T17 --condition full --n-runs 3` under the compositional pipeline
+2. For any subtask classified as AGENT, record its backend execution time and success
+3. (Optional) force-classify the same subtasks as SKILL via a classifier override and re-run
+4. Compare AGENT vs SKILL success rates and wall-time per subtask
+
+**Sequencing:** after Stage 3, before the full 360-record eval. Cheap (~$0.30-0.50, ~45 min).
 
 **Independent of:** ML-training question (item #8) which is already DECIDED kept.
 
@@ -88,9 +101,11 @@ Legend:
 
 ## C. Open decisions blocking pre-eval (resolve before code work begins)
 
-### C1. Per-gap classification + multi-artifact reuse (items #1, #9, row 4b)
+### C1. Per-gap classification + multi-artifact reuse (items #1, #9, row 4b) — **DECIDED**
 
-**Status:** 🔴 — ongoing discussion, three coupled rows.
+**Status:** ✅ DECIDED — ship the full compositional plan (`docs/compositional_synthesis_plan.md`, Stages 1+2+3) before the eval. See `docs/pre_eval_execution_plan.md` for phase sequencing.
+
+**Historical context for future readers (left in place for auditability):**
 
 **The coupling:**
 - **Item #1** — proposal asked for per-gap classification, implementation does per-task
@@ -225,10 +240,15 @@ No standalone work — this prose only makes sense after A1 ships.
 
 ## Quick reference — what to do, in order
 
-1. **Resolve C1** (compositional sequencing) — biggest open call, blocks the eval narrative. **Only remaining open decision.**
-2. **Run B1** (~30 min) — AGENT coverage adequacy check
-3. **Implement A1 + A2** (~120 lines + tests) — pre-eval bundles, single commit
-4. **Run the full 360-record eval** (~26h)
-5. **Run the longitudinal eval** (~3h)
-6. **Implement D1, D2, D3** (~7 hours total) — post-eval aggregations (D3 now bundles the KL function rename per C2)
-7. **Write E1, E2, E3** during chapter drafting
+**All open decisions are now resolved.** The ordered execution plan lives in `docs/pre_eval_execution_plan.md`. Summary:
+
+1. **Pre-eval bundles** — Compositional plan Stages 1+2+3 + A1 (Tier 1 hardening) + A2 (Tier 2 latency)
+2. **Post-Stage-3 empirical check** — B1 AGENT coverage pilot (~45 min)
+3. **Full 360-record eval** (~12h parallel)
+4. **Longitudinal eval** (~3h)
+5. **Post-eval aggregations** — D1 (mock audit, ~5h), D2 (Gini, ~1h), D3 (KL surfacing + function rename, ~1h)
+6. **Chapter drafting** — E1 (Ch 6 testbed prose), E2 (Ch 3 tech-stack), E3 (Ch 4 Tier 1 framing, superseded by A1)
+
+Total realistic pre-eval work: **10-14 working days**, dominated by Stage 3 of the compositional plan.
+
+See `docs/pre_eval_execution_plan.md` for phase definitions, validation gates, dependencies, and what to watch.

@@ -358,7 +358,7 @@ src/
     evaluation.py       # EvaluationRecord, BaselineCondition, FailureReason
   mcp_tools/            # Hand-built MCP tools (fibonacci reference)
 tests/
-  unit/                 # 814+ tests, no I/O
+  unit/                 # 887+ tests, no I/O
   integration/          # Docker, ChromaDB, DuckDB
   evaluation/           # Harness, tasks, snapshots, fixtures
     tasks.py            # T01-T18 definitions + validators
