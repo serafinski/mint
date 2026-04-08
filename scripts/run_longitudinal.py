@@ -44,10 +44,10 @@ import random  # noqa: E402
 logger = logging.getLogger("run_longitudinal")
 
 DATA_DIR = ROOT / "data"
-CHROMA_DIR = DATA_DIR / "chroma"
+CHROMA_DIR = DATA_DIR / "eval" / "chroma"
 MCP_TOOLS_DIR = ROOT / "src" / "mcp_tools"
-SKILLS_DIR = ROOT / ".deepagents" / "skills"
-DEFAULT_DB = str(DATA_DIR / "longitudinal.duckdb")
+SKILLS_DIR = DATA_DIR / "eval" / "skills"
+DEFAULT_DB = str(DATA_DIR / "eval" / "longitudinal.duckdb")
 
 
 def main() -> None:
@@ -94,6 +94,7 @@ def main() -> None:
     from tests.evaluation.tasks import ALL_TASKS
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "eval").mkdir(parents=True, exist_ok=True)
 
     # --- Build task sequence ---
     rng = random.Random(args.seed)

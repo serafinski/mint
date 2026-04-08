@@ -36,7 +36,7 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv(ROOT / ".env")
 
 DATA_DIR = ROOT / "data"
-CHROMA_DIR = DATA_DIR / "chroma"
+CHROMA_DIR = DATA_DIR / "cli" / "chroma"
 
 # ---------------------------------------------------------------------------
 # Logging — verbose flag controls level
@@ -545,12 +545,13 @@ def main() -> int:
     from src.registry.store import SkillRegistry, seed_registry
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "cli").mkdir(parents=True, exist_ok=True)
     registry = SkillRegistry(persist_directory=str(CHROMA_DIR))
     seed_registry(registry)
     loader = ToolLoader()
     # Persist metrics to disk so the optimizer can see invocation history
     # across CLI runs (same pattern as evaluation harness).
-    metrics_store = MetricsStore(db_path=str(DATA_DIR / "cli_metrics.duckdb"))
+    metrics_store = MetricsStore(db_path=str(DATA_DIR / "cli" / "metrics.duckdb"))
 
     # ------------------------------------------------------------------
     # --list

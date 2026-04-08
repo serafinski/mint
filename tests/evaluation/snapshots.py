@@ -3,7 +3,7 @@
 Strategy (per advisor doc):
 - Take ONE clean snapshot before evaluation begins.
 - Restore it at the START of every run (not per-task, not per-condition).
-- Scope: ChromaDB persist dir + src/mcp_tools/ + .deepagents/skills/
+- Scope: ChromaDB persist dir + src/mcp_tools/ + data/eval/skills/
 
 The snapshot ID is a deterministic hash of the clean state contents.
 All runs that start from the same clean slate share the same snap_id —

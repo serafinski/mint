@@ -11,7 +11,7 @@ Produces:
 Usage::
 
     uv run scripts/analyze_results.py
-    uv run scripts/analyze_results.py --db data/evaluation.duckdb
+    uv run scripts/analyze_results.py --db data/eval/metrics.duckdb
     uv run scripts/analyze_results.py --csv  # also export tables to data/analysis/
 """
 
@@ -510,7 +510,7 @@ def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Statistical analysis of evaluation results")
-    parser.add_argument("--db", default=str(ROOT / "data" / "evaluation.duckdb"))
+    parser.add_argument("--db", default=str(ROOT / "data" / "eval" / "metrics.duckdb"))
     parser.add_argument("--csv", action="store_true", help="Export tables to data/analysis/")
     args = parser.parse_args()
 

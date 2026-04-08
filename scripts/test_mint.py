@@ -310,8 +310,8 @@ def main() -> int:
 
         _load_env()
         data = _data_dir()
-        chroma_path = data / "cli_chroma"
-        metrics_path = data / "cli_metrics.duckdb"
+        chroma_path = data / "cli" / "chroma"
+        metrics_path = data / "cli" / "metrics.duckdb"
         last_run_path = data / "last_run.json"
         if chroma_path.exists():
             shutil.rmtree(chroma_path)

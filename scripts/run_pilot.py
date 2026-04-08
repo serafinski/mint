@@ -1,7 +1,7 @@
 """Pilot evaluation runner for Iteration 5.
 
 Runs T01 (seeded retrieval), T07 (moderate JIT), T05 (moderate JIT - data cleaning)
-through the full pipeline and records results to data/evaluation.duckdb.
+through the full pipeline and records results to data/eval/metrics.duckdb.
 
 Usage::
 
@@ -13,7 +13,7 @@ Optional flags::
     --all-tasks   run all 10 tasks instead of pilot subset
     --all-conditions  run all 4 baseline conditions in sequence
 
-Results are printed to stdout and persisted to data/evaluation.duckdb.
+Results are printed to stdout and persisted to data/eval/metrics.duckdb.
 """
 
 from __future__ import annotations
@@ -35,10 +35,10 @@ load_dotenv(ROOT / ".env")
 logger = logging.getLogger("run_pilot")
 
 DATA_DIR = ROOT / "data"
-CHROMA_DIR = DATA_DIR / "chroma"
+CHROMA_DIR = DATA_DIR / "eval" / "chroma"
 MCP_TOOLS_DIR = ROOT / "src" / "mcp_tools"
-SKILLS_DIR = ROOT / ".deepagents" / "skills"
-DB_PATH = str(DATA_DIR / "evaluation.duckdb")
+SKILLS_DIR = DATA_DIR / "eval" / "skills"
+DB_PATH = str(DATA_DIR / "eval" / "metrics.duckdb")
 
 ALL_CONDITIONS = ["full", "no_verification", "no_optimization", "static"]
 
@@ -85,6 +85,7 @@ def main() -> None:
     from tests.evaluation.tasks import ALL_TASKS, PILOT_TASKS, get_task
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "eval").mkdir(parents=True, exist_ok=True)
 
     # --- Set up logging (console + optional file) ---
     log_format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
