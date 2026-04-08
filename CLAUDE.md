@@ -365,7 +365,7 @@ All numbers pending confirmation after full re-run with post-audit code.
   - [x] `uv run pytest tests/unit/` — 814 passed (2026-04-07)
   - [x] `docker build -t jit-sandbox sandbox/` — rebuilt successfully (2026-04-07)
 - [ ] Targeted pre-eval checks (~10 min):
-  - [ ] Prompt review — read all prompts in `src/orchestrator/prompts/` for consistency with current implementation (catches LLM-told vs system-does mismatches)
+  - [x] Prompt review — rewrote classifier (three-layer model), agent generator (real tools, filesystem isolation), decomposition (agent example, anti-split), skill generator (filesystem isolation), MCP tool generator (removed hardcoded pip mappings) (2026-04-07/08)
   - [ ] Snapshot integrity — verify `tests/evaluation/snapshots/` has correct seeded capabilities (T01-T03 MCP_TOOL, T05/T09 SKILL)
   - [ ] Fixture file audit — verify all 32 fixtures in `tests/evaluation/tasks.py` exist and are valid
 - [ ] Purge stale data (no eval DuckDB exists, but stale runtime state remains):
@@ -386,8 +386,8 @@ All numbers pending confirmation after full re-run with post-audit code.
     - [ ] Check success rates aren't suspiciously uniform across conditions (= evaluation bias)
     - [ ] Compare `no_verification` vs `full` — if nearly identical, the gate isn't doing anything
     - [ ] Check token costs are being recorded (not all zeros)
-- [ ] Fix LangFuse tag propagation — sub-component traces (adversarial, decomposition, skill/agent execution) create their own `CallbackHandler()` without inheriting pipeline-level tags (task_id, condition, tier). Must propagate before full eval or traces will be uncorrelatable.
-- [ ] Replace `pip` with `uv` in sandbox Dockerfile — agent tasks spend ~180s on `pip install` per run (3 sandbox calls × ~60s each). Adding `uv` to the Dockerfile and using `uv pip install` in `sandbox_tool.py` would cut this to ~15s. Two files: `sandbox/Dockerfile`, `src/verification/sandbox_tool.py`.
+- [x] Fix LangFuse tag propagation — all sub-component traces (decomposition, adversarial, skill/agent execution, emit_langfuse_event) now inherit pipeline tags via get_config(), module-level metadata, or explicit params (2026-04-08)
+- [x] Replace `pip` with `uv` in sandbox Dockerfile — `uv pip install` cuts package installation from ~40s to ~6s per sandbox call (2026-04-08)
 - [ ] Full evaluation re-run (~$5, ~26h sequential / ~13h with 2 conditions parallel):
   - [ ] `rm -rf data/eval/` — purge pilot records before full run (pilot contamination)
   - [ ] `uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5` (18 × 4 × 5 = 360 records)
