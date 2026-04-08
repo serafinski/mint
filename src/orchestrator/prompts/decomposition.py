@@ -48,13 +48,20 @@ not atomized into individual tool calls.
    capabilities. File I/O, string manipulation, lowercasing, whitespace \
    trimming, and regex are implementation details that belong inside a \
    capability's code — not separate capabilities in their own right.
+9. When a task describes adaptive investigation, autonomous reasoning, or \
+   open-ended analysis (e.g. "investigate anomalies", "diagnose root cause", \
+   "detect fraud patterns"), the ENTIRE task is ONE agent capability. \
+   Do NOT split data reading from analysis — an agent reads its own data \
+   as part of the investigation. "Read YAML file" or "parse CSV" are NOT \
+   separate capabilities when they serve an adaptive investigation.
 
 ## Output
 
 Return your decomposition via the structured output format. Every subtask must
 have at least one required capability.
 
-### Example output (for "Fuzzy-join two CSV files on the company_name column"):
+### Example 1 (tool — single coherent operation):
+Task: "Fuzzy-join two CSV files on the company_name column"
 
 ```json
 {
@@ -66,6 +73,22 @@ have at least one required capability.
     }
   ],
   "reasoning": "The entire task is a single coherent operation. Normalisation (lowercase, trim, regex), similarity scoring, and joining are all implementation details of one fuzzy-join capability — not separate capabilities."
+}
+```
+
+### Example 2 (agent — adaptive investigation):
+Task: "Investigate a cascading system failure using metrics CSV and incident YAML"
+
+```json
+{
+  "subtasks": [
+    {
+      "description": "Investigate the cascading system failure: read the incident report and metrics data, identify which metric changed first (root cause), and determine the cascade chain by examining temporal ordering of anomalies across all metrics",
+      "required_capabilities": ["root-cause-cascade-investigation"],
+      "depends_on": []
+    }
+  ],
+  "reasoning": "This is an adaptive investigation — the analysis path depends on what the data reveals. Reading the YAML and CSV files is part of the investigation, not a separate capability. The agent must examine data, form hypotheses, test them, and revise. Splitting this into 'read YAML' + 'analyze metrics' + 'determine cascade' would atomize an inherently adaptive task into rigid tool calls."
 }
 ```
 """

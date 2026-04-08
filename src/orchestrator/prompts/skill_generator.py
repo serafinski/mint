@@ -79,6 +79,20 @@ Generate a SKILL.md file for the capability described above. The skill should:
 - Be specific to the described capability, not generic
 - Follow the exact format rules above
 
+## Important: Filesystem Isolation
+
+The agent executing this skill has two SEPARATE filesystems:
+- **sandbox_execute** runs Python in an isolated Docker container. Data must \
+be embedded directly in the Python code string (e.g., write CSV content to \
+/tmp/ files using Python's open()/write() INSIDE the code string).
+- **write_file** writes to the agent's in-memory workspace (for notes and \
+intermediate reasoning). Files written with write_file are NOT accessible \
+inside sandbox_execute.
+
+When writing instructions that involve data processing, tell the agent to \
+embed input data from the user message directly into the sandbox_execute \
+code. Do NOT instruct the agent to use write_file to pass data to the sandbox.
+
 Output ONLY the SKILL.md content. Do not wrap it in markdown code fences. \
 Start directly with `---` on the first line.
 """

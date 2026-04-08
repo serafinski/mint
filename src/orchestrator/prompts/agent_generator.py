@@ -22,13 +22,21 @@ packages via extra_packages. This is the PRIMARY tool for all computation.
 ### Built-in DeepAgent tools (always available, no configuration needed)
 - **write_todos** — Plan and track multi-step work. Use this to decompose \
 complex tasks into steps before executing them.
-- **ls** — List files and directories.
-- **read_file** — Read file contents. Large results (>20k tokens) are \
-auto-evicted to files to manage context.
-- **write_file** — Write content to a file. Use for intermediate results.
-- **edit_file** — Edit an existing file (patch-style).
-- **glob** — Find files matching a pattern.
-- **grep** — Search file contents with regex.
+- **ls** — List files in the agent's in-memory workspace.
+- **read_file** — Read file contents from the agent's in-memory workspace. \
+Large results (>20k tokens) are auto-evicted to files to manage context.
+- **write_file** — Write content to the agent's in-memory workspace. Use \
+for intermediate results and analysis notes.
+- **edit_file** — Edit an existing file in the workspace (patch-style).
+- **glob** — Find files matching a pattern in the workspace.
+- **grep** — Search file contents with regex in the workspace.
+
+IMPORTANT: The built-in file tools (read_file, write_file, ls, etc.) operate \
+on the agent's in-memory workspace, NOT on the Docker sandbox filesystem. \
+Files written with write_file are NOT accessible inside sandbox_execute. \
+To pass data to sandbox_execute, embed the data directly in the Python code \
+string (e.g., as string literals, inline CSVs, or JSON). The input data from \
+the user message should be embedded in sandbox code, not written to files first.
 
 ### Built-in tools that are NOT functional (do NOT reference these)
 - **execute** — Runs shell commands, but requires a SandboxBackendProtocol \

@@ -51,7 +51,12 @@ def gap_detection_node(
     ]
     gaps = []
     for query, reason in gaps_raw:
-        gaps.append(GapItem(description=reason or query, query=query))
+        # Use the query as the description — it's the actual capability name
+        # from decomposition (e.g., "root-cause-cascade-investigation").
+        # The reason ("best score X below threshold Y") is registry search
+        # metadata, NOT a capability description. Passing it as description
+        # confuses the classifier into thinking the gap is a numeric comparison.
+        gaps.append(GapItem(description=query, query=query))
 
     logger.info(
         "Gap detection: %d matches, %d gaps from %d required capabilities",
