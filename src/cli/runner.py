@@ -394,6 +394,65 @@ def _create_infra(*, seed: bool = True) -> tuple[Any, Any, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Generator stage diff — progress display helper
+# ---------------------------------------------------------------------------
+
+
+_GEN_STAGE_TYPE_LABELS: dict[str, str] = {
+    "mcp_tool": "Generating MCP tool",
+    "skill": "Generating skill",
+    "agent": "Generating agent",
+}
+
+
+def _compute_gen_stage_diff(
+    artifacts: list[Any],
+    prev_artifact_count: int,
+) -> tuple[int, int, str | None, str | None]:
+    """Compute the progress-line fields for a generator stage.
+
+    Given the current ``generated_artifacts`` list and the artifact count at
+    the end of the previous printed generator stage, returns:
+
+    * ``new_count`` — how many fresh artifacts this stage produced
+    * ``new_prev`` — the updated baseline to carry into the next stage
+      (always ``len(artifacts)``, even on resets/retries — see below)
+    * ``detail`` — the text to append to the stage line, or ``None`` to
+      skip printing this stage entirely
+    * ``label_override`` — the "Generating skill/agent/MCP tool" label to
+      use, or ``None`` to fall back to the node-name label
+
+    **Retry semantics**: when ``verification_node`` fails all artifacts, it
+    resets ``generated_artifacts`` to the passing subset (often empty) and
+    routes back to the first generator. On the next pass, ``cur`` can be
+    less than ``prev_artifact_count``. The old logic only updated the
+    baseline when ``new != 0``, so a drop from 1 → 0 between stages produced
+    a negative ``new = -1`` that got printed as ``-1 artifact(s)``. The fix
+    refreshes the baseline unconditionally and skips the stage when
+    ``new <= 0``.
+
+    This is a pure function so it can be unit-tested without running the CLI.
+    """
+    cur = len(artifacts)
+    new = cur - prev_artifact_count
+    new_prev = cur
+    if new <= 0:
+        return new, new_prev, None, None
+
+    new_arts = artifacts[-new:]
+    types = {
+        str(a.capability_type).split(".")[-1].lower()
+        for a in new_arts
+        if hasattr(a, "capability_type")
+    }
+    label_override = None
+    if len(types) == 1:
+        label_override = _GEN_STAGE_TYPE_LABELS.get(next(iter(types)))
+    detail = f"{new} artifact(s)"
+    return new, new_prev, detail, label_override
+
+
+# ---------------------------------------------------------------------------
 # Artifact selection
 # ---------------------------------------------------------------------------
 
@@ -1074,30 +1133,18 @@ def execute_task(
                 "generate_skill",
                 "generate_agent",
             }
-            _type_labels = {
-                "mcp_tool": "Generating MCP tool",
-                "skill": "Generating skill",
-                "agent": "Generating agent",
-            }
             gen_label_override: str | None = None
             if node_name in _gen_nodes:
                 arts = accumulated.get("generated_artifacts") or []
-                cur = len(arts)
-                new = cur - prev_artifact_count
-                if new == 0:
+                new, prev_artifact_count, gen_detail, gen_label_override = (
+                    _compute_gen_stage_diff(arts, prev_artifact_count)
+                )
+                if gen_detail is None:
+                    # No new artifacts this stage — skip printing entirely.
+                    # Covers both `new == 0` and `new < 0` (retry resets).
                     printed_nodes.add(node_name)
                     return False
-                new_arts = arts[prev_artifact_count:]
-                prev_artifact_count = cur
-                # Use the actual type of the new artifact(s)
-                types = {
-                    str(a.capability_type).split(".")[-1].lower()
-                    for a in new_arts
-                    if hasattr(a, "capability_type")
-                }
-                if len(types) == 1:
-                    gen_label_override = _type_labels.get(next(iter(types)))
-                detail = f"{new} artifact(s)"
+                detail = gen_detail
 
             label = gen_label_override or _STAGE_LABEL.get(node_name, node_name)
             detail_str = f" — {detail}" if detail else ""
@@ -1126,19 +1173,31 @@ def execute_task(
                     node_name = list(event.keys())[0]
                     update = event[node_name]
 
-                    # Merge this node's update into accumulated state
-                    if isinstance(update, dict):
-                        accumulated.update(update)
-
-                    # Mark previous node as done
+                    # Print the PREVIOUS active_node BEFORE merging this
+                    # event's update. This keeps the diff attribution
+                    # accurate: the previous stage's artifact delta is
+                    # computed against the state *it* produced, not against
+                    # a state that already includes the current event's
+                    # changes. Applying the update first would cause e.g.
+                    # `generate_mcp_tool` to be "printed" with the skill
+                    # artifact that `generate_skill` (the current event)
+                    # just added, mislabeling the stage and misattributing
+                    # the diff.
                     if active_node and active_node != node_name:
                         completed.add(active_node)
                         timings[active_node] = time.monotonic() - stage_start
-                        printed = _print_completed(active_node)
-                        # Only reset timer if the stage was visible;
-                        # skipped stages fold their time into the next
-                        if printed:
-                            stage_start = time.monotonic()
+                        _print_completed(active_node)
+                        # Always reset stage_start so each node gets its
+                        # own timing window. Skipped stages lose ~<1s of
+                        # routing overhead — acceptable to fix the prior
+                        # "skipped folds into next" misattribution that
+                        # made verification look like 0.0s while its time
+                        # was attributed to the buggy `-1` generator line.
+                        stage_start = time.monotonic()
+
+                    # NOW merge this event's update into accumulated state
+                    if isinstance(update, dict):
+                        accumulated.update(update)
 
                     active_node = node_name
                     detail = _extract_stage_detail(node_name, update)
