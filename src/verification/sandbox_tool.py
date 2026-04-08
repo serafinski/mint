@@ -130,7 +130,7 @@ def sandbox_execute(
 
     Returns ``{"stdout": str, "stderr": str, "exit_code": int, "success": bool}``.
 
-    When *extra_packages* is provided, a ``pip install`` step runs first
+    When *extra_packages* is provided, a ``uv pip install`` step runs first
     (with network access), then the script runs with ``--network none``.
 
     Raises nothing — all failures are captured in the return dict.
@@ -184,7 +184,7 @@ def _sandbox_execute_with_install(
     """Install extra packages (with network), then run code (without network).
 
     Uses a two-phase approach:
-    1. ``docker run`` with network to pip install packages into a committed layer
+    1. ``docker run`` with network to ``uv pip install`` packages into a committed layer
     2. ``docker run --network none`` to execute the script against that layer
 
     The ephemeral image is cleaned up after execution.
@@ -206,7 +206,7 @@ def _sandbox_execute_with_install(
     pip_args = ", ".join(repr(p) for p in packages)
     install_script = (
         "import subprocess; "
-        f"subprocess.check_call(['pip', 'install', '--no-cache-dir', {pip_args}])"
+        f"subprocess.check_call(['uv', 'pip', 'install', '--system', '--no-cache', {pip_args}])"
     )
     try:
         install_proc = subprocess.run(
@@ -229,7 +229,7 @@ def _sandbox_execute_with_install(
             subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
             return {
                 "stdout": "",
-                "stderr": f"pip install failed: {install_proc.stderr}",
+                "stderr": f"uv pip install failed: {install_proc.stderr}",
                 "exit_code": install_proc.returncode,
                 "success": False,
             }
@@ -246,7 +246,7 @@ def _sandbox_execute_with_install(
     except subprocess.TimeoutExpired:
         subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
         return {
-            "stdout": "", "stderr": "Timeout during pip install",
+            "stdout": "", "stderr": "Timeout during uv pip install",
             "exit_code": -1, "success": False,
         }
     except Exception as exc:
