@@ -188,11 +188,11 @@ the code using Python's open()/write() before processing.
 - Print your final result as JSON to stdout.
 - Declare any non-stdlib packages via extra_packages (e.g., extra_packages=["pandas"]).
 - Use the pip install name, not the Python import name (e.g., "pyyaml" not "yaml").
-- You have at most 3 tool calls. Do not plan — just execute the prescribed steps.
+- You have at most 5 tool calls. Do not plan — just execute the prescribed steps.
 """
 
 # Maximum sandbox_execute calls in the skill execution loop.
-_SKILL_MAX_TOOL_CALLS = 3
+_SKILL_MAX_TOOL_CALLS = 5
 
 
 def execute_skill_artifact(
