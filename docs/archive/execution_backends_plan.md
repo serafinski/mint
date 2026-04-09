@@ -1,9 +1,28 @@
 # Execution Backends: Three Distinct Runtime Paths
 
+> **🗄️ ARCHIVED 2026-04-10 — IMPLEMENTED 2026-04-08, canonical reference is now `CLAUDE.md` "Three Distinct Execution Backends" section.**
+>
+> This plan proposed differentiating SKILL and AGENT execution so that misclassification has measurable runtime consequences (the proposal's claim that "a skill that should have been an agent will lack the autonomy to handle state" was previously false in our implementation because both ran as identical DeepAgents). The plan was fully implemented in commit on 2026-04-08 and is now the architecture documented in `CLAUDE.md` and `tests/evaluation/execution.py`.
+>
+> **What was implemented** (live in the codebase):
+> - **MCP_TOOL backend**: `sandbox_execute()` — Docker, no LLM at runtime, deterministic code execution. 0 LLM calls per invocation.
+> - **SKILL backend**: Constrained LLM with `init_chat_model().bind_tools([sandbox_execute])`, hard-capped at 3 tool calls. No `write_todos`, no planning loop, no file-based context management. The LLM reads SKILL.md instructions, generates code, executes via `sandbox_execute`, returns the result. 1-3 LLM calls per invocation.
+> - **AGENT backend**: Full DeepAgent via `create_deep_agent(model, tools=[sandbox_execute], skills=skills_param, ...)` with progressive skill disclosure via the `skills=` parameter. The agent discovers skills via metadata-first loading and gets `write_todos` planning, file-based context management, and adaptive reasoning. 5-15+ LLM calls per invocation.
+>
+> All three backends are verified via the eval pilot and CLI smoke tests. The classification decision now has genuine runtime consequences — misclassifying SKILL as MCP_TOOL fails because the LLM-driven SKILL backend isn't invoked; misclassifying SKILL as AGENT works but is more expensive than necessary.
+>
+> **Canonical reference**: `CLAUDE.md` § "Three Distinct Execution Backends" (the table summarising backend / LLM calls / character per type).
+>
+> **Implementation reference**: `tests/evaluation/execution.py` (`execute_skill_artifact`, `execute_agent_artifact`, `execute_mcp_tool_in_chain`).
+>
+> **Original document below preserved for historical context.** The architectural rationale and the discussion of "why constrained LLM + tool calling, not pure LLM → code → sandbox" is still useful reading for anyone modifying the SKILL backend.
+
+---
+
 **Date:** 2026-04-07
 **Branch:** `iter/6-execution-backends`
 **Parent:** `iter/6-evaluation`
-**Status:** IMPLEMENTED (2026-04-08) — all backends verified via eval pilot and CLI smoke tests
+**Status:** ARCHIVED 2026-04-10 — IMPLEMENTED 2026-04-08, all backends verified via eval pilot and CLI smoke tests
 
 ---
 

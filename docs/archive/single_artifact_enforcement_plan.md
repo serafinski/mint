@@ -1,8 +1,28 @@
 # Task-Level Classification: One Classification Per Task
 
+> **🗄️ ARCHIVED 2026-04-10 — SUPERSEDED by `docs/compositional_synthesis_plan.md` and Phase 2 of `docs/pre_eval_execution_plan.md` (commit `cab813a`).**
+>
+> This plan proposed collapsing per-gap classification to a single per-task classification ("one classification per task, one artifact per task") to align with the testbed's task-level ground truth. After implementation it was reverted in Phase 2 because:
+>
+> 1. The proposal explicitly describes per-gap classification (Pillar 1 §3): *"Each gap is classified to determine what kind of artifact should be generated"*. The deviation here was openly acknowledged as a deviation, but the eventual decision was to follow the proposal text rather than the testbed-fit shortcut.
+> 2. Empirical finding on 2026-04-08 (T14 reproducer): the single-artifact pipeline produced **decorative registry matches** — capabilities matched and recorded as "invocations" but never actually executed. The metrics store had to write fake `(token_cost=0, latency_ms=0)` records to prevent matched capabilities from being pruned as idle, which corrupted the Pillar 1 reuse narrative.
+> 3. Per-gap classification + multi-artifact generation + compositional execution (the path Phase 2 took, building on `docs/compositional_synthesis_plan.md`) restores both proposal-fidelity AND honest reuse metrics.
+>
+> **The Phase 2 commit (`cab813a`) reverses everything this plan proposed**:
+> - Per-gap classifier (`classify_gap` iterating `state.gaps`) instead of single task-level classification
+> - N enumerated `GapItem`s instead of one placeholder gap
+> - Multi-artifact generation per task instead of single-artifact
+> - Honest invocation records via Phase 1's removal of fake writes (commit `13b1ecd`)
+>
+> **Why kept (not deleted)**: Chapter 3 of the thesis will reference this plan for the methodology story — *"an earlier per-gap classifier was implemented but found to be misaligned with the testbed's measurement, then reverted to per-gap when the deviation's downstream cost (decorative matches, broken reuse metric) became visible"*. This is a real iterative-design narrative worth preserving as part of the implementation history.
+>
+> **Original document below preserved for historical context. The "Status: Planned" line is now wrong — this plan was implemented, ran for ~1 week, then reverted.**
+
+---
+
 **Date:** 2026-04-08
 **Branch:** `iter/6-execution-backends` (or new branch)
-**Status:** Planned (with critique-driven fixes appended)
+**Status:** ARCHIVED 2026-04-10 — implemented circa 2026-04-08, reverted in Phase 2 (`cab813a`) on 2026-04-09/10. (Originally: Planned with critique-driven fixes appended)
 
 ---
 

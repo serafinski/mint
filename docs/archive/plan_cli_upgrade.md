@@ -1,9 +1,28 @@
 # Implementation Plan: MINT CLI with Typer + Rich
 
+> **🗄️ ARCHIVED 2026-04-10 — superseded by the implementation and `pre_eval_execution_plan.md` Phase 7 future-work items.**
+>
+> **What was implemented** (live in `src/cli/` as of commits up to `cab813a`):
+> - Steps 1-5: subcommand scaffolding, Rich output, file metadata augmentation, dry-run plan, list/inspect/history (`src/cli/app.py`)
+> - Step 7: `mint retry` with `--hint`, `--edit`, `--skip-verification` (`src/cli/runner.py:_save_last_run`, `src/cli/app.py:retry`)
+> - Step 10: output quality detection (`src/cli/display.py:_check_output_quality`)
+> - Step 11: `--output-dir` flag (`src/cli/runner.py:_save_output`)
+>
+> **What was NOT implemented and moved to `pre_eval_execution_plan.md` Phase 7 future-work**:
+> - Step 6 (`mint export` / `mint import`) → see **F5** in `pre_eval_execution_plan.md`. Out of scope for the thesis deliverable; valuable for post-thesis CLI users.
+> - Step 9 (`mint run --improve`) → see **F6** in `pre_eval_execution_plan.md`. Out of scope for the thesis evaluation (would alter controlled testbed prompts) and for the thesis deliverable in general (proposal's context-engineering claims are about inter-agent, not user-input).
+>
+> **What was NOT implemented and dropped entirely**:
+> - Step 8 (`--force-regenerate`) — the existing two-step workaround `mint disable <bad-cap-name> && mint retry --hint "..."` is documented in this plan and is good enough. The one-flag version isn't worth a CLI feature for the friction it removes.
+>
+> **Original document below preserved for historical context.** The "(planned)" labels on Steps 6-11 reflect their state at March 30, 2026 — see the matrix above for what subsequently happened to each.
+
+---
+
 **MINT — Model-driven Instantiation of Novel Tools**
 
 **Date:** 2026-03-30
-**Status:** COMPLETED (core CLI implemented; export/import/--improve descoped)
+**Status:** ARCHIVED 2026-04-10 (originally: COMPLETED 2026-04-?? — core CLI implemented; export/import/--improve descoped)
 **Current:** `scripts/run_task.py` — 838 lines, argparse, plain `print()` output
 **Target:** Polished CLI (`mint`) with typer (subcommands) + rich (tables, panels, progress)
 **Future:** Full project rebrand from JustInTimeMAS to MINT (repo name, thesis title, imports) — separate effort

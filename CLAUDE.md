@@ -122,7 +122,7 @@ scripts/                # Evaluation runners + integration tests
 └── test_mint.py            # MINT CLI smoke test (all types + formats)
 
 tests/
-├── unit/               # 938+ tests, no I/O, no external services
+├── unit/               # 939+ tests, no I/O, no external services
 ├── integration/        # Docker, ChromaDB, DuckDB, MCP servers
 └── evaluation/         # Harness, tasks, snapshots, fixtures
 ```
@@ -336,7 +336,9 @@ The sandbox resolves dependencies dynamically at runtime — no hardcoded packag
 
 **All iterations (0–5) are complete.** Current phase: **Iteration 6 — Evaluation & Analysis.**
 
-All core infrastructure is built and tested (938 unit tests pass as of 2026-04-09, post-Phase-1). The MINT CLI (`uv run mint`) is implemented. A comprehensive code audit on 2026-04-06 resolved 33 internal contradictions. **All prior evaluation data is stale** — a full re-run (18 tasks × 4 conditions × 5 runs = 360 records) is required before thesis figures can be produced. **Phase 1 of `docs/pre_eval_execution_plan.md` is complete** (commits `13b1ecd` honest metrics + Tier 1/2 hardening, `8ab68b0` runner verification sidecar). Phases 2 (per-gap restoration) and 3 (compositional executor) remain.
+All core infrastructure is built and tested (939 unit tests pass as of 2026-04-10, post-Phase-2). The MINT CLI (`uv run mint`) is implemented. A comprehensive code audit on 2026-04-06 resolved 33 internal contradictions. **All prior evaluation data is stale** — a full re-run (18 tasks × 4 conditions × 5 runs = 360 records) is required before thesis figures can be produced. **Phases 1 and 2 of `docs/pre_eval_execution_plan.md` are complete** (commits `13b1ecd` honest metrics + Tier 1/2 hardening, `8ab68b0` runner verification sidecar, `cab813a` per-gap restoration with packaging-signal classifier and CLI multi-cap support). **Phase 3 (compositional executor)** and **Phase 3.5 (DeepAgents subagents + context-engineering Bucket A + decomposer rule 10 fix)** remain.
+
+**Phase 2 architectural finding (load-bearing for Phase 3 planning)**: Phase 2 introduced "one step of a workflow" framing in the generator prompts, which is incoherent with the Phase 2 single-artifact priority-sort executor for multi-step MCP_TOOL chains. The generator produces "step 3 of 5" expecting upstream state; the executor runs it standalone with raw input files; the MCP_TOOL backend errors. SKILL and AGENT backends are flexible enough to absorb this incoherence; MCP_TOOL chain steps fail. Test_mint exposed this on T11 (hard fail: `region_revenue_aggregator` missing `joined_records` argument) and T09 (silent fail: `anomalies_output_dict_formatter` returning `{"summary": "Failed to parse..."}`). **The Phase 3 fallback option from the original plan ("ship the eval on Phase 2 alone") is therefore NOT VIABLE** — see `docs/pre_eval_execution_plan.md` Phase 3 for the three documented alternatives if HP4 doesn't solve. The fix is the Phase 3 compositional executor running all N artifacts in dependency order via the workspace.
 
 ### What was built per iteration
 
@@ -346,118 +348,31 @@ All core infrastructure is built and tested (938 unit tests pass as of 2026-04-0
 - **Iter 3**: Three-tier verification gate, `__name__ = "not_main"` sandbox fix, 18 bypass findings
 - **Iter 4**: Granularity optimizer (utility function, prune/split/merge, optimization loop, simulation)
 - **Iter 5**: Performance fixes (Fix 0–7), SKILL/AGENT execution, evaluation harness, MINT CLI
+- **Iter 6 — Phase 1** (2026-04-09): Honest metrics (removed fake invocation records from `gap_detection.py`, added 7 compositional fields to `EvaluationRecord`), Tier 1/2 hardening (mock-import / random-seed / lorem-ipsum AST checks, layered SKILL/AGENT code-fence scanner, three Tier 0 prose hard-fails), Tier 2 latency variance check, CLI verification report sidecar
+- **Iter 6 — Phase 2** (2026-04-09/10): Per-gap restoration (gap_detection produces N gaps, classifier iterates per-gap), packaging-signal classifier with parent-task-first cascade and Anthropic-aligned broader skill definition, decomposer anti-split revert, generator prompts framed as "one step of a workflow", testbed vocabulary cleanup across all 5 prompt files, CLI multi-capability support (5 bug fixes including verification sidecar `getattr` fix, multi-cap display, error capture, per-run manifest, generator anti-catch-own-error discipline)
 
 ### Evaluation testbed
 
 18 tasks (T01–T18), 4 baseline conditions (static, no_verification, no_optimization, full), 5 runs each. Balanced: 8 MCP_TOOL (3 retrieval + 5 synthesis), 5 SKILL (2 retrieval + 3 synthesis), 5 AGENT. 5 tasks have seeded capabilities (T01-T03 as MCP_TOOL, T05/T09 as SKILL). 32 fixture files across 7 formats (CSV, JSON, TXT, YAML, XML, Excel, TSV). See `tests/evaluation/tasks.py` for definitions and `docs/system_overview.md` for full evaluation design.
 
-### Key findings (pre-audit, directional only)
-
-- JIT synthesis ~73% vs static ~14% on synthesis tasks (p<0.001)
-- Verification hurts success by ~9pp due to false positives, adds ~2.3x tokens
-- Optimizer cold-start in snapshot-reset evaluation, but converges to 100% in longitudinal test (40 tasks)
-- Type selection critical for complex tasks (T17: AGENT 100% vs SKILL 9%)
-
-All numbers pending confirmation after full re-run with post-audit code.
-
-### Finding: Task-specification ambiguity as a silent failure mode (T16, 2026-04-08)
-
-**Discovered during the 3-task pilot spot-check** (`T01,T04,T16 --condition full --n-runs 1`) after the task-level classifier rewrite. The generated T16 agent produced `output_in_range=True` but the actual cascade chain was partially wrong — positions 1 and 2 swapped:
-
-- **Produced**: `[db_connections, request_queue_depth, query_latency_ms, error_rate]`
-- **Expected**: `[db_connections, query_latency_ms, request_queue_depth, error_rate]`
-
-**Root cause**: the T16 task prompt in `tests/evaluation/tasks.py:785-787` says *"Identify which metric **changed FIRST** (the root cause) ... the one that **deviated from normal** earliest"*. The words "changed" and "deviated" are direction-agnostic. The LLM reasonably interpreted this as symmetric deviation (any large change, up or down) and wrote a dual-criterion detector (z-score OR |relative change|). The relative-change criterion caught transient noise **dips** in `query_latency_ms` and `request_queue_depth` at onset, firing before the real upward spikes, which corrupted the cascade ordering.
-
-**The ground truth in `expected_values.json` was generated with a single-directional upward z-score method** (verified by replaying both methods against the raw CSV — z-score alone produces the ground-truth order, dual-criterion produces the agent's order). This methodology was never surfaced in the task prompt, so the agent had to guess it.
-
-**Why this is a thesis-relevant finding, not a bug**:
-1. Nothing in `src/` is wrong — our pipeline classified, generated, verified, and executed correctly
-2. The generated code is internally consistent and locally plausible
-3. Tier 1-3 verification cannot catch it — none of the tiers have access to ground truth; they only check internal consistency and adversarial robustness
-4. The validator `_validate_t16` deliberately does not check cascade ordering (only `root_cause_metric` exact match + `len(chain) >= 2`), so the failure is invisible in `output_in_range`
-5. This is a distinct failure mode from "compile error" or "crash" — it's **"correct by policy, wrong by ground truth"**, which is the most dangerous class of LLM failure because it looks like success
-
-**Validator leniency vs exact match**: the current evaluation reports `output_in_range` as the primary success metric. Adding a secondary `exact_match` column (dict-equal to `expected_values.json`) would expose this class of failure in Chapter 6. For the 3-task pilot: validator pass = 3/3, strict exact match = 2/3 (T16 would drop).
-
-**To verify reproducibility** (critical — is this convergent or stochastic?):
-- Run `uv run scripts/run_pilot.py --tasks T16 --condition full --n-runs 5` before the full eval
-- Diff the 5 generated SKILL.md files — do they all use the dual-criterion heuristic?
-- Diff the 5 `cascade_chain` outputs — all wrong, or some correct?
-- **Convergent failure** (N/5 wrong) → strong thesis finding: prompt ambiguity systematically defeats the system
-- **Stochastic failure** (mixed) → reliability story: verification gate cannot provide correctness guarantees on ambiguously-specified tasks
-
-**Optional follow-up ablation**: disambiguate the T16 prompt to *"identify which metric **spiked upward** first"* and re-run. If disambiguation flips the result to correct, that's a clean causal demonstration of the finding for Chapter 6.
-
-**Important**: do NOT modify the T16 prompt before the full 360-record evaluation run. The ambiguity is a feature (a finding worth reporting), not a bug to fix. The disambiguation experiment belongs in a follow-up ablation after the main numbers are in.
-
 ### What remains
 
-- [x] Run code audits and contradiction checks (9 passes complete, diminishing returns)
-- [x] Baseline verification (~5 min):
-  - [x] `uv run pytest tests/unit/` — 938 passed (2026-04-09, post-Phase-1; baseline was 887)
-  - [x] `docker build -t jit-sandbox sandbox/` — rebuilt successfully (2026-04-07)
-- [x] **Phase 1 — honest metrics + Tier 1/2 hardening** (2026-04-09, commits `13b1ecd` + `8ab68b0`):
-  - [x] Track 1a: removed fake `InvocationRecord` writes from `gap_detection.py`; added 7 compositional fields to `EvaluationRecord` (`chain_length`, `chain_success`, `matched_and_executed_count`, `generated_artifact_count`, `capability_types`, `failed_step_index`, `failed_step_name`); added `CapabilityReference` and `ChainResult` schemas; DuckDB schema migration via `_MIGRATIONS` ALTER TABLE
-  - [x] Track 1b: new Tier 1 AST checks (`_check_mock_imports`, `_check_random_seed`, `_check_lorem_ipsum`); layered SKILL/AGENT code-fence scanner in `gate.py` (`_extract_python_fences` + recursive scan as MCP_TOOL on each fence — preserves T04 prose-scoping); three Tier 0 prose hard-fails in `tools/quick_validate.py` (`lorem ipsum`, `TODO: implement`, `# placeholder return`)
-  - [x] Track 1c: renamed existing 5s wall-time check `category="latency"` → `"timeout"` (constant `LATENCY_THRESHOLD_S` → `TIMEOUT_THRESHOLD_S`); added new variance-based `_test_latency` (mean<1ms AND cv<0.10, both required)
-  - [x] Verified: 938 unit tests pass; full `test_mint.py` 7/7 across all 3 capability types; `run_pilot.py T14 --condition full --n-runs 1` writes correct row to `data/eval/metrics.duckdb` with all 7 new compositional columns populated and round-trippable via `_row_to_record`. Stage 1 fake-write purge verified directly via SQL: zero rows in `invocations` match `latency_ms=0`. Zero false positives from new checks across 8 real generations; one true positive caught (T11 placeholder inside SKILL Python fence) with retry loop succeeding cleanly.
-  - [x] CLI runner sidecar (`8ab68b0`): `_save_output` now writes `<cap_name>_<ts>.verification.json` next to the result JSON when `final_state.verification_results` is present, so the CLI's "N minor verification note(s)" findings are inspectable without LangFuse
-- [ ] Targeted pre-eval checks (~10 min):
-  - [x] Prompt review — rewrote classifier (three-layer model), agent generator (real tools, filesystem isolation), decomposition (agent example, anti-split), skill generator (filesystem isolation), MCP tool generator (removed hardcoded pip mappings) (2026-04-07/08)
-  - [ ] Snapshot integrity — verify `tests/evaluation/snapshots/` has correct seeded capabilities (T01-T03 MCP_TOOL, T05/T09 SKILL)
-  - [ ] Fixture file audit — verify all 32 fixtures in `tests/evaluation/tasks.py` exist and are valid
-- [ ] Purge stale data (no eval DuckDB exists, but stale runtime state remains):
-  - [x] Old data paths cleaned (2026-04-08) — migrated to `data/eval/` and `data/cli/` subdirectories
-- [ ] Pre-eval integration sanity checks (~$0.20, ~15 min):
-  - [ ] `uv run scripts/test_pipeline.py` — full 9-node pipeline (~$0.15, ~5 min)
-  - [ ] `uv run scripts/test_verification.py` — three-tier gate with Docker/LLM (~$0.02, ~3 min)
-  - [ ] `uv run scripts/test_mint.py --quick` — CLI format detection ($0, ~30s)
-  - [ ] `uv run scripts/test_auto_optimizer.py` — prune/split/merge (~$0.01, ~1 min)
-  - [ ] `uv run scripts/test_split_merge.py` — optimizer operations (~$0.01, ~2 min)
-- [ ] Pre-eval pilot spot-check (~$0.50, ~30 min):
-  - [ ] `uv run scripts/run_pilot.py --tasks T04,T07,T14 --all-conditions --n-runs 1` — 12 runs, check outputs
-  - [ ] `uv run scripts/test_mint.py` — full CLI smoke test, all 3 types + 6 formats (~$0.20, ~15 min)
-  - [ ] Spot-check any failures in LangFuse — distinguish code bugs from LLM generation issues
-  - [ ] Pilot validation checklist (after 12 runs complete):
-    - [ ] Verify exactly 12 records written to `data/eval/metrics.duckdb` (not fewer = silent data loss)
-    - [ ] Open 2-3 LangFuse traces, skim actual LLM inputs/outputs — catch "works but for wrong reason"
-    - [ ] Check success rates aren't suspiciously uniform across conditions (= evaluation bias)
-    - [ ] Compare `no_verification` vs `full` — if nearly identical, the gate isn't doing anything
-    - [ ] Check token costs are being recorded (not all zeros)
-- [ ] T16 ambiguity reproducibility check (~$0.15, ~15 min) — see "Finding: Task-specification ambiguity as a silent failure mode" above:
-  - [ ] `uv run scripts/run_pilot.py --tasks T16 --condition full --n-runs 5` — 5 runs of T16
-  - [ ] Diff the 5 generated SKILL.md files in `data/eval/skills/` — heuristic stability check
-  - [ ] Compare the 5 `cascade_chain` outputs against ground truth `[db_connections, query_latency_ms, request_queue_depth, error_rate]` — count exact matches
-  - [ ] Record convergent-vs-stochastic conclusion in the finding section
-  - [ ] **Do NOT modify the T16 task prompt before the full 360-record eval** — the ambiguity is a feature (a finding worth reporting), disambiguation experiment is a follow-up ablation
-- [x] Fix LangFuse tag propagation — all sub-component traces (decomposition, adversarial, skill/agent execution, emit_langfuse_event) now inherit pipeline tags via get_config(), module-level metadata, or explicit params (2026-04-08)
-- [x] Replace `pip` with `uv` in sandbox Dockerfile — `uv pip install` cuts package installation from ~40s to ~6s per sandbox call (2026-04-08)
-- [ ] Full evaluation re-run (~$5, ~26h sequential / ~13h with 2 conditions parallel):
-  - [ ] `rm -rf data/eval/` — purge pilot records before full run (pilot contamination)
-  - [ ] `uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5` (18 × 4 × 5 = 360 records)
-  - [ ] Cost breakdown: static ~$0 (0.1h), no_verification ~$0.37 (5h), no_optimization ~$2.21 (10h), full ~$2.32 (11h)
-  - [ ] Adversarial probing is 83% of cost (~$0.025/run); pipeline direct is ~$0.005/run
-- [ ] Re-validate longitudinal optimizer test (~$1.50, ~3h):
-  - [ ] Restore clean state first: `rm -rf data/eval/` (full eval leaves dirty state)
-  - [ ] `uv run scripts/run_longitudinal.py` (40 tasks, sequential, optimizer enabled)
-  - [ ] Longitudinal validation checklist:
-    - [ ] Verify 40 records in `data/longitudinal.duckdb`
-    - [ ] Check convergence: success rate of last 10 tasks > first 10 tasks
-    - [ ] Verify `data/longitudinal_optimizer_log.json` exists and shows prune/split/merge events
-    - [ ] Check optimizer actually fired (not 0 operations across 40 tasks)
-- [ ] Post-eval analysis (~$0, ~5 min):
-  - [ ] `uv run scripts/backfill_token_costs.py --write` — LangFuse → DuckDB token costs
-  - [ ] `uv run scripts/analyze_results.py --csv` — statistical analysis + CSV export
-  - [ ] `uv run scripts/analyze_context_utilization.py --csv` — context window metrics
-- [ ] Post-eval sanity checks (spot hidden issues audits can't catch):
-  - [ ] Token cost sanity: spot-check 3-4 runs in LangFuse, compare actual trace costs vs what `backfill_token_costs.py` attributed — look for mismatches
-  - [ ] Verify 360 records in `data/eval/metrics.duckdb` (not fewer)
-  - [ ] Check no condition has suspiciously uniform success rates (= evaluation bias or bug that helps/hurts uniformly)
-  - [ ] Compare `no_verification` vs `full` success rates — if nearly identical, verification gate may not be working
-  - [ ] Compare `no_optimization` vs `full` — if identical, optimizer isn't firing (expected for snapshot-reset, but confirm)
-  - [ ] Look for tasks that are 100% or 0% across ALL conditions — may indicate task definition issue, not system issue
-- [ ] Produce thesis figures and analysis
+The full ordered checklist lives in `docs/pre_eval_execution_plan.md`. Read that for the canonical sequencing, validation gates, cost estimates, and per-phase task lists. Status snapshot:
+
+- ✅ Phase 0 — baseline verification (commit `f54b49f`)
+- ✅ Phase 1 — honest metrics + Tier 1/2 hardening (commits `13b1ecd`, `8ab68b0`)
+- ✅ Phase 2 — per-gap restoration with packaging-signal classifier and CLI multi-cap support (commit `cab813a`)
+- ⏳ **Phase 3** — compositional executor (HP4 risk: mixed-type workspace passing). Phase 3 fallback "ship the eval on Phase 2" is **NOT VIABLE** — see the architectural finding in the Current State paragraph above.
+- ⏳ Phase 3.5 — DeepAgents subagents for AGENT execution + context-engineering Bucket A + decomposer rule 10 fix
+- ⏳ Phase 4 — pre-eval smoke tests
+- ⏳ Phase 5 — full eval (360 records, ~$5, ~15h wall time) + longitudinal optimizer test
+- ⏳ Phase 6 — post-eval aggregations (D1 mock-contamination audit, D2 Gini, D3 KL rename, D4 hypothetical-budget analysis) + token cost backfill
+- ⏳ Phase 7 — chapter drafting (E1-E8 chapter additions, F1-F4 future-work items)
+
+**Findings worth carrying forward** (full detail in `pre_eval_execution_plan.md`):
+
+- **T16 task-specification ambiguity** (2026-04-08): the T16 prompt's "changed first" / "deviated" wording is direction-agnostic, the LLM writes a dual-criterion detector, the relative-change criterion catches transient noise dips, the cascade chain comes out partially wrong but the validator passes (it only checks `root_cause_metric` exact match, not chain order). This is a "correct by policy, wrong by ground truth" failure mode worth reporting in Chapter 6 as a thesis finding. **Do NOT modify the T16 prompt before the full 360-record eval** — the ambiguity is a feature, the disambiguation experiment belongs in a follow-up ablation.
+- **Pre-audit eval numbers** (JIT ~73% vs static ~14%, verification −9pp, optimizer cold-start, T17 AGENT 100% vs SKILL 9%) are STALE per the 2026-04-06 audit. The post-Phase-2 + post-Phase-3 full re-run produces the canonical Chapter 6 numbers.
 
 ## Stable Interfaces
 
@@ -470,9 +385,9 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/config.py`** — Centralized constants: `DEFAULT_LLM_MODEL` (env: `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env: `JIT_SANDBOX_IMAGE`), `DOCKER_PREINSTALLED`, `FILE_SIZE_LIMIT_BYTES`, `BINARY_EXTENSIONS`, `AUTO_OPTIMIZER_THRESHOLD`
 - **`src/schemas/`** — 18 core types (`CapabilityType`, `CapabilityDescriptor`, `TaskState` (now includes `attempt_count: int = 0`), `TaskStatus`, `SubTask`, `SubTaskItem`, `DecompositionResult`, `ClassificationResult`, `ClassifiedGap`, `GeneratedArtifact` (now includes `pip_packages: list[str]`), `GeneratorInput`, `GapItem`, `MatchItem`, `Severity`, `VerificationFinding`, `VerificationReport`, `InvocationRecord`, `GranularityMetrics`) + 5 evaluation types (`BaselineCondition`, `EvaluationRecord`, `FailureReason`, `HumanLabel`, `TaskTier`)
 - **`src/orchestrator/decomposition.py`** — `decomposition_node()` (DeepAgent-backed task decomposition)
-- **`src/orchestrator/classifier.py`** — `classify_task(task_description, required_capabilities)`, `classifier_node()` (task-level LLM classification — one classification per task, not per gap)
+- **`src/orchestrator/classifier.py`** — `classify_gap(gap, task_description, required_capabilities)` is the primary entry point (per-gap LLM classification with parent-task-first cascade and packaging-signal checklist, post-Phase-2). `classifier_node()` iterates `state.gaps` calling `classify_gap` once per gap. `classify_task()` preserved as a legacy wrapper for the integration test only.
 - **`src/orchestrator/prompts/`** — All prompt constants for decomposition, classification, and all three generators
-- **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry, metrics_store=None)` (per-capability registry matching populates `state.matches` and records match invocations; produces at most ONE placeholder `GapItem` when any capability is unmatched, signaling the task-level classifier to run; always routes to `"classifier_node"`)
+- **`src/orchestrator/gap_detection.py`** — `gap_detection_node(state, registry, metrics_store=None)` (per-capability registry matching populates `state.matches`; produces N enumerated `GapItem`s, one per unmatched required_capability, post-Phase-2. Does NOT write fake invocations to `metrics_store` — the parameter is preserved on the signature for caller stability but the body uses `del metrics_store`. Always routes to `"classifier_node"`.)
 - **`src/orchestrator/loading_node.py`** — `loading_node(state, loader, registry)` (loads MCP_TOOL via importlib, registers all 3 types in ChromaDB with source_code/skill_content/agent_config metadata, sets terminal status)
 - **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader, *, run_optimizer=False, metrics_store=None, verification_enabled=True)` (9-node pipeline; real three-tier gate wired via `gate_fn=gate_verify` closure; `verification_enabled=False` bypasses gate for no_verification baseline; optional `optimizer_node` appended after `loading_node` when `run_optimizer=True`)
 - **`src/orchestrator/verification_node.py`** — `verification_node(state, gate_fn=None)` (retry + artifact replacement logic; real gate wired in pipeline.py)

@@ -1002,7 +1002,7 @@ Before starting Iteration 6, assess: Does the evaluation design actually produce
 | Context window analysis | ✅ | `scripts/analyze_context_utilization.py` — 1,255 traces, max 28.8% utilization. System is cost-bound. |
 | Longitudinal optimizer test | ✅ | `scripts/run_longitudinal.py` — 40 tasks, 69.2%→100%, prune only. `data/longitudinal.duckdb` |
 | Model unification | ✅ | All LLM calls unified to `openai:gpt-5-mini` (was hybrid DeepSeek/GPT-5-mini) |
-| MINT CLI | ✅ | `uv run mint` — Typer + Rich. 11 subcommands. See `src/cli/` and `docs/plan_cli_upgrade.md`. |
+| MINT CLI | ✅ | `uv run mint` — Typer + Rich. 11 subcommands. See `src/cli/`. (Original implementation plan archived to `docs/archive/plan_cli_upgrade.md`; unimplemented future-work items captured as F5/F6 in `docs/pre_eval_execution_plan.md`.) |
 | Re-run batch 1 | ✅ | 180 records: no_verification (76.7% success) + static (27.8%). 2026-04-05, ~2h. |
 
 ### In progress

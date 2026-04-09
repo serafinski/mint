@@ -3,7 +3,7 @@
 **Date:** 2026-04-08 (initial), updated 2026-04-09 (Stage 4.5 added after Phase 2 retrospective)
 **Branch:** `iter/6-execution-backends` → new branch `iter/6-compositional-synthesis`
 **Status:** Stages 1-2 complete (landed in Phase 1 + Phase 2 of `pre_eval_execution_plan.md`); Stages 3-8 pending
-**Supersedes (partially):** `docs/single_artifact_enforcement_plan.md`
+**Supersedes (partially):** `docs/archive/single_artifact_enforcement_plan.md`
 **Cross-reference:** `docs/pre_eval_execution_plan.md` is the sequencing-and-validation layer; this doc is the architectural detail. Stage 1 ↔ Phase 1 Track 1a, Stage 2 ↔ Phase 2, Stages 3-4 ↔ Phase 3, **Stage 4.5 ↔ Phase 3.5b (added 2026-04-09)**, Stages 5-7 are absorbed into Phase 3 / Phase 3.5 verification, Stage 8 ↔ Phases 5-6.
 
 ---
@@ -18,7 +18,7 @@ The original thesis proposal (`docs/thesis_proposal.md`, Pillar 1) describes **p
 >
 > *"Sandboxed integration. Generated capabilities are integrated into the agent's available tool set and invoked to complete the original task."*
 
-The `single_artifact_enforcement_plan.md` deviated from this by collapsing classification and generation to the task level, producing at most one artifact per task. That deviation was justified by evaluation tractability: the 18-task testbed labels each task with ONE target capability type, so per-gap accuracy had no ground truth.
+The `archive/single_artifact_enforcement_plan.md` deviated from this by collapsing classification and generation to the task level, producing at most one artifact per task. That deviation was justified by evaluation tractability: the 18-task testbed labels each task with ONE target capability type, so per-gap accuracy had no ground truth.
 
 **This plan restores the proposal's compositional model**, motivated by an empirical finding on 2026-04-08: the single-artifact pipeline produces **decorative registry matches** — capabilities that are matched and recorded as "invocations" but never actually executed. T14 is the concrete reproducer:
 
@@ -327,7 +327,7 @@ The 18-task testbed was designed for single-artifact execution. Each task has ON
 |---|---|
 | `docs/compositional_synthesis_plan.md` | This file. |
 | `CLAUDE.md` | Update classifier table row, stable interfaces, known findings. Note that the single-artifact deviation from the proposal has been reverted and full compositional synthesis is now implemented. |
-| `docs/single_artifact_enforcement_plan.md` | Add a "Superseded" banner at the top pointing to this plan. Keep the doc for historical context — Chapter 3 references it. |
+| `docs/archive/single_artifact_enforcement_plan.md` | Add a "Superseded" banner at the top pointing to this plan. Keep the doc for historical context — Chapter 3 references it. |
 
 ### What does NOT need changes
 
@@ -583,7 +583,7 @@ CLAUDE.md previously listed compositional agents as Chapter 7 future work, citin
 
 **Changes**:
 - `CLAUDE.md` — update classifier table row, stable interfaces, findings section. Add a new "Finding: Compositional synthesis restored" subsection with the pre/post reuse rate comparison.
-- `docs/single_artifact_enforcement_plan.md` — add a "Superseded" banner pointing to `compositional_synthesis_plan.md`.
+- `docs/archive/single_artifact_enforcement_plan.md` — add a "Superseded" banner pointing to `compositional_synthesis_plan.md`.
 - `docs/compositional_synthesis_plan.md` (this file) — mark as Status: Implemented, add the empirical results from the full eval.
 - Full eval: `uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5` (360 records, ~$5, ~26h)
 
@@ -726,7 +726,7 @@ This is a real cost. The thesis justification is Chapter 6 reuse rate analysis: 
 - [ ] Stage 7: full unit + integration suite is green
 - [ ] Stage 8: full eval re-run produces 360 records with meaningful `matched_and_executed_count` per record
 - [ ] **Chapter 6 can report honest reuse rate**: csv-parser was matched N times AND executed N times (no fake invocations)
-- [ ] **Thesis-level**: the deviation from Pillar 1 documented in `single_artifact_enforcement_plan.md` is closed; the implementation now matches the proposal's literal text
+- [ ] **Thesis-level**: the deviation from Pillar 1 documented in `archive/single_artifact_enforcement_plan.md` is closed; the implementation now matches the proposal's literal text
 
 ---
 
@@ -803,7 +803,7 @@ Remaining future work:
 7. **Should `mint list` distinguish chain-level statistics from artifact-level?**
    - **Decision**: no. `mint list` shows capabilities with real invocation counts. The chain is a runtime concept, not a registry concept. `mint history` could optionally show chain-level executions in a future iteration.
 
-8. **What happens to the `single_artifact_enforcement_plan.md` doc?**
+8. **What happens to the `archive/single_artifact_enforcement_plan.md` doc?**
    - **Decision**: keep it, add a "Superseded" banner. Chapter 3 references it for the methodology story (single-artifact → compositional refinement).
 
 ---
@@ -818,7 +818,7 @@ This plan is compatible with the following changes committed earlier today:
 - **`fix: CLI streaming display diff and stage timing`** — compatible. The display updates for chain steps build on the existing progress-display infrastructure.
 - **`docs: CLAUDE.md updates for Iter 6 pilot findings`** — the T16 ambiguity finding is unrelated and carries forward.
 
-This plan REVERSES these decisions from `single_artifact_enforcement_plan.md`:
+This plan REVERSES these decisions from `archive/single_artifact_enforcement_plan.md`:
 - Task-level classification → per-gap classification (restored)
 - Single placeholder gap → N enumerated gaps (restored)
 - Single-artifact generation → multi-artifact generation (restored)
