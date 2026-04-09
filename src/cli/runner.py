@@ -870,12 +870,29 @@ def _save_output(
     output: dict,
     artifact: Any | None,
     verification_reports: list[Any] | None = None,
+    *,
+    final_state: Any | None = None,
+    task: str | None = None,
+    file_paths: list[Path] | None = None,
+    exec_error: str | None = None,
 ) -> None:
     """Save output to files in the specified directory.
 
-    If ``verification_reports`` is provided, also writes a sidecar
-    ``<cap_name>_<ts>.verification.json`` with the full Tier 1/2/3 findings
-    so they can be inspected without going to LangFuse.
+    Always writes:
+        - ``<cap_name>_<ts>.json`` — the executed capability's output (or
+          an ``_empty`` placeholder including ``_error`` if execution failed)
+
+    When ``verification_reports`` is provided:
+        - ``<cap_name>_<ts>.verification.json`` — Tier 1/2/3 findings sidecar
+          so verification notes are inspectable without going to LangFuse
+
+    When ``final_state`` is provided:
+        - ``<cap_name>_<ts>.run.json`` — per-run manifest listing the task,
+          input files, ALL generated capabilities (with type + gap_query +
+          executed flag), and the execution outcome. This makes a multi-cap
+          run inspectable as a single file, which matters because Phase 2's
+          per-gap restoration produces N artifacts per task even though only
+          one is currently executed (priority sort).
     """
     from datetime import UTC, datetime
 
@@ -928,6 +945,73 @@ def _save_output(
             encoding="utf-8",
         )
         saved.append(str(verification_path))
+
+    # Save per-run manifest so multi-capability runs are inspectable as
+    # a single file. Phase 2 produces N artifacts per task; this manifest
+    # lists all of them with their types, source gap, and which one was
+    # executed. Phase 3's compositional executor will eventually run them
+    # all and the manifest will report chain execution status instead.
+    if final_state is not None:
+        _state_get = (
+            final_state.get
+            if isinstance(final_state, dict)
+            else lambda k, d=None: getattr(final_state, k, d)
+        )
+        all_artifacts = _state_get("generated_artifacts", []) or []
+        matches = _state_get("matches", []) or []
+        classified_gaps = _state_get("classified_gaps", []) or []
+
+        def _artifact_summary(art: Any) -> dict:
+            art_name = getattr(art, "capability_name", None)
+            return {
+                "capability_name": art_name,
+                "capability_type": str(
+                    getattr(art, "capability_type", "")
+                ).split(".")[-1].lower(),
+                "gap_query": getattr(art, "gap_query", None),
+                "description": getattr(art, "description", None),
+                "executed": art_name == cap_name,
+            }
+
+        manifest = {
+            "timestamp": ts,
+            "task": task,
+            "files": [str(fp) for fp in file_paths] if file_paths else [],
+            "executed_capability": cap_name if artifact else None,
+            "execution_outcome": (
+                "error"
+                if exec_error
+                else ("output" if not output.get("_empty") else "empty")
+            ),
+            "execution_error": exec_error,
+            "generated_capabilities": [_artifact_summary(a) for a in all_artifacts],
+            "registry_matches": [
+                {
+                    "capability_name": getattr(
+                        getattr(m, "capability", None), "name", None
+                    ),
+                    "score": getattr(m, "score", None),
+                }
+                for m in matches
+            ],
+            "classified_gaps": [
+                {
+                    "query": getattr(cg, "query", None),
+                    "description": getattr(cg, "description", None),
+                    "classified_type": str(
+                        getattr(cg, "classified_type", "")
+                    ).split(".")[-1].lower(),
+                    "confidence": getattr(cg, "confidence", None),
+                }
+                for cg in classified_gaps
+            ],
+        }
+        manifest_path = output_dir / f"{cap_name}_{ts}.run.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, default=str),
+            encoding="utf-8",
+        )
+        saved.append(str(manifest_path))
 
     for path in saved:
         console.print(f"  [green]\u2713[/green] Saved: [dim]{path}[/dim]")
@@ -1262,6 +1346,7 @@ def execute_task(
     # Select artifact and execute
     artifact = _select_artifact(final_state)
     output: dict | None = None
+    exec_error: str | None = None
 
     if artifact:
         from src.schemas.capability import CapabilityType
@@ -1324,7 +1409,8 @@ def execute_task(
                         or None
                     )
         except Exception as exc:
-            err_console.print(f"[yellow]Execution error: {exc}[/yellow]")
+            exec_error = f"{type(exc).__name__}: {exc}"
+            err_console.print(f"[yellow]Execution error: {exec_error}[/yellow]")
             output = None
 
     # Registry match fallback
@@ -1373,17 +1459,44 @@ def execute_task(
 
     # Always save output (default: data/output/, override with --output-dir)
     save_dir = output_dir or _data_dir() / "mint_output"
-    verification_reports = getattr(final_state, "verification_results", None) or None
+    # final_state is a dict (LangGraph's pipeline.invoke/.stream returns dicts),
+    # so we need the dict-aware accessor — getattr on a dict always returns the
+    # default. This bug previously caused the verification sidecar to never fire.
+    _state_get = (
+        final_state.get
+        if isinstance(final_state, dict)
+        else lambda k, d=None: getattr(final_state, k, d)
+    )
+    verification_reports = _state_get("verification_results", None) or None
     if output:
-        _save_output(save_dir, output, artifact, verification_reports)
-    elif artifact is not None:
-        # Save metadata even for empty outputs so the attempt is recorded
-        cap_name = getattr(artifact, "capability_name", "unknown")
         _save_output(
             save_dir,
-            {"_empty": True, "_capability": cap_name},
+            output,
             artifact,
             verification_reports,
+            final_state=final_state,
+            task=task,
+            file_paths=file_paths,
+            exec_error=exec_error,
+        )
+    elif artifact is not None:
+        # Save metadata even for empty outputs so the attempt is recorded.
+        # Include the captured execution error so failures are inspectable
+        # without going to LangFuse — previously the error was printed to
+        # stderr and lost.
+        cap_name = getattr(artifact, "capability_name", "unknown")
+        placeholder: dict = {"_empty": True, "_capability": cap_name}
+        if exec_error:
+            placeholder["_error"] = exec_error
+        _save_output(
+            save_dir,
+            placeholder,
+            artifact,
+            verification_reports,
+            final_state=final_state,
+            task=task,
+            file_paths=file_paths,
+            exec_error=exec_error,
         )
 
     # Success: artifact executed with output, or registry matched (even

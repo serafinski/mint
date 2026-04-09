@@ -143,10 +143,19 @@ def show_pipeline_result(
     verification_results = _get("verification_results", []) or []
     attempt_count = _get("attempt_count", 0)
     task_description = _get("task_description", "") or ""
+    generated_artifacts = _get("generated_artifacts", []) or []
 
     # Verification findings
     if verification_results and artifact:
         _show_verification_findings(verification_results, artifact, verbose=verbose)
+
+    # Multi-capability summary — Phase 2's per-gap restoration produces N
+    # artifacts per task; show all of them and mark which one was actually
+    # executed (priority sort picks one). Phase 3's compositional executor
+    # will run all of them in dependency order; until then, the others are
+    # registered in the registry but unused for THIS task.
+    if len(generated_artifacts) > 1:
+        _show_multi_capability_summary(generated_artifacts, artifact)
 
     # Output
     console.print()
@@ -206,6 +215,57 @@ def _find_report(verification_results: list, artifact: Any) -> Any | None:
             if r.capability_name == name:
                 return r
     return verification_results[-1] if verification_results else None
+
+
+def _show_multi_capability_summary(
+    generated_artifacts: list, executed_artifact: Any | None
+) -> None:
+    """Show all generated capabilities, marking which one was executed.
+
+    Phase 2's per-gap restoration produces multiple artifacts per task. The
+    executor's priority sort picks ONE for execution; the rest are registered
+    in the registry but not run for this task. Phase 3's compositional
+    executor will run them all in dependency order via the workspace.
+
+    Until Phase 3 lands, this display section makes the multi-artifact
+    output visible so users know what was generated even if only one ran.
+    """
+    executed_name = getattr(executed_artifact, "capability_name", None)
+    n_total = len(generated_artifacts)
+    n_executed = 1 if executed_name else 0
+
+    console.print()
+    console.print(
+        f"[dim]Generated {n_total} capabilities ({n_executed} executed):[/dim]"
+    )
+
+    # Sort for stable display: executed first, then alphabetical by name
+    def _sort_key(a: Any) -> tuple[int, str]:
+        name = getattr(a, "capability_name", "") or ""
+        return (0 if name == executed_name else 1, name)
+
+    for art in sorted(generated_artifacts, key=_sort_key):
+        name = getattr(art, "capability_name", "?") or "?"
+        cap_type = str(getattr(art, "capability_type", "")).split(".")[-1].upper()
+        gap_query = getattr(art, "gap_query", None)
+        is_executed = name == executed_name
+
+        marker = "[green]✓[/green]" if is_executed else "[dim]•[/dim]"
+        status = (
+            "[green]\\[executed][/green]"
+            if is_executed
+            else "[dim]\\[registered, not executed][/dim]"
+        )
+        gap_suffix = f" [dim](from gap: {gap_query})[/dim]" if gap_query else ""
+        console.print(
+            f"  {marker} [bold]{name}[/bold] ([cyan]{cap_type}[/cyan]) {status}{gap_suffix}"
+        )
+
+    if n_total > n_executed:
+        console.print(
+            "  [dim]Phase 3 (compositional executor) will run the registered "
+            "capabilities in dependency order via the workspace.[/dim]"
+        )
 
 
 def _show_verification_findings(

@@ -1,8 +1,13 @@
-"""Unit tests for the task-level capability classifier.
+"""Unit tests for the per-gap capability classifier.
 
 LLM-calling behaviour is covered by ``tests/integration/test_classifier.py``
 with real OpenAI calls.  These tests cover schema validation and the
-classifier node's routing logic (patching ``classify_task``, not the LLM).
+classifier node's routing logic (patching ``classify_gap``, not the LLM).
+
+As of Stage 2 of the compositional refactor, ``classifier_node`` iterates
+over ``state.gaps`` and calls ``classify_gap`` per gap. The legacy
+``classify_task`` wrapper is retained for single-gap / whole-task callers
+and is tested separately at the bottom of this file.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from src.orchestrator.classifier import (
     _normalize_capability_name,
     _slug_from_task,
     classifier_node,
+    classify_gap,
     classify_task,
 )
 from src.schemas.capability import CapabilityType
@@ -391,50 +397,55 @@ class TestClassifyTask:
 
 
 class TestClassifierNode:
-    def test_classifies_task_once(self):
-        """Node calls classify_task exactly once and returns a single classified gap."""
+    def test_classifies_each_gap(self):
+        """Node calls classify_gap once per gap and collects the results."""
         state = TaskState(
             task_description="Parse a CSV file and summarise",
             required_capabilities=["parse-csv", "summarise"],
-            gaps=[GapItem(description="task-level", query="task-level")],
+            gaps=[
+                GapItem(description="parse-csv", query="parse-csv"),
+                GapItem(description="summarise", query="summarise"),
+            ],
         )
 
-        mock_result = ClassifiedGap(
-            description="Parse a CSV file and summarise",
-            query="parse-a-csv-file-and-summarise-abcdef",
-            classified_type=CapabilityType.MCP_TOOL,
-            confidence=0.95,
-            rationale="Atomic parse operation",
-        )
+        def _mock_classify(gap, task_description, required_capabilities):
+            return ClassifiedGap(
+                description=gap.description,
+                query=f"{gap.query}-abcdef",
+                classified_type=CapabilityType.MCP_TOOL,
+                confidence=0.95,
+                rationale="Atomic operation",
+            )
 
         with patch(
-            "src.orchestrator.classifier.classify_task",
-            return_value=mock_result,
+            "src.orchestrator.classifier.classify_gap",
+            side_effect=_mock_classify,
         ) as mock_classify:
             cmd = classifier_node(state)
 
-        assert mock_classify.call_count == 1
+        assert mock_classify.call_count == 2
         assert cmd.goto == "generate_mcp_tool"
         classified = cmd.update["classified_gaps"]
-        assert len(classified) == 1
-        assert classified[0].classified_type == CapabilityType.MCP_TOOL
+        assert len(classified) == 2
+        assert {c.query for c in classified} == {"parse-csv-abcdef", "summarise-abcdef"}
         assert cmd.update["status"] == TaskStatus.CLASSIFYING
 
-    def test_classify_task_receives_task_description_and_required_capabilities(self):
-        """classifier_node calls classify_task with the full task and required caps."""
+    def test_classify_gap_receives_gap_task_description_and_required_capabilities(self):
+        """classifier_node calls classify_gap with gap + task context + required caps."""
         state = TaskState(
             task_description="Multi-part task description",
             required_capabilities=["cap-a", "cap-b", "cap-c"],
-            gaps=[GapItem(description="task-level", query="task-level")],
+            gaps=[GapItem(description="cap-a", query="cap-a")],
         )
 
         captured: dict = {}
 
-        def _mock_classify(task_description, required_capabilities):
+        def _mock_classify(gap, task_description, required_capabilities):
+            captured["gap_query"] = gap.query
             captured["task_description"] = task_description
             captured["required_capabilities"] = required_capabilities
             return ClassifiedGap(
-                description=task_description,
+                description=gap.description,
                 query="slug",
                 classified_type=CapabilityType.MCP_TOOL,
                 confidence=0.9,
@@ -442,13 +453,53 @@ class TestClassifierNode:
             )
 
         with patch(
-            "src.orchestrator.classifier.classify_task",
+            "src.orchestrator.classifier.classify_gap",
             side_effect=_mock_classify,
         ):
             classifier_node(state)
 
+        assert captured["gap_query"] == "cap-a"
         assert captured["task_description"] == "Multi-part task description"
         assert captured["required_capabilities"] == ["cap-a", "cap-b", "cap-c"]
+
+    def test_mixed_type_gaps_produce_mixed_classifications(self):
+        """Two gaps in the same task can get different classified types."""
+        state = TaskState(
+            task_description="Parse CSV then investigate anomalies",
+            required_capabilities=["parse-csv", "investigate"],
+            gaps=[
+                GapItem(description="parse-csv", query="parse-csv"),
+                GapItem(description="investigate", query="investigate"),
+            ],
+        )
+
+        def _mock_classify(gap, task_description, required_capabilities):
+            if gap.query == "parse-csv":
+                return ClassifiedGap(
+                    description=gap.description,
+                    query="csv-parser-1",
+                    classified_type=CapabilityType.MCP_TOOL,
+                    confidence=0.95,
+                    rationale="deterministic",
+                )
+            return ClassifiedGap(
+                description=gap.description,
+                query="investigator-1",
+                classified_type=CapabilityType.AGENT,
+                confidence=0.9,
+                rationale="adaptive",
+            )
+
+        with patch(
+            "src.orchestrator.classifier.classify_gap",
+            side_effect=_mock_classify,
+        ):
+            cmd = classifier_node(state)
+
+        classified = cmd.update["classified_gaps"]
+        assert len(classified) == 2
+        types = {c.classified_type for c in classified}
+        assert types == {CapabilityType.MCP_TOOL, CapabilityType.AGENT}
 
     def test_empty_gaps_is_noop(self):
         """When state.gaps is empty, classifier skips the LLM call."""
@@ -458,7 +509,7 @@ class TestClassifierNode:
             gaps=[],
         )
 
-        with patch("src.orchestrator.classifier.classify_task") as mock_classify:
+        with patch("src.orchestrator.classifier.classify_gap") as mock_classify:
             cmd = classifier_node(state)
 
         mock_classify.assert_not_called()
@@ -467,15 +518,15 @@ class TestClassifierNode:
         assert cmd.goto == "generate_mcp_tool"
 
     def test_single_gap_produces_single_classification(self):
-        """A single placeholder gap produces exactly one classified gap."""
+        """A single gap produces exactly one classified gap."""
         state = TaskState(
             task_description="Compute hash of string",
             required_capabilities=["compute-hash"],
-            gaps=[GapItem(description="Compute hash of string", query="task-level")],
+            gaps=[GapItem(description="compute-hash", query="compute-hash")],
         )
 
         mock_result = ClassifiedGap(
-            description="Compute hash of string",
+            description="compute-hash",
             query="compute-hash-of-string-abcdef",
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.95,
@@ -483,7 +534,7 @@ class TestClassifierNode:
         )
 
         with patch(
-            "src.orchestrator.classifier.classify_task",
+            "src.orchestrator.classifier.classify_gap",
             return_value=mock_result,
         ):
             cmd = classifier_node(state)
@@ -496,11 +547,11 @@ class TestClassifierNode:
         state = TaskState(
             task_description="Sort numbers",
             required_capabilities=["sort"],
-            gaps=[GapItem(description="Sort numbers", query="task-level")],
+            gaps=[GapItem(description="sort", query="sort")],
         )
 
         mock_result = ClassifiedGap(
-            description="Sort numbers",
+            description="sort",
             query="sort-numbers-abcdef",
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.9,
@@ -508,7 +559,7 @@ class TestClassifierNode:
         )
 
         with patch(
-            "src.orchestrator.classifier.classify_task",
+            "src.orchestrator.classifier.classify_gap",
             return_value=mock_result,
         ):
             cmd = classifier_node(state)
@@ -517,15 +568,15 @@ class TestClassifierNode:
             assert isinstance(item, ClassifiedGap)
 
     def test_fallback_classification_added_to_errors(self):
-        """When classify_task returns a fallback result, node records it in state.errors."""
+        """When classify_gap returns a fallback result, node records it in state.errors."""
         state = TaskState(
             task_description="Parse CSV",
             required_capabilities=["parse-csv"],
-            gaps=[GapItem(description="Parse CSV", query="task-level")],
+            gaps=[GapItem(description="parse-csv", query="parse-csv")],
         )
 
         fallback = ClassifiedGap(
-            description="Parse CSV",
+            description="parse-csv",
             query="parse-csv-abcdef",
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.3,
@@ -533,7 +584,7 @@ class TestClassifierNode:
         )
 
         with patch(
-            "src.orchestrator.classifier.classify_task",
+            "src.orchestrator.classifier.classify_gap",
             return_value=fallback,
         ):
             cmd = classifier_node(state)
@@ -546,11 +597,11 @@ class TestClassifierNode:
         state = TaskState(
             task_description="Parse CSV",
             required_capabilities=["parse-csv"],
-            gaps=[GapItem(description="Parse CSV", query="task-level")],
+            gaps=[GapItem(description="parse-csv", query="parse-csv")],
         )
 
         fallback = ClassifiedGap(
-            description="Parse CSV",
+            description="parse-csv",
             query="parse-csv-abcdef",
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.3,
@@ -558,7 +609,7 @@ class TestClassifierNode:
         )
 
         with patch(
-            "src.orchestrator.classifier.classify_task",
+            "src.orchestrator.classifier.classify_gap",
             return_value=fallback,
         ):
             cmd = classifier_node(state)
@@ -582,22 +633,22 @@ class TestClassifierNode:
         # We verify via the update dict having no overwrite of errors field.
         assert "errors" not in cmd.update or "pre-existing error from decomposition" in cmd.update.get("errors", [])
 
-    def test_classify_task_unhandled_exception_propagates(self):
-        """Unexpected exceptions raised by classify_task propagate from classifier_node.
+    def test_classify_gap_unhandled_exception_propagates(self):
+        """Unexpected exceptions raised by classify_gap propagate from classifier_node.
 
-        classify_task has comprehensive exception handling and should not
+        classify_gap has comprehensive exception handling and should not
         normally raise. This test documents the current behaviour for the
-        edge case where an exception does escape classify_task.
+        edge case where an exception does escape classify_gap.
         """
         state = TaskState(
             task_description="Test",
             required_capabilities=["cap"],
-            gaps=[GapItem(description="cap", query="task-level")],
+            gaps=[GapItem(description="cap", query="cap")],
         )
 
         with (
             patch(
-                "src.orchestrator.classifier.classify_task",
+                "src.orchestrator.classifier.classify_gap",
                 side_effect=RuntimeError("unexpected internal error"),
             ),
             pytest.raises(RuntimeError, match="unexpected internal error"),
@@ -605,7 +656,12 @@ class TestClassifierNode:
             classifier_node(state)
 
     def test_preserves_existing_classified_gaps(self):
-        """classifier_node accumulates into existing classified_gaps, not replaces them."""
+        """classifier_node accumulates into existing classified_gaps, not replaces them.
+
+        When a gap in state.gaps shares its description with an existing
+        classified gap (retry scenario), the existing entry is preserved and
+        the gap is skipped; new gaps get classified and appended.
+        """
         existing = ClassifiedGap(
             description="Pre-classified gap from earlier pass",
             query="pre-existing",
@@ -616,20 +672,20 @@ class TestClassifierNode:
         state = TaskState(
             task_description="Incremental classification",
             required_capabilities=["new-tool"],
-            gaps=[GapItem(description="New tool needed", query="task-level")],
+            gaps=[GapItem(description="new-tool", query="new-tool")],
             classified_gaps=[existing],
         )
 
         new_result = ClassifiedGap(
-            description="Incremental classification",
-            query="incremental-classification-abcdef",
+            description="new-tool",
+            query="new-tool-abcdef",
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.95,
             rationale="Atomic operation",
         )
 
         with patch(
-            "src.orchestrator.classifier.classify_task",
+            "src.orchestrator.classifier.classify_gap",
             return_value=new_result,
         ):
             cmd = classifier_node(state)
@@ -640,15 +696,15 @@ class TestClassifierNode:
         assert classified[1].classified_type == CapabilityType.MCP_TOOL
 
     def test_skill_classification(self):
-        """A task classified as SKILL produces a SKILL-typed classified gap."""
+        """A gap classified as SKILL produces a SKILL-typed classified gap."""
         state = TaskState(
             task_description="Multi-step data cleaning pipeline",
-            required_capabilities=["validate", "normalize", "dedupe"],
-            gaps=[GapItem(description="pipeline", query="task-level")],
+            required_capabilities=["pipeline"],
+            gaps=[GapItem(description="pipeline", query="pipeline")],
         )
 
         mock_result = ClassifiedGap(
-            description="Multi-step data cleaning pipeline",
+            description="pipeline",
             query="multi-step-data-cleaning-abcdef",
             classified_type=CapabilityType.SKILL,
             confidence=0.9,
@@ -656,7 +712,7 @@ class TestClassifierNode:
         )
 
         with patch(
-            "src.orchestrator.classifier.classify_task",
+            "src.orchestrator.classifier.classify_gap",
             return_value=mock_result,
         ):
             cmd = classifier_node(state)
@@ -664,15 +720,15 @@ class TestClassifierNode:
         assert cmd.update["classified_gaps"][0].classified_type == CapabilityType.SKILL
 
     def test_agent_classification(self):
-        """A task classified as AGENT produces an AGENT-typed classified gap."""
+        """A gap classified as AGENT produces an AGENT-typed classified gap."""
         state = TaskState(
             task_description="Investigate cascading failures",
-            required_capabilities=["investigate"],
-            gaps=[GapItem(description="investigation", query="task-level")],
+            required_capabilities=["investigation"],
+            gaps=[GapItem(description="investigation", query="investigation")],
         )
 
         mock_result = ClassifiedGap(
-            description="Investigate cascading failures",
+            description="investigation",
             query="investigate-cascading-failures-abcdef",
             classified_type=CapabilityType.AGENT,
             confidence=0.95,
@@ -680,7 +736,7 @@ class TestClassifierNode:
         )
 
         with patch(
-            "src.orchestrator.classifier.classify_task",
+            "src.orchestrator.classifier.classify_gap",
             return_value=mock_result,
         ):
             cmd = classifier_node(state)

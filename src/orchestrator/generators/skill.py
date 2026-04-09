@@ -237,6 +237,7 @@ def _generate_single_skill(
 
     prompt = SKILL_GENERATOR_PROMPT.format(
         task_context=task_context or gap.description,
+        gap_description=gap.description or gap.query,
         forced_name=forced_name,
     )
 
@@ -274,6 +275,7 @@ def _generate_single_skill(
             validation_error=message,
             skill_content=content,
             task_context=task_context or gap.description,
+            gap_description=gap.description or gap.query,
         )
         try:
             repair_response = llm.invoke(repair_prompt)

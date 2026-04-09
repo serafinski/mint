@@ -87,33 +87,67 @@ path parameters should be required (no default).
 - In the `pip_packages` field, list ALL non-stdlib PyPI packages your code \
 imports. Use the **pip install name** (what you'd pass to `pip install`), not \
 the Python import name — e.g. `pyyaml` not `yaml`. If you only use \
-stdlib + mcp + pydantic, leave pip_packages empty.\
+stdlib + mcp + pydantic, leave pip_packages empty.
+- **Do NOT catch exceptions and return them as structured "error result" \
+dicts.** If something goes wrong (file missing, JSON parse failure, schema \
+mismatch, division by zero), let the exception propagate so the calling \
+pipeline reports it as an execution error. Returning \
+``{"summary": "Failed to parse: ...", "data": []}`` instead of raising looks \
+like a successful result to the caller and silently hides the failure. The \
+*only* time you may catch an exception is to add diagnostic context, and \
+in that case you MUST re-raise it (e.g. \
+``raise RuntimeError(f"Failed to parse {path}: {original_exc}") from original_exc``). \
+The pipeline's verification gate, retry loop, and CLI error display all \
+depend on real exceptions reaching them. Returning a soft-failure dict \
+defeats every layer of error handling above the tool.\
 """
 
 MCP_TOOL_USER_PROMPT = """\
-Generate a complete MCP tool implementation that solves the ENTIRE task \
-below end-to-end. Classification has already decided this task is best \
-solved by a single MCP tool — do not split it into helpers.
+Generate a complete MCP tool implementation that performs ONE STEP of a \
+larger workflow. Classification has decided this specific step is best \
+implemented as an MCP tool (a single deterministic function).
 
-## Task
+## Full Task Context (for reference only)
+
+This is the overall task the step belongs to. Other steps of this task are \
+handled by separate artifacts — your tool only implements the single step \
+described below, not the whole task.
 
 {task_context}
+
+## The Specific Step to Implement
+
+Your tool implements this step of the workflow:
+
+    {gap_description}
+
+Focus on exactly this step. Do NOT try to solve the whole task in one tool. \
+If the workflow has other steps (parsing, aggregation, reporting, etc.) \
+those are handled by separate tools.
+
+Accept the inputs relevant to this step (typically file paths plus any \
+step-specific parameters) and return the step's output in one call. If the \
+step produces intermediate data that another step will consume, return it \
+as a plain dict/list that the caller can forward.
 
 The tool function MUST be named exactly `{forced_name}` (snake_case). \
 Do not choose a different name.
 
 Generate a complete, working Python file following the FastMCP pattern shown \
-in the system prompt. The tool should take the task inputs (typically file \
-paths) as parameters and return the final result in one call.\
+in the system prompt.\
 """
 
 MCP_TOOL_REPAIR_PROMPT = """\
 The generated MCP tool has a validation error. Fix the issues and return \
 the corrected version.
 
-## Original Task
+## Full Task Context (reference only)
 
 {task_context}
+
+## The Specific Step to Implement
+
+{gap_description}
 
 ## Your Previous Output
 

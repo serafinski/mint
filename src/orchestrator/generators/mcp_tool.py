@@ -203,6 +203,7 @@ def generate_single_tool(
 
     user_prompt = MCP_TOOL_USER_PROMPT.format(
         task_context=task_context or gap.description,
+        gap_description=gap.description or gap.query,
         forced_name=forced_name,
     )
 
@@ -258,6 +259,7 @@ def generate_single_tool(
 
     repair_prompt = MCP_TOOL_REPAIR_PROMPT.format(
         task_context=task_context or gap.description,
+        gap_description=gap.description or gap.query,
         tool_name=result.tool_name,
         description=result.description,
         source_code=result.source_code,

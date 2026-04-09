@@ -1,15 +1,20 @@
 """Gap detection — LangGraph node wrapping registry.detect_gaps().
 
 Searches the capability registry for each required capability and populates
-``state.matches`` per matched capability. The gap output signals whether the
-task needs generation at all — if ANY required capability is unmatched, a
-single placeholder gap is produced. The task-level classifier downstream
-then classifies the entire task once.
+``state.matches`` per matched capability. For each required capability that
+does NOT match in the registry, produces one enumerated ``GapItem`` so the
+downstream per-gap classifier can classify each gap individually within the
+context of the whole task.
 
 This is a plain Python node — no LLM calls. As of Stage 1 of the
 compositional refactor, matches are NO LONGER recorded as fake invocations
 here; honest invocation records are written by the Stage 3 compositional
 executor after real chain execution.
+
+As of Stage 2 of the compositional refactor, the previous "single
+placeholder gap" collapse is removed: the classifier again receives N
+enumerated gaps (one per unmatched required capability) so generators can
+produce N artifacts, one per step of the workflow.
 """
 
 from __future__ import annotations
@@ -34,10 +39,10 @@ def gap_detection_node(
     """Search the registry for each required capability.
 
     Populates ``state.matches`` with capabilities found above the similarity
-    threshold. Produces a single placeholder ``GapItem`` in ``state.gaps`` if
-    any required capability is unmatched — this signals to the downstream
-    classifier that the task needs generation. If all required capabilities
-    are matched, ``state.gaps`` is empty and the classifier becomes a no-op.
+    threshold. For each required capability that was NOT matched in the
+    registry, produces one enumerated ``GapItem`` in ``state.gaps``. If all
+    required capabilities are matched, ``state.gaps`` is empty and the
+    classifier becomes a no-op.
 
     Always routes to ``classifier_node``.
 
@@ -67,18 +72,17 @@ def gap_detection_node(
     # in T14) without any real execution. The Stage 3 CompositionalExecutor
     # writes honest invocation records after the chain actually runs.
 
-    # Produce a single placeholder gap if ANY required capability was unmatched.
-    # The task-level classifier downstream will decide the type for the whole
-    # task. If gaps_raw is empty, state.gaps stays empty and the classifier is
-    # a no-op (all capabilities already in the registry).
-    gaps: list[GapItem] = []
-    if gaps_raw:
-        gaps = [
-            GapItem(
-                description=state.task_description[:300],
-                query="task-level",
-            )
-        ]
+    # Stage 2 of the compositional refactor: produce N enumerated GapItems,
+    # one per unmatched required capability. The per-gap classifier downstream
+    # classifies each gap independently within the context of the whole task,
+    # which lets generators produce N artifacts (one per workflow step).
+    gaps: list[GapItem] = [
+        GapItem(
+            description=capability_name,
+            query=capability_name,
+        )
+        for capability_name, _reason in gaps_raw
+    ]
 
     logger.info(
         "Gap detection: %d match(es), %d unmatched capability(ies) → %d gap(s) for classification",
@@ -88,11 +92,8 @@ def gap_detection_node(
     )
     for m in matches:
         logger.info("  ✓ matched: %s (score=%.2f)", m.capability.name, m.score)
-    if gaps:
-        logger.info(
-            "  → task requires generation (%d unmatched capability(ies))",
-            len(gaps_raw),
-        )
+    for g in gaps:
+        logger.info("  ✗ gap: %s", g.query)
 
     return Command(
         update={

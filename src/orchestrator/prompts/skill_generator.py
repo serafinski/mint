@@ -1,15 +1,29 @@
 """Prompt template for the skill generator node."""
 
 SKILL_GENERATOR_PROMPT = """\
-You are a skill generator for a multi-agent system. Your task is to generate a \
-SKILL.md file that teaches an AI agent how to perform an ENTIRE task \
-end-to-end. Classification has already decided this task is best solved by a \
-single skill — the SKILL.md you produce should cover the whole task, not a \
-sub-step.
+You are a skill generator for a multi-agent system. Your task is to generate \
+a SKILL.md file that teaches an AI agent how to perform ONE STEP of a larger \
+workflow. Classification has decided this specific step is best implemented \
+as a skill (packaged procedural knowledge with a prescribed workflow).
 
-## Task
+## Full Task Context (for reference only)
+
+This is the overall task the step belongs to. Other steps of this task are \
+handled by separate artifacts — the skill you produce covers only the single \
+step described below, not the whole task.
 
 {task_context}
+
+## The Specific Step to Implement
+
+Your skill teaches an agent how to perform this specific step:
+
+    {gap_description}
+
+Focus on exactly this step. If the workflow has other steps (parsing, \
+aggregation, reporting, investigation, etc.) those are handled by separate \
+skills or tools — do not try to cover them here. The skill should guide the \
+agent through the sub-steps of implementing THIS step.
 
 ## SKILL.md Format Rules
 
@@ -100,9 +114,13 @@ The SKILL.md you generated failed validation with this error:
 
 {validation_error}
 
-## Original Task
+## Full Task Context (reference only)
 
 {task_context}
+
+## The Specific Step to Implement
+
+{gap_description}
 
 Here is the SKILL.md content you produced:
 

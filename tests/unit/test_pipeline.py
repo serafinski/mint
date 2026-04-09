@@ -152,13 +152,13 @@ def test_create_pipeline_run_optimizer_flag(seeded_registry, mock_loader):
     assert "optimizer_node" in builder.nodes
 
 
-def test_classifier_produces_at_most_one_classified_gap(seeded_registry, mock_loader):
-    """Under task-level classification, classifier_node emits ≤ 1 classified_gap.
+def test_classifier_produces_one_classified_gap_per_unmatched(seeded_registry, mock_loader):
+    """Under per-gap classification, classifier_node emits N classified_gaps.
 
-    Runs gap_detection + classifier in sequence with a mocked classify_task so
-    the only LLM call is avoided. The assertion is that the classifier produces
-    exactly one classified gap when there is at least one unmatched capability,
-    regardless of how many were required.
+    Runs gap_detection + classifier in sequence with a mocked classify_gap so
+    no LLM call is made. The assertion is that the classifier produces one
+    ClassifiedGap per unmatched required capability, and that distinct types
+    can be assigned across gaps in the same task (mixed-type workflow).
     """
     from unittest.mock import patch
 
@@ -183,10 +183,10 @@ def test_classifier_produces_at_most_one_classified_gap(seeded_registry, mock_lo
         )
         cmd = gap_detection_node(state, seeded_registry)
 
-    # Exactly one placeholder gap produced
-    assert len(cmd.update["gaps"]) == 1
+    # One enumerated gap per unmatched required capability
+    assert len(cmd.update["gaps"]) == 3
 
-    # Hand the state through the classifier with a mocked classify_task
+    # Hand the state through the classifier with a mocked classify_gap
     next_state = TaskState(
         task_description="Task needing three capabilities",
         required_capabilities=["cap-a", "cap-b", "cap-c"],
@@ -194,23 +194,32 @@ def test_classifier_produces_at_most_one_classified_gap(seeded_registry, mock_lo
         gaps=cmd.update["gaps"],
     )
 
-    mock_classified = ClassifiedGap(
-        description="Task needing three capabilities",
-        query="task-needing-three-capabilities-abcdef",
-        classified_type=CapabilityType.SKILL,
-        confidence=0.9,
-        rationale="Multi-step workflow with domain rules",
-    )
+    # Mix types across gaps: MCP_TOOL, SKILL, AGENT (one of each)
+    type_by_query = {
+        "cap-a": CapabilityType.MCP_TOOL,
+        "cap-b": CapabilityType.SKILL,
+        "cap-c": CapabilityType.AGENT,
+    }
+
+    def _mock_classify(gap, task_description, required_capabilities):
+        return ClassifiedGap(
+            description=gap.description,
+            query=f"{gap.query}-abcdef",
+            classified_type=type_by_query[gap.query],
+            confidence=0.9,
+            rationale="test mock",
+        )
 
     with patch(
-        "src.orchestrator.classifier.classify_task",
-        return_value=mock_classified,
+        "src.orchestrator.classifier.classify_gap",
+        side_effect=_mock_classify,
     ):
         cmd = classifier_node(next_state)
 
     classified = cmd.update["classified_gaps"]
-    assert len(classified) == 1
-    assert classified[0].classified_type == CapabilityType.SKILL
+    assert len(classified) == 3
+    types = {c.classified_type for c in classified}
+    assert types == {CapabilityType.MCP_TOOL, CapabilityType.SKILL, CapabilityType.AGENT}
 
 
 def test_loading_then_optimize_preserves_non_end_goto():

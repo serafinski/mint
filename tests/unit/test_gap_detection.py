@@ -1,9 +1,10 @@
 """Unit tests for the gap detection LangGraph node.
 
-Under task-level classification, gap_detection_node produces AT MOST ONE
-placeholder ``GapItem`` — not N enumerated gaps. Per-capability registry
-matching is preserved (populating ``state.matches`` for each match), only
-the gap-output format changes.
+As of Stage 2 of the compositional refactor, ``gap_detection_node`` produces
+N enumerated ``GapItem``s (one per unmatched required capability) so the
+downstream per-gap classifier can classify each step independently within
+the context of the whole task. Per-capability registry matching is preserved
+(populating ``state.matches`` for each match).
 """
 
 from __future__ import annotations
@@ -64,11 +65,11 @@ def test_all_matches_populates_matches_empty_gaps():
 
 
 # ---------------------------------------------------------------------------
-# All gaps (no matches → single placeholder gap, not N enumerated)
+# All gaps (no matches → one enumerated gap per unmatched capability)
 # ---------------------------------------------------------------------------
 
 
-def test_all_gaps_produces_single_placeholder_gap():
+def test_all_gaps_produces_one_enumerated_gap():
     registry = _make_registry(
         gaps=[("translate text to Klingon", "similarity 0.12 below threshold 0.3")],
     )
@@ -80,19 +81,18 @@ def test_all_gaps_produces_single_placeholder_gap():
     cmd = gap_detection_node(state, registry)
 
     assert cmd.goto == "classifier_node"
-    # Exactly one placeholder gap, regardless of how many raw gaps there were
+    # One enumerated gap per unmatched capability
     assert len(cmd.update["gaps"]) == 1
     assert len(cmd.update["matches"]) == 0
     gap = cmd.update["gaps"][0]
     assert isinstance(gap, GapItem)
-    # Placeholder query
-    assert gap.query == "task-level"
-    # Description is (truncated) task description
-    assert gap.description.startswith("translate text from English into Klingon")
+    # Query is the unmatched capability name
+    assert gap.query == "translate text to Klingon"
+    assert gap.description == "translate text to Klingon"
 
 
-def test_multiple_unmatched_capabilities_still_produce_one_placeholder():
-    """Task with N unmatched capabilities produces ONE placeholder gap, not N."""
+def test_multiple_unmatched_capabilities_produce_n_enumerated_gaps():
+    """Task with N unmatched capabilities produces N enumerated gaps, not 1."""
     registry = _make_registry(
         gaps=[
             ("capability-a", "below threshold"),
@@ -107,16 +107,17 @@ def test_multiple_unmatched_capabilities_still_produce_one_placeholder():
 
     cmd = gap_detection_node(state, registry)
 
-    assert len(cmd.update["gaps"]) == 1
-    assert cmd.update["gaps"][0].query == "task-level"
+    assert len(cmd.update["gaps"]) == 3
+    queries = [g.query for g in cmd.update["gaps"]]
+    assert queries == ["capability-a", "capability-b", "capability-c"]
 
 
 # ---------------------------------------------------------------------------
-# Mixed: some matches, some unmatched → matches preserved, one placeholder
+# Mixed: some matches, some unmatched → matches preserved, one gap per unmatched
 # ---------------------------------------------------------------------------
 
 
-def test_mixed_results_preserves_matches_and_produces_single_gap():
+def test_mixed_results_preserves_matches_and_produces_n_gaps():
     cap = _make_descriptor("csv-parser")
     registry = _make_registry(
         matches=[(cap, 0.88, "parse CSV file")],
@@ -132,9 +133,9 @@ def test_mixed_results_preserves_matches_and_produces_single_gap():
     # Per-capability match still recorded
     assert len(cmd.update["matches"]) == 1
     assert cmd.update["matches"][0].capability.name == "csv-parser"
-    # Exactly one placeholder gap (not one per unmatched capability)
+    # One enumerated gap for the unmatched capability
     assert len(cmd.update["gaps"]) == 1
-    assert cmd.update["gaps"][0].query == "task-level"
+    assert cmd.update["gaps"][0].query == "train ML model"
 
 
 # ---------------------------------------------------------------------------

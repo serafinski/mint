@@ -1,9 +1,10 @@
 # Compositional Capability Synthesis
 
-**Date:** 2026-04-08
+**Date:** 2026-04-08 (initial), updated 2026-04-09 (Stage 4.5 added after Phase 2 retrospective)
 **Branch:** `iter/6-execution-backends` → new branch `iter/6-compositional-synthesis`
-**Status:** Planned
+**Status:** Stages 1-2 complete (landed in Phase 1 + Phase 2 of `pre_eval_execution_plan.md`); Stages 3-8 pending
 **Supersedes (partially):** `docs/single_artifact_enforcement_plan.md`
+**Cross-reference:** `docs/pre_eval_execution_plan.md` is the sequencing-and-validation layer; this doc is the architectural detail. Stage 1 ↔ Phase 1 Track 1a, Stage 2 ↔ Phase 2, Stages 3-4 ↔ Phase 3, **Stage 4.5 ↔ Phase 3.5b (added 2026-04-09)**, Stages 5-7 are absorbed into Phase 3 / Phase 3.5 verification, Stage 8 ↔ Phases 5-6.
 
 ---
 
@@ -456,6 +457,50 @@ Each stage is independently testable and reversible. Commit at each stage bounda
 
 ---
 
+### Stage 4.5: DeepAgents subagents for AGENT-typed compositional execution
+
+**Status**: Added 2026-04-09 after the Phase 2 verification gate exposed a context-engineering gap. See `docs/pre_eval_execution_plan.md` Phase 3.5b for the integrated execution-plan view; the detail below is the architectural design and lives in this plan because it is a Stage 4 follow-up.
+
+**Goal**: when the compositional executor handles an agent-typed chain (i.e., one or more gaps classified as AGENT, including over-decomposed multi-step agent tasks), wrap the chain in a DeepAgents lead-with-subagents pattern instead of running each agent as an independent standalone DeepAgent process. Directly addresses the proposal's third tension (*"context economy in a MAS where agents pass context to each other"*) at the generated-capability layer.
+
+**Background** — why this stage exists:
+
+The original Stage 3/4 design treats AGENT-typed artifacts uniformly with MCP_TOOL and SKILL: each is a single artifact in a dependency-ordered chain, executed sequentially with workspace state passed via JSON files. This works correctly for single-agent tasks but is suboptimal for multi-step agent tasks (e.g. an over-decomposed cascade investigation), because each standalone agent gets a fresh planning context, fresh `write_todos` plan, fresh conversation history, and no awareness of what its sibling agents have done. The agents communicate only through serialised workspace JSON, which is the *workflow with agent steps* pattern from the LangChain multi-agent guide — not the *agent with subagents* pattern that DeepAgents was designed for.
+
+The canonical DeepAgents subagent pattern (per [the subagents documentation](https://docs.langchain.com/oss/python/deepagents/subagents.md)) provides **context quarantine** — the lead agent's context window receives only the structured return values from subagent invocations, not the dozens of intermediate tool calls that produced them. Per the [LangChain multi-agent guide](https://docs.langchain.com/oss/python/langchain/multi-agent/index.md), subagents process *"67% fewer tokens than skills"* in multi-domain scenarios due to this isolation. This is the canonical architectural answer to the proposal's third tension.
+
+CLAUDE.md previously listed compositional agents as Chapter 7 future work, citing "evaluation tractability" — the concern was that switching agent execution backends mid-thesis would change eval results in ways hard to attribute. On re-examination during Phase 2, this concern turned out to be weaker than it sounded: the subagent vs standalone choice does not break any of the four ablation conditions (static / no_verification / no_optimization / full) because all four conditions see the same agent backend uniformly. The choice shifts the absolute headline number for the full system, but does not affect the deltas between conditions, which are the load-bearing eval signal. So compositional agents can be promoted from Chapter 7 future work into the implementation without breaking the eval design.
+
+**Changes**:
+
+- `src/schemas/task.py` — add subagent representation. Two options:
+  - **Option A (preferred)**: extend `GeneratedArtifact.agent_config` (which is `dict | None`) to optionally include a `subagents` key carrying a list of subagent dicts matching the DeepAgents `SubAgent` spec (`name`, `description`, `system_prompt`, `tools`, `model`). No new top-level schema field; backwards compatible with single-agent configs.
+  - **Option B (alternative)**: add a new top-level `CapabilitySubAgent` Pydantic model and a `subagents: list[CapabilitySubAgent] | None = None` field on `GeneratedArtifact`. Stricter typing but breaks the existing `agent_config` shape.
+  - Choose Option A for the smaller schema-migration footprint.
+- `src/orchestrator/generators/agent.py` — when the parent task has multiple gaps classified as `AGENT` in `state.classified_gaps` (i.e., the agent-task was decomposed into multiple subtasks instead of being collapsed by decomposer rule 10), generate ONE coordinated lead config + N subagent dicts in a single LLM call, instead of N independent agent configs. Single-gap agent tasks continue to produce a single standalone agent config (no subagents).
+- `src/orchestrator/prompts/agent_generator.py` — add a "lead-with-subagents" mode to the prompt. New structured-output schema field `subagents: list[SubAgentSpec] | None`. Few-shot example showing a multi-step agent task decomposed into a lead + subagents (e.g., a cascade investigation lead with separate "data-loader" and "anomaly-detector" subagents that the lead delegates to via the `task` tool).
+- `tests/evaluation/execution.py:_execute_agent_inner` — when `agent_config.get("subagents")` is non-empty, pass them to `create_deep_agent(..., subagents=[...])`. The DeepAgents library wires up the `task` tool automatically from the subagent list; the lead agent can then delegate to subagents during execution.
+- `src/orchestrator/composition.py` (the new compositional executor module from Stages 3-4) — when handling an agent-typed chain, route to the lead-with-subagents path instead of running standalone agents in sequence. For the agent-task case, the "chain" collapses to a single lead-agent invocation with subagents pre-bound; the compositional executor's job for agent-task chains becomes "build the lead config from the chain, invoke once".
+- `src/orchestrator/loading_node.py` — when registering a lead-with-subagents agent capability, the registry entry represents the whole composition (lead + subagents). Subagents are not separately searchable in the registry; they exist only as part of the lead's configuration. The capability descriptor's `description` field summarises the lead's purpose.
+- (Optional, deferred to Stage 5) Generator prompt awareness of subagent composition for cross-stage workspace conventions — but agent subagents communicate via the `task` tool's structured return values, not via workspace JSON files, so the Stage 5 workspace-convention prompt updates are less relevant for agent subagents than for tool/skill chains.
+
+**Tests**:
+
+- `tests/unit/test_agent_generator.py` — add multi-gap-agent-task test verifying the generator produces lead+subagents instead of N independent agents. Mock the LLM, assert the structured output contains a `subagents` field with N entries.
+- `tests/unit/test_composition.py` — add an agent-task-chain test verifying the compositional executor's branch logic (multi-gap agent task → lead-with-subagents path; single-gap agent task → standalone agent path).
+- `tests/integration/test_pipeline_e2e.py` (or new `tests/integration/test_subagents.py`) — end-to-end T16-style run, verify the lead agent's LangFuse trace contains subagent invocations via the `task` tool and that the subagent contexts do not bloat the lead's context window (manual inspection of token counts in the trace).
+
+**Verification**:
+
+- Unit suite passes
+- `uv run scripts/run_pilot.py --tasks T16 --condition full --n-runs 1` — T16 should now produce 1 lead agent + N subagents in the generated_artifacts list (or, if decomposer rule 10 is also tightened in Phase 3.5c, T16 collapses to a single standalone agent and the subagent code path is not exercised on this specific task — exercise it on a deliberately multi-step agent task instead)
+- LangFuse trace for T16 shows the lead's `task` tool calls invoking the subagents — not 4 standalone DeepAgent processes
+- Token cost per agent task should drop relative to the Phase 3 baseline (subagent context quarantine: ~67% fewer tokens per the LangChain multi-agent guide for similar isolation patterns)
+
+**Deliverable**: Stage 4.5 commit. AGENT-typed compositional execution uses DeepAgents subagents for context quarantine. The other capability types (MCP_TOOL, SKILL) continue to use the Stage 4 standalone-in-chain pattern via workspace JSON, because their context-bloat surfaces are different (no in-loop tool-call accumulation to quarantine).
+
+---
+
 ### Stage 5: Update generator prompts for composition-awareness
 
 **Goal**: generated artifacts know they're part of a chain and produce composable outputs.
@@ -726,11 +771,12 @@ Closed items (no longer future work):
 - Mixed-type chains
 
 Remaining future work:
-- Subagent delegation (generated agents that call other generated agents)
+- ~~Subagent delegation (generated agents that call other generated agents)~~ — **promoted into Stage 4.5 on 2026-04-09** after the Phase 2 retrospective concluded that the proposal's third tension (context economy in a MAS where agents pass context to each other) is under-exercised at the generated-capability layer and that DeepAgents subagents are the canonical fix. See Stage 4.5 above and `pre_eval_execution_plan.md` Phase 3.5b.
 - Parallel execution of independent chain steps
 - Typed IO schemas (HP1 Option Z) — currently using untyped JSON file passing
 - Dynamic dependency rewiring (if step B fails, retry with different upstream)
 - Compositional verification (verify the chain as a whole, not just individual artifacts)
+- Subagent-to-subagent delegation (a subagent itself spawning further subagents) — Stage 4.5 only enables one level of lead+subagents, not arbitrary nesting
 
 ---
 
@@ -746,7 +792,7 @@ Remaining future work:
    - Current decomposition usually produces 1 required capability per subtask. If multiple, we need a resolution strategy: pick the first, or fail. **Decision**: log a warning and use the first. Future work: allow subtasks to compose multiple capabilities internally.
 
 4. **Can a chain step BE a skill that calls another skill?**
-   - Currently no. Skills execute via a constrained LLM loop with `sandbox_execute` — they don't dispatch to other skills. **Decision**: out of scope for this plan; future work.
+   - Currently no. Skills execute via a constrained LLM loop with `sandbox_execute` — they don't dispatch to other skills. **Decision**: out of scope for this plan; future work. (Note: AGENT-typed chain steps CAN delegate to subagents as of Stage 4.5; this question is specifically about SKILL-typed chain steps, which remain monolithic.)
 
 5. **How is the resolution map built when matches and generated artifacts cover overlapping capabilities?**
    - E.g., registry matched `csv-parser` for `read-csv` AND the classifier routed `read-csv` to generation (returning a new CSV reader). **Decision**: registry matches take precedence. If a capability name is in both `state.matches` and `state.generated_artifacts`, use the match. This prevents redundant generation.

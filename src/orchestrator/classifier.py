@@ -1,17 +1,18 @@
-"""Task-level capability classifier (LLM-based, temperature=0).
+"""Per-gap capability classifier (LLM-based, temperature=0).
 
-Classifies an entire task into ONE ``CapabilityType`` (MCP_TOOL, SKILL, or
-AGENT) and produces a single ``ClassifiedGap``.  This is a plain LangGraph
-node (no DeepAgent) because classification is a single-step task.
+Classifies capability gaps into ``CapabilityType`` values (MCP_TOOL, SKILL,
+or AGENT). This is a plain LangGraph node (no DeepAgent) because each
+classification is a single-step LLM call.
 
-Classification uses a single LLM call with ``temperature=0`` for near-
-deterministic results and ``with_structured_output`` for validated responses.
+As of Stage 2 of the compositional refactor, the classifier operates
+per-gap: ``classifier_node`` iterates over ``state.gaps`` and calls
+``classify_gap`` once for each, producing N entries in ``state.classified_gaps``
+(one per workflow step). The legacy ``classify_task`` wrapper is preserved
+for whole-task classification fallback.
 
-Task-level classification (replaces earlier per-gap classifier): the classifier
-receives the full task description plus the decomposition-produced
-``required_capabilities`` as context and returns ONE classification for the
-whole task. This matches the testbed's single-type-per-task ground truth and
-eliminates multi-artifact waste on multi-gap tasks.
+Each classification uses a single LLM call with ``temperature=0`` for
+near-deterministic results and ``with_structured_output`` for validated
+responses.
 """
 
 from __future__ import annotations
@@ -23,10 +24,19 @@ from typing import Literal
 
 from langgraph.types import Command
 
-from src.orchestrator.prompts.classifier import TASK_CLASSIFICATION_PROMPT
+from src.orchestrator.prompts.classifier import (
+    GAP_CLASSIFICATION_PROMPT,
+    TASK_CLASSIFICATION_PROMPT,
+)
 from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
-from src.schemas.task import ClassificationResult, ClassifiedGap, TaskState, TaskStatus
+from src.schemas.task import (
+    ClassificationResult,
+    ClassifiedGap,
+    GapItem,
+    TaskState,
+    TaskStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,26 +137,110 @@ def _normalize_capability_name(name: str, task_description: str) -> str:
     return f"{cleaned}-{hash_suffix}"
 
 
+def classify_gap(
+    gap: GapItem,
+    task_description: str,
+    required_capabilities: list[str],
+) -> ClassifiedGap:
+    """Classify a single gap within the context of the whole task.
+
+    Uses a single LLM call at ``temperature=0`` with structured output.
+    Returns a ``ClassifiedGap`` whose ``description`` carries the gap's own
+    description and whose ``query`` is the LLM-chosen semantic name with a
+    collision-safe hash suffix.
+
+    On LLM failure, returns a fallback classification: ``MCP_TOOL`` with
+    confidence ``0.3`` and the marker ``"LLM classification failed"`` in the
+    rationale (so ``classifier_node`` can detect the fallback and surface it
+    on ``state.errors``). The fallback's ``query`` is a deterministic slug
+    derived from the gap query (not the task description) so multiple
+    failing gaps in the same task don't collide.
+
+    Args:
+        gap: The single ``GapItem`` to classify (one step of the workflow).
+        task_description: Full natural-language task description, supplied
+            as context so the classifier can reason about the gap's role
+            within the larger workflow.
+        required_capabilities: Capability names produced by decomposition;
+            passed to the prompt as contextual information only.
+    """
+    llm = _get_llm()
+    structured_llm = llm.with_structured_output(ClassificationResult)
+
+    caps_text = (
+        ", ".join(required_capabilities)
+        if required_capabilities
+        else "(none identified)"
+    )
+
+    prompt = GAP_CLASSIFICATION_PROMPT.format(
+        task_description=task_description[:1500],
+        required_capabilities=caps_text,
+        gap_query=gap.query,
+        gap_description=gap.description[:500],
+    )
+
+    # No per-node CallbackHandler: invoked from a LangGraph node so the
+    # pipeline-level handler propagates automatically via LangChain's
+    # contextvar inheritance.
+
+    # Hash-suffix seed: combine task description + gap query so two gaps
+    # within the same task get different suffixes, and the same gap on
+    # retry gets the same suffix (idempotent re-generation).
+    name_seed = f"{task_description}||{gap.query}"
+
+    try:
+        result: ClassificationResult = structured_llm.invoke(prompt)
+        capability_name = _normalize_capability_name(
+            result.capability_name, name_seed
+        )
+        return ClassifiedGap(
+            description=gap.description[:500] or gap.query,
+            query=capability_name,
+            classified_type=result.classified_type,
+            confidence=result.confidence,
+            rationale=result.rationale,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Gap classification LLM call failed for %r: %s", gap.query, exc
+        )
+        emit_langfuse_event(
+            None,
+            "classifier.llm_failure",
+            "ERROR",
+            {
+                "gap_query": gap.query,
+                "task_description": task_description[:200],
+                "error": str(exc),
+            },
+        )
+        # Fallback slug derived from the gap query (not the task), so that
+        # multiple failing gaps in the same task produce distinct slugs.
+        fallback_slug = _slug_from_task(gap.query or task_description)
+        return ClassifiedGap(
+            description=gap.description[:500] or gap.query,
+            query=fallback_slug,
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.3,
+            rationale=f"LLM classification failed ({exc}); defaulting to MCP_TOOL",
+        )
+
+
 def classify_task(
     task_description: str,
     required_capabilities: list[str],
 ) -> ClassifiedGap:
-    """Classify an entire task into one capability type.
+    """Classify an entire task into one capability type (legacy wrapper).
 
-    Uses a single LLM call at ``temperature=0`` with structured output.
-    Returns a ``ClassifiedGap`` whose ``description`` is a truncated task
-    description and whose ``query`` is a deterministic slug.
+    Preserved as a thin wrapper over ``classify_gap`` for callers that want
+    whole-task classification (tests, single-gap fallback paths). Internally
+    uses the legacy ``TASK_CLASSIFICATION_PROMPT`` so the behaviour is
+    identical to the pre-Stage-2 classifier on a single call.
 
-    On LLM failure, returns a fallback classification matching the existing
-    classifier convention: ``MCP_TOOL`` with confidence ``0.3`` and the marker
-    ``"LLM classification failed"`` in the rationale (so ``classifier_node``
-    can detect the fallback and surface it on ``state.errors``).
-
-    Args:
-        task_description: The full natural-language task description.
-        required_capabilities: Capability names produced by decomposition;
-            passed to the prompt as contextual information only (not a
-            routing rule).
+    Prefer ``classify_gap`` for new code — the per-gap classifier handles
+    multi-step tasks correctly and becomes the primary entry point in
+    ``classifier_node``.
     """
     llm = _get_llm()
     structured_llm = llm.with_structured_output(ClassificationResult)
@@ -162,15 +256,8 @@ def classify_task(
         required_capabilities=caps_text,
     )
 
-    # No per-node CallbackHandler: invoked from a LangGraph node so the
-    # pipeline-level handler propagates automatically via LangChain's
-    # contextvar inheritance.
-
     try:
         result: ClassificationResult = structured_llm.invoke(prompt)
-        # Use LLM-chosen semantic name (normalized + hash-suffixed for
-        # collision safety). Falls back to slug-from-task if the LLM's
-        # chosen name fails validation.
         capability_name = _normalize_capability_name(
             result.capability_name, task_description
         )
@@ -206,21 +293,26 @@ def classify_task(
 def classifier_node(
     state: TaskState,
 ) -> Command[Literal["generate_mcp_tool"]]:
-    """Classify the whole task into one capability type.
+    """Classify each gap in ``state.gaps`` individually.
 
     Skips classification if ``state.gaps`` is empty — meaning every required
     capability was matched in the registry by ``gap_detection_node``. In that
     case the pipeline proceeds through the (no-op) generator chain directly
     to the loading node.
 
-    Otherwise, produces exactly ONE ``ClassifiedGap`` representing the
-    task-level classification. Any pre-existing classified gaps in state are
-    preserved (for retry scenarios) and the new task-level classification is
-    appended.
+    Otherwise, iterates over ``state.gaps`` and calls ``classify_gap`` once
+    per gap, producing N ``ClassifiedGap`` entries in ``state.classified_gaps``
+    (one per workflow step). Two gaps in the same task can be classified as
+    different types — generators filter ``classified_gaps`` by type and
+    produce one artifact per gap of their type.
 
-    Records a warning in ``state.errors`` when the LLM falls back to the
-    default classification (detectable via the ``rationale`` marker
-    ``"LLM classification failed"``).
+    On retry, any gap whose query matches an already-classified entry in
+    ``state.classified_gaps`` is skipped (so retries don't duplicate work).
+    Pre-existing classified gaps are preserved.
+
+    Records a warning in ``state.errors`` for each gap where the LLM falls
+    back to the default classification (detectable via the ``rationale``
+    marker ``"LLM classification failed"``).
 
     Routes to ``generate_mcp_tool`` which begins the sequential generator
     chain: generate_mcp_tool → generate_skill → generate_agent → verification.
@@ -234,42 +326,71 @@ def classifier_node(
         )
 
     logger.info(
-        "Classifier: task-level classification (%d required capabilities, %d gap(s))",
-        len(state.required_capabilities),
+        "Classifier: per-gap classification (%d gap(s), %d required capabilities)",
         len(state.gaps),
+        len(state.required_capabilities),
     )
 
-    classified = classify_task(
-        task_description=state.task_description,
-        required_capabilities=state.required_capabilities,
-    )
-
-    logger.info(
-        "Classifier: task classified as %s (confidence=%.2f)",
-        classified.classified_type.value,
-        classified.confidence,
-    )
-    emit_langfuse_event(
-        None,
-        "classifier.task_classified",
-        "DEFAULT",
-        {
-            "classified_type": classified.classified_type.value,
-            "confidence": classified.confidence,
-            "n_required_capabilities": len(state.required_capabilities),
-            "n_gaps_before": len(state.gaps),
-        },
-    )
-
-    # Preserve any pre-existing classified gaps (retry scenarios) and append
-    # the new task-level classification.
+    # Preserve any pre-existing classified gaps (retry scenarios). Use the
+    # pre-existing gap_query (raw, not the LLM-chosen capability_name) to
+    # detect which gaps have already been classified. We stash the raw gap
+    # query in a side-set because ClassifiedGap.query holds the normalized
+    # capability name, not the original gap query.
     classified_gaps = list(state.classified_gaps)
-    classified_gaps.append(classified)
+
+    # On retry, state.classified_gaps may contain entries from a previous
+    # attempt. Skip gaps whose description matches an already-classified
+    # entry's description (which is set to gap.description in classify_gap).
+    already_classified_descriptions = {cg.description for cg in classified_gaps}
 
     errors: list[str] = list(state.errors)
-    # Match the existing convention: "LLM classification failed" marker in rationale
-    if "LLM classification failed" in classified.rationale:
-        errors.append(f"Classification fallback: {classified.rationale}")
+    n_fallbacks = 0
+
+    for gap in state.gaps:
+        gap_desc_key = (gap.description[:500] or gap.query)
+        if gap_desc_key in already_classified_descriptions:
+            logger.info("  → skipping (already classified): %s", gap.query)
+            continue
+
+        classified = classify_gap(
+            gap=gap,
+            task_description=state.task_description,
+            required_capabilities=state.required_capabilities,
+        )
+
+        logger.info(
+            "  classified %s → %s (confidence=%.2f, name=%s)",
+            gap.query,
+            classified.classified_type.value,
+            classified.confidence,
+            classified.query,
+        )
+        emit_langfuse_event(
+            None,
+            "classifier.gap_classified",
+            "DEFAULT",
+            {
+                "gap_query": gap.query,
+                "classified_type": classified.classified_type.value,
+                "confidence": classified.confidence,
+                "capability_name": classified.query,
+            },
+        )
+
+        classified_gaps.append(classified)
+
+        # Match the existing convention: "LLM classification failed" marker
+        # in rationale signals an LLM fallback — record as a warning error.
+        if "LLM classification failed" in classified.rationale:
+            errors.append(f"Classification fallback: {classified.rationale}")
+            n_fallbacks += 1
+
+    if n_fallbacks:
+        logger.warning(
+            "Classifier: %d/%d gap(s) fell back to MCP_TOOL due to LLM failure",
+            n_fallbacks,
+            len(state.gaps),
+        )
 
     return Command(
         update={
