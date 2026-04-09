@@ -122,7 +122,7 @@ scripts/                # Evaluation runners + integration tests
 └── test_mint.py            # MINT CLI smoke test (all types + formats)
 
 tests/
-├── unit/               # 887+ tests, no I/O, no external services
+├── unit/               # 938+ tests, no I/O, no external services
 ├── integration/        # Docker, ChromaDB, DuckDB, MCP servers
 └── evaluation/         # Harness, tasks, snapshots, fixtures
 ```
@@ -336,7 +336,7 @@ The sandbox resolves dependencies dynamically at runtime — no hardcoded packag
 
 **All iterations (0–5) are complete.** Current phase: **Iteration 6 — Evaluation & Analysis.**
 
-All core infrastructure is built and tested (887 unit tests pass as of 2026-04-09). The MINT CLI (`uv run mint`) is implemented. A comprehensive code audit on 2026-04-06 resolved 33 internal contradictions. **All prior evaluation data is stale** — a full re-run (18 tasks × 4 conditions × 5 runs = 360 records) is required before thesis figures can be produced.
+All core infrastructure is built and tested (938 unit tests pass as of 2026-04-09, post-Phase-1). The MINT CLI (`uv run mint`) is implemented. A comprehensive code audit on 2026-04-06 resolved 33 internal contradictions. **All prior evaluation data is stale** — a full re-run (18 tasks × 4 conditions × 5 runs = 360 records) is required before thesis figures can be produced. **Phase 1 of `docs/pre_eval_execution_plan.md` is complete** (commits `13b1ecd` honest metrics + Tier 1/2 hardening, `8ab68b0` runner verification sidecar). Phases 2 (per-gap restoration) and 3 (compositional executor) remain.
 
 ### What was built per iteration
 
@@ -395,8 +395,14 @@ All numbers pending confirmation after full re-run with post-audit code.
 
 - [x] Run code audits and contradiction checks (9 passes complete, diminishing returns)
 - [x] Baseline verification (~5 min):
-  - [x] `uv run pytest tests/unit/` — 887 passed (2026-04-09)
+  - [x] `uv run pytest tests/unit/` — 938 passed (2026-04-09, post-Phase-1; baseline was 887)
   - [x] `docker build -t jit-sandbox sandbox/` — rebuilt successfully (2026-04-07)
+- [x] **Phase 1 — honest metrics + Tier 1/2 hardening** (2026-04-09, commits `13b1ecd` + `8ab68b0`):
+  - [x] Track 1a: removed fake `InvocationRecord` writes from `gap_detection.py`; added 7 compositional fields to `EvaluationRecord` (`chain_length`, `chain_success`, `matched_and_executed_count`, `generated_artifact_count`, `capability_types`, `failed_step_index`, `failed_step_name`); added `CapabilityReference` and `ChainResult` schemas; DuckDB schema migration via `_MIGRATIONS` ALTER TABLE
+  - [x] Track 1b: new Tier 1 AST checks (`_check_mock_imports`, `_check_random_seed`, `_check_lorem_ipsum`); layered SKILL/AGENT code-fence scanner in `gate.py` (`_extract_python_fences` + recursive scan as MCP_TOOL on each fence — preserves T04 prose-scoping); three Tier 0 prose hard-fails in `tools/quick_validate.py` (`lorem ipsum`, `TODO: implement`, `# placeholder return`)
+  - [x] Track 1c: renamed existing 5s wall-time check `category="latency"` → `"timeout"` (constant `LATENCY_THRESHOLD_S` → `TIMEOUT_THRESHOLD_S`); added new variance-based `_test_latency` (mean<1ms AND cv<0.10, both required)
+  - [x] Verified: 938 unit tests pass; full `test_mint.py` 7/7 across all 3 capability types; `run_pilot.py T14 --condition full --n-runs 1` writes correct row to `data/eval/metrics.duckdb` with all 7 new compositional columns populated and round-trippable via `_row_to_record`. Stage 1 fake-write purge verified directly via SQL: zero rows in `invocations` match `latency_ms=0`. Zero false positives from new checks across 8 real generations; one true positive caught (T11 placeholder inside SKILL Python fence) with retry loop succeeding cleanly.
+  - [x] CLI runner sidecar (`8ab68b0`): `_save_output` now writes `<cap_name>_<ts>.verification.json` next to the result JSON when `final_state.verification_results` is present, so the CLI's "N minor verification note(s)" findings are inspectable without LangFuse
 - [ ] Targeted pre-eval checks (~10 min):
   - [x] Prompt review — rewrote classifier (three-layer model), agent generator (real tools, filesystem isolation), decomposition (agent example, anti-split), skill generator (filesystem isolation), MCP tool generator (removed hardcoded pip mappings) (2026-04-07/08)
   - [ ] Snapshot integrity — verify `tests/evaluation/snapshots/` has correct seeded capabilities (T01-T03 MCP_TOOL, T05/T09 SKILL)

@@ -19,6 +19,7 @@ Legend:
 - **B1 (AGENT-type coverage adequacy)** — re-scoped: the armchair verdict ("thin") was unsupported by evidence; the correct B1 check is an empirical pilot run on the post-Stage-3 pipeline. Sequenced for after Stage 3 lands.
 - **CLI display bugs** (`-1 artifact(s)`, `0.0s Tier 3`, `0.0s Classifying gaps`, phantom `268.3s` on `generate_agent`) — ✅ **already fixed** in commit `781dc4e`. Regression-guarded by 12 unit tests in `tests/unit/test_cli_runner_gen_stage.py`. No further work needed.
 - **Phase 0 baseline verification** — ✅ **complete** (2026-04-09): 887 unit tests pass (73 more than CLAUDE.md's old 814 baseline), Docker sandbox rebuilds cleanly, working tree is clean of code changes. Phase 1 of `docs/pre_eval_execution_plan.md` is unblocked.
+- **Phase 1 — honest metrics + Tier 1/2 hardening** — ✅ **complete** (2026-04-09): commits `13b1ecd` (Tracks 1a/1b/1c) + `8ab68b0` (CLI runner verification sidecar follow-up). 938 unit tests pass (+51 net new). Verified end-to-end via full `test_mint.py` (7/7) and `run_pilot.py T14`. Stage 1 fake-write purge confirmed via SQL on `data/cli/metrics.duckdb`. Zero false positives from new checks across 8 real generations; one true positive caught (T11 placeholder in code fence) with retry succeeding. **A1, A2, and the Stage 1 portion of C1 are now done.** Phase 2 (per-gap restoration) and Phase 3 (compositional executor) remain.
 
 ---
 
@@ -26,7 +27,7 @@ Legend:
 
 ### A1. Tier 1 hardening bundle (decision-table item #3)
 
-**Status:** 🔴 → DECIDED. ~75 lines + tests, one focused commit.
+**Status:** ✅ **DONE** in commit `13b1ecd` (2026-04-09). Final size ~140 lines (Part A 70, Part B 50, Part C 12) + ~360 lines of new tests across `test_static_scanner.py`, `test_gate.py`, and the new `test_quick_validate.py`.
 
 **Three parts:**
 
@@ -60,7 +61,7 @@ Legend:
 
 ### A2. Tier 2 latency rename + variance check bundle (decision-table item #4)
 
-**Status:** 🔴 → DECIDED. ~45 lines + tests. **Package deal — rename without the new check is strictly worse than status quo.**
+**Status:** ✅ **DONE** in commit `13b1ecd` (2026-04-09). Final size ~70 lines in `behavioral.py` + ~80 lines of new tests in `test_behavioral.py`. Package shipped together as planned.
 
 **Two parts:**
 

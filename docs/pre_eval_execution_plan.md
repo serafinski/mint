@@ -45,55 +45,73 @@ This doc is the **sequencing and validation** layer. It does not duplicate the i
 
 ---
 
-### Phase 1 — Low-risk foundation (~2-3 days)
+### Phase 1 — Low-risk foundation — ✅ **COMPLETE** (2026-04-09)
+
+**Commits:** `13b1ecd` (honest metrics + Tier 1/2 hardening) and `8ab68b0` (CLI runner verification sidecar follow-up).
+
+**Verified:** 938 unit tests pass (+51 net new); full `test_mint.py` 7/7 across all three capability types; `run_pilot.py T14 --condition full --n-runs 1` writes a correct row to `data/eval/metrics.duckdb` with all 7 new compositional columns populated and round-trippable via `_row_to_record`. Stage 1 fake-write purge verified directly via SQL: zero rows in `data/cli/metrics.duckdb` `invocations` table match the `latency_ms=0` signature. Zero false positives from any new check across 8 real generations; one true positive caught — **T11 attempt 1 had a `placeholder` literal inside a Python code fence in the generated SKILL.md, the new code-fence scanner caught it (CRITICAL `mock_artifact` finding with location `code_fence[0]:'placeholder' at position 47`), the gate hard-rejected, and attempt 2 produced a clean SKILL with no findings**. T04 prose-false-positive scoping is preserved (the prose regex is still scoped to MCP_TOOL inside `static_scanner.scan()`).
 
 **Goal:** land the three cheapest, lowest-risk items so Phase 2/3 start from a cleaner footing. These are independent of each other and can be committed in any order (or interleaved).
 
 Three parallel tracks:
 
-#### Track 1a — Compositional Stage 1 (~1-2 days)
+#### Track 1a — Compositional Stage 1 (~1-2 days) — ✅ **DONE** in `13b1ecd`
 
 Reference: `docs/compositional_synthesis_plan.md` Stage 1.
 
-- [ ] Remove fake `InvocationRecord` writes from `src/orchestrator/gap_detection.py:65-73` (explicit comment marks the block)
-- [ ] Add new `EvaluationRecord` fields with safe defaults: `chain_length`, `chain_success`, `matched_and_executed_count`, `generated_artifact_count`, `capability_types: list[str]`, `failed_step_index: int | None`, `failed_step_name: str | None`
-- [ ] Add `CapabilityReference` and `ChainResult` schemas to `src/schemas/task.py` (used later in Stage 3; adding schemas now keeps Stage 3 lighter)
-- [ ] DuckDB schema migration in `src/registry/evaluation_store.py` — `ALTER TABLE ADD COLUMN` with defaults so existing DBs upgrade cleanly
-- [ ] Update `tests/unit/test_gap_detection.py` — remove assertions that fake invocations ARE recorded, replace with assertion that NO invocations are recorded by gap detection
-- [ ] Update `tests/evaluation/harness.py` `_extract_result` to populate the new fields with single-artifact defaults (`chain_length=1`, etc.)
+- [x] Remove fake `InvocationRecord` writes from `src/orchestrator/gap_detection.py:65-73` (explicit comment marks the block)
+- [x] Add new `EvaluationRecord` fields with safe defaults: `chain_length`, `chain_success`, `matched_and_executed_count`, `generated_artifact_count`, `capability_types: list[str]`, `failed_step_index: int | None`, `failed_step_name: str | None`
+- [x] Add `CapabilityReference` and `ChainResult` schemas to `src/schemas/task.py` (used later in Stage 3; adding schemas now keeps Stage 3 lighter)
+- [x] DuckDB schema migration in `src/registry/evaluation_store.py` — `_INIT_SQL` declares the new columns; `_MIGRATIONS` runs `ALTER TABLE ADD COLUMN IF NOT EXISTS` (DuckDB doesn't support `NOT NULL DEFAULT` on ALTER, so old rows get NULL and `_row_to_record` coerces them via `or 0` / `is not None else default`)
+- [x] Update `tests/unit/test_gap_detection.py` — assertions inverted to `metrics_store.record_invocation.assert_not_called()`
+- [x] Update `tests/evaluation/harness.py` `_extract_result` to populate the new fields with single-artifact defaults (`chain_length=1`, `chain_success = gate_passed and output_in_range`, `matched_and_executed_count = 1 if matches and not artifacts else 0`, etc.)
 
 **Verification:** full unit suite passes. Run `uv run scripts/test_mint.py --mcp-only` smoke test — T14 should produce correct output, and the `csv-parser` invocation count in `data/cli/metrics.duckdb` should be **0** (not 1 from the fake write).
 
-#### Track 1b — Tier 1 hardening bundle A1 (~1 day)
+#### Track 1b — Tier 1 hardening bundle A1 (~1 day) — ✅ **DONE** in `13b1ecd`
 
 Reference: `docs/todo_drift_and_missing.md` section A1.
 
-- [ ] Part A — MCP_TOOL Tier 1 additions (~25 lines): `unittest.mock` import AST check, `random.seed(<Constant>)` AST check, `faker` import AST check, lorem ipsum string-literal regex. All in `src/verification/static_scanner.py`.
-- [ ] Part B — SKILL/AGENT code-fence scanner (~40 lines): extract Python fences from `skill_content` and from `system_prompt` + `skill_content` (for AGENT with `is_deep_agent=True`); run existing AST checks on each extracted snippet. Wire into `src/verification/gate.py`.
-- [ ] Part C — Tier 0 prose checks (~10 lines): extend `tools/quick_validate.py` with lorem ipsum literal + literal `TODO: implement` patterns
-- [ ] Unit tests for each new check (positive + negative cases)
+- [x] Part A — MCP_TOOL Tier 1 additions: `_check_mock_imports` (covers `unittest.mock`, `mock`, `faker` via both `Import` and `ImportFrom` AST nodes — CRITICAL), `_check_random_seed` (catches `random.seed(<literal>)`, `np.random.seed(...)`, `numpy.random.seed(...)` — HIGH), `_check_lorem_ipsum` (regex on source — HIGH). All wired only inside the `if capability_type == CapabilityType.MCP_TOOL:` branch in `static_scanner.scan()`.
+- [x] Part B — SKILL/AGENT code-fence scanner: `_extract_python_fences()` regex helper in `gate.py`, plus layered scan in `_static_scan` that extracts ` ```python ` fences from `skill_content` (SKILL) and from `system_prompt` + `skill_content` (AGENT with `is_deep_agent=True`), runs the full MCP_TOOL `static_scanner.scan()` on each fenced snippet, and merges findings with `code_fence[N]:...` location prefix. Re-evaluates `overall_passed` after merge so fence CRITICALs hard-reject.
+- [x] Part C — Tier 0 prose checks in `tools/quick_validate.py`: three literal hard-fails on `\blorem ipsum\b` (case-insensitive), `TODO: implement`, and `# placeholder return` against the SKILL.md body (frontmatter is stripped first via the same regex used for parsing).
+- [x] Unit tests: 15 new in `test_static_scanner.py`, 7 new in `test_gate.py` (including the `test_skill_prose_placeholder_not_flagged_t04_regression` case that explicitly verifies prose-scoping is preserved), 10 in the new `test_quick_validate.py`.
 
 **Verification:** full unit suite still passes. Run `uv run scripts/test_verification.py` to confirm three-tier gate works end-to-end with the new checks.
 
-#### Track 1c — Tier 2 latency rename + variance bundle A2 (~0.5 day)
+#### Track 1c — Tier 2 latency rename + variance bundle A2 (~0.5 day) — ✅ **DONE** in `13b1ecd`
 
 Reference: `docs/todo_drift_and_missing.md` section A2.
 
-- [ ] Rename existing 5s check from `category="latency"` → `"timeout"` in `src/verification/behavioral.py`
-- [ ] Add new `_test_latency` that reuses boundary inputs (already generated), runs the tool 3-5 times with varied inputs, computes `mean` and `cv = std/mean`, flags only if `mean < 1ms` AND `cv < 0.10`
-- [ ] Unit tests for both branches
+- [x] Renamed `LATENCY_THRESHOLD_S` → `TIMEOUT_THRESHOLD_S`, `_test_latency` (old) → `_test_timeout`, and `category="latency"` → `"timeout"` for the wall-time-based check. `src/cli/display.py:305` uses generic substring matching that handles both labels unchanged.
+- [x] New `_test_latency` (variance check): collects 3 distinct boundary input variants via `_generate_{boundary,negative,large}_inputs`, dedupes by `repr(sorted(...))`, samples elapsed times via the existing sandbox helper, computes mean and stdev via stdlib `statistics`, flags MEDIUM only if `mean < 0.001` AND `cv < 0.10` (both required). Returns empty list if `< 2` successful samples.
+- [x] Unit tests: 9 new across two new test classes in `test_behavioral.py` (positive case, slow case, variable case, insufficient-samples case, empty-schema edge case).
 
 **Verification:** behavioral test suite passes. Spot-check that a legitimate fast tool (e.g. seeded `fibonacci`) does not trip the new variance check.
 
-#### Phase 1 combined gate
+#### Phase 1 combined gate — ✅ **PASSED** (2026-04-09)
 
-- [ ] Full unit suite passes (baseline 887, ideally higher with new tests added)
-- [ ] `uv run scripts/test_mint.py --quick` passes
-- [ ] `uv run scripts/test_pipeline.py` passes (full pipeline integration)
-- [ ] `uv run scripts/test_verification.py` passes (three-tier gate integration)
-- [ ] **Commit:** `feat(phase1): honest metrics + Tier 1/2 hardening bundles`
+What was actually run (deviates from the original mechanical list — see note below):
 
-**Decision gate:** if Phase 1 is clean, proceed to Phase 2. If anything breaks, fix before moving on.
+- [x] Full unit suite passes — **938 passed** in ~130s (was 887 baseline; +51 net new tests across the three tracks)
+- [x] **Full** `uv run scripts/test_mint.py` (not just `--quick`) — **7/7 tasks passed** across all three capability types and 6 file formats. ~$0.20, ~25 min. Strict superset of `--quick` and exercises every new gate path through real LLM generations.
+- [x] `uv run scripts/run_pilot.py --tasks T14 --condition full --n-runs 1` — wrote a clean row to `data/eval/metrics.duckdb` with all 7 new compositional columns populated and round-trippable via `EvaluationStore._row_to_record`. ~$0.10, ~7 min. **Only smoke that exercises the harness path** (`tests/evaluation/harness.py:_extract_result`) and the file-backed `EvaluationStore` migration.
+- [x] Stage 1 fake-write purge confirmed via SQL on `data/cli/metrics.duckdb`: `SELECT COUNT(*) WHERE latency_ms = 0` returns 0.
+- [x] **Commit:** `13b1ecd feat(phase1): honest metrics + Tier 1/2 hardening bundles` + follow-up `8ab68b0 feat(cli): persist verification report sidecar alongside mint_output`. Both pushed to `origin/iter/6-execution-backends`.
+
+**Tests deliberately skipped from the original mechanical list, with rationale:**
+
+- `test_mint.py --quick`: superseded by full `test_mint.py`. The quick variant only checks CLI format detection ($0, 30s); the full variant exercises every code path the quick variant does *plus* end-to-end generation through all three capability types. Running both is redundant.
+- `scripts/test_pipeline.py`: full `test_mint.py` is a strict superset for Phase 1 coverage purposes — both invoke the same 9-node pipeline graph and `test_mint` adds more variety across capability types and file formats.
+- `scripts/test_verification.py`: the unit tests already cover the new gate paths (15 new tests in `test_static_scanner.py`, 7 new in `test_gate.py`, 10 in the new `test_quick_validate.py`, 9 new in `test_behavioral.py`). `test_verification.py` would only add Docker integration coverage, which isn't part of the Phase 1 changeset (we didn't touch `sandbox_tool.py` or the Docker layer).
+
+**What the verification actually caught (real-world signal, not just unit-test green):**
+
+- Zero false positives from any new check (`_check_mock_imports`, `_check_random_seed`, `_check_lorem_ipsum`, code-fence scanner, variance latency) across **8 real LLM generations** (7 from test_mint + 1 from pilot T14, including 2 attempts on T11 and 2 on T14).
+- **One true positive caught:** T11 attempt 1 generated a SKILL.md with a Python code fence containing a literal `placeholder`, the new code-fence scanner extracted the fence and ran the existing `_check_mock_artifacts` regex on it, fired CRITICAL `mock_artifact` with `location="code_fence[0]:'placeholder' at position 47"`, gate hard-rejected, retry produced a clean SKILL on attempt 2. **The T04 prose-false-positive scoping was preserved** — verified by the explicit `test_skill_prose_placeholder_not_flagged_t04_regression` test.
+- **One unrelated true positive caught on the pilot:** T14 attempt 1 generated MCP_TOOL code with two `except Exception: pass` blocks (lines 157 and 175). Existing `_check_silent_except` (NOT a new check) flagged both as HIGH, gate aggregated to reject after running all three tiers, retry produced clean code on attempt 2. Same pattern — retry loop is doing real work, not creating false friction.
+
+**Decision gate:** ✅ Phase 1 is clean. Phase 2 (per-gap restoration) is unblocked.
 
 ---
 
