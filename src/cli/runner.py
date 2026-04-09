@@ -865,8 +865,18 @@ def _record_invocation(
 # ---------------------------------------------------------------------------
 
 
-def _save_output(output_dir: Path, output: dict, artifact: Any | None) -> None:
-    """Save output to files in the specified directory."""
+def _save_output(
+    output_dir: Path,
+    output: dict,
+    artifact: Any | None,
+    verification_reports: list[Any] | None = None,
+) -> None:
+    """Save output to files in the specified directory.
+
+    If ``verification_reports`` is provided, also writes a sidecar
+    ``<cap_name>_<ts>.verification.json`` with the full Tier 1/2/3 findings
+    so they can be inspected without going to LangFuse.
+    """
     from datetime import UTC, datetime
 
     try:
@@ -904,6 +914,20 @@ def _save_output(output_dir: Path, output: dict, artifact: Any | None) -> None:
     result_path = output_dir / f"{cap_name}_{ts}.json"
     result_path.write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
     saved.append(str(result_path))
+
+    # Save verification report sidecar so findings (including non-blocking
+    # MEDIUM/INFO notes from Tier 1/2/3) can be inspected without LangFuse.
+    if verification_reports:
+        verification_payload = [
+            r.model_dump(mode="json") if hasattr(r, "model_dump") else r
+            for r in verification_reports
+        ]
+        verification_path = output_dir / f"{cap_name}_{ts}.verification.json"
+        verification_path.write_text(
+            json.dumps(verification_payload, indent=2, default=str),
+            encoding="utf-8",
+        )
+        saved.append(str(verification_path))
 
     for path in saved:
         console.print(f"  [green]\u2713[/green] Saved: [dim]{path}[/dim]")
@@ -1349,12 +1373,18 @@ def execute_task(
 
     # Always save output (default: data/output/, override with --output-dir)
     save_dir = output_dir or _data_dir() / "mint_output"
+    verification_reports = getattr(final_state, "verification_results", None) or None
     if output:
-        _save_output(save_dir, output, artifact)
+        _save_output(save_dir, output, artifact, verification_reports)
     elif artifact is not None:
         # Save metadata even for empty outputs so the attempt is recorded
         cap_name = getattr(artifact, "capability_name", "unknown")
-        _save_output(save_dir, {"_empty": True, "_capability": cap_name}, artifact)
+        _save_output(
+            save_dir,
+            {"_empty": True, "_capability": cap_name},
+            artifact,
+            verification_reports,
+        )
 
     # Success: artifact executed with output, or registry matched (even
     # without source_code — the system found a relevant capability)
