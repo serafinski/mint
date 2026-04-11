@@ -141,7 +141,32 @@ def sandbox_execute(
     return _sandbox_execute_core(code, timeout, network=False)
 
 
-def _sandbox_execute_core(code: str, timeout: int, *, network: bool) -> dict:
+def sandbox_execute_in_workspace(
+    code: str,
+    workspace_path: Path | str,
+    timeout: int = 10,
+    extra_packages: list[str] | None = None,
+) -> dict:
+    """Execute code in Docker with a host workspace mounted at ``/workspace``.
+
+    Same as :func:`sandbox_execute` but mounts *workspace_path* read-write
+    into the container so chain steps can pass state via files like
+    ``/workspace/step_0_output.json``.
+
+    This function is for programmatic use by the compositional executor —
+    it is NOT exposed as an LLM tool (``sandbox_execute`` is the tool-facing
+    function with a clean schema).
+    """
+    ws = Path(workspace_path)
+    if extra_packages:
+        return _sandbox_execute_with_install(code, timeout, extra_packages, workspace_path=ws)
+
+    return _sandbox_execute_core(code, timeout, network=False, workspace_path=ws)
+
+
+def _sandbox_execute_core(
+    code: str, timeout: int, *, network: bool, workspace_path: Path | None = None,
+) -> dict:
     """Run code in Docker, optionally with network access."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(code)
@@ -149,17 +174,20 @@ def _sandbox_execute_core(code: str, timeout: int, *, network: bool) -> dict:
 
     network_flag = "bridge" if network else "none"
 
+    docker_args = [
+        "docker", "run", "--rm",
+        "--network", network_flag,
+        "--memory", "128m",
+        "--cpus", "0.5",
+        "-v", f"{script_path}:/sandbox/script.py:ro",
+    ]
+    if workspace_path is not None:
+        docker_args += ["-v", f"{workspace_path}:/workspace"]
+    docker_args += [SANDBOX_IMAGE, "/sandbox/script.py"]
+
     try:
         proc = subprocess.run(
-            [
-                "docker", "run", "--rm",
-                "--network", network_flag,
-                "--memory", "128m",
-                "--cpus", "0.5",
-                "-v", f"{script_path}:/sandbox/script.py:ro",
-                SANDBOX_IMAGE,
-                "/sandbox/script.py",  # ENTRYPOINT is already `python`
-            ],
+            docker_args,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -179,7 +207,8 @@ def _sandbox_execute_core(code: str, timeout: int, *, network: bool) -> dict:
 
 
 def _sandbox_execute_with_install(
-    code: str, timeout: int, packages: list[str]
+    code: str, timeout: int, packages: list[str],
+    *, workspace_path: Path | None = None,
 ) -> dict:
     """Install extra packages (with network), then run code (without network).
 
@@ -258,18 +287,21 @@ def _sandbox_execute_with_install(
         f.write(code)
         script_path = f.name
 
+    docker_args = [
+        "docker", "run", "--rm",
+        "--network", "none",
+        "--memory", "128m",
+        "--cpus", "0.5",
+        "--user", "sandbox",
+        "-v", f"{script_path}:/sandbox/script.py:ro",
+    ]
+    if workspace_path is not None:
+        docker_args += ["-v", f"{workspace_path}:/workspace"]
+    docker_args += [ephemeral_tag, "/sandbox/script.py"]
+
     try:
         proc = subprocess.run(
-            [
-                "docker", "run", "--rm",
-                "--network", "none",
-                "--memory", "128m",
-                "--cpus", "0.5",
-                "--user", "sandbox",
-                "-v", f"{script_path}:/sandbox/script.py:ro",
-                ephemeral_tag,
-                "/sandbox/script.py",
-            ],
+            docker_args,
             capture_output=True,
             text=True,
             timeout=timeout,

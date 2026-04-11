@@ -196,7 +196,7 @@ def classify_gap(
         )
         return ClassifiedGap(
             description=gap.description[:500] or gap.query,
-            query=capability_name,
+            query=gap.query,
             classified_type=result.classified_type,
             confidence=result.confidence,
             rationale=result.rationale,
@@ -217,10 +217,9 @@ def classify_gap(
         )
         # Fallback slug derived from the gap query (not the task), so that
         # multiple failing gaps in the same task produce distinct slugs.
-        fallback_slug = _slug_from_task(gap.query or task_description)
         return ClassifiedGap(
             description=gap.description[:500] or gap.query,
-            query=fallback_slug,
+            query=gap.query,
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.3,
             rationale=f"LLM classification failed ({exc}); defaulting to MCP_TOOL",

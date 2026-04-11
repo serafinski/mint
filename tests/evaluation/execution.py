@@ -487,6 +487,152 @@ def _execute_skill_inner(
 
 
 # ---------------------------------------------------------------------------
+# MCP_TOOL chain execution (Phase 3 — compositional executor)
+# ---------------------------------------------------------------------------
+
+
+def execute_mcp_tool_in_chain(
+    source_code: str,
+    step_index: int,
+    workspace_path: Path,
+    pip_packages: list[str] | None = None,
+    capability_name: str = "tool",
+) -> dict:
+    """Execute an MCP_TOOL as one step of a chain with workspace state passing.
+
+    Reads inputs from ``/workspace/fixtures/`` and ``/workspace/step_*_output.json``,
+    runs the tool function, writes output to ``/workspace/step_<N>_output.json``.
+
+    Never raises — returns ``{}`` on any failure.
+    """
+    from src.verification.behavioral import _extract_function_name
+    from src.verification.sandbox_tool import (
+        resolve_extra_packages,
+        sandbox_execute_in_workspace,
+    )
+
+    func_name = _extract_function_name(source_code) or capability_name.replace("-", "_")
+
+    sandbox_code = f"""\
+import asyncio, json, inspect, os, glob
+
+__name__ = "not_main"
+
+{source_code}
+
+async def _run():
+    try:
+        _all_inputs = {{}}
+        _fixture_paths = []
+
+        # Read upstream step outputs FIRST (higher priority for later steps).
+        # These are the structured JSON handoffs from previous chain steps —
+        # the proposal's "world state at each handoff point".
+        for _sf in sorted(glob.glob("/workspace/step_*_output.json")):
+            _step_name = os.path.basename(_sf).replace("_output.json", "")
+            try:
+                with open(_sf) as _f:
+                    _data = json.load(_f)
+                if isinstance(_data, dict):
+                    _all_inputs.update(_data)
+                _all_inputs[_step_name] = _data
+            except Exception:
+                pass
+
+        # Then read fixture files (lower priority — used mainly by step 0).
+        _fixtures_dir = "/workspace/fixtures"
+        if os.path.isdir(_fixtures_dir):
+            for _fp in sorted(os.listdir(_fixtures_dir)):
+                _full = os.path.join(_fixtures_dir, _fp)
+                if os.path.isfile(_full):
+                    _all_inputs[_fp] = _full
+                    _fixture_paths.append(_full)
+
+        # Match available inputs to function parameters
+        _sig = inspect.signature({func_name})
+        _valid = set(_sig.parameters.keys())
+        _kwargs = {{k: v for k, v in _all_inputs.items() if k in _valid}}
+
+        # Path-like parameter matching: assign fixture paths to params
+        # whose names suggest they expect a file path (file_path, csv_path, etc.)
+        _PATH_KEYWORDS = {{"path", "file", "csv", "log", "json", "txt", "xml",
+                          "yaml", "yml", "tsv", "xlsx", "doc", "input"}}
+        _required = {{
+            name for name, p in _sig.parameters.items()
+            if p.default is inspect.Parameter.empty
+        }}
+        _unmatched = _required - set(_kwargs)
+        _used_fixtures = set()
+        for _p in sorted(_unmatched):
+            _p_lower = _p.lower()
+            if any(kw in _p_lower for kw in _PATH_KEYWORDS):
+                for _fp in _fixture_paths:
+                    if _fp not in _used_fixtures:
+                        _kwargs[_p] = _fp
+                        _used_fixtures.add(_fp)
+                        break
+
+        # Fuzzy word-overlap match for remaining unmatched params
+        _still_unmatched = _required - set(_kwargs)
+        _unused = {{k: v for k, v in _all_inputs.items() if k not in _kwargs}}
+        def _words(s):
+            return set(w.rstrip("s") for w in s.lower().replace("_", " ").split() if len(w) > 2)
+        for _p in _still_unmatched:
+            _pw = _words(_p)
+            best, best_n = None, 0
+            for _ek, _ev in _unused.items():
+                n = len(_pw & _words(_ek))
+                if n > best_n:
+                    best, best_n = (_ek, _ev), n
+            if best_n > 0:
+                _kwargs[_p] = best[1]
+
+        result = await {func_name}(**_kwargs)
+
+        # Write output to workspace for downstream steps
+        with open(f"/workspace/step_{step_index}_output.json", "w") as _out:
+            json.dump(result, _out, default=str)
+
+        print(json.dumps({{"result": result}}, default=str))
+    except Exception as e:
+        print(json.dumps({{"error": str(e)}}))
+
+asyncio.run(_run())
+"""
+    extra_pkgs = pip_packages if pip_packages else resolve_extra_packages(source_code)
+    exec_timeout = 60 if extra_pkgs else 30
+
+    result = sandbox_execute_in_workspace(
+        sandbox_code,
+        workspace_path=workspace_path,
+        timeout=exec_timeout,
+        extra_packages=extra_pkgs or None,
+    )
+
+    if not result.get("success") or not result.get("stdout"):
+        logger.warning(
+            "Chain MCP_TOOL step %d (%s) failed: exit=%s stderr=%s",
+            step_index,
+            capability_name,
+            result.get("exit_code"),
+            (result.get("stderr") or "")[:500],
+        )
+        return {}
+
+    try:
+        parsed = json.loads(result["stdout"].strip().splitlines()[-1])
+        if "error" in parsed:
+            logger.warning(
+                "Chain MCP_TOOL %s raised: %s", capability_name, str(parsed["error"])[:500]
+            )
+            return {}
+        return parsed.get("result", {}) or {}
+    except (json.JSONDecodeError, KeyError, IndexError):
+        logger.warning("Chain MCP_TOOL output parse failed for %s", capability_name)
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # AGENT execution
 # ---------------------------------------------------------------------------
 

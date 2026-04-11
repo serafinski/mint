@@ -179,6 +179,10 @@ class MatchItem(BaseModel):
 
     capability: CapabilityDescriptor = Field(..., description="The matched capability")
     score: float = Field(..., description="Similarity score from registry search")
+    query: str = Field(
+        default="",
+        description="The original required_capability query that this match answered",
+    )
 
     model_config = {"extra": "forbid"}
 

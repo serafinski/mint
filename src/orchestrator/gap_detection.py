@@ -63,8 +63,8 @@ def gap_detection_node(
     matches_raw, gaps_raw = registry.detect_gaps(state.required_capabilities)
 
     matches = [
-        MatchItem(capability=cap, score=score)
-        for cap, score, _query in matches_raw
+        MatchItem(capability=cap, score=score, query=query)
+        for cap, score, query in matches_raw
     ]
 
     # Stage 1 of the compositional refactor: matches are NOT recorded as

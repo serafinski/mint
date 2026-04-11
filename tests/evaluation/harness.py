@@ -455,9 +455,159 @@ class EvaluationHarness:
         _lf_meta = invoke_config.get("metadata", {})
         return _extract_result(
             final_state, task, loader,
+            metrics_store=metrics_store,
             langfuse_tags=_lf_meta.get("langfuse_tags"),
             langfuse_session_id=_lf_meta.get("langfuse_session_id"),
         )
+
+
+# ---------------------------------------------------------------------------
+# Compositional result extraction (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _extract_result_compositional(
+    subtasks: list,
+    artifacts: list,
+    matches: list,
+    classified_gaps: list,
+    required_capabilities: list[str],
+    verification_results: list,
+    attempt_count: int,
+    task: TaskDefinition,
+    *,
+    metrics_store: Any | None = None,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
+) -> dict:
+    """Compositional execution path — run all artifacts in dependency order.
+
+    Used when the decomposition produced multiple subtasks with resolved
+    capabilities.  Builds a resolution map, creates a
+    :class:`CompositionalExecutor`, runs the chain, and maps
+    :class:`ChainResult` fields onto the ``EvaluationRecord`` dict.
+    """
+    from src.orchestrator.composition import CompositionalExecutor, build_resolution_map
+
+    # Check gate: all generated artifacts must have passed verification.
+    # If verification was enabled and any artifact failed, the pipeline
+    # would have retried up to MAX_ATTEMPTS.  We check the latest report
+    # for each artifact.
+    gate_passed = True
+    verification_tier_reached: int | None = None
+    if verification_results:
+        _latest_by_name: dict[str, Any] = {}
+        for report in verification_results:
+            _latest_by_name[report.capability_name] = report
+        for report in _latest_by_name.values():
+            if not report.overall_passed:
+                gate_passed = False
+            if verification_tier_reached is None or (
+                report.tier_reached is not None
+                and report.tier_reached > (verification_tier_reached or 0)
+            ):
+                verification_tier_reached = report.tier_reached
+    elif artifacts:
+        # No verification reports but artifacts exist = no_verification condition
+        gate_passed = True
+
+    # Build resolution map
+    resolution = build_resolution_map(
+        required_capabilities, matches, artifacts, classified_gaps,
+    )
+
+    # Determine primary capability type (highest priority in chain)
+    cap_types = []
+    for ref in resolution.values():
+        ct = str(ref.capability_type).split(".")[-1].lower()
+        if ct not in cap_types:
+            cap_types.append(ct)
+    # Primary type for the record: use most capable type present
+    _type_order = {"agent": 0, "skill": 1, "mcp_tool": 2}
+    capability_type = min(cap_types, key=lambda t: _type_order.get(t, 9)) if cap_types else None
+
+    if not gate_passed:
+        # Verification failed — don't attempt execution
+        tier_map = {1: "tier1", 2: "tier2", 3: "tier3"}
+        return {
+            "gate_passed": False,
+            "output_in_range": False,
+            "failure_reason": tier_map.get(verification_tier_reached, "tier1"),
+            "attempt_count": attempt_count,
+            "capability_type": capability_type,
+            "verification_tier_reached": verification_tier_reached,
+            "token_cost": 0,
+            "invocation_record_id": None,
+            "required_capability_count": len(required_capabilities),
+            "matched_in_registry_count": len(matches),
+            "chain_length": len(subtasks),
+            "chain_success": False,
+            "matched_and_executed_count": 0,
+            "generated_artifact_count": len(artifacts),
+            "capability_types": cap_types,
+            "failed_step_index": None,
+            "failed_step_name": None,
+        }
+
+    # Run the compositional chain
+    executor = CompositionalExecutor(
+        subtasks=subtasks,
+        resolution=resolution,
+        artifacts=artifacts,
+        matches=matches,
+        fixture_paths=task.fixture_paths or [],
+        task=task,
+        metrics_store=metrics_store,
+        langfuse_tags=langfuse_tags,
+        langfuse_session_id=langfuse_session_id,
+    )
+
+    chain_result = executor.run(task_id=task.task_id)
+
+    # Validate final output
+    output_in_range = False
+    failure_reason = "generation_failed"
+    if chain_result.chain_success and chain_result.step_results:
+        final_output = chain_result.step_results[-1]
+        try:
+            output_in_range = task.validator(final_output)
+            failure_reason = "none" if output_in_range else "output_rejected"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Validator failed for compositional output of %s: %s",
+                task.task_id, exc,
+            )
+            failure_reason = "output_rejected"
+    elif not chain_result.chain_success:
+        failure_reason = "chain_step_failed"
+
+    # Count how many registry matches vs generated artifacts were executed
+    matched_count = sum(
+        1 for ref in resolution.values() if ref.source == "registry"
+    )
+    generated_count = sum(
+        1 for ref in resolution.values() if ref.source == "generated"
+    )
+
+    return {
+        "gate_passed": gate_passed,
+        "output_in_range": output_in_range,
+        "failure_reason": failure_reason,
+        "attempt_count": attempt_count,
+        "capability_type": capability_type,
+        "verification_tier_reached": verification_tier_reached,
+        "token_cost": 0,
+        "invocation_record_id": None,
+        "required_capability_count": len(required_capabilities),
+        "matched_in_registry_count": len(matches),
+        "chain_length": chain_result.chain_length,
+        "chain_success": chain_result.chain_success,
+        "matched_and_executed_count": matched_count,
+        "generated_artifact_count": generated_count,
+        "capability_types": cap_types,
+        "failed_step_index": chain_result.failed_step_index,
+        "failed_step_name": chain_result.failed_step_name,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +620,7 @@ def _extract_result(
     task: TaskDefinition,
     loader: ToolLoader,
     *,
+    metrics_store: Any | None = None,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
 ) -> dict:
@@ -481,6 +632,32 @@ def _extract_result(
     required_capabilities = _get("required_capabilities", []) or []
     verification_results = _get("verification_results", []) or []
     attempt_count = _get("attempt_count", 0)
+    subtasks = _get("subtasks", []) or []
+    classified_gaps = _get("classified_gaps", []) or []
+
+    # ---------------------------------------------------------------
+    # Compositional execution path (Phase 3): when the task was
+    # decomposed into multiple subtasks, run all resolved artifacts
+    # in dependency order via the CompositionalExecutor.
+    # ---------------------------------------------------------------
+    if len(subtasks) > 1 and (len(artifacts) + len(matches) > 1):
+        return _extract_result_compositional(
+            subtasks=subtasks,
+            artifacts=artifacts,
+            matches=matches,
+            classified_gaps=classified_gaps,
+            required_capabilities=required_capabilities,
+            verification_results=verification_results,
+            attempt_count=attempt_count,
+            task=task,
+            metrics_store=metrics_store,
+            langfuse_tags=langfuse_tags,
+            langfuse_session_id=langfuse_session_id,
+        )
+
+    # ---------------------------------------------------------------
+    # Single-artifact execution path (legacy, Phase 2 and earlier)
+    # ---------------------------------------------------------------
 
     # Determine verification outcome from the last VerificationReport
     gate_passed = False

@@ -753,6 +753,142 @@ def _execute_skill_or_agent(
 
 
 # ---------------------------------------------------------------------------
+# Compositional chain execution (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _execute_compositional_chain(
+    final_state: Any,
+    file_paths: list[Path],
+    task_prompt: str,
+    json_output: bool,
+    console: Any,
+    *,
+    invoke_config: dict | None = None,
+    metrics_store: Any | None = None,
+) -> tuple[dict | None, Any | None, str | None]:
+    """Run a compositional chain when multiple subtasks are present.
+
+    Returns ``(output, artifact_for_display, exec_error)``.
+    """
+    from src.orchestrator.composition import CompositionalExecutor, build_resolution_map
+
+    _get = (
+        final_state.get
+        if isinstance(final_state, dict)
+        else lambda k, d=None: getattr(final_state, k, d)
+    )
+    subtasks = _get("subtasks", []) or []
+    artifacts = _get("generated_artifacts", []) or []
+    matches = _get("matches", []) or []
+    required_capabilities = _get("required_capabilities", []) or []
+    classified_gaps = _get("classified_gaps", []) or []
+
+    resolution = build_resolution_map(
+        required_capabilities, matches, artifacts, classified_gaps,
+    )
+
+    # Minimal task-like object for execute_skill_artifact / execute_agent_artifact
+    from dataclasses import dataclass, field as dc_field
+
+    @dataclass
+    class _CliChainTask:
+        task_id: str = ""
+        task_prompt: str = ""
+        fixture_paths: list = dc_field(default_factory=list)
+
+    cli_task = _CliChainTask(
+        task_prompt=task_prompt,
+        fixture_paths=[str(p) for p in file_paths],
+    )
+
+    _lf_meta = (invoke_config or {}).get("metadata", {})
+
+    executor = CompositionalExecutor(
+        subtasks=subtasks,
+        resolution=resolution,
+        artifacts=artifacts,
+        matches=matches,
+        fixture_paths=file_paths,
+        task=cli_task,
+        metrics_store=metrics_store,
+        langfuse_tags=_lf_meta.get("langfuse_tags"),
+        langfuse_session_id=_lf_meta.get("langfuse_session_id"),
+    )
+
+    exec_error: str | None = None
+    chain_result = None
+
+    if json_output:
+        try:
+            chain_result = executor.run()
+        except Exception as exc:
+            exec_error = f"{type(exc).__name__}: {exc}"
+    else:
+        import threading
+
+        console.print()
+
+        chain_start = time.monotonic()
+        status_text = f"[cyan]Chain step 1/{len(subtasks)}...[/cyan] [dim](0s)[/dim]"
+        chain_stop = threading.Event()
+
+        def _on_step_start(position: int, total: int, ref: Any) -> None:
+            cap_type = str(ref.capability_type).split(".")[-1].upper()
+            nonlocal status_text
+            status_text = (
+                f"[cyan]Chain step {position + 1}/{total}: "
+                f"{ref.capability_name} ({cap_type}, {ref.source})[/cyan]"
+            )
+
+        def _on_step_end(position: int, total: int, ref: Any, success: bool) -> None:
+            marker = "[green]✓[/green]" if success else "[red]✗[/red]"
+            cap_type = str(ref.capability_type).split(".")[-1].upper()
+            console.print(
+                f"  {marker} Step {position + 1}/{total}: "
+                f"{ref.capability_name} ([cyan]{cap_type}[/cyan], {ref.source})"
+            )
+
+        def _timer(status_ref: Any) -> None:
+            while not chain_stop.is_set():
+                sec = int(time.monotonic() - chain_start)
+                status_ref.update(f"{status_text} [dim]({sec}s)[/dim]")
+                chain_stop.wait(1)
+
+        with console.status(status_text, spinner="dots") as chain_status:
+            t = threading.Thread(target=_timer, args=(chain_status,), daemon=True)
+            t.start()
+            try:
+                chain_result = executor.run(
+                    on_step_start=_on_step_start,
+                    on_step_end=_on_step_end,
+                )
+            except Exception as exc:
+                exec_error = f"{type(exc).__name__}: {exc}"
+            finally:
+                chain_stop.set()
+                t.join(timeout=1)
+
+        if chain_result and not chain_result.chain_success:
+            step_info = ""
+            if chain_result.failed_step_name:
+                step_info = (
+                    f" at step {chain_result.failed_step_index}: "
+                    f"{chain_result.failed_step_name}"
+                )
+            console.print(f"[yellow]Chain failed{step_info}[/yellow]")
+
+    output: dict | None = None
+    if chain_result is not None and chain_result.chain_success and chain_result.step_results:
+        output = chain_result.step_results[-1] or None
+
+    # Use first artifact for display / save metadata
+    artifact_for_display = artifacts[0] if artifacts else None
+
+    return output, artifact_for_display, exec_error
+
+
+# ---------------------------------------------------------------------------
 # Registry match fallback
 # ---------------------------------------------------------------------------
 
@@ -896,17 +1032,20 @@ def _save_output(
     """
     from datetime import UTC, datetime
 
+    cap_name = getattr(artifact, "capability_name", "output") if artifact else "output"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Create a subdirectory per run: mint_output/<cap_name>_<ts>/
+    run_dir = output_dir / f"{cap_name}_{ts}"
     try:
-        output_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         logging.getLogger(__name__).warning(
-            "Cannot create output directory %s: %s", output_dir, exc
+            "Cannot create run directory %s: %s", run_dir, exc
         )
         return
 
-    cap_name = getattr(artifact, "capability_name", "output") if artifact else "output"
-    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    saved: list[str] = []
+    saved: list[tuple[str, str]] = []  # (label, path)
 
     # Scan output for file-like content and save separately
     for key, value in output.items():
@@ -923,28 +1062,27 @@ def _save_output(
                 ext = ".md"
             else:
                 ext = ".txt"
-            file_path = output_dir / f"{key}_{ts}{ext}"
+            file_path = run_dir / f"{key}{ext}"
             file_path.write_text(value, encoding="utf-8")
-            saved.append(str(file_path))
+            saved.append((f"Data ({key})", str(file_path)))
 
     # Always save the full result as JSON
-    result_path = output_dir / f"{cap_name}_{ts}.json"
+    result_path = run_dir / "output.json"
     result_path.write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
-    saved.append(str(result_path))
+    saved.append(("Output", str(result_path)))
 
-    # Save verification report sidecar so findings (including non-blocking
-    # MEDIUM/INFO notes from Tier 1/2/3) can be inspected without LangFuse.
+    # Save verification report sidecar
     if verification_reports:
         verification_payload = [
             r.model_dump(mode="json") if hasattr(r, "model_dump") else r
             for r in verification_reports
         ]
-        verification_path = output_dir / f"{cap_name}_{ts}.verification.json"
+        verification_path = run_dir / "verification.json"
         verification_path.write_text(
             json.dumps(verification_payload, indent=2, default=str),
             encoding="utf-8",
         )
-        saved.append(str(verification_path))
+        saved.append(("Verification", str(verification_path)))
 
     # Save per-run manifest so multi-capability runs are inspectable as
     # a single file. Phase 2 produces N artifacts per task; this manifest
@@ -961,6 +1099,12 @@ def _save_output(
         matches = _state_get("matches", []) or []
         classified_gaps = _state_get("classified_gaps", []) or []
 
+        # Check if this was a compositional chain run (all artifacts executed)
+        subtasks = _state_get("subtasks", []) or []
+        _all_executed = len(subtasks) > 1 and (
+            len(all_artifacts) + len(matches) > 1
+        )
+
         def _artifact_summary(art: Any) -> dict:
             art_name = getattr(art, "capability_name", None)
             return {
@@ -970,7 +1114,7 @@ def _save_output(
                 ).split(".")[-1].lower(),
                 "gap_query": getattr(art, "gap_query", None),
                 "description": getattr(art, "description", None),
-                "executed": art_name == cap_name,
+                "executed": True if _all_executed else art_name == cap_name,
             }
 
         manifest = {
@@ -1006,15 +1150,15 @@ def _save_output(
                 for cg in classified_gaps
             ],
         }
-        manifest_path = output_dir / f"{cap_name}_{ts}.run.json"
+        manifest_path = run_dir / "run.json"
         manifest_path.write_text(
             json.dumps(manifest, indent=2, default=str),
             encoding="utf-8",
         )
-        saved.append(str(manifest_path))
+        saved.append(("Run manifest", str(manifest_path)))
 
-    for path in saved:
-        console.print(f"  [green]\u2713[/green] Saved: [dim]{path}[/dim]")
+    for label, path in saved:
+        console.print(f"  [green]\u2713[/green] {label}: [dim]{path}[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -1045,11 +1189,28 @@ def _extract_stage_detail(node_name: str, state_update: Any) -> str:
     elif node_name == "verification_node":
         results = _get("verification_results", []) or []
         if results:
-            last = results[-1]
-            if getattr(last, "overall_passed", False):
-                return f"[green]\u2713 Tier {last.tier_reached}[/green]"
+            # Deduplicate: keep only the latest report per capability_name.
+            # verification_results accumulates across retries; without this,
+            # the display would show inflated counts (e.g., "9 passed" when
+            # only 4 artifacts exist but 3 verification passes ran).
+            latest_by_name: dict[str, Any] = {}
+            for r in results:
+                cap = getattr(r, "capability_name", None)
+                if cap:
+                    latest_by_name[cap] = r
+            deduped = list(latest_by_name.values())
+            passed = sum(1 for r in deduped if getattr(r, "overall_passed", False))
+            failed = len(deduped) - passed
+            max_tier = max(
+                (getattr(r, "tier_reached", 0) or 0 for r in deduped), default=0
+            )
+            if failed > 0:
+                return (
+                    f"[red]\u2717 {failed} failed[/red], "
+                    f"[green]{passed} passed[/green] (Tier {max_tier})"
+                )
             else:
-                return f"[red]\u2717 Tier {last.tier_reached}[/red]"
+                return f"[green]\u2713 Tier {max_tier}[/green]"
         return ""
     elif node_name.startswith("generate_"):
         artifacts = _get("generated_artifacts", []) or []
@@ -1226,6 +1387,7 @@ def execute_task(
         current_label = _STAGE_LABEL.get(first_node, "Starting") + "..."
         printed_nodes: set[str] = set()
         prev_artifact_count = 0
+        node_visit_count: dict[str, int] = {}  # track retries
 
         def _print_completed(node_name: str) -> bool:
             """Print a completed stage line. Returns True if printed."""
@@ -1277,33 +1439,31 @@ def execute_task(
                 timer_thread = threading.Thread(target=_timer_loop, args=(status,), daemon=True)
                 timer_thread.start()
 
+                _GEN_NODES = {"generate_mcp_tool", "generate_skill", "generate_agent"}
+
                 for event in pipeline.stream(initial_state, config=invoke_config):
                     node_name = list(event.keys())[0]
                     update = event[node_name]
 
-                    # Print the PREVIOUS active_node BEFORE merging this
-                    # event's update. This keeps the diff attribution
-                    # accurate: the previous stage's artifact delta is
-                    # computed against the state *it* produced, not against
-                    # a state that already includes the current event's
-                    # changes. Applying the update first would cause e.g.
-                    # `generate_mcp_tool` to be "printed" with the skill
-                    # artifact that `generate_skill` (the current event)
-                    # just added, mislabeling the stage and misattributing
-                    # the diff.
-                    if active_node and active_node != node_name:
+                    # Track how many times each node has been visited
+                    # (retry loop causes generators + verification to repeat)
+                    node_visit_count[node_name] = node_visit_count.get(node_name, 0) + 1
+
+                    # On retry, allow nodes to be re-printed by removing
+                    # them from printed_nodes.
+                    if node_visit_count[node_name] > 1:
+                        printed_nodes.discard(node_name)
+
+                    # When a NEW node starts, print the previous node if
+                    # it hasn't been printed yet (generator nodes that need
+                    # artifact diff attribution are deferred to here).
+                    if active_node and active_node != node_name and active_node not in printed_nodes:
                         completed.add(active_node)
                         timings[active_node] = time.monotonic() - stage_start
                         _print_completed(active_node)
-                        # Always reset stage_start so each node gets its
-                        # own timing window. Skipped stages lose ~<1s of
-                        # routing overhead — acceptable to fix the prior
-                        # "skipped folds into next" misattribution that
-                        # made verification look like 0.0s while its time
-                        # was attributed to the buggy `-1` generator line.
                         stage_start = time.monotonic()
 
-                    # NOW merge this event's update into accumulated state
+                    # Merge this event's update into accumulated state
                     if isinstance(update, dict):
                         accumulated.update(update)
 
@@ -1312,9 +1472,25 @@ def execute_task(
                     if detail:
                         stage_details[node_name] = detail
 
+                    # For non-generator nodes, print completion immediately
+                    # so the ✓ line appears BEFORE the next spinner starts.
+                    # Generator nodes are deferred because their artifact
+                    # diff needs to be computed against state that doesn't
+                    # yet include the next generator's artifacts.
+                    if node_name not in _GEN_NODES and node_name not in printed_nodes:
+                        completed.add(node_name)
+                        timings[node_name] = time.monotonic() - stage_start
+                        _print_completed(node_name)
+                        stage_start = time.monotonic()
+
                     # Update spinner to show what's running NEXT
-                    # (this event means node_name just completed)
-                    current_label = _NEXT_STAGE_LABEL.get(node_name, "Processing...")
+                    next_label = _NEXT_STAGE_LABEL.get(node_name, "Processing...")
+                    # Enrich verification spinner with artifact count
+                    if "Verifying" in next_label:
+                        n_arts = len(accumulated.get("generated_artifacts") or [])
+                        if n_arts:
+                            next_label = f"Verifying {n_arts} artifact(s)..."
+                    current_label = next_label
 
                 # Mark last node as done
                 if active_node:
@@ -1343,12 +1519,37 @@ def execute_task(
 
     elapsed_ms = int((time.monotonic() - t_start) * 1000)
 
-    # Select artifact and execute
-    artifact = _select_artifact(final_state)
+    # ---------------------------------------------------------------
+    # Compositional execution: if the task was decomposed into
+    # multiple subtasks with resolved capabilities, run the chain.
+    # ---------------------------------------------------------------
+    _state_get_early = (
+        final_state.get
+        if isinstance(final_state, dict)
+        else lambda k, d=None: getattr(final_state, k, d)
+    )
+    _subtasks = _state_get_early("subtasks", []) or []
+    _artifacts_all = _state_get_early("generated_artifacts", []) or []
+    _matches_all = _state_get_early("matches", []) or []
+    _use_compositional = len(_subtasks) > 1 and (len(_artifacts_all) + len(_matches_all) > 1)
+
+    artifact: Any = None
     output: dict | None = None
     exec_error: str | None = None
 
-    if artifact:
+    if _use_compositional:
+        output, artifact, exec_error = _execute_compositional_chain(
+            final_state, file_paths, task_prompt, json_output, console,
+            invoke_config=invoke_config,
+            metrics_store=metrics_store,
+        )
+    else:
+        # ---------------------------------------------------------------
+        # Single-artifact execution (legacy path)
+        # ---------------------------------------------------------------
+        artifact = _select_artifact(final_state)
+
+    if not _use_compositional and artifact:
         from src.schemas.capability import CapabilityType
 
         cap_type = artifact.capability_type

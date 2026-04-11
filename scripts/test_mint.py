@@ -261,7 +261,7 @@ def main() -> int:
 
     log_dir = ROOT / "data" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / f"test_mint_{ts}.log"
 
     import re as _re

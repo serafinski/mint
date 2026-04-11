@@ -429,13 +429,24 @@ def _test_boundary(
                     )
                 )
             else:
+                # Distinguish dependency install failures (tool is broken)
+                # from code crashes on bad input (expected for boundaries).
+                is_dep_failure = (
+                    "pip install failed" in stderr
+                    or "No solution found" in stderr
+                    or "No matching distribution" in stderr
+                )
                 findings.append(
                     VerificationFinding(
                         tier=2,
-                        category="boundary",
-                        severity=Severity.MEDIUM,
-                        message=f"Tool crashed on {label} boundary inputs: {stderr[:200] or '(no stderr)'}",
-                        location=f"boundary/{label}",
+                        category="dependency" if is_dep_failure else "boundary",
+                        severity=Severity.HIGH if is_dep_failure else Severity.MEDIUM,
+                        message=(
+                            f"Dependency install failed: {stderr[:300] or '(no stderr)'}"
+                            if is_dep_failure
+                            else f"Tool crashed on {label} boundary inputs: {stderr[:200] or '(no stderr)'}"
+                        ),
+                        location="pip_packages" if is_dep_failure else f"boundary/{label}",
                     )
                 )
 
@@ -579,9 +590,31 @@ def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
             )
         ]
 
-    # Resolve extra pip packages from imports so sandbox installs them dynamically.
-    extra_pkgs = resolve_extra_packages(source_code)
-    _sandbox = partial(sandbox_execute, extra_packages=extra_pkgs or None)
+    # Prefer generator-declared pip_packages (accurate PyPI names).
+    # Fall back to LLM-based import resolution for old artifacts.
+    declared_pkgs = artifact.pip_packages if artifact.pip_packages else None
+    extra_pkgs = declared_pkgs or resolve_extra_packages(source_code) or None
+
+    # Upfront dependency check: if the sandbox can't install the tool's
+    # packages, all behavioral tests will fail with the same error.
+    # Report once as HIGH and skip the rest.
+    if extra_pkgs:
+        dep_check = sandbox_execute(
+            'print("deps_ok")', timeout=60, extra_packages=extra_pkgs,
+        )
+        if not dep_check.get("success"):
+            stderr = dep_check.get("stderr", "")
+            return [
+                VerificationFinding(
+                    tier=2,
+                    category="dependency",
+                    severity=Severity.HIGH,
+                    message=f"Cannot install declared dependencies: {stderr[:300]}",
+                    location="pip_packages",
+                )
+            ]
+
+    _sandbox = partial(sandbox_execute, extra_packages=extra_pkgs)
 
     schema = extract_parameter_schema(source_code)
     if not schema:

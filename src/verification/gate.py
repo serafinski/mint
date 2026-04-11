@@ -223,6 +223,22 @@ def _verify_inner(
             tier_reached=2,
         )
 
+    # Tier 2 clearance: if Tier 1 had HIGH findings but Tier 2 is clean,
+    # the HIGHs were false alarms (code smells that don't affect behavior).
+    # Downgrade them to MEDIUM so they don't block at the final gate.
+    # Per thesis proposal: "HIGH findings require Tier 2 clearance."
+    t1_had_high = any(
+        f.severity == Severity.HIGH and f.tier == 1 for f in all_findings
+    )
+    if t1_had_high and not t2_has_critical_or_high:
+        for f in all_findings:
+            if f.severity == Severity.HIGH and f.tier == 1:
+                logger.info(
+                    "Tier 2 cleared Tier 1 HIGH finding for %s: %s",
+                    name, f.message[:80],
+                )
+                f.severity = Severity.MEDIUM
+
     # ------------------------------------------------------------------
     # Tier 3: Adversarial probing (high cost)
     # ------------------------------------------------------------------
