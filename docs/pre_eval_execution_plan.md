@@ -284,11 +284,11 @@ The architecturally significant change. When ≥2 gaps are classified as AGENT, 
 
 **Commit:** `feat(phase3.5b): DeepAgents subagents for compositional agent-task execution`
 
-#### Stage 3.5c — Decomposer hardening + workspace fixes (~half day)
+#### Stage 3.5c — Decomposer hardening + workspace fixes (~half day) — ✅ **DONE**
 
-**Expanded scope** (2026-04-11): the Phase 3.5a/b test_mint run exposed three additional issues beyond the original rule 10 fix. All are decomposer or workspace-level issues that affect test_mint pass rate directly.
+**Expanded scope** (2026-04-11): the Phase 3.5a/b test_mint run exposed additional issues beyond the original rule 10 fix. All are decomposer, generator, or executor-level issues that affect test_mint pass rate directly.
 
-**Three sub-items:**
+**Six sub-items (all implemented):**
 
 **C1 — Decomposer rule 10 tightening (investigation collapse):**
 T16 "investigate root cause" → 5 subtasks (should be 1). Rule 10 ("adaptive investigations stay as ONE capability") doesn't fire reliably. With Phase 3.5b, this creates a lead + 5 subagents that times out at 480s (actual execution was 792s per LangFuse).

@@ -1208,6 +1208,13 @@ def _extract_stage_detail(node_name: str, state_update: Any) -> str:
         classified = _get("classified_gaps", []) or []
         if classified:
             types = [str(g.classified_type).split(".")[-1] for g in classified]
+            # When ≥2 AGENT gaps, indicate they'll be consolidated into lead + subagents
+            agent_count = sum(1 for t in types if t == "agent")
+            if agent_count >= 2:
+                non_agent = [t for t in types if t != "agent"]
+                agent_label = f"agent x{agent_count} (→ 1 lead + {agent_count} subagents)"
+                parts = non_agent + [agent_label]
+                return ", ".join(parts)
             return ", ".join(types)
         return ""
     elif node_name == "verification_node":
@@ -1485,6 +1492,10 @@ def execute_task(
                     # artifact diff attribution are deferred to here).
                     if active_node and active_node != node_name and active_node not in printed_nodes:
                         completed.add(active_node)
+                        # LangGraph streams events AFTER nodes complete.
+                        # stage_start was set when the previous event was
+                        # processed — that's when this (deferred) node started
+                        # running. Use it as the baseline.
                         timings[active_node] = time.monotonic() - stage_start
                         _print_completed(active_node)
                         stage_start = time.monotonic()
@@ -1503,6 +1514,9 @@ def execute_task(
                     # Generator nodes are deferred because their artifact
                     # diff needs to be computed against state that doesn't
                     # yet include the next generator's artifacts.
+                    # NOTE: LangGraph streams events AFTER the node completes,
+                    # so stage_start (set when the previous node finished) is
+                    # the correct baseline — it's when this node started running.
                     if node_name not in _GEN_NODES and node_name not in printed_nodes:
                         completed.add(node_name)
                         timings[node_name] = time.monotonic() - stage_start

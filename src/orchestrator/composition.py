@@ -426,20 +426,31 @@ class CompositionalExecutor:
         cap_type = ref.capability_type
 
         if cap_type == CapabilityType.MCP_TOOL:
-            return self._execute_mcp_tool_step(
+            output = self._execute_mcp_tool_step(
                 artifact_or_match, ref, step_index, workspace
             )
         elif cap_type == CapabilityType.SKILL:
-            return self._execute_skill_step(
+            output = self._execute_skill_step(
                 artifact_or_match, ref, workspace, upstream_outputs
             )
         elif cap_type == CapabilityType.AGENT:
-            return self._execute_agent_step(
+            output = self._execute_agent_step(
                 artifact_or_match, ref, workspace, upstream_outputs
             )
         else:
             logger.warning("Unknown capability type: %s", cap_type)
             return {}
+
+        # Tolerate bare list returns (e.g. a join step returning [row, row, ...])
+        # by wrapping in a dict. ChainResult.step_results requires list[dict].
+        if isinstance(output, list):
+            logger.info(
+                "Step %d returned a list (%d items); wrapping as {'result': [...]}",
+                step_index, len(output),
+            )
+            output = {"result": output}
+
+        return output
 
     # ------------------------------------------------------------------
     # Main entry point

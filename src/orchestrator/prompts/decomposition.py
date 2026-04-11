@@ -93,14 +93,24 @@ capabilities.** File I/O, string manipulation, lowercasing, whitespace \
 trimming, and regex are implementation details that belong inside a \
 capability's code — not separate capabilities in their own right. Loading \
 a CSV is part of "parse-csv-file", not its own "file-io" step.
-10. **Adaptive investigations stay as ONE capability.** When a task \
-describes open-ended investigation, autonomous reasoning, or hypothesis \
-testing (e.g. "triage a patient case", "review a contract for clause \
-risks", "explore a dataset to form a hypothesis"), the ENTIRE task is \
-ONE agent capability. Do NOT split data reading from analysis — an \
-agent reads its own data as part of the investigation. "Read the intake \
-form" or "parse the contract" are NOT separate capabilities when they \
-serve an adaptive investigation.
+10. **Adaptive investigations stay as ONE capability.** When the \
+reasoning path depends on intermediate findings — the agent must \
+examine data, form hypotheses, test them, and revise its approach \
+based on what it discovers — the entire investigation is ONE agent \
+capability. Do NOT split it into "read data" + "analyze" + "report \
+findings" — the agent reads its own data as part of the investigation. \
+The test: if the agent needs to go back and re-examine earlier data \
+based on later findings, it's adaptive and should not be decomposed. \
+Splitting adaptive tasks into rigid pipeline steps removes the \
+agent's ability to iterate.
+11. **Simple tasks stay as ONE subtask.** When the task has a small number \
+of input files and asks for a single output dict, and the operation is \
+straightforward (parse + compute + return), produce EXACTLY ONE subtask. \
+Do NOT split into "read file" + "process data" + "format output dict" — \
+that creates three tools to do one tool's job. A task like "parse this \
+CSV and return row_count and column_names" is ONE subtask, not three. \
+The test: if every intermediate step's output is just the input to the \
+next step with no branching or fan-out, it should be one subtask.
 
 ## Output
 
@@ -197,6 +207,36 @@ form hypotheses, test them against symptoms, and revise."
     }
   ],
   "reasoning": "This is an adaptive investigation — the reasoning path depends on what the intake and vitals reveal. Reading the intake form is part of the triage, not a separate capability. The agent must examine inputs, form hypotheses, test them, and revise. Splitting this into 'read intake' + 'analyze vitals' + 'recommend specialist' would atomize an inherently adaptive task into rigid tool calls."
+}
+```
+
+### Example 5 (simple task — stays one subtask, do NOT over-decompose):
+Task: "Parse this CSV file and return the row count and column names. \
+Return a dict with keys 'row_count' (int) and 'column_names' (list of str)."
+
+WRONG decomposition (3 subtasks — over-decomposed):
+```json
+{
+  "subtasks": [
+    {"description": "Read the CSV file at the provided path", "required_capabilities": ["read-file-at-path"], "depends_on": []},
+    {"description": "Parse the CSV contents and count rows", "required_capabilities": ["parse-csv-and-count-rows"], "depends_on": [0]},
+    {"description": "Format the result dict", "required_capabilities": ["format-result-dict"], "depends_on": [1]}
+  ]
+}
+```
+This is WRONG because "read file" → "parse" → "format" is one operation split into three tools. Each step just passes its output to the next with no branching.
+
+CORRECT decomposition (1 subtask):
+```json
+{
+  "subtasks": [
+    {
+      "description": "Parse the CSV file and return a dict with 'row_count' (int) and 'column_names' (list of str).",
+      "required_capabilities": ["parse-csv-and-return-stats"],
+      "depends_on": []
+    }
+  ],
+  "reasoning": "This is a single straightforward operation: read a file, extract two pieces of information, return them. Splitting into read+parse+format creates three tools to do one tool's job."
 }
 ```
 """

@@ -81,9 +81,24 @@ scikit-learn, scipy, requests, beautifulsoup4, etc.)
 - Tool name should be snake_case for both FastMCP() and the function
 - Include appropriate `annotations` for tool hints
 - The tool must be self-contained — no dependencies on external state or files
-- All non-file parameters (thresholds, limits, flags, etc.) MUST have sensible \
-default values so the tool can be called with just the data inputs. Only file \
-path parameters should be required (no default).
+- **CRITICAL: Parameter defaults.** The pipeline calls your tool with ONLY \
+file paths. Every parameter that is NOT a file path MUST have a Python default \
+value in the function signature — the `= value` AFTER the closing parenthesis \
+of `Annotated[...]`. Example:
+  CORRECT: `delimiter: Annotated[str, Field(...)] = ","` — has Python default
+  WRONG:   `delimiter: Annotated[str, Field(default=",")] — NO Python default
+The `Field(default=...)` inside Annotated is Pydantic metadata only — it does \
+NOT make the parameter optional in Python. Without `= value` at the end, the \
+parameter is a required positional argument and the tool WILL fail at runtime. \
+Only file path parameters should be required (no default).
+- **Binary files in workspace.** When the tool reads files from a \
+workspace directory (``/workspace/``), it may encounter binary files \
+like ``.xlsx``, ``.xls``, ``.parquet``, ``.pkl``, or ``.zip``. When \
+iterating directory contents, skip files you don't need. When opening \
+files, use the appropriate reader: ``openpyxl`` for ``.xlsx``, \
+``pandas.read_parquet`` for ``.parquet``, etc. Do NOT blindly \
+``open(path, 'r')`` on all files — binary files will crash with a \
+UnicodeDecodeError.
 - In the `pip_packages` field, list ALL non-stdlib PyPI packages your code \
 imports. Use the **pip install name** (what you'd pass to `pip install`), not \
 the Python import name — e.g. `pyyaml` not `yaml`. If you only use \
@@ -146,10 +161,24 @@ This is CORRECT — the tool returns only what the step asks for.
 If you find yourself computing something that a later step is supposed \
 to do, STOP. Return only the intermediate data this step produces.
 
-Accept the inputs relevant to this step (typically file paths plus any \
-step-specific parameters) and return the step's output in one call. If the \
-step produces intermediate data that another step will consume, return it \
-as a plain dict/list that the caller can forward.
+## Chain Data Flow Contract
+
+Tools in a multi-step workflow follow a strict data flow:
+
+- **First step (no depends_on):** receives raw file paths as parameters. \
+Read them using appropriate libraries (csv, openpyxl, json, yaml, etc.). \
+Output a JSON-serializable dict containing the parsed data.
+- **Middle steps (depends_on earlier steps):** receive **structured JSON \
+data** (dicts, lists) from upstream steps — NOT file paths. Accept this \
+data directly as parameters (e.g., `rows: list[dict]`, `stats: dict`). \
+Do NOT use `pd.read_csv()`, `open()`, or any file reader — the data is \
+already parsed. Output a JSON-serializable dict.
+- **Last step (nothing depends on it):** receives JSON from upstream. \
+Output a JSON dict by default. Only produce a different format (CSV, \
+Excel, Markdown, etc.) if the task EXPLICITLY asks for it.
+
+All inter-step communication uses JSON. This is the pipeline's "world \
+state at each handoff point."
 
 The tool function MUST be named exactly `{forced_name}` (snake_case). \
 Do not choose a different name.

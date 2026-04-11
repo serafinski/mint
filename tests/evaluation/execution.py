@@ -547,14 +547,19 @@ async def _run():
             except Exception:
                 pass
 
-        # Then read fixture files (lower priority — used mainly by step 0).
+        # Read fixture files. For step 0, fixture filenames are added to
+        # _all_inputs as generic keys (the parser step needs broad access).
+        # For later steps, fixtures are only in _fixture_paths for explicit
+        # parameter-name matching — they won't be assigned to unrelated params
+        # via the generic fuzzy matcher below.
         _fixtures_dir = "/workspace/fixtures"
         if os.path.isdir(_fixtures_dir):
             for _fp in sorted(os.listdir(_fixtures_dir)):
                 _full = os.path.join(_fixtures_dir, _fp)
                 if os.path.isfile(_full):
-                    _all_inputs[_fp] = _full
                     _fixture_paths.append(_full)
+                    if {step_index} == 0:
+                        _all_inputs[_fp] = _full
 
         # Match available inputs to function parameters
         _sig = inspect.signature({func_name})
@@ -563,6 +568,11 @@ async def _run():
 
         # Path-like parameter matching: assign fixture paths to params
         # whose names suggest they expect a file path (file_path, csv_path, etc.)
+        # For step 0: any path-like param gets the first unused fixture (broad).
+        # For later steps: only match when the fixture filename overlaps with
+        # the parameter name (e.g. param "xlsx_path" matches "products.xlsx").
+        # This prevents binary fixtures from being blindly assigned to unrelated
+        # params in downstream steps (T11 .xlsx crash reproducer).
         _PATH_KEYWORDS = {{"path", "file", "csv", "log", "json", "txt", "xml",
                           "yaml", "yml", "tsv", "xlsx", "doc", "input"}}
         _required = {{
@@ -575,10 +585,21 @@ async def _run():
             _p_lower = _p.lower()
             if any(kw in _p_lower for kw in _PATH_KEYWORDS):
                 for _fp in _fixture_paths:
-                    if _fp not in _used_fixtures:
+                    if _fp in _used_fixtures:
+                        continue
+                    if {step_index} == 0:
+                        # Step 0: broad matching — first unused fixture
                         _kwargs[_p] = _fp
                         _used_fixtures.add(_fp)
                         break
+                    else:
+                        # Later steps: name-aware matching only
+                        _fp_words = set(os.path.splitext(os.path.basename(_fp))[0].lower().replace("_", " ").replace("-", " ").split())
+                        _p_words = set(_p_lower.replace("_", " ").replace("-", " ").split())
+                        if _fp_words & _p_words:
+                            _kwargs[_p] = _fp
+                            _used_fixtures.add(_fp)
+                            break
 
         # Fuzzy word-overlap match for remaining unmatched params
         _still_unmatched = _required - set(_kwargs)
@@ -595,7 +616,19 @@ async def _run():
             if best_n > 0:
                 _kwargs[_p] = best[1]
 
+        # Diagnostic: log what the tool receives and produces (stderr)
+        import sys
+        print(f"[CHAIN STEP {step_index}] Function: {func_name}", file=sys.stderr)
+        print(f"[CHAIN STEP {step_index}] _all_inputs keys: {{list(_all_inputs.keys())}}", file=sys.stderr)
+        print(f"[CHAIN STEP {step_index}] _fixture_paths: {{_fixture_paths}}", file=sys.stderr)
+        print(f"[CHAIN STEP {step_index}] _kwargs keys: {{list(_kwargs.keys())}}", file=sys.stderr)
+        for _k, _v in _kwargs.items():
+            _v_str = str(_v)[:200] if not isinstance(_v, str) else _v[:200]
+            print(f"[CHAIN STEP {step_index}]   {{_k}} = {{_v_str}}", file=sys.stderr)
+
         result = await {func_name}(**_kwargs)
+
+        print(f"[CHAIN STEP {step_index}] result keys: {{list(result.keys()) if isinstance(result, dict) else type(result).__name__}}", file=sys.stderr)
 
         # Write output to workspace for downstream steps
         with open(f"/workspace/step_{step_index}_output.json", "w") as _out:
@@ -617,13 +650,20 @@ asyncio.run(_run())
         extra_packages=extra_pkgs or None,
     )
 
+    # Log chain step diagnostics from stderr (always, not just on failure)
+    stderr = result.get("stderr") or ""
+    chain_diag = [l for l in stderr.splitlines() if "[CHAIN STEP" in l]
+    if chain_diag:
+        for line in chain_diag:
+            logger.info("  %s", line)
+
     if not result.get("success") or not result.get("stdout"):
         logger.warning(
             "Chain MCP_TOOL step %d (%s) failed: exit=%s stderr=%s",
             step_index,
             capability_name,
             result.get("exit_code"),
-            (result.get("stderr") or "")[:500],
+            stderr[:500],
         )
         return {}
 

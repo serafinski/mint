@@ -330,7 +330,7 @@ The sandbox resolves dependencies dynamically at runtime — no hardcoded packag
 
 **All iterations (0–5) are complete.** Current phase: **Iteration 6 — Evaluation & Analysis.**
 
-All core infrastructure is built and tested (989 unit tests pass as of 2026-04-11, post-Phase-3.5b). The MINT CLI (`uv run mint`) is implemented. A comprehensive code audit on 2026-04-06 resolved 33 internal contradictions. **All prior evaluation data is stale** — a full re-run (18 tasks × 4 conditions × 5 runs = 360 records) is required before thesis figures can be produced. **Phases 1, 2, 3, 3.5a, and 3.5b of `docs/pre_eval_execution_plan.md` are complete** (commits `13b1ecd` honest metrics + Tier 1/2 hardening, `8ab68b0` runner verification sidecar, `cab813a` per-gap restoration with packaging-signal classifier and CLI multi-cap support, `e32c34b` compositional executor, Phase 3.5a/b uncommitted). **Phase 3.5c (decomposer rule 10 fix)** remains.
+All core infrastructure is built and tested (989 unit tests pass as of 2026-04-11, post-Phase-3.5c). The MINT CLI (`uv run mint`) is implemented. A comprehensive code audit on 2026-04-06 resolved 33 internal contradictions. **All prior evaluation data is stale** — a full re-run (18 tasks × 4 conditions × 5 runs = 360 records) is required before thesis figures can be produced. **Phases 1, 2, 3, and 3.5 (a/b/c) of `docs/pre_eval_execution_plan.md` are complete** (commits `13b1ecd` honest metrics + Tier 1/2 hardening, `8ab68b0` runner verification sidecar, `cab813a` per-gap restoration with packaging-signal classifier and CLI multi-cap support, `e32c34b` compositional executor, Phase 3.5a/b uncommitted). **Phase 3.5c (decomposer rule 10 fix)** remains.
 
 **Phase 3 resolved the Phase 2 architectural finding**: the compositional executor (`src/orchestrator/composition.py`) runs all N artifacts in dependency order via a workspace at `/tmp/mint_workspace_<id>/`. MCP_TOOL steps mount the workspace into Docker (`sandbox_execute_in_workspace`). SKILL/AGENT steps receive upstream outputs via `fixture_contents` injection (solving HP4 — no StateBackend vs Docker filesystem mismatch). test_mint results: T01, T04, T14, T16 pass with correct outputs (T04 exact match on all fields, T16 correct root cause). Remaining failures (T09, T11) are generator quality issues (over-parameterized tools, monolith tools) addressed by Phase 3.5a.
 
@@ -360,7 +360,7 @@ The full ordered checklist lives in `docs/pre_eval_execution_plan.md`. Read that
 - ✅ Phase 3 — compositional executor with dependency-ordered chain execution (uncommitted, 968 unit tests pass). HP4 solved via fixture_contents injection for SKILL/AGENT steps.
 - ✅ Phase 3.5a — spec-aligned context engineering (SKILL body length warning, generator prompt discipline, registry description compression)
 - ✅ Phase 3.5b — DeepAgents subagents for compositional agent-task execution (lead-with-subagents generator, execution wiring, resolution map, compositor dedup)
-- ⏳ **Phase 3.5c** — decomposer rule 10 fix
+- ✅ Phase 3.5c — decomposer hardening (rule 10 + simple-task collapse + binary workspace + list-return tolerance + over-parameterized prevention + CLI display fixes)
 - ⏳ Phase 4 — pre-eval smoke tests
 - ⏳ Phase 5 — full eval (360 records, ~$5, ~15h wall time) + longitudinal optimizer test
 - ⏳ Phase 6 — post-eval aggregations (D1 mock-contamination audit, D2 Gini, D3 KL rename, D4 hypothetical-budget analysis) + token cost backfill
