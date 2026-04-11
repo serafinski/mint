@@ -303,6 +303,14 @@ the code using Python's open()/write() before processing.
 - Declare any non-stdlib packages via extra_packages (e.g., extra_packages=["pandas"]).
 - Use the pip install name, not the Python import name (e.g., "pyyaml" not "yaml").
 - You have at most 5 tool calls. Do not plan — just execute the prescribed steps.
+
+## CRITICAL: Output Only What the Skill Asks For
+The task description in the user message is provided for CONTEXT ONLY — it \
+tells you what the overall pipeline does. You must NOT compute or return the \
+final task answer. Produce ONLY the output described in the skill instructions \
+above. If the skill says "return filtered products", return filtered products \
+— do NOT also compute reorder costs, aggregates, or any other fields that \
+belong to later steps in the pipeline. Later steps will handle those.
 """
 
 # Maximum sandbox_execute calls in the skill execution loop.
@@ -797,14 +805,41 @@ def _execute_agent_inner(
 
     result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
 
-    agent = create_deep_agent(
-        model=init_chat_model(DEFAULT_LLM_MODEL),
-        tools=[sandbox_execute],
-        system_prompt=system_prompt,
-        skills=skills_param,
-        response_format=result_model,
-        name="agent-executor",
-    )
+    # Build subagents list if this is a lead-with-subagents artifact.
+    # Each subagent config is a dict with name, description, system_prompt, tools.
+    # The tool names are resolved to actual tool objects (only sandbox_execute).
+    subagents_config = agent_config.get("subagents")
+    subagents_param = None
+    if subagents_config:
+        subagents_param = []
+        for sub in subagents_config:
+            sub_tools = []
+            for tool_name in sub.get("tools", []):
+                if tool_name == "sandbox_execute":
+                    sub_tools.append(sandbox_execute)
+            subagents_param.append({
+                "name": sub["name"],
+                "description": sub["description"],
+                "system_prompt": sub["system_prompt"],
+                "tools": sub_tools,
+            })
+        logger.info(
+            "Agent executor using lead-with-subagents: %d subagent(s)",
+            len(subagents_param),
+        )
+
+    agent_kwargs: dict = {
+        "model": init_chat_model(DEFAULT_LLM_MODEL),
+        "tools": [sandbox_execute],
+        "system_prompt": system_prompt,
+        "skills": skills_param,
+        "response_format": result_model,
+        "name": "agent-executor",
+    }
+    if subagents_param:
+        agent_kwargs["subagents"] = subagents_param
+
+    agent = create_deep_agent(**agent_kwargs)
 
     # Build the workspace files dict: skills (for progressive disclosure) +
     # fixtures (so `read_file("filename")` works from the agent's workspace).

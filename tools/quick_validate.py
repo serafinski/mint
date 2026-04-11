@@ -151,6 +151,17 @@ def validate_skill(skill_path):
     if "# placeholder return" in body:
         return False, "Skill body contains literal '# placeholder return' marker"
 
+    # Body length warning (per Agent Skills spec: < 500 lines recommended).
+    # Does not fail validation — appended to the success message.
+    warnings: list[str] = []
+    body_lines = body.count("\n") + (1 if body and not body.endswith("\n") else 0)
+    if body_lines > 500:
+        warnings.append(
+            f"Body is {body_lines} lines (spec recommends < 500)"
+        )
+
+    if warnings:
+        return True, "Skill is valid! Warning: " + "; ".join(warnings)
     return True, "Skill is valid!"
 
 

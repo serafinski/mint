@@ -77,6 +77,10 @@ def build_resolution_map(
     for art in artifacts:
         if art.gap_query:
             artifact_by_query[art.gap_query] = art
+        # Lead-with-subagents: the lead artifact covers multiple gaps
+        if art.agent_config and art.agent_config.get("subagent_gap_queries"):
+            for sub_query in art.agent_config["subagent_gap_queries"]:
+                artifact_by_query[sub_query] = art
 
     # Also build a classified_gaps lookup for type information
     gap_type_by_query: dict[str, CapabilityType] = {}
@@ -469,6 +473,9 @@ class CompositionalExecutor:
         workspace = self.build_workspace(task_id)
         step_results: list[dict] = []
         executed_outputs: dict[int, dict] = {}
+        # Lead dedup: when multiple subtasks resolve to the same artifact
+        # (lead-with-subagents), execute it once and cache the output.
+        _lead_cache: dict[str, dict] = {}
 
         # LangFuse: create a parent trace for the entire chain execution
         lf, chain_trace = self._start_langfuse_chain_trace(
@@ -525,10 +532,27 @@ class CompositionalExecutor:
                     ref, subtask,
                 )
 
+                # Lead dedup: if this artifact was already executed (lead-with-
+                # subagents covering multiple subtasks), reuse cached output.
                 t_step = time.monotonic()
-                output = self._execute_step(
-                    step_idx, subtask, ref, artifact_or_match, workspace, upstream
-                )
+                if ref.capability_name in _lead_cache:
+                    output = _lead_cache[ref.capability_name]
+                    logger.info(
+                        "Step %d reusing cached lead output from %s",
+                        step_idx, ref.capability_name,
+                    )
+                else:
+                    output = self._execute_step(
+                        step_idx, subtask, ref, artifact_or_match, workspace, upstream
+                    )
+                    # Cache output from lead-with-subagents artifacts
+                    if (
+                        ref.capability_type == CapabilityType.AGENT
+                        and isinstance(artifact_or_match, GeneratedArtifact)
+                        and artifact_or_match.agent_config
+                        and artifact_or_match.agent_config.get("subagents")
+                    ):
+                        _lead_cache[ref.capability_name] = output
                 step_ms = (time.monotonic() - t_step) * 1000
 
                 # LangFuse: end step span

@@ -651,3 +651,112 @@ class TestMatchToArtifact:
         assert art.capability_type == CapabilityType.MCP_TOOL
         assert art.source_code is not None
         assert "csv_parser" in art.source_code
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.5b: subagent_gap_queries in resolution map
+# ---------------------------------------------------------------------------
+
+
+class TestResolutionMapSubagentGapQueries:
+    def test_lead_artifact_covers_all_gap_queries(self):
+        """A lead-with-subagents artifact should resolve all its covered gap queries."""
+        lead = _make_artifact(
+            "lead-investigator",
+            CapabilityType.AGENT,
+            gap_query="profile-data",
+            agent_config={
+                "system_prompt": "lead",
+                "is_deep_agent": True,
+                "subagents": [{"name": "sub-1"}],
+                "subagent_gap_queries": ["profile-data", "detect-anomalies", "verify-fix"],
+            },
+        )
+        resolution = build_resolution_map(
+            required_capabilities=["profile-data", "detect-anomalies", "verify-fix"],
+            matches=[],
+            artifacts=[lead],
+        )
+        assert len(resolution) == 3
+        for cap_name in ["profile-data", "detect-anomalies", "verify-fix"]:
+            assert cap_name in resolution
+            assert resolution[cap_name].capability_name == "lead-investigator"
+            assert resolution[cap_name].source == "generated"
+
+    def test_registry_match_takes_priority_over_subagent_gap(self):
+        """Registry matches should take priority even if a subagent covers the gap."""
+        lead = _make_artifact(
+            "lead-investigator",
+            CapabilityType.AGENT,
+            gap_query="profile-data",
+            agent_config={
+                "system_prompt": "lead",
+                "subagent_gap_queries": ["profile-data", "detect-anomalies"],
+            },
+        )
+        match = _make_match("detect-anomalies", CapabilityType.MCP_TOOL, score=0.9)
+        match.query = "detect-anomalies"
+        resolution = build_resolution_map(
+            required_capabilities=["profile-data", "detect-anomalies"],
+            matches=[match],
+            artifacts=[lead],
+        )
+        # profile-data → lead (no match)
+        assert resolution["profile-data"].capability_name == "lead-investigator"
+        # detect-anomalies → registry match (higher priority)
+        assert resolution["detect-anomalies"].capability_name == "detect-anomalies"
+        assert resolution["detect-anomalies"].source == "registry"
+
+
+class TestLeadDedup:
+    """Verify the compositional executor runs a lead-with-subagents artifact only once."""
+
+    def test_lead_executed_once_for_multiple_subtasks(self):
+        """When multiple subtasks resolve to the same lead artifact, execute once."""
+        lead = _make_artifact(
+            "lead-agent",
+            CapabilityType.AGENT,
+            gap_query="step-a",
+            agent_config={
+                "system_prompt": "lead",
+                "is_deep_agent": True,
+                "subagents": [
+                    {"name": "sub-1", "description": "d", "system_prompt": "s", "tools": []},
+                ],
+                "subagent_gap_queries": ["step-a", "step-b"],
+            },
+        )
+        subtasks = [
+            _make_subtask("Step A", ["step-a"]),
+            _make_subtask("Step B", ["step-b"], depends_on=[0]),
+        ]
+        resolution = build_resolution_map(
+            required_capabilities=["step-a", "step-b"],
+            matches=[],
+            artifacts=[lead],
+        )
+        executor = CompositionalExecutor(
+            subtasks=subtasks,
+            resolution=resolution,
+            artifacts=[lead],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+
+        call_count = 0
+        original_execute = executor._execute_step
+
+        def counting_execute(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return {"result": "ok"}
+
+        with patch.object(executor, "_execute_step", side_effect=counting_execute):
+            result = executor.run()
+
+        # Lead should be executed only once; second subtask reuses cached output
+        assert call_count == 1
+        assert result.chain_success is True
+        assert len(result.step_results) == 2
+        assert result.step_results[0] == result.step_results[1]

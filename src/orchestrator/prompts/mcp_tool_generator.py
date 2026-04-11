@@ -123,7 +123,28 @@ Your tool implements this step of the workflow:
 
 Focus on exactly this step. Do NOT try to solve the whole task in one tool. \
 If the workflow has other steps (parsing, aggregation, reporting, etc.) \
-those are handled by separate tools.
+those are handled by separate tools — you must NOT duplicate their work.
+
+## CRITICAL: Do Not Build a Monolith
+
+Your tool must produce ONLY the output described in the step above. \
+It must NOT compute or return fields that belong to later steps in the \
+workflow. The decomposer split this task into separate steps for a reason \
+— each tool does its own part and passes intermediate data forward.
+
+**Bad example (MONOLITH — DO NOT DO THIS):**
+Step says: "Parse the three input files into structured tables"
+Tool returns: {{"summary_row_count": 3, "region_revenues": {{"North": 20000}}, "regions_meeting_target": 1}}
+This is WRONG — the tool jumped ahead and computed the final answer. \
+Parsing should return the parsed tables, not the aggregated results.
+
+**Good example (STEP-SPECIFIC):**
+Step says: "Parse the three input files into structured tables"
+Tool returns: {{"sales": [...rows...], "products": [...rows...], "targets": [...rows...]}}
+This is CORRECT — the tool returns only what the step asks for.
+
+If you find yourself computing something that a later step is supposed \
+to do, STOP. Return only the intermediate data this step produces.
 
 Accept the inputs relevant to this step (typically file paths plus any \
 step-specific parameters) and return the step's output in one call. If the \

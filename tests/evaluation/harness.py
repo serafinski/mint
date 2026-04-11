@@ -265,7 +265,11 @@ class EvaluationHarness:
 
         # Step 5: execute each task
         records: list[EvaluationRecord] = []
-        for task in shuffled_tasks:
+        for i, task in enumerate(shuffled_tasks):
+            logger.info(
+                "──── Task %d/%d: %s (%s) ────",
+                i + 1, len(shuffled_tasks), task.task_id, task.tier,
+            )
             record = self._run_one_task(
                 task=task,
                 condition=condition,

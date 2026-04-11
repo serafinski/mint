@@ -174,9 +174,17 @@ def show_pipeline_result(
             "low": ("[dim]Info[/dim]", "dim"),
             "info": ("[dim]Info[/dim]", "dim"),
         }
-        # Deduplicate: group findings by (capability, explanation) and count
-        grouped: dict[str, list[tuple[str, str, str]]] = {}  # cap → [(sev, label, explanation)]
+        # Deduplicate to latest report per capability (verification_results
+        # accumulates across retries; earlier reports may have CRITICALs that
+        # were fixed on retry — only the final verdict matters).
+        latest_by_cap: dict[str, object] = {}
         for report in verification_results:
+            cap_name = getattr(report, "capability_name", "?")
+            latest_by_cap[cap_name] = report  # last one wins
+
+        # Group findings by (capability, explanation) and count
+        grouped: dict[str, list[tuple[str, str, str]]] = {}  # cap → [(sev, label, explanation)]
+        for report in latest_by_cap.values():
             findings = getattr(report, "findings", []) or []
             if not findings:
                 continue

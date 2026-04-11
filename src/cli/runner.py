@@ -448,7 +448,19 @@ def _compute_gen_stage_diff(
     label_override = None
     if len(types) == 1:
         label_override = _GEN_STAGE_TYPE_LABELS.get(next(iter(types)))
-    detail = f"{new} artifact(s)"
+
+    # Check for lead-with-subagents artifacts
+    subagent_count = 0
+    for a in new_arts:
+        config = getattr(a, "agent_config", None) or {}
+        subs = config.get("subagents", [])
+        if subs:
+            subagent_count += len(subs)
+
+    if subagent_count > 0:
+        detail = f"{new} lead + {subagent_count} subagent(s)"
+    else:
+        detail = f"{new} artifact(s)"
     return new, new_prev, detail, label_override
 
 
@@ -833,20 +845,32 @@ def _execute_compositional_chain(
         status_text = f"[cyan]Chain step 1/{len(subtasks)}...[/cyan] [dim](0s)[/dim]"
         chain_stop = threading.Event()
 
+        def _subagent_label(ref: Any) -> str:
+            """Return ' (lead + N subagents)' suffix if applicable."""
+            for a in artifacts:
+                if a.capability_name == ref.capability_name:
+                    config = getattr(a, "agent_config", None) or {}
+                    subs = config.get("subagents", [])
+                    if subs:
+                        return f" (lead + {len(subs)} subagents)"
+            return ""
+
         def _on_step_start(position: int, total: int, ref: Any) -> None:
             cap_type = str(ref.capability_type).split(".")[-1].upper()
+            sub_label = _subagent_label(ref)
             nonlocal status_text
             status_text = (
                 f"[cyan]Chain step {position + 1}/{total}: "
-                f"{ref.capability_name} ({cap_type}, {ref.source})[/cyan]"
+                f"{ref.capability_name} ({cap_type}{sub_label}, {ref.source})[/cyan]"
             )
 
         def _on_step_end(position: int, total: int, ref: Any, success: bool) -> None:
             marker = "[green]✓[/green]" if success else "[red]✗[/red]"
             cap_type = str(ref.capability_type).split(".")[-1].upper()
+            sub_label = _subagent_label(ref)
             console.print(
                 f"  {marker} Step {position + 1}/{total}: "
-                f"{ref.capability_name} ([cyan]{cap_type}[/cyan], {ref.source})"
+                f"{ref.capability_name} ([cyan]{cap_type}{sub_label}[/cyan], {ref.source})"
             )
 
         def _timer(status_ref: Any) -> None:
@@ -1450,9 +1474,11 @@ def execute_task(
                     node_visit_count[node_name] = node_visit_count.get(node_name, 0) + 1
 
                     # On retry, allow nodes to be re-printed by removing
-                    # them from printed_nodes.
+                    # them from printed_nodes, and reset the timing baseline
+                    # so the retried node's elapsed time is accurate.
                     if node_visit_count[node_name] > 1:
                         printed_nodes.discard(node_name)
+                        stage_start = time.monotonic()
 
                     # When a NEW node starts, print the previous node if
                     # it hasn't been printed yet (generator nodes that need

@@ -41,6 +41,7 @@ class FailureReason(StrEnum):
     TIER3 = "tier3"
     OUTPUT_REJECTED = "output_rejected"
     NO_SOURCE_CODE = "no_source_code"
+    CHAIN_STEP_FAILED = "chain_step_failed"
 
 
 class HumanLabel(StrEnum):
