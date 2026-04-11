@@ -183,6 +183,9 @@ These came out of building and testing the system. They are not in the proposal 
 | **Context Engineering Mapping** | `docs/context_engineering_mapping.md` maps Write/Select/Compress/Isolate primitives to all three artifact types across orchestration and execution layers. Not in proposal but directly addresses the thesis domain ("Context Engineering in LLM-Powered Multi-Agent Systems"). | ⭐ Strengthened — makes the proposal's third tension (context economy) concrete and measurable. |
 | **DuckDB Metrics Store** | Proposal silent on metrics storage. Implementation uses DuckDB for invocation records, evaluation records, and longitudinal optimizer state. Load-bearing for Pillar 3. | ⭐ Strengthened — without it, no prune decisions, no convergence curves, no Chapter 6 analysis. |
 | **LangFuse Observability** | Proposal silent on tracing. Implementation traces every LLM call. `backfill_token_costs.py` reads traces post-hoc → delivers the "token cost per task" metric directly. | ⭐ Strengthened — delivers one of six proposal metrics. |
+| **Chain Data Flow Contract** | Proposal says "strictly typed JSON schemas representing the world state at each handoff point." Implementation enforces: first step reads raw files → JSON, middle steps JSON → JSON, last step JSON → requested format (default JSON). MCP_TOOL generator prompt describes this explicitly. | ✅ Faithful — directly implements proposal §3.4. |
+| **Binary File Structural Fix** | Proposal silent on binary file handling. Implementation: step 0 gets all fixtures (broad matching), steps 1+ use name-aware matching only (fixture filename must overlap with parameter name). Prevents `.xlsx` being blindly assigned to unrelated params in downstream steps. | 🟡 Refined — engineering fix for observed failure mode (T11 `.xlsx` crash). |
+| **Chain Step Diagnostic Logging** | Not in proposal. Sandbox wrapper logs `_all_inputs` keys, `_fixture_paths`, `_kwargs`, and result keys to stderr for each chain step. Enables debugging data flow issues without accessing ephemeral Docker containers. | 🟡 Refined — debugging infrastructure. |
 
 ---
 
@@ -190,10 +193,10 @@ These came out of building and testing the system. They are not in the proposal 
 
 | Verdict | Count | Description |
 |---|---|---|
-| ✅ Faithful | 25 | Matches proposal |
+| ✅ Faithful | 26 | Matches proposal |
 | ⭐ Strengthened | 9 | Goes beyond proposal, improves thesis claims |
 | 🟢 Kept deviation | 6 | Deliberate divergence with justification |
-| 🟡 Refined | 4 | Additive/defensive, no thesis impact |
+| 🟡 Refined | 6 | Additive/defensive, no thesis impact |
 | 🔴 Drift | 0 | All previously-flagged drift items are resolved |
 | ❌ Missing | 3 | Post-eval aggregation work (Gini, KL, mock audit) |
 

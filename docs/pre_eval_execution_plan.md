@@ -293,34 +293,34 @@ The architecturally significant change. When ≥2 gaps are classified as AGENT, 
 **C1 — Decomposer rule 10 tightening (investigation collapse):**
 T16 "investigate root cause" → 5 subtasks (should be 1). Rule 10 ("adaptive investigations stay as ONE capability") doesn't fire reliably. With Phase 3.5b, this creates a lead + 5 subagents that times out at 480s (actual execution was 792s per LangFuse).
 
-- [ ] **Strengthen rule 10** in `src/orchestrator/prompts/decomposition.py`: be more explicit and absolute. *"If the task uses any of the following words — investigate, diagnose, trace, triage, troubleshoot, examine, explore, form hypotheses, root cause, cascade — produce EXACTLY ONE subtask. Do not split the investigation into 'load data' + 'analyse data' + 'report findings'. The agent reads its own data as part of the investigation."*
-- [ ] **Spot-check**: T16 should produce 1 subtask, not 5.
+- [x] **Strengthen rule 10** in `src/orchestrator/prompts/decomposition.py`: softened from keyword list to structural description — "when the reasoning path depends on intermediate findings and the agent needs to go back and re-examine earlier data." No domain-specific vocabulary.
+- [x] **Spot-check**: T16 produced 1 subtask in test_mint (C1 worked). In pilot, 4 gaps due to LLM non-determinism but subagents handled it.
 
 **C2 — Decomposer simple-task collapse:**
 T01 "parse CSV and return row_count + column_names" → 3 subtasks ("read file" → "parse CSV" → "format dict"). Should be 1. Over-decomposition caused: (a) the seeded `csv-parser` registry match to miss (query was `read-file-at-path`, not `parse-csv`), (b) 3 tools generated where 1 sufficed, (c) step 1 became a monolith (computed full answer despite being "read file"), (d) 236s instead of 22s.
 
-- [ ] **Add simple-task rule** in `src/orchestrator/prompts/decomposition.py`: *"If the task has a single input file and asks for a single output dict with a small number of keys, produce EXACTLY ONE subtask. Do not split into 'read file' + 'process' + 'format output' — that is three tools to do one tool's job."* Add a few-shot example showing a simple task that should NOT be decomposed.
-- [ ] **Spot-check**: T01 should produce 1 subtask.
+- [x] **Add simple-task rule** in `src/orchestrator/prompts/decomposition.py`: *"If the task has a single input file and asks for a single output dict with a small number of keys, produce EXACTLY ONE subtask. Do not split into 'read file' + 'process' + 'format output' — that is three tools to do one tool's job."* Add a few-shot example showing a simple task that should NOT be decomposed.
+- [x] **Spot-check**: T01 should produce 1 subtask.
 
 **C3 — Binary fixtures in workspace:**
 T11 step 3 (`aggregate_revenue_by_region`) crashed with `'utf-8' codec can't decode byte 0x9a` because it iterated ALL workspace files (including `t11_products.xlsx`) as text. The binary file was correctly copied to `fixtures/` by the workspace builder, but downstream MCP_TOOL code read everything in the workspace indiscriminately.
 
-- [ ] **Option A — Workspace structure**: separate `fixtures/binary/` from `fixtures/text/` so text-processing tools only iterate text files. Requires changes to `CompositionalExecutor.build_workspace()` and `_execute_mcp_tool_step()`.
-- [ ] **Option B — Generator prompt**: add instruction to the MCP_TOOL generator prompt: *"When reading files from /workspace/, skip binary files (.xlsx, .xls, .parquet, .pkl, .zip). Use `open(path, 'r', errors='replace')` for robustness."* Cheaper but depends on LLM compliance.
-- [ ] **Option C — Sandbox code wrapper**: the `execute_mcp_tool_in_chain()` function already builds the sandbox code string. Could filter workspace file listing to exclude binary extensions before passing to the tool.
+- [x] **Option A — Workspace structure**: separate `fixtures/binary/` from `fixtures/text/` so text-processing tools only iterate text files. Requires changes to `CompositionalExecutor.build_workspace()` and `_execute_mcp_tool_step()`.
+- [x] **Option B — Generator prompt**: add instruction to the MCP_TOOL generator prompt: *"When reading files from /workspace/, skip binary files (.xlsx, .xls, .parquet, .pkl, .zip). Use `open(path, 'r', errors='replace')` for robustness."* Cheaper but depends on LLM compliance.
+- [x] **Option C — Sandbox code wrapper**: the `execute_mcp_tool_in_chain()` function already builds the sandbox code string. Could filter workspace file listing to exclude binary extensions before passing to the tool.
 
 **C4 — Chain executor list-return tolerance:**
 T11 step 2 (`join_sales_with_products`) returned a bare list `[{...}, {...}]` instead of a dict `{"enriched_sales": [...]}`. `ChainResult.step_results` is `list[dict]` so a list at position 1 fails Pydantic validation, causing the entire chain to report failure despite all steps succeeding (confirmed via LangFuse). The final step (SKILL) even produced the correct output keys (`summary_row_count, region_revenues, regions_meeting_target`).
 
-- [ ] **Option A (executor fix)**: in `CompositionalExecutor._execute_step()`, if the step output is a `list` instead of a `dict`, wrap it: `output = {"result": output}`. One line, robust, doesn't depend on generator compliance.
-- [ ] **Option B (prompt fix)**: strengthen MCP_TOOL generator prompt to say "always return a dict, never a bare list". Depends on LLM compliance — fragile.
-- [ ] Recommend: **both** — executor wraps for safety, prompt guides for quality.
+- [x] **Option A (executor fix)**: in `CompositionalExecutor._execute_step()`, if the step output is a `list` instead of a `dict`, wrap it: `output = {"result": output}`. One line, robust, doesn't depend on generator compliance.
+- [x] **Option B (prompt fix)**: strengthen MCP_TOOL generator prompt to say "always return a dict, never a bare list". Depends on LLM compliance — fragile.
+- [x] Recommend: **both** — executor wraps for safety, prompt guides for quality.
 
 **C6 — Over-parameterized tool prevention:**
 MCP_TOOL generator produces tools with required positional arguments for non-file parameters (e.g., `product_id_col`, `max_rows`, `records`) that the chain executor can't fill. The prompt already says "non-file parameters MUST have sensible default values" but the LLM interprets `Field(default="product_id")` inside `Annotated` as providing a default — it doesn't. The Python function signature still has a required positional argument. T04 step 2 had 7 required column-name params; T09 step 4 had a required `records` param.
 
-- [ ] **Prompt fix**: strengthen MCP_TOOL generator prompt: *"Every parameter that is NOT a file path MUST have a Python default value in the function signature — e.g., `col_name: Annotated[str, Field(...)] = 'product_id'`. The `= 'product_id'` AFTER the Annotated bracket is required. Without it, the parameter is a required positional argument and the tool will fail when called by the pipeline, which only passes file paths."* Add a negative example showing the wrong pattern.
-- [ ] **Validation fix (optional)**: in `_validate_generated_tool()`, use AST to check that all non-`path` parameters have default values in the function signature. Emit a validation error if not — triggers repair pass.
+- [x] **Prompt fix**: strengthen MCP_TOOL generator prompt: *"Every parameter that is NOT a file path MUST have a Python default value in the function signature — e.g., `col_name: Annotated[str, Field(...)] = 'product_id'`. The `= 'product_id'` AFTER the Annotated bracket is required. Without it, the parameter is a required positional argument and the tool will fail when called by the pipeline, which only passes file paths."* Add a negative example showing the wrong pattern.
+- [ ] **Validation fix (optional, deferred)**: in `_validate_generated_tool()`, use AST to check that all non-`path` parameters have default values in the function signature. Emit a validation error if not — triggers repair pass.
 
 **C5 — CLI display fixes:**
 Two display issues that confuse the user:
@@ -359,29 +359,34 @@ The 480s AGENT_EXECUTION_TIMEOUT_S is insufficient for a lead + 5 subagents (T16
 
 ### Phase 4 — Pre-eval smoke tests (~2 hours)
 
-**Goal:** catch integration bugs on cheap fast runs before committing to the full 12h eval.
+**Goal:** catch integration bugs on the redesigned 20-task testbed before committing to the ~18h eval.
 
-- [ ] `rm -rf data/eval/` — purge stale pilot state
+**Prerequisite:** all pre-eval readiness items (A1-A5, B1-B3, C1-C3) from `docs/pre_eval_readiness.md` must be complete.
+
+- [ ] `uv run pytest tests/unit/` — 989+ unit tests pass
 - [ ] `uv run scripts/test_pipeline.py` — full 9-node pipeline integration
 - [ ] `uv run scripts/test_verification.py` — three-tier gate
 - [ ] `uv run scripts/test_auto_optimizer.py` — prune/split/merge
 - [ ] `uv run scripts/test_split_merge.py` — optimizer operations
-- [ ] `uv run scripts/run_pilot.py --tasks T01,T04,T14 --condition full --n-runs 1` — 3-task pilot on the new pipeline
-- [ ] **B1 empirical check** (~45 min): run T08, T10, T13, T16, T17 under compositional pipeline, check whether subtasks that classify as AGENT actually need AGENT
-- [ ] Review 2-3 LangFuse traces manually to confirm chains are running end-to-end
-- [ ] Spot-check `data/eval/metrics.duckdb` — verify invocation counts are honest (csv-parser should have `latency_ms > 0` from real execution, not 0 from fake writes)
+- [ ] `uv run scripts/test_mint.py` — all 20 tasks, target ≥15/20
+- [ ] `uv run scripts/run_pilot.py --all-tasks --condition full --n-runs 1` — 20-task pilot, single run
+- [ ] Verify type spread: count MCP_TOOL / SKILL / AGENT artifacts across the 20-task pilot
+- [ ] Verify output format spread: ≥5 tasks produce non-JSON outputs
+- [ ] Verify seeded matches: T01, T02 (MCP_TOOL), T05, T09 (SKILL), T19 (AGENT) match from registry
+- [ ] Review 3-4 LangFuse traces (1 per type + 1 seeded) to confirm chains run end-to-end
+- [ ] Spot-check `data/eval/metrics.duckdb` — verify invocation counts are honest
 
-**Gate to Phase 5:** all smoke tests green. If any fail, loop back to the relevant phase.
+**Gate to Phase 5:** all smoke tests green, type spread ≥4/5/4/4 across seeded/MCP_TOOL/SKILL/AGENT, ≥5 non-JSON outputs confirmed. If any fail, loop back.
 
 ---
 
-### Phase 5 — Full eval (~15h wall time)
+### Phase 5 — Full eval (~18h wall time)
 
-**Goal:** run the 360-record eval on the clean pipeline.
+**Goal:** run the 400-record eval on the redesigned 20-task testbed.
 
 - [ ] `rm -rf data/eval/` — clean slate
-- [ ] `uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5` — 18 × 4 × 5 = 360 records, ~12h with 2 conditions in parallel
-- [ ] `uv run scripts/run_longitudinal.py` — 40 tasks, no reset, ~3h
+- [ ] `uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5` — 20 × 4 × 5 = 400 records
+- [ ] `uv run scripts/run_longitudinal.py` — 40+ tasks, no reset, ~3h
 
 **Gate to Phase 6:** eval completes without crashes. Spot-check 3-4 records in LangFuse for sanity.
 

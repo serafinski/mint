@@ -1,7 +1,7 @@
 # Pre-Eval Readiness Assessment
 
 **Date:** 2026-04-11 (post-Phase 3.5c)
-**Purpose:** Checklist of what needs to be resolved before committing to the 15h 360-record eval run.
+**Purpose:** Checklist of what needs to be resolved before committing to the ~18h 400-record eval run (20 tasks × 4 conditions × 5 runs).
 
 ---
 
@@ -64,7 +64,7 @@
 - Steps 1+: fixtures in `_fixture_paths` only, with **name-aware matching** — a param `xlsx_path` matches `products.xlsx` (word overlap), but `csv_path` does NOT match `products.xlsx` (no overlap). Prevents binary fixtures from being blindly assigned to unrelated params.
 - Later steps that legitimately need a fixture can still access it via a parameter whose name overlaps with the fixture filename.
 
-**Status:** code fix applied, 989 unit tests pass. Needs test_mint validation.
+**Status:** ✅ Code fix applied and validated. T11 confirmed passing with exact output match (first time ever). 989 unit tests pass.
 
 ---
 
@@ -237,10 +237,21 @@ These items should be completed before the 15h 360-record eval.
 2. A1-A5 (testbed redesign) — new tasks, prompt edits, output formats
 3. B1-B2 (network flag + severity)
 4. C1-C3 (documentation)
-5. Phase 4 smoke tests (validation gate)
-6. Phase 5 (15h eval)
+5. Phase 4 smoke tests (see below)
+6. Phase 5 (~18h eval)
 
-**Total remaining pre-eval work: ~5-6 hours.**
+**Phase 4 smoke tests (validation gate before eval):**
+- [ ] `uv run pytest tests/unit/` — 989+ pass
+- [ ] `uv run scripts/test_pipeline.py` — pipeline integration
+- [ ] `uv run scripts/test_verification.py` — three-tier gate
+- [ ] `uv run scripts/test_auto_optimizer.py` — optimizer
+- [ ] `uv run scripts/test_mint.py` — all 20 tasks, target ≥15/20
+- [ ] `uv run scripts/run_pilot.py --all-tasks --condition full --n-runs 1` — 20-task pilot
+- [ ] Verify type spread (≥4 of each type), output format spread (≥5 non-JSON), seeded matches (5 tasks)
+- [ ] Review 3-4 LangFuse traces
+- [ ] Spot-check `data/eval/metrics.duckdb`
+
+**Total remaining pre-eval work: ~5-6 hours + ~2h Phase 4 testing.**
 
 **Recommended priority:**
 1. Wait for pilot results (blocking)
