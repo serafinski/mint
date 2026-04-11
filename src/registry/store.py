@@ -30,15 +30,32 @@ class SkillRegistry:
     # --- Private helpers ---
 
     @staticmethod
+    def _summarize_description(description: str, max_words: int = 50) -> str:
+        """Truncate description to *max_words* for embedding efficiency.
+
+        The full description is preserved in ChromaDB metadata
+        (``raw_description``); this summary is used only for the embedding
+        document so that search-time token costs stay bounded.
+        """
+        words = description.split()
+        if len(words) <= max_words:
+            return description
+        return " ".join(words[:max_words]) + "…"
+
+    @staticmethod
     def _build_document(capability: CapabilityDescriptor) -> str:
         """Build hierarchical embedding document for richer semantic search.
 
-        Format: "{domain} > {capability_type} > {name}: {description}"
+        Format: "{domain} > {capability_type} > {name}: {summary}"
+
+        The description is truncated to ~50 words for embedding efficiency;
+        the full description is kept in metadata (``raw_description``).
         """
         domain = getattr(capability, "domain", "general")
+        summary = SkillRegistry._summarize_description(capability.description)
         return (
             f"{domain} > {capability.capability_type.value} > "
-            f"{capability.name}: {capability.description}"
+            f"{capability.name}: {summary}"
         )
 
     @staticmethod
@@ -242,7 +259,7 @@ class SkillRegistry:
         return pairs
 
     def detect_gaps(
-        self, queries: list[str], *, threshold: float = 0.5
+        self, queries: list[str], *, threshold: float = 0.6
     ) -> tuple[list[tuple[CapabilityDescriptor, float, str]], list[tuple[str, str]]]:
         """For each query, search the registry and classify as match or gap.
 

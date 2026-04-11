@@ -512,3 +512,43 @@ def test_detect_gaps_active_capability_still_matches(registry):
     assert len(matches) == 1
     assert len(gaps) == 0
     assert matches[0][0].name == "active-tool"
+
+
+# --- Description summarization for embedding efficiency ---
+
+
+class TestDescriptionSummarization:
+    def test_short_description_unchanged(self):
+        desc = "Parse a CSV file and return rows"
+        assert SkillRegistry._summarize_description(desc) == desc
+
+    def test_long_description_truncated_to_50_words(self):
+        words = [f"word{i}" for i in range(100)]
+        desc = " ".join(words)
+        summary = SkillRegistry._summarize_description(desc)
+        assert summary.endswith("…")
+        # 50 words + ellipsis
+        assert len(summary.split()) == 50  # trailing … is part of last token
+
+    def test_exactly_50_words_unchanged(self):
+        words = [f"word{i}" for i in range(50)]
+        desc = " ".join(words)
+        summary = SkillRegistry._summarize_description(desc)
+        assert summary == desc
+        assert "…" not in summary
+
+    def test_build_document_uses_summary(self, registry):
+        long_desc = " ".join(f"word{i}" for i in range(100))
+        cap = _make_cap(name="long-desc-cap", description=long_desc)
+        doc = SkillRegistry._build_document(cap)
+        # Document should contain the truncated summary, not the full description
+        assert "…" in doc
+        assert "word99" not in doc
+
+    def test_full_description_preserved_in_metadata(self, registry):
+        long_desc = " ".join(f"word{i}" for i in range(100))
+        cap = _make_cap(name="long-desc-cap", description=long_desc)
+        registry.add(cap)
+        fetched = registry.get("long-desc-cap")
+        assert fetched is not None
+        assert fetched.description == long_desc

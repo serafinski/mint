@@ -160,3 +160,59 @@ class TestProseHardFails:
             path = _write_skill(Path(tmp), content)
             ok, _msg = validate_skill(path)
             assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# Body length warnings (Agent Skills spec: < 500 lines recommended)
+# ---------------------------------------------------------------------------
+
+
+class TestBodyLengthWarning:
+    def test_short_body_no_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            content = (
+                "---\n"
+                "name: short-skill\n"
+                "description: A short skill\n"
+                "---\n\n"
+                "## Overview\n\nBrief content.\n"
+            )
+            path = _write_skill(Path(tmp), content)
+            ok, msg = validate_skill(path)
+            assert ok is True
+            assert msg == "Skill is valid!"
+
+    def test_long_body_warns(self):
+        """A body over 500 lines should pass but include a warning."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body_lines = "\n".join(f"Line {i}" for i in range(510))
+            content = (
+                "---\n"
+                "name: long-skill\n"
+                "description: A very long skill\n"
+                "---\n\n"
+                + body_lines
+                + "\n"
+            )
+            path = _write_skill(Path(tmp), content)
+            ok, msg = validate_skill(path)
+            assert ok is True
+            assert "Warning" in msg
+            assert "500" in msg
+
+    def test_exactly_500_lines_no_warning(self):
+        """Exactly 500 lines should not trigger the warning."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body_lines = "\n".join(f"Line {i}" for i in range(499))
+            content = (
+                "---\n"
+                "name: edge-skill\n"
+                "description: Edge case skill\n"
+                "---\n\n"
+                + body_lines
+                + "\n"
+            )
+            path = _write_skill(Path(tmp), content)
+            ok, msg = validate_skill(path)
+            assert ok is True
+            assert msg == "Skill is valid!"

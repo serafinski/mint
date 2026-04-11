@@ -25,6 +25,12 @@ aggregation, reporting, investigation, etc.) those are handled by separate \
 skills or tools — do not try to cover them here. The skill should guide the \
 agent through the sub-steps of implementing THIS step.
 
+CRITICAL: Do NOT produce a skill that solves the entire task. The skill must \
+guide the agent through THIS step only. If the step says "filter products \
+below threshold", the skill must NOT also compute reorder quantities or \
+aggregate costs — those are later steps handled by other artifacts. \
+Return only the intermediate data this step produces.
+
 ## SKILL.md Format Rules
 
 The file MUST:
@@ -83,6 +89,14 @@ Return a structured error report so upstream callers can fix and retry.
 The SKILL.md `name` frontmatter field MUST be exactly `{forced_name}` \
 (hyphen-case). Do not choose a different name.
 
+## Body Length Guideline
+
+Per the Agent Skills specification, the SKILL.md body (everything after the \
+closing `---`) should be under 500 lines and under 5,000 tokens. Keep the \
+skill focused and concise. If detailed reference material or long examples \
+are needed, mention that they should go in `references/` files — but do NOT \
+generate those files yourself; only generate the SKILL.md.
+
 ## Instructions
 
 Generate a SKILL.md file for the capability described above. The skill should:
@@ -90,6 +104,7 @@ Generate a SKILL.md file for the capability described above. The skill should:
 - Include code examples where relevant
 - Be specific to the described capability, not generic
 - Follow the exact format rules above
+- Stay under 500 lines of body content
 
 ## Important: Filesystem Isolation
 

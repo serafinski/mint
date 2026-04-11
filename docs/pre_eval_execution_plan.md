@@ -6,6 +6,7 @@
 - `docs/proposal_vs_implementation.md` — full audit, every row with tags and justifications
 - `docs/todo_drift_and_missing.md` — focused list of remaining drift/missing items
 - `docs/compositional_synthesis_plan.md` — concrete implementation plan for Stages 1-3 of the compositional refactor (referenced from Phase 1-3 below)
+- `docs/context_engineering_mapping.md` — Write/Select/Compress/Isolate × MCP_TOOL/SKILL/AGENT implementation mapping (the thesis's context-engineering reference)
 
 This doc is the **sequencing and validation** layer. It does not duplicate the implementation detail in the compositional plan — it decides **what order** to do things in, **where to stop and check**, and **what to watch for**.
 
@@ -247,58 +248,112 @@ During Phase 2 verification (T01/T04/T14/T16 pilot, 4/4 success), three observat
 
 #### Stage 3.5a — Context engineering Bucket A (~half day)
 
-Cheap context-engineering interventions for SKILL and MCP_TOOL. These are prompt and validator changes — no architectural restructuring.
+Spec-aligned context-engineering interventions. Scoped to items backed by the Agent Skills specification or the MCP specification — arbitrary limits without spec basis were dropped after a review against the official docs (agentskills.io, modelcontextprotocol.io) and the thesis proposal.
 
-- [ ] **MCP_TOOL Tier 1 token-budget check** in `src/verification/static_scanner.py`: emit MEDIUM finding when generated tool source exceeds ~1500 tokens. Does not hard-reject; contributes to the optimiser's β·token_cost penalty over time.
-- [ ] **MCP_TOOL generator prompt discipline** in `src/orchestrator/prompts/mcp_tool_generator.py`: add a line to the system prompt instructing the generator to keep tool source under ~150 lines and to avoid long docstrings, redundant comments, or extensive type annotations beyond `Annotated[type, Field(description=...)]`. Brief rationale: the registry stores the source and other agents pay the token cost on every discovery.
-- [ ] **MCP_TOOL `description` field length cap** in `src/orchestrator/generators/mcp_tool.py` `GeneratedToolCode`: add `max_length=200` to the `description` Pydantic field so the LLM can't produce a 200-word description.
-- [ ] **SKILL body length check** in `tools/quick_validate.py`: warn when SKILL.md body exceeds ~500 lines (Anthropic's recommended ideal). Same shape as the existing prose checks (Tier 0 hard-fails).
-- [ ] **SKILL generator prompt discipline** in `src/orchestrator/prompts/skill_generator.py`: instruct the generator to keep SKILL.md body under 500 lines and to move long examples or reference data into `references/<name>.md` files within the skill directory.
-- [ ] **Cross-cutting registry description compression**: when registering a capability in ChromaDB (`src/registry/store.py`), compute a 50-word `embedding_summary` from the full description (truncate or LLM-summarise) and embed that, while keeping the full description for display. Saves embedding tokens and search-time injection costs.
+**Dropped items (no spec basis for size limits):**
+- ~~MCP_TOOL Tier 1 token-budget check (~1500 tokens)~~ — the MCP spec prescribes no source-size limit. The thesis proposal calls for token cost as a **metric and optimizer pressure** (β·token_cost), not a static gate. The optimizer already handles this via soft penalty.
+- ~~MCP_TOOL source line cap (~150 lines)~~ — same reasoning; no spec basis for a line cap.
+- ~~MCP_TOOL `description` max_length=200~~ — the MCP spec has no description length limit. 200 chars was arbitrary and inconsistent with the Agent Skills spec allowing 1,024 chars for skill descriptions.
 
-**Verification:** unit suite passes. Spot-check a fresh pilot run on T04+T14 — generated tools should be under 1500 tokens of source, generated SKILL.md bodies should be under 500 lines.
+**Added (anti-monolith prompt discipline — not in original plan):**
+- [x] **MCP_TOOL anti-monolith instructions** in `src/orchestrator/prompts/mcp_tool_generator.py`: explicit "CRITICAL: Do Not Build a Monolith" section with a negative few-shot example showing a parser tool that wrongly returns the final aggregated answer instead of parsed tables. Addresses the top failure mode in test_mint (T11 step 1 returned final answer format instead of parsed data).
+- [x] **SKILL anti-monolith instructions** in `src/orchestrator/prompts/skill_generator.py`: same principle — skill must guide the agent through THIS step only, must not solve the entire task.
 
-**Commit:** `feat(phase3.5a): context-engineering Bucket A — token budgets and registry compression`
+**Kept items (spec-aligned):**
+- [x] **SKILL body length check** in `tools/quick_validate.py`: warn (not hard-fail) when SKILL.md body exceeds 500 lines. Per Agent Skills spec: < 500 lines / < 5,000 tokens recommended. Validation still returns `True`; warning is appended to the success message.
+- [x] **SKILL generator prompt discipline** in `src/orchestrator/prompts/skill_generator.py`: added body-length guideline section citing the Agent Skills spec's 500-line / 5,000-token recommendation. Instructs generator to keep body concise and mention `references/` for overflow material.
+- [x] **Registry description compression** in `src/registry/store.py`: `_summarize_description()` truncates descriptions to 50 words for the ChromaDB embedding document. Full description preserved in metadata (`raw_description`). Implementation efficiency optimization — not a spec requirement, but reduces embedding and search-time token costs.
 
-#### Stage 3.5b — DeepAgents subagents for AGENT execution (~1-2 days)
+**Verification:** unit suite passes. 3 new tests in `test_quick_validate.py` (body length warning), 5 new tests in `test_registry.py` (description summarization + metadata preservation).
 
-The architecturally significant change. When the decomposer produces a multi-step structure for an agent-task, the generator now produces ONE lead agent config with N subagent dicts, instead of N independent standalone agents. The compositional executor invokes the lead via `create_deep_agent(..., subagents=[...])`, and the lead uses its built-in `task` tool to delegate to subagents during the investigation.
+**Commit:** `feat(phase3.5a): spec-aligned context engineering — SKILL body length warning, generator prompt discipline, registry description compression`
 
-- [ ] **Schema change** in `src/schemas/task.py`: add `subagents: list[dict] | None = None` to whatever holds `agent_config` (likely as a nested field within `GeneratedArtifact.agent_config` rather than a top-level field, to avoid breaking the existing `agent_config` shape). Add `CapabilitySubAgent` Pydantic model (name, description, system_prompt, tools, model — matching the DeepAgents `SubAgent` spec).
-- [ ] **Generator change** in `src/orchestrator/generators/agent.py` + `src/orchestrator/prompts/agent_generator.py`: detect when the parent task is an agent-task with multiple subtasks (i.e. multiple gaps classified as agent in `state.classified_gaps`). In that case, generate ONE coordinated lead config + N subagent dicts in a single LLM call, instead of N independent agent configs. Generator prompt updated with a "lead-with-subagents" mode and a few-shot example.
-- [ ] **Execution change** in `tests/evaluation/execution.py:_execute_agent_inner`: when `agent_config.get("subagents")` is non-empty, pass them to `create_deep_agent(..., subagents=[...])`. The DeepAgents library wires up the `task` tool automatically; the lead agent can then delegate to subagents during execution.
-- [ ] **Compositional executor branch** in `src/orchestrator/composition.py` (the new module from Phase 3): when handling an agent-typed chain, route to the lead-with-subagents path instead of running standalone agents in sequence. For the agent-task case, the "chain" is just one lead agent invocation with subagents pre-bound.
-- [ ] **Loading change** in `src/orchestrator/loading_node.py`: when registering a lead-with-subagents agent capability, the registry entry represents the whole composition (lead + subagents). Consider whether subagents should be separately searchable (probably no — they're internal to the lead).
-- [ ] **Tests** in `tests/unit/test_agent_generator.py`: add multi-gap-agent-task case verifying the generator produces lead+subagents instead of N independent agents. In `tests/integration/test_pipeline_e2e.py` (or new file): end-to-end T16-style run, verify the lead agent's LangFuse trace contains subagent invocations via the `task` tool.
+#### Stage 3.5b — DeepAgents subagents for AGENT execution (~1-2 days) — ✅ **DONE**
 
-**Verification:**
-- Unit suite passes
-- `uv run scripts/run_pilot.py --tasks T16 --condition full --n-runs 1` — T16 should now produce 1 lead agent + N subagents in the generated_artifacts list
-- LangFuse trace for T16 should show the lead's `task` tool calls invoking the subagents (not 4 standalone DeepAgent processes)
-- Token cost per agent task should drop relative to the Phase 2 baseline (subagent context quarantine = ~67% fewer tokens per the multi-agent guide)
+The architecturally significant change. When ≥2 gaps are classified as AGENT, the generator produces ONE lead agent config with N subagent dicts instead of N independent standalone agents. The lead delegates via the built-in `task` tool; each subagent runs in isolated context.
+
+- [x] **Schema**: `SubAgentConfig` and `LeadWithSubagentsResult` Pydantic models in `src/orchestrator/generators/agent.py`. Subagents stored as `agent_config["subagents"]` (list of dicts) and `agent_config["subagent_gap_queries"]` (list of covered gap queries). No changes to `src/schemas/task.py` — subagents live inside the existing `agent_config: dict` field.
+- [x] **Generator**: `_generate_lead_with_subagents()` in `agent.py` — single LLM call producing a coordinated lead + N subagent configs. `generate_agent` node detects ≥2 AGENT gaps → lead mode; falls back to standalone generation on failure. `AGENT_LEAD_SUBAGENTS_PROMPT` with ETL investigation few-shot example.
+- [x] **Execution**: `_execute_agent_inner()` in `execution.py` — when `agent_config.get("subagents")` is non-empty, resolves tool names to objects and passes `subagents=[...]` to `create_deep_agent()`. DeepAgents wires the `task` tool automatically.
+- [x] **Resolution map**: `build_resolution_map()` in `composition.py` — indexes `subagent_gap_queries` so all AGENT gaps resolve to the single lead artifact.
+- [x] **Compositional executor**: lead dedup cache in `CompositionalExecutor.run()` — when multiple subtasks resolve to the same lead artifact, executes it once and reuses cached output.
+- [x] **Loading**: no change needed — registry stores the lead artifact with subagents in `agent_config` metadata. Subagents are internal to the lead, not separately searchable.
+- [x] **Tests**: 6 validation tests (`TestValidateLeadResult`), 4 mode-selection tests (`TestLeadWithSubagentsModeSelection`), 2 resolution-map tests (`TestResolutionMapSubagentGapQueries`), 1 lead-dedup test (`TestLeadDedup`). 1 pre-existing test updated for new mode selection.
+
+**Verification:** 989 unit tests pass (976 baseline + 13 new).
 
 **Commit:** `feat(phase3.5b): DeepAgents subagents for compositional agent-task execution`
 
-#### Stage 3.5c — Decomposer rule 10 tightening (~30 min)
+#### Stage 3.5c — Decomposer hardening + workspace fixes (~half day)
 
-Small fix. T16 over-decomposition in the Phase 2 pilot showed that rule 10 in `decomposition.py` ("adaptive investigations stay as ONE capability") doesn't always fire. Tighten the language so cascade-investigation-shape tasks reliably collapse to 1 subtask. With Stage 3.5b implemented this becomes less critical (over-decomposed agent-tasks get wrapped in a lead+subagents composition anyway), but it's still cheap and reduces wasted classifier calls on the over-decomposed input.
+**Expanded scope** (2026-04-11): the Phase 3.5a/b test_mint run exposed three additional issues beyond the original rule 10 fix. All are decomposer or workspace-level issues that affect test_mint pass rate directly.
 
-- [ ] **Strengthen rule 10** in `src/orchestrator/prompts/decomposition.py`: be more explicit and absolute. *"If the task uses any of the following words — investigate, diagnose, trace, triage, troubleshoot, examine, explore, form hypotheses, root cause, cascade — produce EXACTLY ONE subtask. Do not split the investigation into 'load data' + 'analyse data' + 'report findings'. The agent reads its own data as part of the investigation."* Add Example 4's reasoning text to be more emphatic about *why* over-decomposition is wrong.
-- [ ] **Spot-check** with a single T16 run after the change. Should now produce 1 subtask, not 4.
+**Three sub-items:**
 
-**Commit:** `fix(decomposition): tighten rule 10 to reliably collapse adaptive investigations`
+**C1 — Decomposer rule 10 tightening (investigation collapse):**
+T16 "investigate root cause" → 5 subtasks (should be 1). Rule 10 ("adaptive investigations stay as ONE capability") doesn't fire reliably. With Phase 3.5b, this creates a lead + 5 subagents that times out at 480s (actual execution was 792s per LangFuse).
+
+- [ ] **Strengthen rule 10** in `src/orchestrator/prompts/decomposition.py`: be more explicit and absolute. *"If the task uses any of the following words — investigate, diagnose, trace, triage, troubleshoot, examine, explore, form hypotheses, root cause, cascade — produce EXACTLY ONE subtask. Do not split the investigation into 'load data' + 'analyse data' + 'report findings'. The agent reads its own data as part of the investigation."*
+- [ ] **Spot-check**: T16 should produce 1 subtask, not 5.
+
+**C2 — Decomposer simple-task collapse:**
+T01 "parse CSV and return row_count + column_names" → 3 subtasks ("read file" → "parse CSV" → "format dict"). Should be 1. Over-decomposition caused: (a) the seeded `csv-parser` registry match to miss (query was `read-file-at-path`, not `parse-csv`), (b) 3 tools generated where 1 sufficed, (c) step 1 became a monolith (computed full answer despite being "read file"), (d) 236s instead of 22s.
+
+- [ ] **Add simple-task rule** in `src/orchestrator/prompts/decomposition.py`: *"If the task has a single input file and asks for a single output dict with a small number of keys, produce EXACTLY ONE subtask. Do not split into 'read file' + 'process' + 'format output' — that is three tools to do one tool's job."* Add a few-shot example showing a simple task that should NOT be decomposed.
+- [ ] **Spot-check**: T01 should produce 1 subtask.
+
+**C3 — Binary fixtures in workspace:**
+T11 step 3 (`aggregate_revenue_by_region`) crashed with `'utf-8' codec can't decode byte 0x9a` because it iterated ALL workspace files (including `t11_products.xlsx`) as text. The binary file was correctly copied to `fixtures/` by the workspace builder, but downstream MCP_TOOL code read everything in the workspace indiscriminately.
+
+- [ ] **Option A — Workspace structure**: separate `fixtures/binary/` from `fixtures/text/` so text-processing tools only iterate text files. Requires changes to `CompositionalExecutor.build_workspace()` and `_execute_mcp_tool_step()`.
+- [ ] **Option B — Generator prompt**: add instruction to the MCP_TOOL generator prompt: *"When reading files from /workspace/, skip binary files (.xlsx, .xls, .parquet, .pkl, .zip). Use `open(path, 'r', errors='replace')` for robustness."* Cheaper but depends on LLM compliance.
+- [ ] **Option C — Sandbox code wrapper**: the `execute_mcp_tool_in_chain()` function already builds the sandbox code string. Could filter workspace file listing to exclude binary extensions before passing to the tool.
+
+**C4 — Chain executor list-return tolerance:**
+T11 step 2 (`join_sales_with_products`) returned a bare list `[{...}, {...}]` instead of a dict `{"enriched_sales": [...]}`. `ChainResult.step_results` is `list[dict]` so a list at position 1 fails Pydantic validation, causing the entire chain to report failure despite all steps succeeding (confirmed via LangFuse). The final step (SKILL) even produced the correct output keys (`summary_row_count, region_revenues, regions_meeting_target`).
+
+- [ ] **Option A (executor fix)**: in `CompositionalExecutor._execute_step()`, if the step output is a `list` instead of a `dict`, wrap it: `output = {"result": output}`. One line, robust, doesn't depend on generator compliance.
+- [ ] **Option B (prompt fix)**: strengthen MCP_TOOL generator prompt to say "always return a dict, never a bare list". Depends on LLM compliance — fragile.
+- [ ] Recommend: **both** — executor wraps for safety, prompt guides for quality.
+
+**C6 — Over-parameterized tool prevention:**
+MCP_TOOL generator produces tools with required positional arguments for non-file parameters (e.g., `product_id_col`, `max_rows`, `records`) that the chain executor can't fill. The prompt already says "non-file parameters MUST have sensible default values" but the LLM interprets `Field(default="product_id")` inside `Annotated` as providing a default — it doesn't. The Python function signature still has a required positional argument. T04 step 2 had 7 required column-name params; T09 step 4 had a required `records` param.
+
+- [ ] **Prompt fix**: strengthen MCP_TOOL generator prompt: *"Every parameter that is NOT a file path MUST have a Python default value in the function signature — e.g., `col_name: Annotated[str, Field(...)] = 'product_id'`. The `= 'product_id'` AFTER the Annotated bracket is required. Without it, the parameter is a required positional argument and the tool will fail when called by the pipeline, which only passes file paths."* Add a negative example showing the wrong pattern.
+- [ ] **Validation fix (optional)**: in `_validate_generated_tool()`, use AST to check that all non-`path` parameters have default values in the function signature. Emit a validation error if not — triggers repair pass.
+
+**C5 — CLI display fixes:**
+Two display issues that confuse the user:
+
+**(a) Generator/verification timing shows `(0.0s)` on first pass:**
+CLI shows `✓ Generating agent — 1 lead + 4 subagent(s) (0.0s)` when the actual LLM call took ~60s per LangFuse. The retry timing fix (resetting `stage_start` when `node_visit_count > 1`) only covers retries. For first-pass generator nodes, timing is deferred (artifact diff attribution) and the elapsed time is computed against a stale `stage_start` baseline.
+
+- [ ] Fix the deferred-printing timing path in `src/cli/runner.py` (lines 1460-1464): when a generator node's timing is computed at the transition to the next node, the baseline should be the time the generator node started, not the time the previous node ended.
+
+**(b) Classifier line says `agent, agent, agent, agent` for subagent cases:**
+After 45s of classification, the user sees `agent, agent, agent, agent` and expects 4 independent agents. Only later does `✓ Generating agent — 1 lead + 4 subagent(s)` correct this. The 45s gap is confusing.
+
+- [ ] When the classifier produces ≥2 AGENT gaps, the display should indicate consolidation: e.g., `agent x4 (→ 1 lead + 4 subagents)` instead of `agent, agent, agent, agent`. Note: 4 classified gaps produce 1 lead + 4 subagents (5 total — the lead is additional, each gap becomes a subagent). This requires checking `classified_gaps` in the display logic after the classifier node completes.
+
+**Additional finding — subagent recursion_limit not propagated:**
+DeepAgents issue #1698: `SubAgentMiddleware` does not forward parent's `recursion_limit` to subagents. Subagents silently use the default limit of 25. If Phase 3.5b subagents hit this limit, they would silently truncate. Note for Phase 3.5b follow-up: explicitly set `recursion_limit` in subagent configs if needed.
+
+**Additional finding — agent timeout for subagent chains:**
+The 480s AGENT_EXECUTION_TIMEOUT_S is insufficient for a lead + 5 subagents (T16 LangFuse shows 792s). With C1 collapsing T16 to 1 subtask, this won't trigger for T16. But if subagents are used on genuinely multi-step agent tasks, the timeout may need scaling. Monitor during Phase 4 smoke tests; increase if needed.
+
+**Commit:** `fix(decomposition): rule 10 + simple-task collapse + binary workspace handling`
 
 #### Phase 3.5 verification gate
 
 - Full unit suite passes
-- Pilot spot-check: `uv run scripts/run_pilot.py --tasks T01,T04,T14,T16,T11 --condition full --n-runs 1` — five tasks covering all three capability types and a registry-reuse case
+- `uv run scripts/test_mint.py` — target ≥5/7 (T01, T04, T09, T14 should pass with decomposer + threshold + anti-monolith fixes; T11 depends on binary fix choice; T16 depends on rule 10)
 - LangFuse spot-checks:
-  - **T16**: 1 subtask (rule 10 fix), 1 lead agent + N subagents (Stage 3.5b)
-  - **T04 / T14**: at least one SKILL classification per task, with the skill artifact under 500 lines (Stage 3.5a body length check)
-  - **MCP_TOOL outputs**: source code under 1500 tokens (Stage 3.5a Tier 1 check)
-- Token cost per task should be measurably lower than Phase 3 baseline for agent tasks (subagent quarantine) and comparable-or-lower for skill/tool tasks (Bucket A budgets)
+  - **T01**: 1 subtask, seeded `csv-parser` match at registry
+  - **T16**: 1 subtask (rule 10 fix), standalone agent (not subagents)
+  - **T04 / T14**: step output keys match step descriptions (no monoliths)
+- No false registry matches above 0.6 threshold
 
-**Decision gate:** if all three sub-stages land, proceed to Phase 4. Each sub-stage can be skipped independently if its budget overruns — Stage 3.5a is the most independent, Stage 3.5b is the most thesis-load-bearing, Stage 3.5c is a 30-minute fix that's rarely worth deferring.
+**Decision gate:** if all sub-stages land, proceed to Phase 4.
 
 ---
 
@@ -374,11 +429,7 @@ Small fix. T16 over-decomposition in the Phase 2 pilot showed that rule 10 in `d
 - [ ] **E1** — Ch 6 testbed description: replace "ML model training, inference" with "statistical analysis, anomaly detection, root-cause inference, reporting"
 - [ ] **E2** — Ch 3 §3.5 + tech-stack table: drop Google ADK / A2A / TypeScript MCP / TOML / Claude-Code-as-runtime; add DeepAgents (harness-on-small-model strategy), DuckDB (⭐ metrics backbone), LangFuse (⭐ delivers token cost metric), three execution backends (⭐ classifier has runtime consequences)
 - [ ] **E3** — Ch 4 Tier 1 framing: "Tier 1 scopes its checks to executable portions of each artifact (Python source for MCP_TOOL, code-fenced snippets for SKILL/AGENT); prose-level cheating is out of scope by design and caught by Tier 2/3"
-- [ ] **E4** — Ch 3 / Ch 4 / Ch 5 / Ch 6 explicit Write/Select/Compress/Isolate mapping. The thesis's domain is *"Context Engineering in LLM-Powered Multi-Agent Systems"*; the four primitives from Martin (2025) and the ACE framework (Zhang et al. 2025) are cited in §2.2 of the proposal. Map our implementation to each primitive concretely:
-  - **Write**: Pydantic state schemas (`src/schemas/`), SKILL.md files on disk, DeepAgent `StateBackend` workspace, optional `references/` for skills (deferred to Ch 7)
-  - **Select**: ChromaDB hierarchical embeddings with `domain → capability → specific skill` levels, DeepAgents progressive disclosure for skills via `skills=` parameter, registry `detect_gaps()` above-threshold filtering
-  - **Compress**: Phase 3.5a token budgets (MCP_TOOL ~1500 tokens, SKILL.md body ~500 lines), `description max_length=200` cap, registry 50-word `embedding_summary` for ChromaDB, optimiser β·token_cost penalty
-  - **Isolate**: orchestration-level isolation via separate `create_deep_agent()` calls per pipeline node (decomposer / adversarial-prober) with their own `write_todos` and file scratchpads, **generated-capability-level isolation via DeepAgents subagents (Phase 3.5b)** so the AGENT type's lead agent receives only structured subagent return values rather than dozens of intermediate tool calls, sandbox isolation via `--network none` Docker for MCP_TOOL execution
+- [ ] **E4** — Ch 3 / Ch 4 / Ch 5 / Ch 6 explicit Write/Select/Compress/Isolate mapping. The implementation-level reference is now `docs/context_engineering_mapping.md` (created Phase 3.5a) — it maps all four primitives × three artifact types × two layers (orchestration + generated-capability) with file paths, status, and rationale for deferrals. Chapter drafting should draw from that doc rather than re-deriving the mapping.
 - [ ] **E5** — Ch 4 §3.3 (skill generation) explicit defense of the SKILL.md-only choice. Cite the proposal's exact wording: *"a SKILL.md file with instructions, templates, and **optional** scripts that teach an agent how to perform a specialized workflow"* (line 81) and the Anthropic spec's *"at its simplest, a skill is a directory that contains a SKILL.md file"*. Note that bundled resources (`references/`, `scripts/`, `assets/`) are permitted by the spec but are not required by the proposal; defer to Ch 7 future work. Justify with the testbed observation: the skill-shaped tasks (T04, T11, T12, T14) all fit within Anthropic's recommended <500-line SKILL.md guideline once the Phase 3.5a body-length budget is enforced, so bundled resources would be optional richness rather than a structural necessity.
 - [ ] **E6** — Ch 6 subagent context-economy reporting. After Phase 5 eval data is in, report: (a) absolute token costs for the 5 agent-targeted tasks (T08, T10, T13, T16, T17) under the Phase 3.5b lead-with-subagents implementation, (b) qualitative comparison against the LangChain multi-agent guide's *"67% fewer tokens than skills"* claim for similar context-isolation patterns, (c) per-task chain length and subagent invocation count from LangFuse traces. If schedule allows, run a counterfactual baseline with subagents disabled and report the delta — but this is nice-to-have, not load-bearing.
 - [ ] **E7** — Ch 6 SKILL.md body size measurement. Aggregate the line count of every generated SKILL.md across the 360-record full eval. Plot a distribution. If any are over Anthropic's <500-line ideal, flag as a finding and motivate bundled resources for Ch 7. If all are well under 500, report this as evidence that the Phase 3.5a body-length budget is comfortable rather than constraining.
@@ -414,7 +465,7 @@ Small fix. T16 over-decomposition in the Phase 2 pilot showed that rule 10 in `d
 4. **Optimizer coupling after Stage 1** — removing fake invocation records changes what `prune()` sees. Verify in Phase 1 that prune correctly identifies unused capabilities without false positives.
 5. **SKILL `network_disconnect` Tier 3 finding (T11, stale data)** — seen once in a pre-fix run, likely a prober false positive on a skill without source code. Watch for it in Phase 4 smoke tests; if it reproduces, investigate whether Tier 3 should skip SKILLs without source code.
 6. **Phase 3.5b subagent generator complexity** — the generator now has two modes (single-agent vs lead-with-subagents) and has to decide which to produce based on classified_gaps content. The mode-selection logic is the new sharp edge; if it gets wrong (produces lead+subagents when single-agent would suffice, or vice versa) the eval numbers shift in ways that require generator-prompt iteration. Mitigate by adding a clear few-shot example for both modes and unit tests covering both branches.
-7. **Phase 3.5a token-budget false positives** — the SKILL.md body length check (>500 lines warns) and the MCP_TOOL source token budget (>1500 tokens emits MEDIUM finding) might fire on legitimate generations during the eval and inflate the optimiser's penalty. Watch the Phase 4 smoke test for unexpectedly-high MEDIUM finding rates from these new checks; if rates are elevated, soften the budgets.
+7. **Phase 3.5a SKILL body length warnings** — the SKILL.md body length check (>500 lines warns) is a non-blocking warning per the Agent Skills spec. Watch the Phase 4 smoke test for unexpectedly long SKILL.md bodies; if the generator routinely exceeds 500 lines, tighten the prompt guidance or consider a soft penalty. MCP_TOOL source token budgets were dropped (no spec basis; the optimizer's β·token_cost handles this via soft pressure per the thesis proposal).
 
 **Metrics worth monitoring at each phase gate:**
 
@@ -422,7 +473,7 @@ Small fix. T16 over-decomposition in the Phase 2 pilot showed that rule 10 in `d
 - Full-suite runtime (should not degrade meaningfully)
 - LangFuse trace sanity on 1-2 representative tasks per phase
 - After Phase 3.5b: token cost per agent task (should drop from Phase 3 baseline due to subagent context quarantine)
-- After Phase 3.5a: SKILL.md body line counts (should stay under 500 ideally) and MCP_TOOL source token counts (should stay under 1500 ideally)
+- After Phase 3.5a: SKILL.md body line counts (should stay under 500 per Agent Skills spec)
 
 ---
 
