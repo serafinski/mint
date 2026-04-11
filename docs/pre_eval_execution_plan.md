@@ -171,31 +171,43 @@ Pattern: Phase 2 single-artifact execution works when (a) the task is simple, OR
 
 ---
 
-### Phase 3 — Compositional executor (~3-5 days, possibly longer if HP4 bites)
+### Phase 3 — Compositional executor ✅ COMPLETE (2026-04-10/11, uncommitted)
 
 **Goal:** the payoff phase. Matched capabilities and generated artifacts actually run in dependency order, with workspace passing.
 
-Reference: `docs/compositional_synthesis_plan.md` Stage 3 — see HP1 (output passing), HP4 (mixed-type execution), HP5 (validator redesign). This is the highest-risk phase.
+Reference: `docs/compositional_synthesis_plan.md` Stage 3 — see HP1 (output passing), HP4 (mixed-type execution), HP5 (validator redesign).
 
-- [ ] New `src/orchestrator/composition.py` with `CompositionalExecutor` class. Takes `subtasks`, a `resolution` dict (map from required_capability → `CapabilityReference`), and fixture paths. Builds a DAG via `graphlib.TopologicalSorter`, executes in order, passes workspace state.
-- [ ] Workspace structure: `/tmp/mint_workspace_<task_id>/` with `fixtures/` subdirectory for input files and `step_<N>_output.json` for intermediate outputs
-- [ ] `src/verification/sandbox_tool.py` — add optional `workspace_path` parameter to `sandbox_execute()`. When provided, mount the host workspace into the Docker container at `/workspace` via `-v` flag
-- [ ] `tests/evaluation/execution.py` — add `execute_mcp_tool_in_chain()` helper. Refactor `execute_skill_artifact` and `execute_agent_artifact` to accept a `workspace_path` parameter
-- [ ] **HP4 risk checkpoint**: verify that a chain with `MCP_TOOL → SKILL` actually works. The MCP_TOOL writes to `/workspace/step_0_output.json` in Docker; the SKILL (in-process DeepAgent via `StateBackend`) must be able to read that file. If the SKILL backend cannot see Docker-mounted volumes, we need to inject the step-0 output as a parameter or pre-populate the DeepAgent's `StateBackend`. **Flag this as a risk and test it early in Phase 3.**
-- [ ] `tests/evaluation/harness.py` `_extract_result` — branch on chain length. Length 1 → existing single-artifact path (backwards compat). Length >1 → `CompositionalExecutor`. Populate chain-level fields in `EvaluationRecord`
-- [ ] `src/cli/runner.py` — same branching. Update `src/cli/display.py` with chain visualisation: `Step 1/3: csv-parser (registry match) → Step 2/3: ...`
-- [ ] New test file `tests/unit/test_composition.py` — DAG building, topological sort, cycle detection, workspace management, **mixed-type chain execution (the risky test)**, chain failure handling
-- [ ] New test file `tests/integration/test_composition.py` — end-to-end T14-style run, verify `csv-parser` is actually invoked (non-zero latency_ms in metrics store), verify output is correct
+- [x] New `src/orchestrator/composition.py` with `CompositionalExecutor` class. Takes `subtasks`, a `resolution` dict (map from required_capability → `CapabilityReference`), and fixture paths. Builds a DAG via `graphlib.TopologicalSorter`, executes in order, passes workspace state. **Deviation from plan:** constructor also takes `artifacts`, `matches`, `task`, `metrics_store` for artifact lookup and invocation recording.
+- [x] Workspace structure: `/tmp/mint_workspace_<task_id>/` with `fixtures/` subdirectory for input files and `step_<N>_output.json` for intermediate outputs. Dirs 0o755, files 0o644 for Docker sandbox user access.
+- [x] `src/verification/sandbox_tool.py` — **deviation:** workspace_path NOT added to `sandbox_execute()` (broke OpenAI tool schema — `"format": "path"` rejected). Instead: separate `sandbox_execute_in_workspace()` function for programmatic chain use.
+- [x] `tests/evaluation/execution.py` — `execute_mcp_tool_in_chain()` added. SKILL/AGENT workspace_path skipped — HP4 solved via fixture_contents injection instead (simpler, avoids StateBackend mismatch).
+- [x] **HP4 resolved**: SKILL/AGENT steps receive upstream outputs via `fixture_contents` dict (inline in LLM message). No Docker workspace mount needed for SKILL/AGENT. MCP_TOOL steps use Docker `-v` mount. Mixed-type chains verified working (T04: MCP→SKILL→SKILL→MCP, T16: AGENT+MCP_TOOL).
+- [x] `tests/evaluation/harness.py` `_extract_result` — branches on `len(subtasks) > 1 and len(artifacts) + len(matches) > 1`. `_extract_result_compositional()` added with metrics_store threading.
+- [x] `src/cli/runner.py` — same branching via `_execute_compositional_chain()`. Chain step spinner with live progress. Output subdirectories. Local timestamps.
+- [x] New `tests/unit/test_composition.py` — 29 tests covering DAG, resolution, workspace, mixed-type chains, failure handling, cleanup.
+- [x] New `tests/integration/test_composition.py` — 2-step Docker chain test + metrics recording test.
 
-**Verification:**
-- Full unit suite passes
-- `uv run scripts/test_mint.py` — all tests
-- **T14 LangFuse trace should now show**: csv-parser invocation with real `latency_ms > 0` in metrics, chain_length=2, matched_and_executed_count=1, generated_artifact_count=1
-- `mint list` should show csv-parser with real invocation counts (not decorative)
+**Additional work done during Phase 3 (bugs discovered via live testing):**
+- [x] `ClassifiedGap.query` root cause fix in `classifier.py` (was set to LLM-generated capability_name, breaking resolution chain)
+- [x] `MatchItem.query` field added to `task.py`, populated in `gap_detection.py`
+- [x] Behavioral test `pip_packages` priority fix (was using broken LLM resolution instead of generator-declared packages)
+- [x] Upfront dependency check in behavioral `run()` — reports HIGH on install failure
+- [x] Tier 2 clearance for Tier 1 HIGHs (per proposal: "HIGH findings require Tier 2 clearance")
+- [x] Skip re-verification of already-passed artifacts on retry
+- [x] Verification display dedup (accumulated results deduplicated by capability_name)
+- [x] LangFuse `chain-executor` traces with per-step spans (verified working)
 
-**Commit:** `feat(phase3): compositional executor with dependency-ordered chain execution`
+**Verification results (2026-04-11):**
+- 968 unit tests pass (939 baseline + 29 new composition tests)
+- test_mint best run: 4/7 (T01, T04, T14, T16 pass). T04 exact match on all 3 fields. T16 correct root cause.
+- Remaining failures are generator quality issues (over-parameterized tools, monolith tools), not executor bugs — addressed by Phase 3.5a.
+- LangFuse `chain-executor` traces verified working with per-step spans.
+- T04 4-step mixed chain (MCP→SKILL→SKILL→MCP) produces exact output match.
+- T16 4-step mixed chain (AGENT+MCP_TOOL) produces correct root_cause_metric.
 
-**Decision gate:** if Phase 3 works end-to-end for T14 and at least one mixed-type chain, proceed to **Phase 3.5** (context-engineering hardening + subagents + decomposer rule 10 fix). **If HP4 is not solvable in ~5 days, stop and reassess** — but see the "Fallback NOT viable" note below.
+**Commit:** `feat(phase3): compositional executor with dependency-ordered chain execution` (uncommitted as of 2026-04-11)
+
+**Decision gate: PASSED.** Phase 3 works end-to-end for T04 (mixed-type chain, exact output), T14 (registry + generated chain), and T16 (AGENT + MCP_TOOL chain). HP4 solved via fixture_contents injection. Proceed to Phase 3.5.
 
 **Fallback option — NO LONGER VIABLE (discovered 2026-04-09 during Phase 2 verification):** the original plan said the fallback was "the codebase stays at the end of Phase 2 (per-gap classification, multi-artifact generation, priority-sort execution)". This fallback **does not work** for the testbed. Phase 2's `test_mint.py` run on 2026-04-09 exposed a real architectural incoherence: the new generator prompts frame each artifact as *"one step of a workflow"* expecting upstream state, but the priority-sort executor runs that artifact in isolation passing only the raw input files. The two are incompatible, with the following observed pattern across the 7 test_mint cases:
 

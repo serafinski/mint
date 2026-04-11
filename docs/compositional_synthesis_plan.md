@@ -1,8 +1,8 @@
 # Compositional Capability Synthesis
 
-**Date:** 2026-04-08 (initial), updated 2026-04-09 (Stage 4.5 added after Phase 2 retrospective)
-**Branch:** `iter/6-execution-backends` → new branch `iter/6-compositional-synthesis`
-**Status:** Stages 1-2 complete (landed in Phase 1 + Phase 2 of `pre_eval_execution_plan.md`); Stages 3-8 pending
+**Date:** 2026-04-08 (initial), updated 2026-04-09 (Stage 4.5 added), updated 2026-04-11 (Stages 3-4 implemented)
+**Branch:** `iter/6-execution-backends`
+**Status:** Stages 1-4 complete (Stages 1-2 committed, Stages 3-4 uncommitted as of 2026-04-11); Stage 4.5 and Stages 5-8 pending
 **Supersedes (partially):** `docs/archive/single_artifact_enforcement_plan.md`
 **Cross-reference:** `docs/pre_eval_execution_plan.md` is the sequencing-and-validation layer; this doc is the architectural detail. Stage 1 ↔ Phase 1 Track 1a, Stage 2 ↔ Phase 2, Stages 3-4 ↔ Phase 3, **Stage 4.5 ↔ Phase 3.5b (added 2026-04-09)**, Stages 5-7 are absorbed into Phase 3 / Phase 3.5 verification, Stage 8 ↔ Phases 5-6.
 
