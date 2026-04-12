@@ -43,7 +43,7 @@ Legend:
 | Silent exception handling (High) | Bare except, except Exception return default | AST: bare/broad excepts that pass/return default. Permits re-raise/logging. | ✅ |
 | Mock artifacts (Critical) | unittest.mock imports, @patch, MagicMock | AST: `import unittest.mock`, `import mock`, `import faker`. Regex: "mock", "fake", "dummy", "placeholder", "DEMO", "TEST_DATA". | ✅ Covers imports; `@patch`/`MagicMock` caught transitively via import check. |
 | Synthetic data (Medium) | random.seed(fixed), faker, lorem ipsum | AST: `random.seed(<literal>)`, `np.random.seed(...)`. Regex: lorem ipsum. | ⭐ Strengthened — severity escalated to HIGH (stricter than proposal). LLM generators use these patterns more often than anticipated. |
-| Missing external calls (High) | Functions declaring API params without network requests | AST: fetch/query/call/get-named functions without network imports. | 🟢 Kept deviation — MEDIUM because sandbox runs `--network none`. Will become dynamic (HIGH when `--allow-network`). |
+| Missing external calls (High) | Functions declaring API params without network requests | AST: fetch/query/call/get-named functions without network imports. Dynamic severity: MEDIUM when `--network none` (default), HIGH when `--allow-network`. | ✅ Faithful — severity now matches proposal intent contextually. MEDIUM offline (informational), HIGH online (per proposal). |
 
 **Type scoping:**
 - MCP_TOOL: full AST + regex scan ✅
@@ -53,7 +53,7 @@ Legend:
 
 **Severity mismatches vs proposal:**
 - Synthetic data indicators: implementation HIGH, proposal says Medium — ⭐ **Strengthened**. LLM generators reach for `random.seed` and `faker` more frequently than the proposal anticipated. Escalating to HIGH ensures these patterns require Tier 2 behavioral clearance.
-- Missing external calls: implementation MEDIUM, proposal says High — 🟢 **Kept deviation**. Correct for `--network none` default (sandbox can't make network requests regardless). Will become dynamic with `--allow-network` flag: MEDIUM when network disabled, HIGH when network enabled (proposal intent applies when tools can actually reach the network).
+- Missing external calls: now **dynamic** — MEDIUM when network disabled (default), HIGH when `--allow-network` is enabled. ✅ **Resolved**. Matches proposal intent: severity is HIGH when tools can actually reach the network (per proposal), MEDIUM when they can't (informational only).
 
 ### Tier 2 — Behavioral Testing
 
@@ -103,7 +103,7 @@ Legend:
 
 | Proposal | Implementation | Status |
 |---|---|---|
-| Business Analytics Pipeline | 18 tasks (T01-T18), 7 file formats, 32 fixtures, 3 tiers | ✅ |
+| Business Analytics Pipeline | 20 tasks (T01-T20), 7 file formats, 34 fixtures, 3 tiers. 5 seeded (2 MCP_TOOL, 2 SKILL, 1 AGENT), 5 JIT MCP_TOOL, 5 JIT SKILL, 5 JIT AGENT. | ✅ |
 | ML model training, inference | No actual ML. Statistical analysis, anomaly detection, root-cause inference. | 🟢 Kept — proposal language was loose. Reword Ch 6. |
 | Diverse capability types | ~8 MCP_TOOL, ~3 SKILL (weak), ~5 AGENT | 🟢 Kept — all three types present. See coverage analysis below. |
 
@@ -178,7 +178,7 @@ These came out of building and testing the system. They are not in the proposal 
 | **Registry Threshold 0.6** | Proposal says "confidence threshold" without specifying a value. Implementation uses 0.6 (raised from 0.5 after false-match analysis causing T09/T14 failures). Based on best practices research (0.6-0.7 recommended for balanced precision/recall). | 🟡 Refined — proposal silent on value; we chose based on empirical data. |
 | **Retry Loop with Feedback** | Proposal silent on retry mechanism. Implementation: MAX_ATTEMPTS=3, verification feedback injected into next generation prompt. Failed artifacts are regenerated with error context. | 🟢 Kept deviation — materially affects success rate. Without retry, single Tier 1 hit terminates generation. |
 | **Three Execution Backends** | Proposal treats execution as undifferentiated. Implementation: MCP_TOOL → Docker no-LLM (0 calls), SKILL → constrained LLM (max 5 calls), AGENT → full DeepAgent (unbounded). Makes classifier routing decision have measurable runtime consequences. | ⭐ Strengthened — converts classifier from metadata tag to load-bearing routing decision. |
-| **Network-Disabled Sandbox** | Proposal implies tools can make network requests (Tier 1 "missing external calls" check, Tier 3 "network disconnect" test). Implementation runs `--network none` on all generated code. | 🟢 Kept deviation — deliberate security constraint. `--allow-network` flag planned as opt-in escape hatch. See `pre_eval_readiness.md` item 7. |
+| **Network-Disabled Sandbox** | Proposal implies tools can make network requests (Tier 1 "missing external calls" check, Tier 3 "network disconnect" test). Implementation runs `--network none` by default; `--allow-network` flag enables `--network bridge` for opt-in network access. | ✅ Faithful — default is secure (`--network none`); `--allow-network` enables network when needed (opt-in via CLI `mint run --allow-network`). Tier 1 severity is dynamic (MEDIUM offline, HIGH online). |
 | **`FailureReason.CHAIN_STEP_FAILED`** | Post-Phase-3 addition to evaluation schema for compositional chain failures. Original `FailureReason` enum didn't anticipate multi-step chain execution. | 🟡 Refined — schema evolution to support compositional execution. |
 | **Context Engineering Mapping** | `docs/context_engineering_mapping.md` maps Write/Select/Compress/Isolate primitives to all three artifact types across orchestration and execution layers. Not in proposal but directly addresses the thesis domain ("Context Engineering in LLM-Powered Multi-Agent Systems"). | ⭐ Strengthened — makes the proposal's third tension (context economy) concrete and measurable. |
 | **DuckDB Metrics Store** | Proposal silent on metrics storage. Implementation uses DuckDB for invocation records, evaluation records, and longitudinal optimizer state. Load-bearing for Pillar 3. | ⭐ Strengthened — without it, no prune decisions, no convergence curves, no Chapter 6 analysis. |
@@ -193,9 +193,9 @@ These came out of building and testing the system. They are not in the proposal 
 
 | Verdict | Count | Description |
 |---|---|---|
-| ✅ Faithful | 26 | Matches proposal |
+| ✅ Faithful | 28 | Matches proposal |
 | ⭐ Strengthened | 9 | Goes beyond proposal, improves thesis claims |
-| 🟢 Kept deviation | 6 | Deliberate divergence with justification |
+| 🟢 Kept deviation | 4 | Deliberate divergence with justification |
 | 🟡 Refined | 6 | Additive/defensive, no thesis impact |
 | 🔴 Drift | 0 | All previously-flagged drift items are resolved |
 | ❌ Missing | 3 | Post-eval aggregation work (Gini, KL, mock audit) |
@@ -220,10 +220,10 @@ These came out of building and testing the system. They are not in the proposal 
 - ❌ Mock contamination audit (~5h, mostly human labelling)
 
 ### ⚠️ Open questions (pre-eval) — see `docs/pre_eval_readiness.md`:
-- SKILL testbed coverage is weak (no pure-SKILL task)
-- AGENT coverage: 2/5 genuine, 2/5 borderline, 1/5 could be SKILL
-- JSON-only output format (no file output support)
-- Decomposer non-determinism (rules 10/11 ignored ~50% of the time)
-- Binary file handling depends on LLM compliance (T11 fails)
-- Network-disabled sandbox (`--allow-network` flag planned but not implemented)
-- Tier 1 `missing_external_calls` severity — dynamic once `--allow-network` lands
+- ~~SKILL testbed coverage is weak~~ → ✅ Resolved: T04, T12, T14, T15 prompts strengthened with policy/rules language; T20 added as pure-SKILL task. 5 JIT SKILL tasks total.
+- ~~AGENT coverage: 2/5 genuine, 2/5 borderline~~ → ✅ Resolved: T08, T10, T13 prompts strengthened with iterative/adaptive investigation requirements. 5 JIT AGENT tasks total.
+- ~~JSON-only output format~~ → ✅ Resolved: B3 file output support implemented (ChainResult.output_files, CLI file saving, file_validator on TaskDefinition).
+- Decomposer non-determinism (rules 10/11 ignored ~50% of the time) — accepted, document as Ch 6 finding
+- Binary file handling depends on LLM compliance (T11 fails) — accepted, document as limitation
+- ~~Network-disabled sandbox~~ → ✅ Resolved: `--allow-network` flag implemented on sandbox_execute, sandbox_execute_in_workspace, and CLI.
+- ~~Tier 1 `missing_external_calls` severity~~ → ✅ Resolved: dynamic severity (MEDIUM offline, HIGH with `--allow-network`).
