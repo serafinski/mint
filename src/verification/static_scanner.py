@@ -213,8 +213,18 @@ def _check_missing_external_calls(
     tree: ast.Module,
     source_code: str,
     findings: list[VerificationFinding],
+    *,
+    allow_network: bool = False,
 ) -> None:
-    """Flag tools that claim to fetch/query but contain no network imports."""
+    """Flag tools that claim to fetch/query but contain no network imports.
+
+    Severity is context-dependent:
+    - MEDIUM when network is disabled (default) — the tool can't reach the
+      network anyway, so missing imports are informational.
+    - HIGH when ``allow_network`` is True — the tool *could* reach the
+      network, so claiming to fetch without network imports is a red flag
+      (possibly faking data).
+    """
     # Collect all function names
     fn_names: list[str] = []
     for node in ast.walk(tree):
@@ -228,11 +238,12 @@ def _check_missing_external_calls(
     # Check if source contains any external import
     has_external_import = bool(_EXTERNAL_IMPORT_PATTERNS.search(source_code))
     if not has_external_import:
+        severity = Severity.HIGH if allow_network else Severity.MEDIUM
         findings.append(
             VerificationFinding(
                 tier=1,
                 category="missing_external_calls",
-                severity=Severity.MEDIUM,
+                severity=severity,
                 message=(
                     "Function name implies external interaction "
                     f"({', '.join(n for n in fn_names if _EXTERNAL_FN_NAMES.match(n))}) "
@@ -369,6 +380,8 @@ def scan(
     source_code: str,
     capability_name: str,
     capability_type: str = "mcp_tool",
+    *,
+    allow_network: bool = False,
 ) -> VerificationReport:
     """Run Tier 0 (skills only) + Tier 1 static analysis on source code.
 
@@ -380,6 +393,9 @@ def scan(
         Name of the capability being scanned.
     capability_type:
         One of ``CapabilityType`` values (``"mcp_tool"``, ``"skill"``, ``"agent"``).
+    allow_network:
+        Whether the sandbox allows network access.  Affects severity of
+        ``missing_external_calls`` findings (MEDIUM offline, HIGH online).
 
     Returns
     -------
@@ -428,7 +444,9 @@ def scan(
             _check_hardcoded_return(node, findings)
             _check_silent_except(node, findings)
 
-        _check_missing_external_calls(tree, source_code, findings)
+        _check_missing_external_calls(
+            tree, source_code, findings, allow_network=allow_network,
+        )
         _check_mock_imports(tree, findings)
         _check_random_seed(tree, findings)
 

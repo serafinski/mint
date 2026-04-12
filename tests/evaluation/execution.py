@@ -561,10 +561,28 @@ async def _run():
                     if {step_index} == 0:
                         _all_inputs[_fp] = _full
 
-        # Match available inputs to function parameters
+        # Match available inputs to function parameters.
+        # For steps 1+ (middle/last), prefer passing all upstream data as
+        # a single `upstream_data` dict — this is robust against key name
+        # mismatches. Falls back to per-key matching if the function does
+        # not accept `upstream_data`.
         _sig = inspect.signature({func_name})
         _valid = set(_sig.parameters.keys())
-        _kwargs = {{k: v for k, v in _all_inputs.items() if k in _valid}}
+
+        if {step_index} > 0 and "upstream_data" in _valid:
+            # Collect only upstream step outputs (not fixtures) into one dict
+            _upstream = {{}}
+            for _sf in sorted(glob.glob("/workspace/step_*_output.json")):
+                try:
+                    with open(_sf) as _uf:
+                        _ud = json.load(_uf)
+                    if isinstance(_ud, dict):
+                        _upstream.update(_ud)
+                except Exception:
+                    pass
+            _kwargs = {{"upstream_data": _upstream}}
+        else:
+            _kwargs = {{k: v for k, v in _all_inputs.items() if k in _valid}}
 
         # Path-like parameter matching: assign fixture paths to params
         # whose names suggest they expect a file path (file_path, csv_path, etc.)

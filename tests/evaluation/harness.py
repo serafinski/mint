@@ -574,7 +574,10 @@ def _extract_result_compositional(
     if chain_result.chain_success and chain_result.step_results:
         final_output = chain_result.step_results[-1]
         try:
-            output_in_range = task.validator(final_output)
+            if chain_result.output_files and task.file_validator is not None:
+                output_in_range = task.file_validator(final_output, chain_result.output_files)
+            else:
+                output_in_range = task.validator(final_output)
             failure_reason = "none" if output_in_range else "output_rejected"
         except Exception as exc:  # noqa: BLE001
             logger.warning(

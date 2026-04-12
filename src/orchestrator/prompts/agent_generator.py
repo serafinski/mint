@@ -209,6 +209,8 @@ scope the agent to this step.
 The `agent_name` field MUST be exactly `{forced_name}` (hyphen-case). \
 Do not choose a different name.
 
+{schema_context}
+
 Generate a complete agent configuration. Be specific in the system prompt — \
 include concrete instructions, constraints, and expected behavior. The system \
 prompt MUST instruct the agent to use sandbox_execute for computation and \

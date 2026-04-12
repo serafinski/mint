@@ -168,17 +168,27 @@ Tools in a multi-step workflow follow a strict data flow:
 - **First step (no depends_on):** receives raw file paths as parameters. \
 Read them using appropriate libraries (csv, openpyxl, json, yaml, etc.). \
 Output a JSON-serializable dict containing the parsed data.
-- **Middle steps (depends_on earlier steps):** receive **structured JSON \
-data** (dicts, lists) from upstream steps — NOT file paths. Accept this \
-data directly as parameters (e.g., `rows: list[dict]`, `stats: dict`). \
-Do NOT use `pd.read_csv()`, `open()`, or any file reader — the data is \
-already parsed. Output a JSON-serializable dict.
-- **Last step (nothing depends on it):** receives JSON from upstream. \
-Output a JSON dict by default. Only produce a different format (CSV, \
-Excel, Markdown, etc.) if the task EXPLICITLY asks for it.
+- **Middle steps (depends_on earlier steps):** receive **all upstream data \
+as a single ``upstream_data`` parameter** — a dict containing every key \
+produced by earlier steps. Your function signature MUST include \
+``upstream_data: Annotated[dict, Field(description="Upstream step outputs")]`` \
+as its ONLY required parameter. Read the keys you need from inside it: \
+``inventory = upstream_data["inventory"]``. Do NOT use separate parameters \
+for each upstream key. Do NOT use `pd.read_csv()`, `open()`, or any file \
+reader — the data is already parsed JSON. Output a JSON-serializable dict.
+- **Last step (nothing depends on it):** same as middle steps — receives \
+``upstream_data: dict`` as its only required parameter. Output a JSON \
+dict by default. If the task EXPLICITLY asks for a file output (CSV, \
+Excel, Markdown, etc.), write the file to ``/workspace/output.<ext>`` \
+(e.g. ``/workspace/output.csv``, ``/workspace/output.xlsx``) AND return \
+a JSON dict with metadata about the file \
+(e.g. ``{{"output_file": "output.csv", "row_count": 42}}``). \
+The pipeline will collect the file from the workspace automatically.
 
 All inter-step communication uses JSON. This is the pipeline's "world \
 state at each handoff point."
+
+{schema_context}
 
 The tool function MUST be named exactly `{forced_name}` (snake_case). \
 Do not choose a different name.

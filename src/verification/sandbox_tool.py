@@ -125,20 +125,28 @@ def sandbox_execute(
     code: Annotated[str, Field(description="Python code snippet to execute in the sandbox")],
     timeout: Annotated[int, Field(default=10, description="Timeout in seconds")] = 10,
     extra_packages: list[str] | None = None,
+    *,
+    allow_network: bool = False,
 ) -> dict:
     """Execute a Python snippet in an isolated Docker container.
 
     Returns ``{"stdout": str, "stderr": str, "exit_code": int, "success": bool}``.
 
     When *extra_packages* is provided, a ``uv pip install`` step runs first
-    (with network access), then the script runs with ``--network none``.
+    (with network access), then the script runs with ``--network none``
+    (unless *allow_network* is ``True``).
+
+    When *allow_network* is ``True``, the script runs with ``--network bridge``
+    instead of ``--network none``.  Default is ``False`` (offline) for safety.
 
     Raises nothing — all failures are captured in the return dict.
     """
     if extra_packages:
-        return _sandbox_execute_with_install(code, timeout, extra_packages)
+        return _sandbox_execute_with_install(
+            code, timeout, extra_packages, allow_network=allow_network,
+        )
 
-    return _sandbox_execute_core(code, timeout, network=False)
+    return _sandbox_execute_core(code, timeout, network=allow_network)
 
 
 def sandbox_execute_in_workspace(
@@ -146,6 +154,8 @@ def sandbox_execute_in_workspace(
     workspace_path: Path | str,
     timeout: int = 10,
     extra_packages: list[str] | None = None,
+    *,
+    allow_network: bool = False,
 ) -> dict:
     """Execute code in Docker with a host workspace mounted at ``/workspace``.
 
@@ -159,9 +169,12 @@ def sandbox_execute_in_workspace(
     """
     ws = Path(workspace_path)
     if extra_packages:
-        return _sandbox_execute_with_install(code, timeout, extra_packages, workspace_path=ws)
+        return _sandbox_execute_with_install(
+            code, timeout, extra_packages, workspace_path=ws,
+            allow_network=allow_network,
+        )
 
-    return _sandbox_execute_core(code, timeout, network=False, workspace_path=ws)
+    return _sandbox_execute_core(code, timeout, network=allow_network, workspace_path=ws)
 
 
 def _sandbox_execute_core(
@@ -208,7 +221,7 @@ def _sandbox_execute_core(
 
 def _sandbox_execute_with_install(
     code: str, timeout: int, packages: list[str],
-    *, workspace_path: Path | None = None,
+    *, workspace_path: Path | None = None, allow_network: bool = False,
 ) -> dict:
     """Install extra packages (with network), then run code (without network).
 
@@ -282,14 +295,15 @@ def _sandbox_execute_with_install(
         subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
         return {"stdout": "", "stderr": str(exc), "exit_code": -1, "success": False}
 
-    # Phase 2: run the actual code (no network) against ephemeral image
+    # Phase 2: run the actual code against ephemeral image
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(code)
         script_path = f.name
 
+    network_flag = "bridge" if allow_network else "none"
     docker_args = [
         "docker", "run", "--rm",
-        "--network", "none",
+        "--network", network_flag,
         "--memory", "128m",
         "--cpus", "0.5",
         "--user", "sandbox",

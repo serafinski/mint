@@ -222,6 +222,7 @@ def _generate_single_skill(
     gap: ClassifiedGap,
     task_context: str,
     output_dir: Path | None = None,
+    schema_context: str = "",
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate a single SKILL.md for a classified gap.
 
@@ -235,10 +236,17 @@ def _generate_single_skill(
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
     # handler propagates automatically via LangChain's contextvar inheritance.
 
+    _schema_section = ""
+    if schema_context:
+        _schema_section = (
+            "## Input/Output Schema Contract\n\n" + schema_context
+        )
+
     prompt = SKILL_GENERATOR_PROMPT.format(
         task_context=task_context or gap.description,
         gap_description=gap.description or gap.query,
         forced_name=forced_name,
+        schema_context=_schema_section,
     )
 
     # --- First attempt ---
@@ -367,9 +375,15 @@ def generate_skill(
     logger.info("generate_skill: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(skill_gaps) - len(gaps_to_generate))
     task_context = build_task_context(state)
 
+    from src.orchestrator.generators.utils import build_schema_context
+    subtasks = list(state.subtasks) if state.subtasks else []
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
         futures = {
-            pool.submit(_generate_single_skill, gap, task_context): gap
+            pool.submit(
+                _generate_single_skill, gap, task_context,
+                schema_context=build_schema_context(gap, subtasks),
+            ): gap
             for gap in gaps_to_generate
         }
         raw_results: list[tuple[GeneratedArtifact | None, str | None]] = []

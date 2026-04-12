@@ -112,10 +112,27 @@ CSV and return row_count and column_names" is ONE subtask, not three. \
 The test: if every intermediate step's output is just the input to the \
 next step with no branching or fan-out, it should be one subtask.
 
+12. **Define output_schema for every subtask.** The ``output_schema`` field \
+is a dict mapping output key names to brief type descriptions. These key \
+names become the **binding data contract** between steps — downstream steps \
+will receive a dict with exactly these keys.
+
+Guidelines for ``output_schema``:
+- Use descriptive, unambiguous key names (``products_below_threshold``, \
+NOT ``items`` or ``result`` or ``data``).
+- Include the type and a one-line description of what the value contains.
+- If a step passes through data from an upstream step unchanged, reuse the \
+SAME key name — do not rename it.
+- The **last step's** output_schema keys must match the keys the user's \
+task prompt asks for (e.g., if the task asks for ``row_count`` and \
+``column_names``, those must be in the last step's output_schema).
+- For single-subtask decompositions, output_schema should list the final \
+output keys the task prompt requests.
+
 ## Output
 
 Return your decomposition via the structured output format. Every subtask must
-have at least one required capability.
+have at least one required capability and an output_schema.
 
 ### Example 1 (multi-step tool workflow — pure compute stages, no domain rules):
 Task: "Given a folder of image files, compute a perceptual hash for each \
@@ -128,17 +145,20 @@ return the groups sorted by group size descending."
     {
       "description": "Walk the input folder and compute a perceptual hash for each image file, returning a list of (filename, phash) pairs.",
       "required_capabilities": ["phash-image-folder"],
-      "depends_on": []
+      "depends_on": [],
+      "output_schema": {"image_hashes": "list[dict] — each dict has 'filename' (str) and 'phash' (str)"}
     },
     {
       "description": "Cluster the phash list by Hamming distance threshold 5, returning a list of groups where each group is a list of filenames.",
       "required_capabilities": ["cluster-phashes-by-hamming-distance"],
-      "depends_on": [0]
+      "depends_on": [0],
+      "output_schema": {"groups": "list[list[str]] — each inner list is a cluster of similar filenames"}
     },
     {
       "description": "Sort the groups by group size descending and return the ordered list.",
       "required_capabilities": ["sort-groups-by-size"],
-      "depends_on": [1]
+      "depends_on": [1],
+      "output_schema": {"groups": "list[list[str]] — same structure, sorted by length descending"}
     }
   ],
   "reasoning": "Three distinct compute stages with no domain rules: hash, cluster, sort. Each stage produces a distinct intermediate output that feeds the next. No policy inputs, no domain thresholds — this is a straightforward image-deduplication pipeline."
@@ -158,17 +178,20 @@ principal. Return summary statistics."
     {
       "description": "Parse the applicant records and the underwriting policy input into structured form: a list of applicants and a policy dict containing the credit-score floor, debt-to-income ceiling, and collateral haircut percentage.",
       "required_capabilities": ["parse-applicants-and-underwriting-policy"],
-      "depends_on": []
+      "depends_on": [],
+      "output_schema": {"applicants": "list[dict] — each dict has credit_score, income, debt, collateral_value", "policy": "dict — keys: credit_score_floor (int), dti_ceiling (float), haircut_pct (float)"}
     },
     {
       "description": "Apply the underwriting policy to every applicant: reject applicants below the credit-score floor or above the debt-to-income ceiling, compute the approved principal as collateral value minus the haircut percentage, and return one decision record per applicant.",
       "required_capabilities": ["apply-underwriting-policy-to-applicants"],
-      "depends_on": [0]
+      "depends_on": [0],
+      "output_schema": {"decisions": "list[dict] — each dict has applicant_id, approved (bool), approved_principal (float)"}
     },
     {
       "description": "Aggregate approval statistics across the decision records: total applicants, number approved, number denied, and total approved principal.",
       "required_capabilities": ["aggregate-approval-statistics"],
-      "depends_on": [1]
+      "depends_on": [1],
+      "output_schema": {"total_applicants": "int", "approved_count": "int", "denied_count": "int", "total_approved_principal": "float"}
     }
   ],
   "reasoning": "This is a domain workflow driven by an underwriting policy input. Stage 1 is pure I/O (parsing records and a policy). Stage 2 is the domain-logic core — it applies the three policy knobs (credit-score floor, debt-to-income ceiling, collateral haircut) and is where the 'how to do underwriting' knowledge lives; its name preserves the 'underwriting-policy' signal so the downstream classifier can see the domain policy. Stage 3 is a trivial aggregate over the stage-2 output."
@@ -184,7 +207,8 @@ Task: "Fuzzy-join two CSV files on the company_name column."
     {
       "description": "Fuzzy-join two CSV files on the company_name column, applying normalisation and similarity threshold internally, returning matched row pairs.",
       "required_capabilities": ["fuzzy-join-csvs"],
-      "depends_on": []
+      "depends_on": [],
+      "output_schema": {"row_count": "int — number of matched rows", "null_count_on_key": "int — null company_name values in join result"}
     }
   ],
   "reasoning": "The entire task is a single coherent operation. Normalisation (lowercase, trim, regex), similarity scoring, and joining are all implementation details of one fuzzy-join capability — not separate capabilities. Splitting this into 'normalise' + 'score' + 'join' would be fine-grained atomization, not meaningful decomposition."
@@ -203,7 +227,8 @@ form hypotheses, test them against symptoms, and revise."
     {
       "description": "Triage the incoming patient case: read the intake form and recent vitals, form hypotheses about the most likely acute condition, test those hypotheses against the symptom profile, and recommend the appropriate specialist with a confidence score.",
       "required_capabilities": ["patient-case-triage"],
-      "depends_on": []
+      "depends_on": [],
+      "output_schema": {"condition": "str — most likely acute condition", "specialist": "str — recommended specialist to page", "confidence": "float — confidence score 0-1"}
     }
   ],
   "reasoning": "This is an adaptive investigation — the reasoning path depends on what the intake and vitals reveal. Reading the intake form is part of the triage, not a separate capability. The agent must examine inputs, form hypotheses, test them, and revise. Splitting this into 'read intake' + 'analyze vitals' + 'recommend specialist' would atomize an inherently adaptive task into rigid tool calls."
@@ -233,7 +258,8 @@ CORRECT decomposition (1 subtask):
     {
       "description": "Parse the CSV file and return a dict with 'row_count' (int) and 'column_names' (list of str).",
       "required_capabilities": ["parse-csv-and-return-stats"],
-      "depends_on": []
+      "depends_on": [],
+      "output_schema": {"row_count": "int — number of data rows", "column_names": "list[str] — header column names"}
     }
   ],
   "reasoning": "This is a single straightforward operation: read a file, extract two pieces of information, return them. Splitting into read+parse+format creates three tools to do one tool's job."

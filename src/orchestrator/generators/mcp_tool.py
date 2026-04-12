@@ -185,6 +185,7 @@ def _validate_code(source_code: str) -> str | None:
 def generate_single_tool(
     gap: ClassifiedGap,
     task_context: str = "",
+    schema_context: str = "",
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate a single MCP tool from a classified gap.
 
@@ -201,10 +202,18 @@ def generate_single_tool(
     # inherited via LangChain's contextvar-based callback propagation.  Creating an
     # additional handler here would generate duplicate traces.
 
+    # Build schema contract section — empty string if no schema available
+    _schema_section = ""
+    if schema_context:
+        _schema_section = (
+            "## Input/Output Schema Contract\n\n" + schema_context
+        )
+
     user_prompt = MCP_TOOL_USER_PROMPT.format(
         task_context=task_context or gap.description,
         gap_description=gap.description or gap.query,
         forced_name=forced_name,
+        schema_context=_schema_section,
     )
 
     messages = [
@@ -357,10 +366,18 @@ def generate_mcp_tool(
     logger.info("generate_mcp_tool: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(mcp_gaps) - len(gaps_to_generate))
     task_context = build_task_context(state)
 
+    # Build per-gap schema context from decomposer output_schema
+    from src.orchestrator.generators.utils import build_schema_context
+    subtasks = list(state.subtasks) if state.subtasks else []
+
     # Parallel generation — collect results then merge sequentially
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
         futures = {
-            pool.submit(generate_single_tool, gap, task_context=task_context): gap
+            pool.submit(
+                generate_single_tool, gap,
+                task_context=task_context,
+                schema_context=build_schema_context(gap, subtasks),
+            ): gap
             for gap in gaps_to_generate
         }
         raw_results: list[tuple[GeneratedArtifact | None, str | None]] = []

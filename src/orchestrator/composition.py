@@ -19,9 +19,11 @@ step output files there.  SKILL and AGENT steps receive upstream outputs via
 
 from __future__ import annotations
 
+import base64
 import graphlib
 import json
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -36,6 +38,7 @@ from src.schemas.task import (
     ChainResult,
     GeneratedArtifact,
     MatchItem,
+    StepTiming,
     SubTask,
 )
 
@@ -206,6 +209,28 @@ class CompositionalExecutor:
             shutil.rmtree(workspace, ignore_errors=True)
         except Exception:  # noqa: BLE001
             pass
+
+    @staticmethod
+    def _collect_output_files(workspace: Path) -> dict[str, bytes]:
+        """Scan workspace for ``output.*`` files written by the last step.
+
+        Returns a mapping of filename → raw bytes.  Only files matching
+        the ``output.*`` naming convention are collected (the MCP_TOOL
+        generator prompt instructs last-step tools to write here when the
+        task requests a non-JSON output format).
+        """
+        output_files: dict[str, bytes] = {}
+        try:
+            for candidate in workspace.iterdir():
+                if candidate.is_file() and candidate.stem == "output":
+                    output_files[candidate.name] = candidate.read_bytes()
+                    logger.info(
+                        "Collected output file: %s (%d bytes)",
+                        candidate.name, len(output_files[candidate.name]),
+                    )
+        except OSError as exc:
+            logger.warning("Failed to scan workspace for output files: %s", exc)
+        return output_files
 
     # ------------------------------------------------------------------
     # Resolution helpers
@@ -468,7 +493,7 @@ class CompositionalExecutor:
 
         Optional callbacks:
             on_step_start(position, total, ref): called before each step
-            on_step_end(position, total, ref, success): called after each step
+            on_step_end(position, total, ref, success, step_ms): called after each step
         """
         execution_order = self.build_execution_order()
 
@@ -483,6 +508,7 @@ class CompositionalExecutor:
 
         workspace = self.build_workspace(task_id)
         step_results: list[dict] = []
+        step_timings: list[StepTiming] = []
         executed_outputs: dict[int, dict] = {}
         # Lead dedup: when multiple subtasks resolve to the same artifact
         # (lead-with-subagents), execute it once and cache the output.
@@ -511,6 +537,7 @@ class CompositionalExecutor:
                         chain_length=len(execution_order),
                         chain_success=False,
                         step_results=step_results,
+                        step_timings=step_timings,
                         failed_step_index=step_idx,
                         failed_step_name=subtask.description,
                     )
@@ -571,8 +598,29 @@ class CompositionalExecutor:
                     step_span, bool(output), step_ms, output,
                 )
 
+                step_timings.append(StepTiming(
+                    step_index=step_idx,
+                    capability_name=ref.capability_name,
+                    capability_type=ref.capability_type.value,
+                    source=ref.source,
+                    success=bool(output),
+                    latency_ms=step_ms,
+                ))
+
                 step_results.append(output)
                 executed_outputs[step_idx] = output
+
+                # Diagnostic: check output keys against schema contract
+                if subtask.output_schema and output:
+                    expected = set(subtask.output_schema.keys())
+                    actual = set(output.keys())
+                    missing = expected - actual
+                    if missing:
+                        logger.warning(
+                            "Step %d (%s) output missing expected schema keys: %s "
+                            "(expected: %s, got: %s)",
+                            step_idx, ref.capability_name, missing, expected, actual,
+                        )
 
                 # Record real invocation in metrics store
                 self._record_step_invocation(
@@ -581,7 +629,7 @@ class CompositionalExecutor:
 
                 if on_step_end:
                     try:
-                        on_step_end(position, len(execution_order), ref, bool(output))
+                        on_step_end(position, len(execution_order), ref, bool(output), step_ms)
                     except Exception:  # noqa: BLE001
                         pass
 
@@ -602,17 +650,47 @@ class CompositionalExecutor:
                         chain_length=len(execution_order),
                         chain_success=False,
                         step_results=step_results,
+                        step_timings=step_timings,
                         failed_step_index=step_idx,
                         failed_step_name=subtask.description,
                     )
+
+            # Collect any output files the last step wrote to the workspace
+            # (e.g. output.csv, output.xlsx) before cleanup removes them.
+            collected_files = self._collect_output_files(workspace)
+
+            # SKILL/AGENT steps can't write to the Docker workspace, so they
+            # embed file content in the output dict using special keys.
+            if step_results:
+                last_output = step_results[-1]
+                file_name = last_output.get("_output_file_name")
+                file_content = last_output.get("_output_file_content")
+                if file_name and file_content and file_name not in collected_files:
+                    if isinstance(file_content, str):
+                        # Use base64 only for binary file extensions
+                        _binary_exts = {".xlsx", ".xls", ".parquet", ".pkl", ".zip", ".gz"}
+                        _, ext = os.path.splitext(file_name)
+                        if ext.lower() in _binary_exts:
+                            try:
+                                collected_files[file_name] = base64.b64decode(
+                                    file_content, validate=True,
+                                )
+                            except Exception:  # noqa: BLE001
+                                collected_files[file_name] = file_content.encode("utf-8")
+                        else:
+                            collected_files[file_name] = file_content.encode("utf-8")
+                    elif isinstance(file_content, bytes):
+                        collected_files[file_name] = file_content
 
             self._end_langfuse_chain_trace(lf, chain_trace, True, step_results)
             return ChainResult(
                 chain_length=len(execution_order),
                 chain_success=True,
                 step_results=step_results,
+                step_timings=step_timings,
                 failed_step_index=None,
                 failed_step_name=None,
+                output_files=collected_files,
             )
         finally:
             self.cleanup_workspace(workspace)

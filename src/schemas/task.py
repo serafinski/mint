@@ -40,6 +40,14 @@ class SubTaskItem(BaseModel):
         default_factory=list,
         description="Zero-based indices of subtasks this one depends on",
     )
+    output_schema: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Keys this step MUST include in its output dict, mapped to type "
+            "descriptions. Downstream steps use these exact key names as their "
+            "input contract. Example: {'inventory': 'list[dict] with product records'}"
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -65,6 +73,13 @@ class SubTask(BaseModel):
     )
     depends_on: list[int] = Field(
         default_factory=list, description="Indices of sub-tasks this one depends on"
+    )
+    output_schema: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Keys this step MUST include in its output dict, mapped to type "
+            "descriptions. Downstream steps use these exact key names."
+        ),
     )
     status: TaskStatus = Field(
         default=TaskStatus.PENDING, description="Current status of this sub-task"
@@ -262,6 +277,19 @@ class CapabilityReference(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class StepTiming(BaseModel):
+    """Per-step execution metrics for chain analysis."""
+
+    step_index: int
+    capability_name: str
+    capability_type: str
+    source: str  # "registry" or "generated"
+    success: bool
+    latency_ms: float
+
+    model_config = {"extra": "forbid"}
+
+
 class ChainResult(BaseModel):
     """Result of a compositional execution chain."""
 
@@ -270,5 +298,17 @@ class ChainResult(BaseModel):
     step_results: list[dict] = Field(default_factory=list)
     failed_step_index: int | None = None
     failed_step_name: str | None = None
+    step_timings: list[StepTiming] = Field(
+        default_factory=list,
+        description="Per-step execution metrics (capability name, type, latency).",
+    )
+    output_files: dict[str, bytes] = Field(
+        default_factory=dict,
+        description=(
+            "Files produced by the last step of the chain. "
+            "Maps filename (e.g. 'output.csv') to raw bytes. "
+            "Populated when the last step writes to /workspace/output.*"
+        ),
+    )
 
     model_config = {"extra": "forbid"}

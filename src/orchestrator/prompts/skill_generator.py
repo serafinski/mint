@@ -120,6 +120,19 @@ When writing instructions that involve data processing, tell the agent to \
 embed input data from the user message directly into the sandbox_execute \
 code. Do NOT instruct the agent to use write_file to pass data to the sandbox.
 
+## File Output (last step only)
+
+If this step is the LAST step of a workflow and the task explicitly requests a \
+file output format (CSV, Excel, Markdown, etc.), the skill should instruct the \
+agent to produce BOTH:
+1. A JSON dict with metadata (e.g. ``{{"output_file": "output.csv", "row_count": 42}}``)
+2. The file content embedded in the dict under a ``_output_file_content`` key \
+(base64-encoded for binary formats, plain text for text formats) and the \
+filename under ``_output_file_name`` (e.g. ``"output.csv"``).
+If the task does NOT ask for a file format, return a plain JSON dict as usual.
+
+{schema_context}
+
 Output ONLY the SKILL.md content. Do not wrap it in markdown code fences. \
 Start directly with `---` on the first line.
 """

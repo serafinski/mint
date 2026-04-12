@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import re
+from typing import TYPE_CHECKING
 
 from src.schemas.task import TaskState
 from src.schemas.verification import Severity
+
+if TYPE_CHECKING:
+    from src.schemas.task import ClassifiedGap, SubTask
 
 
 def slugify_gap(query: str) -> str:
@@ -75,3 +79,62 @@ def build_task_context(state: TaskState) -> str:
         + "\n".join(feedback_lines)
         + "\n\nDo NOT use mock data, hardcoded return values, placeholders, or TODO stubs."
     )
+
+
+def build_schema_context(
+    gap: ClassifiedGap,
+    subtasks: list[SubTask],
+) -> str:
+    """Build an input/output schema contract string for a generator prompt.
+
+    Finds the subtask whose ``required_capabilities`` contains the gap's query,
+    then formats that subtask's ``output_schema`` and the ``output_schema`` of
+    its upstream dependencies into a human-readable contract block.
+
+    Returns an empty string if no matching subtask is found or if the subtask
+    has no ``output_schema`` defined (backward-compatible with old decompositions).
+    """
+    # Find the subtask matching this gap
+    target_subtask: SubTask | None = None
+    target_idx: int | None = None
+    for idx, st in enumerate(subtasks):
+        if gap.query in st.required_capabilities:
+            target_subtask = st
+            target_idx = idx
+            break
+
+    if target_subtask is None or not target_subtask.output_schema:
+        return ""
+
+    lines: list[str] = []
+
+    # Input contract: upstream steps' output_schema
+    if target_subtask.depends_on:
+        input_parts: list[str] = []
+        for dep_idx in target_subtask.depends_on:
+            if 0 <= dep_idx < len(subtasks):
+                dep = subtasks[dep_idx]
+                if dep.output_schema:
+                    for key, desc in dep.output_schema.items():
+                        input_parts.append(f"  - \"{key}\": {desc}")
+        if input_parts:
+            lines.append("**Your step receives a dict from the previous step with these keys:**")
+            lines.extend(input_parts)
+            lines.append(
+                "Use these exact key names to read the upstream data. "
+                "Do NOT assume different key names."
+            )
+            lines.append("")
+
+    # Output contract: this step's output_schema
+    output_parts: list[str] = []
+    for key, desc in target_subtask.output_schema.items():
+        output_parts.append(f"  - \"{key}\": {desc}")
+    if output_parts:
+        lines.append("**Your step MUST return a dict with exactly these keys:**")
+        lines.extend(output_parts)
+        lines.append(
+            "Do NOT use different key names. Downstream steps depend on these exact names."
+        )
+
+    return "\n".join(lines)

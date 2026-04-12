@@ -141,6 +141,7 @@ def decomposition_node(
                         description=item.description,
                         required_capabilities=item.required_capabilities,
                         depends_on=item.depends_on,
+                        output_schema=item.output_schema,
                     )
                 )
                 required_caps.extend(item.required_capabilities)

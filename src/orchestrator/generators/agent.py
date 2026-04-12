@@ -214,6 +214,7 @@ def _generate_single_agent(
     task_context: str,
     *,
     output_dir: Path | None = None,
+    schema_context: str = "",
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate an agent config for a single classified gap.
 
@@ -226,11 +227,18 @@ def _generate_single_agent(
 
     from src.config import DEFAULT_LLM_MODEL
 
+    _schema_section = ""
+    if schema_context:
+        _schema_section = (
+            "## Input/Output Schema Contract\n\n" + schema_context
+        )
+
     prompt = AGENT_GENERATOR_PROMPT.format(
         task_context=task_context or gap.description,
         gap_description=gap.description or gap.query,
         forced_name=forced_name,
         model_default=DEFAULT_LLM_MODEL,
+        schema_context=_schema_section,
     )
 
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
@@ -568,6 +576,9 @@ def generate_agent(
 
     task_context = build_task_context(state)
 
+    from src.orchestrator.generators.utils import build_schema_context
+    subtasks = list(state.subtasks) if state.subtasks else []
+
     # Lead-with-subagents mode: ≥2 AGENT gaps → ONE lead + N subagents
     if len(gaps_to_generate) >= 2:
         logger.info(
@@ -588,7 +599,10 @@ def generate_agent(
             )
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
                 futures = {
-                    pool.submit(_generate_single_agent, gap, task_context): gap
+                    pool.submit(
+                        _generate_single_agent, gap, task_context,
+                        schema_context=build_schema_context(gap, subtasks),
+                    ): gap
                     for gap in gaps_to_generate
                 }
                 for future in concurrent.futures.as_completed(futures):
@@ -607,7 +621,10 @@ def generate_agent(
         # Single AGENT gap → standalone agent (existing behavior)
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
             futures = {
-                pool.submit(_generate_single_agent, gap, task_context): gap
+                pool.submit(
+                    _generate_single_agent, gap, task_context,
+                    schema_context=build_schema_context(gap, subtasks),
+                ): gap
                 for gap in gaps_to_generate
             }
             for future in concurrent.futures.as_completed(futures):
