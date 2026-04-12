@@ -934,7 +934,7 @@ class TestParallelGeneration:
         ]
         state = TaskState(task_description="Test", classified_gaps=gaps)
 
-        def mock_gen(gap, task_context=""):
+        def mock_gen(gap, task_context="", **kwargs):
             return (
                 GeneratedArtifact(
                     capability_name=f"gen_{gap.query}",
@@ -969,7 +969,7 @@ class TestParallelGeneration:
 
         call_count = 0
 
-        def mock_gen(gap, task_context=""):
+        def mock_gen(gap, task_context="", **kwargs):
             nonlocal call_count
             call_count += 1
             if gap.query == "tool-0":

@@ -418,6 +418,22 @@ def retrieve_items():
         report = scan(code, "retrieve-tool")
         assert report.overall_passed is True
 
+    def test_missing_external_is_medium_offline(self):
+        """Default (network disabled): severity is MEDIUM."""
+        code = 'def fetch_data(): return []\n'
+        report = scan(code, "fetch-tool")
+        findings = [f for f in report.findings if f.category == "missing_external_calls"]
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.MEDIUM
+
+    def test_missing_external_is_high_with_network(self):
+        """When allow_network=True: severity is HIGH."""
+        code = 'def fetch_data(): return []\n'
+        report = scan(code, "fetch-tool", allow_network=True)
+        findings = [f for f in report.findings if f.category == "missing_external_calls"]
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.HIGH
+
 
 # ===================================================================
 # SyntaxError handling

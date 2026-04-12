@@ -760,3 +760,278 @@ class TestLeadDedup:
         assert result.chain_success is True
         assert len(result.step_results) == 2
         assert result.step_results[0] == result.step_results[1]
+
+
+# ---------------------------------------------------------------------------
+# File output support (B3)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectOutputFiles:
+    """Tests for _collect_output_files — detecting output.* files in workspace."""
+
+    def test_collects_output_csv(self, tmp_path):
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        csv_content = b"a,b,c\n1,2,3\n"
+        (ws / "output.csv").write_bytes(csv_content)
+        # Non-output files should be ignored
+        (ws / "step_0_output.json").write_text("{}")
+        (ws / "data.txt").write_text("hello")
+
+        result = CompositionalExecutor._collect_output_files(ws)
+        assert result == {"output.csv": csv_content}
+
+    def test_collects_multiple_output_files(self, tmp_path):
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        (ws / "output.csv").write_bytes(b"a,b\n1,2\n")
+        (ws / "output.xlsx").write_bytes(b"\x50\x4b")  # fake xlsx bytes
+
+        result = CompositionalExecutor._collect_output_files(ws)
+        assert len(result) == 2
+        assert "output.csv" in result
+        assert "output.xlsx" in result
+
+    def test_empty_workspace(self, tmp_path):
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        result = CompositionalExecutor._collect_output_files(ws)
+        assert result == {}
+
+    def test_no_output_stem_files(self, tmp_path):
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        (ws / "step_0_output.json").write_text("{}")
+        (ws / "result.csv").write_bytes(b"a,b\n")
+
+        result = CompositionalExecutor._collect_output_files(ws)
+        assert result == {}
+
+    def test_nonexistent_workspace(self, tmp_path):
+        ws = tmp_path / "nonexistent"
+        result = CompositionalExecutor._collect_output_files(ws)
+        assert result == {}
+
+
+class TestChainResultOutputFiles:
+    """Tests for ChainResult.output_files field."""
+
+    def test_default_empty(self):
+        cr = ChainResult(chain_length=1, chain_success=True, step_results=[{"a": 1}])
+        assert cr.output_files == {}
+
+    def test_with_files(self):
+        cr = ChainResult(
+            chain_length=1,
+            chain_success=True,
+            step_results=[{"output_file": "output.csv"}],
+            output_files={"output.csv": b"a,b\n1,2\n"},
+        )
+        assert cr.output_files == {"output.csv": b"a,b\n1,2\n"}
+
+
+class TestEmbeddedFileExtraction:
+    """Tests for SKILL/AGENT _output_file_content extraction in run()."""
+
+    def test_extracts_text_file_from_last_step(self):
+        """When last step dict has _output_file_name + _output_file_content (text),
+        it should appear in output_files."""
+        art = _make_artifact(
+            "reporter", CapabilityType.MCP_TOOL,
+            gap_query="report", source_code="async def reporter(): return {}",
+        )
+        subtask = _make_subtask("report", ["report"])
+        resolution = {"report": CapabilityReference(
+            source="generated", capability_name="reporter",
+            capability_type=CapabilityType.MCP_TOOL,
+        )}
+        executor = CompositionalExecutor(
+            subtasks=[subtask],
+            resolution=resolution,
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+        csv_content = "a,b\n1,2\n"
+        step_output = {
+            "output_file": "output.csv",
+            "_output_file_name": "output.csv",
+            "_output_file_content": csv_content,
+        }
+
+        with patch.object(executor, "_execute_step", return_value=step_output):
+            result = executor.run()
+
+        assert result.chain_success is True
+        assert "output.csv" in result.output_files
+        assert result.output_files["output.csv"] == csv_content.encode("utf-8")
+
+    def test_extracts_base64_binary_file(self):
+        """When _output_file_content is base64-encoded, it should be decoded."""
+        import base64
+
+        art = _make_artifact(
+            "exporter", CapabilityType.MCP_TOOL,
+            gap_query="export", source_code="async def exporter(): return {}",
+        )
+        subtask = _make_subtask("export", ["export"])
+        resolution = {"export": CapabilityReference(
+            source="generated", capability_name="exporter",
+            capability_type=CapabilityType.MCP_TOOL,
+        )}
+        executor = CompositionalExecutor(
+            subtasks=[subtask],
+            resolution=resolution,
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+        raw_bytes = b"\x50\x4b\x03\x04binary_content"
+        encoded = base64.b64encode(raw_bytes).decode("ascii")
+        step_output = {
+            "_output_file_name": "output.xlsx",
+            "_output_file_content": encoded,
+        }
+
+        with patch.object(executor, "_execute_step", return_value=step_output):
+            result = executor.run()
+
+        assert result.chain_success is True
+        assert result.output_files["output.xlsx"] == raw_bytes
+
+    def test_no_extraction_without_markers(self):
+        """Without _output_file_name, no file extraction occurs."""
+        art = _make_artifact(
+            "plain", CapabilityType.MCP_TOOL,
+            gap_query="plain", source_code="async def plain(): return {}",
+        )
+        subtask = _make_subtask("plain", ["plain"])
+        resolution = {"plain": CapabilityReference(
+            source="generated", capability_name="plain",
+            capability_type=CapabilityType.MCP_TOOL,
+        )}
+        executor = CompositionalExecutor(
+            subtasks=[subtask],
+            resolution=resolution,
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+
+        with patch.object(executor, "_execute_step", return_value={"data": 42}):
+            result = executor.run()
+
+        assert result.output_files == {}
+
+
+# ---------------------------------------------------------------------------
+# Chain schema contracts
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSchemaContext:
+    """Tests for build_schema_context — inter-step schema contracts."""
+
+    def test_output_schema_in_context(self):
+        """Output schema keys appear in the context string."""
+        from src.orchestrator.generators.utils import build_schema_context
+        from src.schemas.task import ClassifiedGap
+
+        gap = ClassifiedGap(
+            description="aggregate costs",
+            query="aggregate-costs",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="",
+        )
+        subtasks = [
+            SubTask(
+                description="parse data",
+                required_capabilities=["parse-data"],
+                depends_on=[],
+                output_schema={"records": "list[dict]"},
+            ),
+            SubTask(
+                description="aggregate costs",
+                required_capabilities=["aggregate-costs"],
+                depends_on=[0],
+                output_schema={"total_cost": "float", "count": "int"},
+            ),
+        ]
+        ctx = build_schema_context(gap, subtasks)
+        assert '"total_cost"' in ctx
+        assert '"count"' in ctx
+        assert '"records"' in ctx  # upstream input contract
+
+    def test_no_schema_returns_empty(self):
+        """When subtask has no output_schema, returns empty string."""
+        from src.orchestrator.generators.utils import build_schema_context
+        from src.schemas.task import ClassifiedGap
+
+        gap = ClassifiedGap(
+            description="do something",
+            query="do-something",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="",
+        )
+        subtasks = [
+            SubTask(
+                description="do something",
+                required_capabilities=["do-something"],
+                depends_on=[],
+            ),
+        ]
+        ctx = build_schema_context(gap, subtasks)
+        assert ctx == ""
+
+    def test_no_matching_subtask_returns_empty(self):
+        """When gap query doesn't match any subtask, returns empty string."""
+        from src.orchestrator.generators.utils import build_schema_context
+        from src.schemas.task import ClassifiedGap
+
+        gap = ClassifiedGap(
+            description="unrelated",
+            query="unrelated-query",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="",
+        )
+        subtasks = [
+            SubTask(
+                description="something else",
+                required_capabilities=["other-thing"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+        ]
+        ctx = build_schema_context(gap, subtasks)
+        assert ctx == ""
+
+    def test_first_step_no_input_contract(self):
+        """First step (no depends_on) only has output, no input contract."""
+        from src.orchestrator.generators.utils import build_schema_context
+        from src.schemas.task import ClassifiedGap
+
+        gap = ClassifiedGap(
+            description="parse input",
+            query="parse-input",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="",
+        )
+        subtasks = [
+            SubTask(
+                description="parse input",
+                required_capabilities=["parse-input"],
+                depends_on=[],
+                output_schema={"data": "list[dict]"},
+            ),
+        ]
+        ctx = build_schema_context(gap, subtasks)
+        assert '"data"' in ctx
+        assert "receives" not in ctx.lower()  # no input contract for first step
