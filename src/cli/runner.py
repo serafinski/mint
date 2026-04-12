@@ -64,13 +64,13 @@ def _save_last_run(
         "enable_optimizer": enable_optimizer,
         "timeout": timeout,
     }
-    path = _data_dir() / _LAST_RUN_FILE
+    path = _data_dir() / "cli" / _LAST_RUN_FILE
     path.write_text(json.dumps(data, indent=2))
 
 
 def load_last_run() -> dict | None:
     """Load last run config. Returns None if no previous run."""
-    path = _data_dir() / _LAST_RUN_FILE
+    path = _data_dir() / "cli" / _LAST_RUN_FILE
     if not path.exists():
         return None
     try:
@@ -778,10 +778,10 @@ def _execute_compositional_chain(
     *,
     invoke_config: dict | None = None,
     metrics_store: Any | None = None,
-) -> tuple[dict | None, Any | None, str | None]:
+) -> tuple[dict | None, Any | None, str | None, dict[str, bytes], list[dict]]:
     """Run a compositional chain when multiple subtasks are present.
 
-    Returns ``(output, artifact_for_display, exec_error)``.
+    Returns ``(output, artifact_for_display, exec_error, output_files, step_timings)``.
     """
     from src.orchestrator.composition import CompositionalExecutor, build_resolution_map
 
@@ -864,13 +864,17 @@ def _execute_compositional_chain(
                 f"{ref.capability_name} ({cap_type}{sub_label}, {ref.source})[/cyan]"
             )
 
-        def _on_step_end(position: int, total: int, ref: Any, success: bool) -> None:
+        def _on_step_end(
+            position: int, total: int, ref: Any, success: bool, step_ms: float = 0,
+        ) -> None:
             marker = "[green]✓[/green]" if success else "[red]✗[/red]"
             cap_type = str(ref.capability_type).split(".")[-1].upper()
             sub_label = _subagent_label(ref)
+            elapsed = f" [dim]({step_ms / 1000:.1f}s)[/dim]" if step_ms > 0 else ""
             console.print(
                 f"  {marker} Step {position + 1}/{total}: "
                 f"{ref.capability_name} ([cyan]{cap_type}{sub_label}[/cyan], {ref.source})"
+                f"{elapsed}"
             )
 
         def _timer(status_ref: Any) -> None:
@@ -903,13 +907,20 @@ def _execute_compositional_chain(
             console.print(f"[yellow]Chain failed{step_info}[/yellow]")
 
     output: dict | None = None
-    if chain_result is not None and chain_result.chain_success and chain_result.step_results:
-        output = chain_result.step_results[-1] or None
+    output_files: dict[str, bytes] = {}
+    step_timings_data: list[dict] = []
+    if chain_result is not None:
+        if chain_result.chain_success and chain_result.step_results:
+            output = chain_result.step_results[-1] or None
+            output_files = chain_result.output_files
+        step_timings_data = [
+            t.model_dump(mode="json") for t in chain_result.step_timings
+        ]
 
     # Use first artifact for display / save metadata
     artifact_for_display = artifacts[0] if artifacts else None
 
-    return output, artifact_for_display, exec_error
+    return output, artifact_for_display, exec_error, output_files, step_timings_data
 
 
 # ---------------------------------------------------------------------------
@@ -1035,6 +1046,9 @@ def _save_output(
     task: str | None = None,
     file_paths: list[Path] | None = None,
     exec_error: str | None = None,
+    output_files: dict[str, bytes] | None = None,
+    step_timings: list[dict] | None = None,
+    pipeline_metrics: dict | None = None,
 ) -> None:
     """Save output to files in the specified directory.
 
@@ -1094,6 +1108,13 @@ def _save_output(
     result_path = run_dir / "output.json"
     result_path.write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
     saved.append(("Output", str(result_path)))
+
+    # Save chain output files (CSV, Excel, Markdown, etc.)
+    if output_files:
+        for fname, content in output_files.items():
+            file_dest = run_dir / fname
+            file_dest.write_bytes(content)
+            saved.append((f"File ({fname})", str(file_dest)))
 
     # Save verification report sidecar
     if verification_reports:
@@ -1174,6 +1195,10 @@ def _save_output(
                 for cg in classified_gaps
             ],
         }
+        if step_timings:
+            manifest["step_timings"] = step_timings
+        if pipeline_metrics:
+            manifest["pipeline_metrics"] = pipeline_metrics
         manifest_path = run_dir / "run.json"
         manifest_path.write_text(
             json.dumps(manifest, indent=2, default=str),
@@ -1268,6 +1293,7 @@ def execute_task(
     output_dir: Path | None = None,
     json_output: bool = False,
     verbose: bool = False,
+    allow_network: bool = False,
 ) -> int:
     """Run a task through the full JIT pipeline with live progress."""
     _load_env()
@@ -1341,6 +1367,8 @@ def execute_task(
         _trace_tags.append("no-verification")
     if run_optimizer:
         _trace_tags.append("optimizer-on")
+    if allow_network:
+        _trace_tags.append("allow-network")
     invoke_config = _langfuse_config(
         session_id=f"mint-run-{_run_id}",
         tags=_trace_tags,
@@ -1350,6 +1378,7 @@ def execute_task(
             "params": parsed_params,
             "optimizer": run_optimizer,
             "verification": not skip_verification,
+            "allow_network": allow_network,
         },
     )
 
@@ -1471,8 +1500,15 @@ def execute_task(
                 timer_thread.start()
 
                 _GEN_NODES = {"generate_mcp_tool", "generate_skill", "generate_agent"}
+                # Track when each event arrives so we can compute per-node
+                # elapsed time as the delta between consecutive events.
+                # LangGraph streams events AFTER nodes complete, so the
+                # delta between consecutive events = wall time of the node
+                # whose event arrived second.
+                _prev_event_time = stage_start
 
                 for event in pipeline.stream(initial_state, config=invoke_config):
+                    event_time = time.monotonic()
                     node_name = list(event.keys())[0]
                     update = event[node_name]
 
@@ -1485,20 +1521,22 @@ def execute_task(
                     # so the retried node's elapsed time is accurate.
                     if node_visit_count[node_name] > 1:
                         printed_nodes.discard(node_name)
-                        stage_start = time.monotonic()
+                        _prev_event_time = event_time
+                        stage_start = event_time
 
-                    # When a NEW node starts, print the previous node if
-                    # it hasn't been printed yet (generator nodes that need
-                    # artifact diff attribution are deferred to here).
+                    # Capture timing for this node IMMEDIATELY — even if
+                    # printing is deferred (generator nodes). This is the
+                    # delta between this event and the previous one, which
+                    # equals the wall time this node spent executing.
+                    timings[node_name] = event_time - _prev_event_time
+
+                    # When a NEW node's event arrives, print the previous
+                    # node if it was deferred (generator nodes wait for
+                    # artifact diff attribution).  Timing was already
+                    # captured when the deferred node's event arrived.
                     if active_node and active_node != node_name and active_node not in printed_nodes:
                         completed.add(active_node)
-                        # LangGraph streams events AFTER nodes complete.
-                        # stage_start was set when the previous event was
-                        # processed — that's when this (deferred) node started
-                        # running. Use it as the baseline.
-                        timings[active_node] = time.monotonic() - stage_start
                         _print_completed(active_node)
-                        stage_start = time.monotonic()
 
                     # Merge this event's update into accumulated state
                     if isinstance(update, dict):
@@ -1510,18 +1548,18 @@ def execute_task(
                         stage_details[node_name] = detail
 
                     # For non-generator nodes, print completion immediately
-                    # so the ✓ line appears BEFORE the next spinner starts.
+                    # so the checkmark line appears BEFORE the next spinner.
                     # Generator nodes are deferred because their artifact
                     # diff needs to be computed against state that doesn't
                     # yet include the next generator's artifacts.
-                    # NOTE: LangGraph streams events AFTER the node completes,
-                    # so stage_start (set when the previous node finished) is
-                    # the correct baseline — it's when this node started running.
                     if node_name not in _GEN_NODES and node_name not in printed_nodes:
                         completed.add(node_name)
-                        timings[node_name] = time.monotonic() - stage_start
                         _print_completed(node_name)
-                        stage_start = time.monotonic()
+
+                    # This event's arrival time becomes the baseline for
+                    # the next node's elapsed time calculation.
+                    _prev_event_time = event_time
+                    stage_start = event_time
 
                     # Update spinner to show what's running NEXT
                     next_label = _NEXT_STAGE_LABEL.get(node_name, "Processing...")
@@ -1576,9 +1614,11 @@ def execute_task(
     artifact: Any = None
     output: dict | None = None
     exec_error: str | None = None
+    chain_output_files: dict[str, bytes] = {}
+    chain_step_timings: list[dict] = []
 
     if _use_compositional:
-        output, artifact, exec_error = _execute_compositional_chain(
+        output, artifact, exec_error, chain_output_files, chain_step_timings = _execute_compositional_chain(
             final_state, file_paths, task_prompt, json_output, console,
             invoke_config=invoke_config,
             metrics_store=metrics_store,
@@ -1699,7 +1739,7 @@ def execute_task(
         show_pipeline_result(final_state, artifact, output, elapsed_ms, verbose=verbose)
 
     # Always save output (default: data/output/, override with --output-dir)
-    save_dir = output_dir or _data_dir() / "mint_output"
+    save_dir = output_dir or _data_dir() / "cli" / "mint_output"
     # final_state is a dict (LangGraph's pipeline.invoke/.stream returns dicts),
     # so we need the dict-aware accessor — getattr on a dict always returns the
     # default. This bug previously caused the verification sidecar to never fire.
@@ -1709,6 +1749,19 @@ def execute_task(
         else lambda k, d=None: getattr(final_state, k, d)
     )
     verification_reports = _state_get("verification_results", None) or None
+
+    # Build pipeline metrics for run.json — structured stage timings
+    # so the thesis can aggregate without querying LangFuse.
+    _subtask_count = len(_state_get("subtasks", []) or [])
+    _attempt_count = _state_get("attempt_count", 0) or 0
+    _pmx: dict = {
+        "total_elapsed_ms": elapsed_ms,
+        "attempt_count": _attempt_count,
+        "subtask_count": _subtask_count,
+        "stage_timings_s": {k: round(v, 1) for k, v in timings.items()},
+        "stage_details": stage_details,
+    }
+
     if output:
         _save_output(
             save_dir,
@@ -1719,6 +1772,9 @@ def execute_task(
             task=task,
             file_paths=file_paths,
             exec_error=exec_error,
+            output_files=chain_output_files or None,
+            step_timings=chain_step_timings or None,
+            pipeline_metrics=_pmx,
         )
     elif artifact is not None:
         # Save metadata even for empty outputs so the attempt is recorded.
@@ -1738,6 +1794,7 @@ def execute_task(
             task=task,
             file_paths=file_paths,
             exec_error=exec_error,
+            pipeline_metrics=_pmx,
         )
 
     # Success: artifact executed with output, or registry matched (even

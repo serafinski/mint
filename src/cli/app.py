@@ -53,6 +53,9 @@ def run(
         bool, typer.Option("--json", help="Output as JSON (no Rich formatting)")
     ] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Debug logging")] = False,
+    allow_network: Annotated[
+        bool, typer.Option("--allow-network", help="Allow generated tools to access the network")
+    ] = False,
 ) -> None:
     """Run a task through the JIT capability synthesis pipeline."""
     from src.cli.runner import execute_task
@@ -68,6 +71,7 @@ def run(
         output_dir=output_dir,
         json_output=json,
         verbose=verbose,
+        allow_network=allow_network,
     )
     raise SystemExit(code)
 
