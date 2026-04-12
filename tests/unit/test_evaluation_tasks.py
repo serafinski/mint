@@ -31,7 +31,7 @@ from tests.evaluation.tasks import (
 
 class TestTaskRegistry:
     def test_all_tasks_count(self):
-        assert len(ALL_TASKS) == 18
+        assert len(ALL_TASKS) == 20
 
     def test_task_ids_unique(self):
         ids = [t.task_id for t in ALL_TASKS]

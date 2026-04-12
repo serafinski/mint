@@ -1,0 +1,16 @@
+applicant_id,business_name,annual_revenue,employee_count,years_in_business,industry
+A001,TechStart Solutions,120000,8,3,Technology
+A002,GreenGrow Farms,450000,35,5,Agriculture
+A003,MedDevice Labs,380000,22,4,Healthcare
+A004,QuickBite Catering,90000,5,1,Food Service
+A005,EduTech Academy,250000,15,6,Education
+A006,BuildRight Mfg,600000,45,10,Manufacturing
+A007,CloudPeak Software,200000,12,3,Technology
+A008,WellCare Clinic,180000,18,2,Healthcare
+A009,NanoFab Corp,420000,48,7,Manufacturing
+A010,LuxeRetail Co,350000,55,4,Retail
+A011,DataMinds AI,95000,6,2,Technology
+A012,TeachForward,310000,20,8,Education
+A013,FreshFields Ag,280000,30,3,Agriculture
+A014,PrintPrecise 3D,150000,10,1,Manufacturing
+A015,HealthBridge,490000,40,5,Healthcare

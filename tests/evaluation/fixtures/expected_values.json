@@ -191,5 +191,18 @@
       "quantity",
       "price"
     ]
+  },
+  "T19": {
+    "n_rows": 25,
+    "n_columns": 6,
+    "n_categories": 3,
+    "categories": ["Clothing", "Electronics", "Home"]
+  },
+  "T20": {
+    "total_applications": 15,
+    "eligible_count": 9,
+    "ineligible_count": 6,
+    "eligible_ids": ["A001", "A003", "A005", "A007", "A008", "A009", "A011", "A012", "A015"],
+    "rules_applied": 4
   }
 }
