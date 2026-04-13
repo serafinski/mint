@@ -132,6 +132,27 @@ class GeneratedArtifact(BaseModel):
         default_factory=list,
         description="PyPI package names declared by the generator (e.g. ['pyyaml', 'scikit-learn'])",
     )
+    input_schema: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Input parameter contract as {name: type_string}. For MCP_TOOL, "
+            "extracted from the function signature via AST. For SKILL/AGENT, "
+            "set from the upstream subtask's output_schema (or empty). "
+            "Used by the registry to build the enriched embedding document (B1) "
+            "so Pillar 1 gap detection and Pillar 3 Merge can match on "
+            "structural signatures rather than description prose alone."
+        ),
+    )
+    output_schema: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Output contract as {name: type_string}. Populated from the "
+            "decomposer's SubTask.output_schema (Phase 3.5c) or by AST "
+            "extraction of the return annotation. Used in the enriched "
+            "embedding document (B1) and by downstream steps as the input "
+            "schema they will receive."
+        ),
+    )
     generated_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="When this artifact was generated",
