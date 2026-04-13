@@ -217,45 +217,91 @@ These items should be completed before the 15h 360-record eval.
 - Decomposer non-determinism — LLM limitation, 5 runs average it out. Ch 6 finding.
 - Binary file handling (T11) — prompt-only fix, LLM compliance dependent. Ch 6 limitation.
 
+### E. Test suite and scripts audit (~1-2h, added 2026-04-13)
+
+**Motivation:** 1005 unit tests and a `scripts/` directory accumulated across 6 iterations. Almost certainly contains coverage for code paths that no longer exist (pre-Phase-2 single-gap classifier, pre-Phase-3 non-compositional executor, pre-Phase-3.5b single-agent generation, Iter-3 `tool_loader.py` TODO shapes). `scripts/` has similar archaeology: legacy `run_task.py` vs current `mint run`, pilot scripts that predate the 20-task testbed, ad-hoc diagnostic one-offs. Auditing **pre-eval** gives a clean baseline so thesis numbers are anchored to a tidy codebase, and post-eval cleanup doesn't risk invalidating the narrative by touching things after the numbers are locked.
+
+**Scope:** relevance audit, not coverage expansion. The goal is to **delete** stale tests and scripts, not to add new ones.
+
+- [ ] **E1 — Collect test inventory**: `uv run pytest tests/ --collect-only -q > /tmp/test_inventory.txt`. Group by target module.
+- [ ] **E2 — Cross-reference against current source**: for each test file, identify which `src/` module it targets. Flag any test that targets:
+  - Removed symbols (grep for imports that no longer resolve)
+  - Pre-Phase-2 single-gap classifier shape (`classify_task` as primary, not the legacy wrapper)
+  - Pre-Phase-3 non-compositional executor paths
+  - Pre-Phase-3.5b single-agent generator (before lead-with-subagents)
+  - Iter-3 `tool_loader.py` empty-schema TODO assertions (will be obsolete after B1 Gap 1 fix)
+- [ ] **E3 — Delete or migrate flagged tests**: for each flagged test, either delete (if the code it exercised is gone) or migrate to the current shape (if the intent is still valid). Commit as its own diff, separate from B1/Iter-4 work, so `git blame` stays clean.
+- [ ] **E4 — Scripts inventory**: `ls scripts/` and categorize each file as:
+  - `active` — used by CI or eval harness
+  - `diagnostic` — one-off investigation still worth keeping (e.g., `test_registry_matching.py`)
+  - `legacy` — superseded by CLI or other scripts (e.g., `run_task.py` if fully replaced by `mint run`)
+  - `duplicate` — covered by another script
+- [ ] **E5 — Delete legacy/duplicate scripts**: anything in those two categories goes. Active and diagnostic stay.
+- [ ] **E6 — Re-run `pytest tests/` after deletions**: confirm no accidental removal of still-needed coverage. Expect the count to drop (target: <1000, actual depends on findings).
+
+**Ordering:** run E **after** B1 + Iter-4 fixes land (so the audit sees the final code shape) but **before** Phase 4 smoke tests (so the smoke tests run against a clean, trimmed suite). This is the natural insertion point: B1 changes `loop.py`, `operations.py`, `loading_node.py`, `tool_loader.py` — after which many existing tests for those modules will be stale anyway, making the audit concrete rather than speculative.
+
+**Safety rails:**
+- Delete in a separate commit from any code change so reverts are surgical
+- Never delete a test that's currently failing without understanding why — a failing test may be catching a real regression, not just stale
+- If uncertain about a test, leave it and annotate with a `# TODO: audit relevance` comment instead of deleting
+
 ---
 
 ## Summary
 
 | Issue | Severity | Action | Effort | Status |
 |---|---|---|---|---|
-| Testbed rebalance (20 tasks) | High | A1-A5 — seeded spread, SKILL/AGENT coverage, output formats, 2 new tasks | ~2-3h | TODO |
-| File output support | High | B3 — executor + CLI + validator (blocks A4) | ~1-2h | TODO |
-| Network access flag | Low | B1 — sandbox + CLI flag | ~30 min | TODO |
-| Tier 1 severity dynamic | Low | B2 — one `if` statement | ~5 min | TODO |
-| Documentation | Low | C1-C3 | ~15 min | TODO |
-| Decomposer non-determinism | Medium | D — document as Ch 6 finding | ~5 min | TODO |
+| Testbed rebalance (20 tasks) | High | A1-A5 — seeded spread, SKILL/AGENT coverage, output formats, 2 new tasks | ~2-3h | ✅ DONE (2026-04-12) |
+| File output support | High | B3 — executor + CLI + validator (blocks A4) | ~1-2h | ✅ DONE (2026-04-12). **Known limitation:** SKILL/AGENT last steps don't produce files. See `docs/file_output_fix_plan.md`. |
+| Network access flag | Low | B1 — sandbox + CLI flag | ~30 min | ✅ DONE (2026-04-12) |
+| Tier 1 severity dynamic | Low | B2 — one `if` statement | ~5 min | ✅ DONE (2026-04-12) |
+| Documentation | Low | C1-C3 | ~15 min | ✅ DONE (2026-04-12) |
+| Chain data flow key mismatch | High | Schema contracts + upstream_data parameter | ~2h | ✅ DONE (2026-04-12). See `docs/chain_schema_contracts_plan.md`. |
+| Decomposer non-determinism | Medium | D — document as Ch 6 finding | ~5 min | Accepted — LLM limitation |
 | Binary file handling (T11) | — | Fixed — sandbox wrapper name-aware matching | done | ✅ DONE |
-| Pilot results | — | 2/4 passed (T01, T16). T04/T14 non-deterministic. | done | ✅ DONE |
+| Pilot results (2026-04-12) | — | test_mint 7/7 passed. T04 exact match (first time). T11 5/6 fields. | done | ✅ DONE |
 
-**Execution order:**
-1. B3 (file output support) — unblocks A4
-2. A1-A5 (testbed redesign) — new tasks, prompt edits, output formats
-3. B1-B2 (network flag + severity)
-4. C1-C3 (documentation)
-5. Phase 4 smoke tests (see below)
-6. Phase 5 (~18h eval)
+**Pre-eval readiness items: ALL COMPLETE** for the original 2026-04-12 checklist.
 
-**Phase 4 smoke tests (validation gate before eval):**
-- [ ] `uv run pytest tests/unit/` — 989+ pass
+**⚠️ NEW eval-blocking items discovered 2026-04-13** — see `docs/b1_enriched_embedding_plan.md` for full details.
+
+| Issue | Severity | Action | Effort | Status |
+|---|---|---|---|---|
+| Seed description drift | High | 5/8 seed descriptions over-promised vs. code. Fixed in `src/registry/store.py`, upserted into `data/cli/chroma`. | ~30 min | ✅ DONE (2026-04-13) |
+| T01 registry miss (csv-parser) | High | Fixed as side effect of seed description update — new description aligns better with decomposer query vocabulary | — | ✅ DONE (2026-04-13) |
+| Pillar 3 Merge missing "overlapping input schemas" conjunct | High | Iter-4 drift discovered 2026-04-13. Fix in progress as B1. Populate schemas + add Jaccard helper + `[0.5, 1.0)` gate in `identify_candidates_node`. | ~1.5h | 🟡 PARTIAL (schemas done for seeds, AST extractor done, loading-node wiring + Jaccard pending) |
+| `merge()` produces metadata-only stubs | **Eval-blocking** | Iter-4 gap discovered 2026-04-13. Retain highest-reuse parent's implementation when creating merged descriptor. Partial fix for proposal's "inherits strongest behavioral patterns". | ~1h | ⏸ PENDING |
+| `split()` produces metadata-only stubs | **Eval-blocking** | Iter-4 gap discovered 2026-04-13. Disable via `split_reuse_threshold=1.01` in pipeline factory. Principled fix deferred to Chapter 7. | ~10 min | ⏸ PENDING |
+| Phase D reusability measurement | — | Running on 11 generated caps produced thesis-level tension-#2 finding: 73% scenario-bound, 91/9/0 tight/mid/cross reuse gradient. Chapter 6 number. | — | ✅ DONE (2026-04-13) |
+| Test suite + scripts audit (1005 tests, archaeology) | Medium | E1-E6 — delete stale tests/scripts so eval baseline is clean. Run AFTER B1/Iter-4 lands, BEFORE Phase 4 smoke tests. | ~1-2h | ⏸ PENDING |
+
+**Additional work done (not in original plan):**
+- Chain schema contracts (proposal §3.4 compliance) — decomposer output_schema + generator contracts
+- `upstream_data` parameter for robust MCP_TOOL chain data flow
+- CLI timing fix (real elapsed times)
+- Pipeline metrics + step timings in run.json
+- Data path cleanup (mint_output + last_run.json → data/cli/)
+- **NEW 2026-04-13:** `scripts/test_registry_matching.py` four-phase diagnostic (naive probe + context audit + self-consistency audit + generalization audit)
+- **NEW 2026-04-13:** `src/orchestrator/schema_extraction.py` AST-based MCP tool signature extractor
+
+**Phase 4 smoke tests (validation gate before eval) — BLOCKED on Iter-4 fixes:**
+- [x] `uv run pytest tests/unit/` — 1005 pass ✅
+- [ ] **⚠️ Re-run after B1 + Iter-4 fixes land** — schema/extractor changes may affect unit tests
 - [ ] `uv run scripts/test_pipeline.py` — pipeline integration
 - [ ] `uv run scripts/test_verification.py` — three-tier gate
-- [ ] `uv run scripts/test_auto_optimizer.py` — optimizer
-- [ ] `uv run scripts/test_mint.py` — all 20 tasks, target ≥15/20
+- [ ] `uv run scripts/test_auto_optimizer.py` — optimizer (will exercise the fixed merge/split paths)
+- [x] `uv run scripts/test_mint.py` — 7/7 passed ✅ (2026-04-12, pre-B1)
+- [ ] `uv run scripts/test_mint.py` re-run after B1 + Iter-4 fixes
 - [ ] `uv run scripts/run_pilot.py --all-tasks --condition full --n-runs 1` — 20-task pilot
-- [ ] Verify type spread (≥4 of each type), output format spread (≥5 non-JSON), seeded matches (5 tasks)
+- [ ] Verify type spread (≥4 of each type), seeded matches (T01/T02/T05/T09/T19)
 - [ ] Review 3-4 LangFuse traces
 - [ ] Spot-check `data/eval/metrics.duckdb`
 
-**Total remaining pre-eval work: ~5-6 hours + ~2h Phase 4 testing.**
-
-**Recommended priority:**
-1. Wait for pilot results (blocking)
-2. Strengthen SKILL coverage (high impact, low effort)
-3. Strengthen AGENT task prompts (medium impact, low effort)
-4. Decide on JSON-only output (medium impact, higher effort)
-5. Accept decomposer non-determinism and T11 as documented limitations
+**Remaining before eval (updated 2026-04-13):**
+1. **Finish B1 + Iter-4 fixes** (~4-5h) — see `docs/b1_enriched_embedding_plan.md` combined fix list
+2. File output fix for SKILL/AGENT last steps (~1h) — see `docs/file_output_fix_plan.md`
+3. **Test suite + scripts audit** (~1-2h) — section E above. Run after #1/#2 so the audit sees final code shape.
+4. Re-run Phase 4 smoke tests after fixes + audit land
+5. Run `run_pilot --all-tasks --condition full --n-runs 1` (20-task pilot)
+6. Phase 5 eval (20 tasks × 4 conditions × 5 runs, ~18h)

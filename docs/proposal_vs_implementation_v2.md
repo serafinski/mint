@@ -90,8 +90,8 @@ Legend:
 |---|---|---|---|
 | Four metrics | reuse, success, token_cost, maintenance | All four in `MetricsStore.compute_granularity_metrics()` | ✅ |
 | Utility formula | U(c) = α·reuse·success − β·token_cost − γ·maintenance | Exact match. α=1.0, β=0.1, γ=0.1 defaults. | ✅ |
-| Split | >60% reuse, <70% success, SKILL+AGENT | Exact thresholds. MCP_TOOL raises ValueError. | ✅ |
-| Merge | <5% reuse + similarity, SKILL only | Exact threshold. MCP_TOOL/AGENT raise ValueError. | ✅ |
+| Split | >60% reuse, <70% success, SKILL+AGENT | Exact thresholds. MCP_TOOL raises ValueError. **BUT** `operations.py:190-198` creates variants as metadata-only descriptors (no source_code / skill_content / agent_config), then deactivates the parent — variants are unexecutable stubs. Proposal's *"generates targeted variants for each subspace"* requires code generation and is not implemented. | 🔴 **Drift discovered 2026-04-13** — disabling for eval (set `split_reuse_threshold=1.01`); principled fix is Chapter 7 future work |
+| Merge | <5% reuse + similarity (**embedding distance of descriptions AND overlapping input schemas**), SKILL only | Type-scoped check OK. **BUT:** (a) `loop.py:identify_candidates_node` only checks description cosine — the *"overlapping input schemas"* conjunct is literally absent from the code, and `input_schema`/`output_schema` are empty on generated capabilities (TODO at `tool_loader.py:310`). (b) `operations.py:304-311` creates the merged descriptor as metadata-only (no source_code/skill_content/agent_config) and deactivates both parents — merged capability is unexecutable. Proposal's *"inherits the strongest behavioral patterns from each parent"* is not honored. | 🔴 **Drift discovered 2026-04-13** — two latent gaps from Iter 4. Fix in progress as part of B1 (`docs/b1_enriched_embedding_plan.md`): populate schemas, add Jaccard second conjunct with `< 1.0` safety rule, retain winning parent's implementation on merge |
 | Prune | Zero invocations, all types | `deactivate()` (soft-delete). Respects pinned capabilities. | ✅ |
 | KL convergence | KL divergence between consecutive snapshots | Point-mass version (primary, in optimizer loop) + histogram version (sensitivity, in simulation). | ✅ Computed. ❌ Not surfaced in `analyze_results.py`. |
 
@@ -193,11 +193,11 @@ These came out of building and testing the system. They are not in the proposal 
 
 | Verdict | Count | Description |
 |---|---|---|
-| ✅ Faithful | 28 | Matches proposal |
+| ✅ Faithful | 26 | Matches proposal |
 | ⭐ Strengthened | 9 | Goes beyond proposal, improves thesis claims |
 | 🟢 Kept deviation | 4 | Deliberate divergence with justification |
 | 🟡 Refined | 6 | Additive/defensive, no thesis impact |
-| 🔴 Drift | 0 | All previously-flagged drift items are resolved |
+| 🔴 Drift | 2 | **Merge and Split Iter-4 gaps discovered 2026-04-13** (see Pillar 3 table above). Fix in progress via B1. |
 | ❌ Missing | 3 | Post-eval aggregation work (Gini, KL, mock audit) |
 
 ### ✅ Done (no further code work before eval):
