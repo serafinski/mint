@@ -128,7 +128,7 @@ A zero-dependency scanner runs regex-based and AST-based pattern detection acros
 | Synthetic data indicators | `random.seed()` with fixed values, `faker` library usage in non-test code, lorem ipsum strings | Medium |
 | Missing external calls | Functions that declare API parameters but never make network requests | High |
 
-The scanner produces a severity-ranked report. Any "Critical" finding blocks deployment immediately — the capability is rejected without proceeding to Tier 2 or Tier 3, which are significantly more expensive. "High" findings require Tier 2 clearance. This tiered cost structure is a deliberate design choice: static analysis is near-zero cost, behavioral testing requires LLM invocations and sandbox execution, and adversarial probing requires multi-step autonomous reasoning. Running all three tiers on every artifact regardless of Tier 1 results would waste compute on capabilities that can be rejected deterministically.
+The scanner produces a severity-ranked report. Any "Critical" finding blocks deployment; "High" findings require Tier 2 clearance.
 
 **Tier 2 — Behavioral Testing (Edge-Case Probing)**
 
@@ -170,15 +170,13 @@ After each task execution cycle, four metrics are computed for every capability 
 | **Token cost** | Context window tokens consumed by the capability's definition (schema for MCP tools, instruction text for Skills) | Is it efficient? |
 | **Maintenance burden** | How often the capability has required regeneration, patching, or version updates | Is it stable? |
 
-These metrics drive three evolutionary operations, scoped by artifact type to match what LLMs can reliably perform:
+These metrics drive three evolutionary operations:
 
-**Split (capability is too general).** When a capability shows high reuse but mediocre success (say, >60% reuse, <70% success), it is decomposed into two or more specialized variants. The optimizer agent analyzes failure cases to identify the input subspaces where the capability breaks, then generates targeted variants for each subspace. Split applies to Skills and Agent configurations, where the operation amounts to refining instructions or system prompts. For MCP tools, splitting would require automated code refactoring — a problem beyond reliable LLM capability — and is deferred to future work.
+**Split (capability is too general).** When a capability shows high reuse but mediocre success (say, >60% reuse, <70% success), it is decomposed into two or more specialized variants. The optimizer agent analyzes failure cases to identify the input subspaces where the capability breaks, then generates targeted variants for each subspace.
 
-**Merge (capabilities are too specific).** When two or more capabilities show very low reuse (<5%) but high similarity (measured by embedding distance of their descriptions and overlapping input schemas), they are merged into a single, broader capability. The merged version inherits the strongest behavioral patterns from each parent. Merge applies to Skills, where combining instruction sets is a natural LLM strength. Merging MCP tool source code is excluded from the implementation for the same reason as splitting, though the formal framework applies uniformly.
+**Merge (capabilities are too specific).** When two or more capabilities show very low reuse (<5%) but high similarity (measured by embedding distance of their descriptions and overlapping input schemas), they are merged into a single, broader capability. The merged version inherits the strongest behavioral patterns from each parent.
 
-**Prune (capability is dead weight).** Capabilities with zero invocations over a configurable window and no declared dependencies are retired from the active registry (archived, not deleted, for potential resurrection). Prune applies to all artifact types — it requires no code transformation, only a registry state change.
-
-The formal framework (utility function, convergence analysis) is artifact-type-agnostic. The implementation scopes operations to where LLMs can perform them reliably, and the thesis discusses the full framework alongside the scoped implementation.
+**Prune (capability is dead weight).** Capabilities with zero invocations over a configurable window and no declared dependencies are retired from the active registry (archived, not deleted, for potential resurrection).
 
 ### Formal Framework
 
@@ -202,11 +200,13 @@ This creates a "Darwinian" pressure: capabilities compete for registry space bas
 
 ## Evaluation Strategy
 
-### Testbed: Business Analytics Pipeline
+### Testbed Options
 
-The architecture is evaluated on a Business Analytics Pipeline testbed: complex analytics tasks requiring data ingestion from heterogeneous sources, data transformation, ML model training, inference, and report generation. This testbed was chosen because it naturally produces diverse capability types — deterministic data ingestion tools (MCP tools), domain-specific transformation workflows (Skills), and stateful analysis agents (Agents) — which exercises all three artifact classifications in the capability pipeline. The tasks span multiple difficulty levels, from trivially simple (e.g., string manipulation, basic statistics) to genuinely complex (e.g., multi-source joins with schema reconciliation), ensuring the evaluation always produces analyzable data even if the most complex tasks fail.
+The architecture can be evaluated on either of two existing project environments:
 
-An alternative testbed — a MAS-based factory simulation with scheduling optimization, breakdown diagnosis, and quality control — was considered but deferred. The factory simulation offers better repeatability but less diversity in required capability types, which is the primary dimension this thesis investigates.
+**Option A: Factory Simulation.** MAS-based factory with competing machines, orders, and resource allocation decisions. Tasks include scheduling optimization, breakdown diagnosis, and quality-control analysis. Advantages: controlled environment, repeatable scenarios, rich emergent behavior to observe.
+
+**Option B: Business Analytics Pipeline.** Complex analytics tasks requiring data ingestion from heterogeneous sources, ML model training, inference, and report generation. Advantages: realistic heterogeneity of required capabilities, natural diversity of skill granularity needs.
 
 ### Baselines
 
