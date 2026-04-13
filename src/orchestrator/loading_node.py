@@ -24,6 +24,10 @@ from typing import Literal
 from langgraph.graph import END
 from langgraph.types import Command
 
+from src.orchestrator.schema_extraction import (
+    derive_input_schema_from_upstream,
+    find_subtask_for_gap,
+)
 from src.orchestrator.tool_loader import ToolLoader
 from src.registry.store import SkillRegistry
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
@@ -118,11 +122,38 @@ def loading_node(
                     if isinstance(artifact.agent_config, dict)
                     else str(artifact.agent_config)
                 )
+
+            # Populate input_schema / output_schema for Pillar 3 Merge (B1).
+            # Priority order:
+            #   1. Prefer artifact-provided schemas if the generator set them.
+            #   2. Fall back to deriving from the matching SubTask using the
+            #      decomposer's output_schema (Phase 3.5c). Input contract
+            #      for middle/last steps comes from upstream subtasks.
+            # SKILL/AGENT artifacts have no source code to AST-extract, so
+            # subtask-based derivation is the only fallback.
+            input_schema: dict = dict(artifact.input_schema or {})
+            output_schema: dict = dict(artifact.output_schema or {})
+            if not input_schema or not output_schema:
+                matched_subtask, _ = find_subtask_for_gap(
+                    artifact.gap_query, state.subtasks
+                )
+                if matched_subtask is not None:
+                    if not output_schema and matched_subtask.output_schema:
+                        output_schema = dict(matched_subtask.output_schema)
+                    if not input_schema:
+                        derived_inputs = derive_input_schema_from_upstream(
+                            matched_subtask, state.subtasks
+                        )
+                        if derived_inputs:
+                            input_schema = derived_inputs
+
             descriptor = CapabilityDescriptor(
                 name=artifact.capability_name,
                 description=artifact.description or artifact.capability_name,
                 capability_type=artifact.capability_type,
                 domain="generated",
+                input_schema=input_schema,
+                output_schema=output_schema,
                 metadata=metadata,
             )
             registry.add(descriptor)

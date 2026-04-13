@@ -28,6 +28,7 @@ from typing import Any
 from pydantic import BaseModel
 from pydantic import Field as PydanticField  # aliased; generated-tool code also imports Field
 
+from src.orchestrator.schema_extraction import extract_mcp_tool_signature
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import GeneratedArtifact
 
@@ -307,10 +308,22 @@ class ToolLoader:
                 f"got {artifact.capability_type.value}"
             )
 
-        # NOTE: input_schema and output_schema are left as empty dicts (defaults).
-        # The Tier 2 behavioral tester (Iteration 3) will need input_schema to
-        # generate test inputs; this should be populated by parsing the generated
-        # source code's function signature or passed from the generator.
+        # Populate input_schema / output_schema for Pillar 3 Merge (B1).
+        # Priority order:
+        #   1. Prefer artifact-provided schemas if the generator set them.
+        #   2. Fall back to AST extraction from the generated source code,
+        #      which walks the @mcp.tool() decorated async def and pulls
+        #      parameter types + return-dict literal keys.
+        # Never raises — AST extraction returns ({}, {}) on parse failure.
+        input_schema: dict = dict(artifact.input_schema or {})
+        output_schema: dict = dict(artifact.output_schema or {})
+        if (not input_schema or not output_schema) and artifact.source_code:
+            ast_inputs, ast_outputs = extract_mcp_tool_signature(artifact.source_code)
+            if not input_schema:
+                input_schema = dict(ast_inputs)
+            if not output_schema:
+                output_schema = dict(ast_outputs)
+
         fallback_desc = artifact.capability_name.replace("-", " ").replace("_", " ")
         descriptor = CapabilityDescriptor(
             name=artifact.capability_name,
@@ -318,6 +331,8 @@ class ToolLoader:
             capability_type=CapabilityType.MCP_TOOL,
             domain=domain,
             tags=tags or [],
+            input_schema=input_schema,
+            output_schema=output_schema,
             metadata={
                 "generated": "true",
                 "source": "jit_pipeline",
@@ -325,7 +340,12 @@ class ToolLoader:
             },
         )
         registry.add(descriptor)
-        logger.info("Registered MCP tool %r in registry", artifact.capability_name)
+        logger.info(
+            "Registered MCP tool %r in registry (input_schema=%d keys, output_schema=%d keys)",
+            artifact.capability_name,
+            len(input_schema),
+            len(output_schema),
+        )
         return descriptor
 
     def cleanup(self) -> None:
