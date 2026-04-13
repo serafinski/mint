@@ -79,6 +79,55 @@ def load_last_run() -> dict | None:
         return None
 
 
+def _format_json(state: Any, artifact: Any | None, output: dict | None, elapsed_ms: int) -> str:
+    _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
+    verification_results = _get("verification_results", []) or []
+
+    verification: dict[str, Any] | None = None
+    if verification_results:
+        artifact_name = getattr(artifact, "capability_name", None) if artifact else None
+        report = None
+        if artifact_name:
+            for r in reversed(verification_results):
+                if r.capability_name == artifact_name:
+                    report = r
+                    break
+        if report is None:
+            report = verification_results[-1]
+
+        findings_list = []
+        for f in getattr(report, "findings", []) or []:
+            findings_list.append({
+                "severity": str(getattr(f, "severity", "")).upper(),
+                "category": getattr(f, "category", ""),
+                "message": getattr(f, "message", ""),
+                "location": getattr(f, "location", None),
+            })
+
+        verification = {
+            "passed": getattr(report, "overall_passed", None),
+            "tier_reached": getattr(report, "tier_reached", None),
+            "findings": findings_list,
+        }
+
+    result: dict[str, Any] = {
+        "success": artifact is not None and bool(output),
+        "elapsed_ms": elapsed_ms,
+        "capability_name": getattr(artifact, "capability_name", None) if artifact else None,
+        "capability_type": (
+            str(artifact.capability_type).split(".")[-1].lower() if artifact else None
+        ),
+        "subtask_count": len(_get("subtasks", []) or []),
+        "match_count": len(_get("matches", []) or []),
+        "gap_count": len(_get("gaps", []) or []),
+        "artifact_count": len(_get("generated_artifacts", []) or []),
+        "attempt_count": _get("attempt_count", 0),
+        "verification": verification,
+        "output": output,
+    }
+    return json.dumps(result, indent=2, default=str)
+
+
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -1732,8 +1781,6 @@ def execute_task(
 
     # Output
     if json_output:
-        from scripts.run_task import _format_json
-
         print(_format_json(final_state, artifact, output, elapsed_ms))
     else:
         show_pipeline_result(final_state, artifact, output, elapsed_ms, verbose=verbose)

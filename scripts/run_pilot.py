@@ -1,17 +1,23 @@
-"""Pilot evaluation runner for Iteration 5.
+"""Evaluation runner.
 
-Runs T01 (seeded retrieval), T07 (moderate JIT), T05 (moderate JIT - data cleaning)
-through the full pipeline and records results to data/eval/metrics.duckdb.
+Runs tasks through the full pipeline and records results to
+data/eval/metrics.duckdb. Supports the 20-task testbed (T01-T20) across
+four baseline conditions. Use `--all-tasks` for the full eval and
+`--tasks T01,T07,...` for targeted runs.
 
 Usage::
 
-    uv run scripts/run_pilot.py
+    uv run scripts/run_pilot.py                                      # PILOT_TASKS subset
+    uv run scripts/run_pilot.py --all-tasks --condition full         # 20 tasks, one condition
+    uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5  # full eval (400 records)
 
 Optional flags::
 
     --condition full|no_verification|no_optimization|static  (default: full)
-    --all-tasks   run all 10 tasks instead of pilot subset
-    --all-conditions  run all 4 baseline conditions in sequence
+    --all-tasks        run all 20 tasks instead of PILOT_TASKS subset
+    --all-conditions   run all 4 baseline conditions in sequence
+    --tasks IDS        comma-separated task IDs (overrides --all-tasks)
+    --n-runs N         number of runs per condition (default: 1)
 
 Results are printed to stdout and persisted to data/eval/metrics.duckdb.
 """
@@ -54,7 +60,7 @@ def main() -> None:
     parser.add_argument(
         "--all-tasks",
         action="store_true",
-        help="Run all 10 tasks instead of pilot subset [T01, T07, T05]",
+        help="Run all 20 tasks instead of PILOT_TASKS subset",
     )
     parser.add_argument(
         "--all-conditions",

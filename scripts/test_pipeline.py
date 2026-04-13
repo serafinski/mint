@@ -4,10 +4,12 @@ Runs tasks through the complete 9-node pipeline and verifies every
 intermediate state: decomposition -> gap detection -> classification
 -> generation -> verification -> loading -> registration.
 
-Tests all three capability types:
-- MCP_TOOL: T05 (dirty CSV cleaning)
-- SKILL: multi-source data integration (T11-like)
-- AGENT: anomaly investigation (T13-like)
+Tests all three capability types with inline prompts (not imported from
+`tests/evaluation/tasks.py`), so this script is independent of testbed
+changes. Representative shapes:
+- MCP_TOOL: dirty CSV cleaning
+- SKILL: multi-source data integration
+- AGENT: anomaly investigation
 
 Usage::
 

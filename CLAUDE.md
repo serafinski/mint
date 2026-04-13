@@ -111,7 +111,6 @@ tools/                  # Development & validation utilities
 scripts/                # Evaluation runners + integration tests
 ├── run_pilot.py            # Evaluation runner (18 tasks × 4 conditions × N runs)
 ├── run_longitudinal.py     # Longitudinal optimizer test (40+ tasks, no reset)
-├── run_task.py             # Legacy CLI runner
 ├── analyze_results.py      # Statistical analysis (CIs, Fisher's exact)
 ├── backfill_token_costs.py # LangFuse → DuckDB token cost extraction
 ├── analyze_context_utilization.py  # Context window utilization from LangFuse
@@ -412,7 +411,6 @@ The following modules are implemented and tested. Import from them; avoid modify
 - **`src/cli/app.py`** — MINT CLI entry point (Typer): `run`, `plan`, `retry`, `list`, `inspect`, `history`, `prune`, `seed`, `reset`, `disable`, `enable`
 - **`src/cli/runner.py`** — Pipeline execution with streaming progress, file metadata augmentation, AST-based parameter matching, auto-save output to `data/mint_output/` (timestamped), `--output-dir` override
 - **`src/cli/display.py`** — Rich formatting (progress table, verification findings, capability list/inspect/history, output quality detection)
-- **`scripts/run_task.py`** — User-facing CLI: `uv run scripts/run_task.py "task" [--file PATH] [--param K=V] [--dry-run] [--list] [--skip-verification] [--enable-optimizer] [--no-optimizer] [--timeout SECONDS] [--output-format json|human]`. Optimizer auto-enables after 20+ invocations. Persists capabilities (ChromaDB) and invocation metrics (`data/cli/metrics.duckdb`) across runs.
 
 ## Notes for AI Agents
 
