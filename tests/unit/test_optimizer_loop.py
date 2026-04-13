@@ -9,17 +9,26 @@ import pytest
 from src.optimizer.loop import (
     OptimizerState,
     _compute_kl_divergence,
+    _schema_jaccard,
     create_optimization_loop,
 )
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.metrics import GranularityMetrics
 
 
-def _make_cap(name: str, cap_type: CapabilityType = CapabilityType.SKILL) -> CapabilityDescriptor:
+def _make_cap(
+    name: str,
+    cap_type: CapabilityType = CapabilityType.SKILL,
+    *,
+    input_schema: dict | None = None,
+    output_schema: dict | None = None,
+) -> CapabilityDescriptor:
     return CapabilityDescriptor(
         name=name,
         description=f"Description for {name}",
         capability_type=cap_type,
+        input_schema=input_schema or {},
+        output_schema=output_schema or {},
     )
 
 
@@ -77,6 +86,74 @@ class TestKLDivergence:
         curr = {"a": 0.5, "b": -1.0}
         kl = _compute_kl_divergence(prev, curr)
         assert kl > 0.0
+
+
+class TestSchemaJaccard:
+    """Tests for the _schema_jaccard helper (B1 Merge second conjunct)."""
+
+    def test_both_empty_returns_zero(self):
+        """Unpopulated schemas must not form merge candidates — safe default."""
+        a = _make_cap("a")
+        b = _make_cap("b")
+        assert _schema_jaccard(a, b) == 0.0
+
+    def test_one_empty_returns_zero(self):
+        """Single-sided empty also rejects the merge — both sides must be populated."""
+        a = _make_cap("a", input_schema={"x": "int"}, output_schema={"y": "str"})
+        b = _make_cap("b")
+        assert _schema_jaccard(a, b) == 0.0
+        assert _schema_jaccard(b, a) == 0.0  # symmetric
+
+    def test_full_overlap_returns_one(self):
+        """Identical schemas return 1.0 — the gate's exclusive upper bound blocks these."""
+        a = _make_cap(
+            "a", input_schema={"file_path": "str"}, output_schema={"row_count": "int"}
+        )
+        b = _make_cap(
+            "b", input_schema={"file_path": "str"}, output_schema={"row_count": "int"}
+        )
+        assert _schema_jaccard(a, b) == 1.0
+
+    def test_partial_overlap(self):
+        """Half the keys shared → Jaccard = |intersection| / |union|."""
+        a = _make_cap(
+            "a",
+            input_schema={"file_path": "str", "row_count": "int"},
+            output_schema={"result": "dict"},
+        )
+        b = _make_cap(
+            "b",
+            input_schema={"file_path": "str", "col_count": "int"},
+            output_schema={"result": "dict"},
+        )
+        # Union = {file_path, row_count, col_count, result} = 4
+        # Intersection = {file_path, result} = 2
+        # Jaccard = 2 / 4 = 0.5
+        assert _schema_jaccard(a, b) == 0.5
+
+    def test_symmetric(self):
+        """f(a, b) == f(b, a) for any inputs."""
+        a = _make_cap(
+            "a",
+            input_schema={"k1": "int", "k2": "str"},
+            output_schema={"o1": "dict"},
+        )
+        b = _make_cap(
+            "b",
+            input_schema={"k1": "int", "k3": "float"},
+            output_schema={"o2": "list"},
+        )
+        assert _schema_jaccard(a, b) == _schema_jaccard(b, a)
+
+    def test_disjoint_returns_zero(self):
+        """Completely non-overlapping schemas → 0.0, never a merge candidate."""
+        a = _make_cap(
+            "a", input_schema={"x": "int"}, output_schema={"y": "str"}
+        )
+        b = _make_cap(
+            "b", input_schema={"p": "int"}, output_schema={"q": "str"}
+        )
+        assert _schema_jaccard(a, b) == 0.0
 
 
 def _build_mock_registry_and_store(cap_names, cap_types=None, metrics_kwargs=None):
@@ -178,9 +255,30 @@ class TestCreateOptimizationLoop:
     @patch("src.optimizer.loop.split")
     @patch("src.optimizer.loop.merge")
     def test_merge_candidates_use_similarity(self, mock_merge, mock_split, mock_prune):
-        """Merge pairs are formed via registry.search similarity, not consecutive indexing."""
-        cap_a = _make_cap("skill-a", CapabilityType.SKILL)
-        cap_b = _make_cap("skill-b", CapabilityType.SKILL)
+        """Merge pairs are formed via registry.search similarity AND schema overlap.
+
+        Both conjuncts of the proposal's merge criterion must fire:
+        (1) description cosine >= 0.5, (2) schema Jaccard in [0.5, 1.0).
+        """
+        # Overlapping schemas. Union of input+output keys per cap:
+        #   cap_a = {file_path, row_count, extra_a, result}
+        #   cap_b = {file_path, row_count, extra_b, result}
+        # Intersection = {file_path, row_count, result} = 3
+        # Union = {file_path, row_count, extra_a, extra_b, result} = 5
+        # Jaccard = 3/5 = 0.6 → in [0.5, 1.0), the gate accepts the pair.
+        shared_inputs = {"file_path": "str", "row_count": "int"}
+        cap_a = _make_cap(
+            "skill-a",
+            CapabilityType.SKILL,
+            input_schema={**shared_inputs, "extra_a": "str"},
+            output_schema={"result": "dict"},
+        )
+        cap_b = _make_cap(
+            "skill-b",
+            CapabilityType.SKILL,
+            input_schema={**shared_inputs, "extra_b": "str"},
+            output_schema={"result": "dict"},
+        )
         caps = {"skill-a": cap_a, "skill-b": cap_b}
 
         registry = MagicMock()
@@ -236,6 +334,95 @@ class TestCreateOptimizationLoop:
         # Low similarity → no pairs formed
         assert result["merge_candidates"] == []
 
+    @patch("src.optimizer.loop.prune", return_value=[])
+    @patch("src.optimizer.loop.split")
+    @patch("src.optimizer.loop.merge")
+    def test_merge_candidates_rejected_when_schemas_disjoint(
+        self, mock_merge, mock_split, mock_prune
+    ):
+        """B1 second conjunct: high description cosine but disjoint schemas → no pair.
+
+        Protects against regression of the proposal's *"overlapping input schemas"*
+        clause. Without this test, silently removing the Jaccard gate in
+        ``identify_candidates_node`` would still pass all other merge tests.
+        """
+        # Description cosine will be mocked high (0.8), but schemas have zero overlap.
+        cap_a = _make_cap(
+            "skill-a",
+            CapabilityType.SKILL,
+            input_schema={"path_a": "str", "size_a": "int"},
+            output_schema={"out_a": "dict"},
+        )
+        cap_b = _make_cap(
+            "skill-b",
+            CapabilityType.SKILL,
+            input_schema={"path_b": "str", "size_b": "int"},
+            output_schema={"out_b": "dict"},
+        )
+        caps = {"skill-a": cap_a, "skill-b": cap_b}
+
+        registry = MagicMock()
+        registry.list_all.return_value = list(caps.values())
+        registry.get.side_effect = lambda n: caps.get(n)
+        registry.count = 2
+        registry.search.return_value = [(cap_b, 0.8)]  # high cosine
+
+        store = MagicMock()
+        store.compute_granularity_metrics.side_effect = lambda cap_id, **kw: _make_metrics(
+            cap_id, reuse_rate=0.01
+        )
+
+        graph = create_optimization_loop(registry, store, merge_reuse_threshold=0.05)
+        result = graph.invoke(OptimizerState())
+
+        # Jaccard = 0.0 (disjoint) → no pair even though cosine is high
+        assert result["merge_candidates"] == []
+
+    @patch("src.optimizer.loop.prune", return_value=[])
+    @patch("src.optimizer.loop.split")
+    @patch("src.optimizer.loop.merge")
+    def test_merge_candidates_rejected_when_schemas_identical(
+        self, mock_merge, mock_split, mock_prune
+    ):
+        """B1 safety rule: identical schemas (Jaccard = 1.0) → no merge.
+
+        Two capabilities with identical input/output contracts may hide
+        different internal logic (e.g., strict vs. lenient CSV parsing).
+        The exclusive upper bound ``Jaccard < 1.0`` preserves diversity.
+        """
+        shared_inputs = {"file_path": "str", "row_count": "int"}
+        shared_outputs = {"result": "dict"}
+        cap_a = _make_cap(
+            "skill-a",
+            CapabilityType.SKILL,
+            input_schema=shared_inputs,
+            output_schema=shared_outputs,
+        )
+        cap_b = _make_cap(
+            "skill-b",
+            CapabilityType.SKILL,
+            input_schema=shared_inputs,
+            output_schema=shared_outputs,
+        )
+        caps = {"skill-a": cap_a, "skill-b": cap_b}
+
+        registry = MagicMock()
+        registry.list_all.return_value = list(caps.values())
+        registry.get.side_effect = lambda n: caps.get(n)
+        registry.count = 2
+        registry.search.return_value = [(cap_b, 0.9)]  # high cosine
+
+        store = MagicMock()
+        store.compute_granularity_metrics.side_effect = lambda cap_id, **kw: _make_metrics(
+            cap_id, reuse_rate=0.01
+        )
+
+        graph = create_optimization_loop(registry, store, merge_reuse_threshold=0.05)
+        result = graph.invoke(OptimizerState())
+
+        # Jaccard = 1.0 → outside [0.5, 1.0), safety rule blocks the merge
+        assert result["merge_candidates"] == []
+
     @patch("src.optimizer.loop.prune", return_value=["skill-a"])
     @patch("src.optimizer.loop.split")
     @patch("src.optimizer.loop.merge")
@@ -253,8 +440,21 @@ class TestCreateOptimizationLoop:
         prune() is mocked to return ["skill-a"].  apply_operations_node must then
         skip the ("skill-a", "skill-b") pair because skill-a is in pruned_set.
         """
-        cap_a = _make_cap("skill-a", CapabilityType.SKILL)
-        cap_b = _make_cap("skill-b", CapabilityType.SKILL)
+        # Overlapping schemas so the B1 Jaccard gate accepts the pair.
+        # Jaccard = 3/5 = 0.6 — see test_merge_candidates_use_similarity.
+        shared_inputs = {"file_path": "str", "row_count": "int"}
+        cap_a = _make_cap(
+            "skill-a",
+            CapabilityType.SKILL,
+            input_schema={**shared_inputs, "extra_a": "str"},
+            output_schema={"result": "dict"},
+        )
+        cap_b = _make_cap(
+            "skill-b",
+            CapabilityType.SKILL,
+            input_schema={**shared_inputs, "extra_b": "str"},
+            output_schema={"result": "dict"},
+        )
         caps = {"skill-a": cap_a, "skill-b": cap_b}
 
         registry = MagicMock()

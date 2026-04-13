@@ -105,6 +105,37 @@ def _compute_kl_divergence(
     return float(entropy(curr, prev))
 
 
+def _schema_jaccard(
+    cap_a: "CapabilityDescriptor", cap_b: "CapabilityDescriptor"
+) -> float:
+    """Jaccard similarity over the union of input+output schema key names.
+
+    Implements the proposal's second Merge conjunct: *"overlapping input
+    schemas"*. Computes |A ∩ B| / |A ∪ B| where A and B are the sets of
+    parameter names + output-key names from each capability's schemas.
+
+    Returns 0.0 if either side has no schema (which disables merge on
+    unpopulated capabilities — safe default, because merging two caps
+    with unknown contracts risks producing garbage).
+
+    Uses key-name overlap (not type overlap) because type tokens like
+    ``int``/``dict`` carry little semantic signal for clustering decisions;
+    the stronger signal is that two capabilities share parameter *names*
+    like ``file_path`` or ``row_count``.
+    """
+    a_keys = set((cap_a.input_schema or {}).keys()) | set(
+        (cap_a.output_schema or {}).keys()
+    )
+    b_keys = set((cap_b.input_schema or {}).keys()) | set(
+        (cap_b.output_schema or {}).keys()
+    )
+    if not a_keys or not b_keys:
+        return 0.0
+    intersection = a_keys & b_keys
+    union = a_keys | b_keys
+    return len(intersection) / len(union)
+
+
 def create_optimization_loop(
     registry: SkillRegistry,
     metrics_store: MetricsStore,
@@ -170,29 +201,36 @@ def create_optimization_loop(
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to compute metrics for '%s': %s", cap_id, e)
 
-        # Build merge pairs: low-reuse SKILL pairs with high embedding similarity.
-        # Use registry.search() to find semantically similar partners rather than
-        # pairing consecutive skills (which would be arbitrary).
-        low_reuse_skills: list[str] = []
+        # Build merge pairs: low-reuse capability pairs with high embedding
+        # similarity AND overlapping I/O schemas (the second proposal conjunct).
+        # Use registry.search() to find semantically similar partners rather
+        # than pairing consecutive capabilities (which would be arbitrary).
+        #
+        # Type scoping: candidates are collected across all three capability
+        # types (MCP_TOOL, SKILL, AGENT). Pairing within the search loop
+        # enforces same-type pairs — cross-type merge is not supported
+        # because merge() dispatches on type and the combined executable
+        # content only makes sense within a type (Ch 7 future work).
+        low_reuse: list[str] = []
         for cap_id in state.capabilities_snapshot:
             cap = registry.get(cap_id)
-            if cap is None or cap.capability_type != CapabilityType.SKILL:
+            if cap is None:
                 continue
             m = metrics_cache.get(cap_id)
             if m is None:
                 continue
             if m.reuse_rate < merge_reuse_threshold:
-                low_reuse_skills.append(cap_id)
+                low_reuse.append(cap_id)
 
-        low_reuse_set = set(low_reuse_skills)
+        low_reuse_set = set(low_reuse)
         # Compute registry size once — registry.count hits ChromaDB on every call.
         total_caps = registry.count or 1
-        n_search = min(max(10, len(low_reuse_skills)), total_caps)
+        n_search = min(max(10, len(low_reuse)), total_caps)
         paired: set[str] = set()
-        for skill_id in low_reuse_skills:
-            if skill_id in paired:
+        for cap_id in low_reuse:
+            if cap_id in paired:
                 continue
-            cap = registry.get(skill_id)
+            cap = registry.get(cap_id)
             if cap is None:
                 continue
             try:
@@ -203,19 +241,30 @@ def create_optimization_loop(
                 )
                 for similar_cap, score in similar:
                     partner_id = similar_cap.name
+                    # First conjunct (proposal): description cosine >= 0.5
+                    # Second conjunct (proposal + user safety rule):
+                    #     schema Jaccard in [0.5, 1.0)
+                    # The exclusive upper bound preserves diversity — two
+                    # capabilities with identical schemas may hide different
+                    # internal logic, and merging them risks destroying that
+                    # diversity. Require some overlap (>= 0.5) but not full
+                    # identity (< 1.0).
                     if (
-                        partner_id != skill_id
-                        and partner_id in low_reuse_set  # only active caps are in low_reuse_set
+                        partner_id != cap_id
+                        and partner_id in low_reuse_set
                         and partner_id not in paired
                         and similar_cap.is_active
-                        and score >= 0.5  # meaningful semantic similarity
+                        and similar_cap.capability_type == cap.capability_type
+                        and score >= 0.5
                     ):
-                        merge_cands.append((skill_id, partner_id))
-                        paired.add(skill_id)
-                        paired.add(partner_id)
-                        break
+                        jaccard = _schema_jaccard(cap, similar_cap)
+                        if 0.5 <= jaccard < 1.0:
+                            merge_cands.append((cap_id, partner_id))
+                            paired.add(cap_id)
+                            paired.add(partner_id)
+                            break
             except Exception as e:  # noqa: BLE001
-                logger.warning("Failed similarity search for '%s' (merge): %s", skill_id, e)
+                logger.warning("Failed similarity search for '%s' (merge): %s", cap_id, e)
 
         return Command(
             update={
