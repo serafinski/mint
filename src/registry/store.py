@@ -273,6 +273,7 @@ class SkillRegistry:
         *,
         min_confidence: float = 0.0,
         is_active: bool | None = True,
+        domain: str | None = None,
     ) -> list[tuple[CapabilityDescriptor, float]]:
         """Semantic search. Returns (capability, score) pairs sorted by relevance.
 
@@ -285,8 +286,21 @@ class SkillRegistry:
             is_active: Filter by active status. ``True`` (default) returns only
                 active capabilities; ``False`` returns only inactive
                 capabilities; ``None`` returns all regardless of status.
+            domain: Optional domain filter applied at the ChromaDB ``where``
+                level — restricts the search to capabilities whose ``domain``
+                metadata matches exactly. When ``None`` (default) the search
+                is unrestricted, preserving the pre-B1 behaviour. This is the
+                proposal's "hierarchical embeddings (domain → capability →
+                specific skill)" criterion realised as a cheap pre-filter
+                rather than a multi-level cascaded search. Used by the
+                domain-filter experiment in Phase 2 Step 3.5 of the master
+                plan; also available for production gap detection if the
+                experiment shows a false-positive reduction.
         """
-        results = self._collection.query(query_texts=[query], n_results=n_results)
+        query_kwargs: dict = {"query_texts": [query], "n_results": n_results}
+        if domain is not None:
+            query_kwargs["where"] = {"domain": {"$eq": domain}}
+        results = self._collection.query(**query_kwargs)
 
         pairs: list[tuple[CapabilityDescriptor, float]] = []
         if not results["ids"] or not results["ids"][0]:
@@ -307,9 +321,20 @@ class SkillRegistry:
         return pairs
 
     def detect_gaps(
-        self, queries: list[str], *, threshold: float = 0.6
+        self,
+        queries: list[str],
+        *,
+        threshold: float = 0.6,
+        domain: str | None = None,
     ) -> tuple[list[tuple[CapabilityDescriptor, float, str]], list[tuple[str, str]]]:
         """For each query, search the registry and classify as match or gap.
+
+        Args:
+            queries: Required-capability query strings.
+            threshold: Minimum similarity score to count as a match.
+            domain: Optional domain filter threaded through to :meth:`search`.
+                When ``None`` (default) the search is unrestricted. See
+                :meth:`search` for rationale.
 
         Returns:
             matches: list of (capability, score, original_query) above threshold
@@ -321,8 +346,10 @@ class SkillRegistry:
         for query in queries:
             # search() filters out is_active=False, so also query unfiltered
             # to detect deactivated capabilities and produce accurate gap reasons.
-            results = self.search(query, n_results=1)
-            unfiltered = self.search(query, n_results=1, is_active=None)
+            results = self.search(query, n_results=1, domain=domain)
+            unfiltered = self.search(
+                query, n_results=1, is_active=None, domain=domain
+            )
 
             if results and results[0][1] >= threshold:
                 cap, score = results[0]
