@@ -168,6 +168,17 @@ Nothing produces ``transactions``. Step 2 must either drop the \
 be changed to parse BOTH files and declare both keys in its \
 output_schema.
 
+**Avoid key collisions across sibling predecessors.** When a downstream \
+subtask depends on two or more earlier subtasks, their ``output_schema`` \
+top-level keys must be **disjoint**. If two parsers both emit a key \
+named ``'records'`` (one for sales, one for inventory), the runtime \
+``upstream_data`` dict merges them via last-write-wins and silently \
+drops one of the two. Rename one side to disambiguate: use domain-\
+specific names like ``'sales_records'`` and ``'inventory_records'`` \
+instead of a generic ``'records'``. Applies at the whole-chain level — \
+not just direct predecessors but every transitive predecessor of any \
+given successor.
+
 14. **Describe subtasks in terms of data shape and operation, not \
 specific paths or values.** Subtask descriptions are consumed by two \
 downstream systems:

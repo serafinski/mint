@@ -535,6 +535,429 @@ class TestCollectTransitiveUpstreamKeys:
         assert keys == {"x", "y"}
 
 
+class TestCollectTransitiveKeyProducers:
+    """Unit tests for the producer-attribution helper used by collision detection."""
+
+    def test_empty_depends_on(self):
+        from src.orchestrator.decomposition import _collect_transitive_key_producers
+
+        subtasks = [
+            SubTask(
+                description="Root.",
+                required_capabilities=["root"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+        ]
+        # Root subtask has no transitive predecessors → empty producer map.
+        assert _collect_transitive_key_producers(subtasks, 0) == {}
+
+    def test_single_predecessor_single_key(self):
+        from src.orchestrator.decomposition import _collect_transitive_key_producers
+
+        subtasks = [
+            SubTask(
+                description="A.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"records": "list[dict]"},
+            ),
+            SubTask(
+                description="B.",
+                required_capabilities=["b"],
+                depends_on=[0],
+                output_schema={"summary": "dict"},
+            ),
+        ]
+        producers = _collect_transitive_key_producers(subtasks, 1)
+        assert producers == {"records": [0]}
+
+    def test_two_predecessors_disjoint_keys(self):
+        from src.orchestrator.decomposition import _collect_transitive_key_producers
+
+        subtasks = [
+            SubTask(
+                description="A.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"alpha": "int"},
+            ),
+            SubTask(
+                description="B.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"beta": "str"},
+            ),
+            SubTask(
+                description="C.",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"final": "dict"},
+            ),
+        ]
+        producers = _collect_transitive_key_producers(subtasks, 2)
+        assert producers == {"alpha": [0], "beta": [1]}
+
+    def test_two_predecessors_colliding_key(self):
+        """The critical case: two transitive predecessors produce the same
+        top-level key. The producer list must contain both indices in
+        sorted order so downstream dedup logic is deterministic.
+        """
+        from src.orchestrator.decomposition import _collect_transitive_key_producers
+
+        subtasks = [
+            SubTask(
+                description="Parses sales CSV.",
+                required_capabilities=["parse-sales"],
+                depends_on=[],
+                output_schema={"records": "list[dict]"},
+            ),
+            SubTask(
+                description="Parses inventory CSV.",
+                required_capabilities=["parse-inventory"],
+                depends_on=[],
+                output_schema={"records": "list[dict]"},
+            ),
+            SubTask(
+                description="Merge.",
+                required_capabilities=["merge"],
+                depends_on=[0, 1],
+                output_schema={"merged": "list"},
+            ),
+        ]
+        producers = _collect_transitive_key_producers(subtasks, 2)
+        assert producers == {"records": [0, 1]}
+
+    def test_transitive_walk_collects_grandparent_producers(self):
+        """Step 3 depends on step 2; step 2 depends on steps 0 and 1. The
+        producers map for step 3 must include the grandparent contributions.
+        """
+        from src.orchestrator.decomposition import _collect_transitive_key_producers
+
+        subtasks = [
+            SubTask(
+                description="A.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"alpha": "int"},
+            ),
+            SubTask(
+                description="B.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"beta": "str"},
+            ),
+            SubTask(
+                description="C.",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"gamma": "dict"},
+            ),
+            SubTask(
+                description="D.",
+                required_capabilities=["d"],
+                depends_on=[2],
+                output_schema={"delta": "list"},
+            ),
+        ]
+        producers = _collect_transitive_key_producers(subtasks, 3)
+        assert producers == {"alpha": [0], "beta": [1], "gamma": [2]}
+
+    def test_cycle_protection(self):
+        """Cyclic depends_on (pathological decomposition) must not infinite-loop.
+        The visited set short-circuits the walk the first time it re-enters
+        an already-visited index.
+        """
+        from src.orchestrator.decomposition import _collect_transitive_key_producers
+
+        subtasks = [
+            SubTask(
+                description="A.",
+                required_capabilities=["a"],
+                depends_on=[1],  # cycle: A depends on B
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="B.",
+                required_capabilities=["b"],
+                depends_on=[0],  # cycle: B depends on A
+                output_schema={"y": "int"},
+            ),
+        ]
+        producers = _collect_transitive_key_producers(subtasks, 0)
+        # Walks A's deps → B, collects y; walks B's deps → A, collects x;
+        # tries to revisit B but hit the visited set → halts.
+        assert set(producers.keys()) == {"x", "y"}
+
+
+class TestDetectUpstreamKeyCollisions:
+    """Unit tests for the collision detector (Option A, soft warnings only).
+
+    See ``docs/MASTER_PLAN_2026_04_13.md`` §14.10 for the full rationale.
+    """
+
+    def test_empty_and_single_subtask_chains(self):
+        from src.orchestrator.decomposition import _detect_upstream_key_collisions
+
+        # Empty chain → no collisions possible
+        assert _detect_upstream_key_collisions([]) == []
+
+        # Single subtask → no predecessors, no collisions possible
+        single = [
+            SubTask(
+                description="Only.",
+                required_capabilities=["only"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+        ]
+        assert _detect_upstream_key_collisions(single) == []
+
+    def test_no_collisions_disjoint_output_schemas(self):
+        """Chain where every predecessor's output_schema uses distinct key
+        names produces no collision warnings.
+        """
+        from src.orchestrator.decomposition import _detect_upstream_key_collisions
+
+        subtasks = [
+            SubTask(
+                description="Parse sales.",
+                required_capabilities=["parse-sales"],
+                depends_on=[],
+                output_schema={"sales": "list[dict]"},
+            ),
+            SubTask(
+                description="Parse inventory.",
+                required_capabilities=["parse-inventory"],
+                depends_on=[],
+                output_schema={"inventory": "list[dict]"},
+            ),
+            SubTask(
+                description="Merge sales and inventory.",
+                required_capabilities=["merge"],
+                depends_on=[0, 1],
+                output_schema={"merged": "list"},
+                requires_upstream_keys=["sales", "inventory"],
+            ),
+        ]
+        assert _detect_upstream_key_collisions(subtasks) == []
+
+    def test_canonical_collision_two_parsers_same_key(self):
+        """Two parsers both produce ``records`` → downstream merge silently
+        loses one of them at runtime. Must be flagged.
+        """
+        from src.orchestrator.decomposition import _detect_upstream_key_collisions
+
+        subtasks = [
+            SubTask(
+                description="Parse sales CSV.",
+                required_capabilities=["parse-sales-csv"],
+                depends_on=[],
+                output_schema={"records": "list[dict] — sales rows"},
+            ),
+            SubTask(
+                description="Parse inventory CSV.",
+                required_capabilities=["parse-inventory-csv"],
+                depends_on=[],
+                output_schema={"records": "list[dict] — inventory rows"},
+            ),
+            SubTask(
+                description="Analyze.",
+                required_capabilities=["analyze"],
+                depends_on=[0, 1],
+                output_schema={"report": "dict"},
+                requires_upstream_keys=["records"],
+            ),
+        ]
+        warnings = _detect_upstream_key_collisions(subtasks)
+        assert len(warnings) == 1
+        assert "'records'" in warnings[0]
+        assert "[0, 1]" in warnings[0]
+        assert "last-write-wins" in warnings[0]
+        assert "2" in warnings[0]  # reported at subtask index 2
+
+    def test_collision_reported_at_first_successor_only(self):
+        """If two successors both have the colliding predecessors in their
+        transitive set, the collision is reported at the earliest one only
+        (dedup by (key, producer_indices) fingerprint).
+        """
+        from src.orchestrator.decomposition import _detect_upstream_key_collisions
+
+        subtasks = [
+            SubTask(
+                description="A produces X.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="B also produces X.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="C depends on A and B.",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"c_out": "dict"},
+                requires_upstream_keys=["x"],
+            ),
+            SubTask(
+                description="D depends on C (transitively on A, B).",
+                required_capabilities=["d"],
+                depends_on=[2],
+                output_schema={"d_out": "dict"},
+                requires_upstream_keys=["c_out"],
+            ),
+        ]
+        warnings = _detect_upstream_key_collisions(subtasks)
+        # Only ONE warning — the collision fingerprint (('x', (0, 1)))
+        # is already seen by the time we walk D's predecessors.
+        assert len(warnings) == 1
+        # And it must be reported at subtask 2, not subtask 3.
+        assert "Subtask 2" in warnings[0]
+        assert "Subtask 3" not in warnings[0]
+
+    def test_multiple_distinct_collisions_all_reported(self):
+        """Two different colliding keys (different producer sets) must both
+        be reported.
+        """
+        from src.orchestrator.decomposition import _detect_upstream_key_collisions
+
+        subtasks = [
+            SubTask(
+                description="A.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"records": "list", "metadata": "dict"},
+            ),
+            SubTask(
+                description="B.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"records": "list", "metadata": "dict"},
+            ),
+            SubTask(
+                description="Merge.",
+                required_capabilities=["merge"],
+                depends_on=[0, 1],
+                output_schema={"result": "dict"},
+                requires_upstream_keys=["records", "metadata"],
+            ),
+        ]
+        warnings = _detect_upstream_key_collisions(subtasks)
+        # A single warning message for subtask 2 that lists BOTH colliding keys.
+        assert len(warnings) == 1
+        assert "'records'" in warnings[0]
+        assert "'metadata'" in warnings[0]
+
+    def test_successor_own_output_not_a_collision_with_predecessor(self):
+        """A key that appears in BOTH a predecessor's output_schema AND the
+        successor's own output_schema is not a collision — the successor's
+        own output is never merged into its own ``upstream_data``.
+        """
+        from src.orchestrator.decomposition import _detect_upstream_key_collisions
+
+        subtasks = [
+            SubTask(
+                description="Parse.",
+                required_capabilities=["parse"],
+                depends_on=[],
+                output_schema={"records": "list"},
+            ),
+            SubTask(
+                description="Transform and republish under same key.",
+                required_capabilities=["transform"],
+                depends_on=[0],
+                output_schema={"records": "list"},  # same name, but own output
+                requires_upstream_keys=["records"],
+            ),
+        ]
+        # The successor's own output_schema is NOT part of its transitive
+        # predecessor set — the walker starts from depends_on, not from
+        # subtask_index itself. So no collision.
+        assert _detect_upstream_key_collisions(subtasks) == []
+
+    def test_collision_across_transitive_predecessors_not_direct_deps(self):
+        """Collision between two grandparent producers must still be
+        detected when the successor only directly depends on a middle step.
+        """
+        from src.orchestrator.decomposition import _detect_upstream_key_collisions
+
+        subtasks = [
+            SubTask(
+                description="A produces X.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="B also produces X.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="C depends on A and B, produces Y.",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"y": "dict"},
+                requires_upstream_keys=["x"],
+            ),
+            SubTask(
+                description="D depends on C only, but transitively on A & B.",
+                required_capabilities=["d"],
+                depends_on=[2],
+                output_schema={"final": "dict"},
+                requires_upstream_keys=["y"],
+            ),
+        ]
+        warnings = _detect_upstream_key_collisions(subtasks)
+        # C sees the collision first (its direct depends_on is [0, 1]).
+        # D also transitively sees it but is deduplicated.
+        assert len(warnings) == 1
+        assert "Subtask 2" in warnings[0]
+
+    def test_collisions_do_not_trip_hard_violations(self):
+        """The validator (hard violations) and the collision detector (soft
+        warnings) are orthogonal. A chain that has only collisions but no
+        missing-key violations must pass ``_validate_chain_coherence`` and
+        only be flagged by ``_detect_upstream_key_collisions``.
+        """
+        from src.orchestrator.decomposition import (
+            _detect_upstream_key_collisions,
+            _validate_chain_coherence,
+        )
+
+        subtasks = [
+            SubTask(
+                description="A produces X.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="B also produces X.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="C requires X — satisfied by SOME producer.",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"y": "dict"},
+                requires_upstream_keys=["x"],
+            ),
+        ]
+        # Hard violations: none (x has a producer — in fact, two).
+        assert _validate_chain_coherence(subtasks) == []
+        # Soft warnings: one (the collision).
+        warnings = _detect_upstream_key_collisions(subtasks)
+        assert len(warnings) == 1
+
+
 class TestValidateChainCoherence:
     """Unit tests for the coherence validator."""
 
@@ -817,3 +1240,61 @@ class TestDecompositionNodeCoherenceIntegration:
         # No coherence violation messages
         errors = cmd.update["errors"]
         assert not any("coherence" in e.lower() for e in errors)
+
+    def test_upstream_key_collision_surfaces_warning_without_tripping_flag(self, state):
+        """Option A (per master plan §14.10): upstream key collisions are
+        surfaced as warnings in ``state.errors`` but DO NOT trip the sticky
+        ``decomposition_succeeded`` flag. The chain may still work at
+        runtime if the successor happens to want the last-writing
+        predecessor's value, so we don't want the yellow DECOMPOSITION
+        FAILED banner — just a log trail and an errors-list entry for
+        post-mortem visibility.
+        """
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(
+                    description="Parse sales CSV into records.",
+                    required_capabilities=["parse-sales"],
+                    depends_on=[],
+                    output_schema={"records": "list[dict] — sales rows"},
+                ),
+                SubTaskItem(
+                    description="Parse inventory CSV into records.",
+                    required_capabilities=["parse-inventory"],
+                    depends_on=[],
+                    output_schema={"records": "list[dict] — inventory rows"},
+                ),
+                SubTaskItem(
+                    description="Analyze upstream records.",
+                    required_capabilities=["analyze"],
+                    depends_on=[0, 1],
+                    output_schema={"report": "dict"},
+                    requires_upstream_keys=["records"],
+                ),
+            ]
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        # The chain has a real collision — step 2's transitive predecessors
+        # 0 and 1 both produce 'records'. But there's no HARD violation:
+        # step 2 declares requires_upstream_keys=['records'], and 'records'
+        # IS produced by the predecessor set (twice).
+        assert cmd.update["decomposition_succeeded"] is True
+
+        # The collision is reported as a soft warning in errors.
+        errors = cmd.update["errors"]
+        warning_entries = [
+            e for e in errors
+            if "coherence warning" in e.lower() and "'records'" in e
+        ]
+        assert len(warning_entries) == 1, (
+            f"expected exactly one collision warning in errors; got: {errors}"
+        )
+
+        # The warning message must cite last-write-wins so a reader
+        # understands the runtime consequence.
+        assert "last-write-wins" in warning_entries[0]

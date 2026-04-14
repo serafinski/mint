@@ -154,6 +154,12 @@ def _validate_chain_coherence(subtasks: list[SubTask]) -> list[str]:
 
     Single-subtask chains and subtasks with empty ``requires_upstream_keys``
     are trivially coherent — the check returns early.
+
+    **This function reports HARD violations only** — chains that will crash
+    at execution time because a required upstream key has no producer. Soft
+    warnings (e.g. upstream key collisions where two predecessors produce
+    the same key, causing silent last-write-wins data loss) are reported
+    separately by :func:`_detect_upstream_key_collisions`.
     """
     violations: list[str] = []
 
@@ -190,6 +196,131 @@ def _validate_chain_coherence(subtasks: list[SubTask]) -> list[str]:
             )
 
     return violations
+
+
+def _collect_transitive_key_producers(
+    subtasks: list[SubTask], subtask_index: int
+) -> dict[str, list[int]]:
+    """Return a dict mapping each top-level output_schema key to the sorted
+    list of transitive predecessor indices that produce it.
+
+    Walks the ``depends_on`` DAG breadth-first from ``subtask_index``, the
+    same way :func:`_collect_transitive_upstream_keys` does, but preserves
+    producer attribution instead of collapsing to a set. A key with more
+    than one producer is a collision — at runtime the MCP_TOOL executor's
+    ``_upstream.update(_data)`` merge will silently drop all but the
+    last-writing producer's value.
+
+    Single-producer keys are still returned (with a one-element list) so
+    callers can distinguish "no producer" (missing entry) from "exactly one
+    producer" (single-element list) without an extra check.
+    """
+    if subtask_index < 0 or subtask_index >= len(subtasks):
+        return {}
+
+    visited: set[int] = set()
+    queue: list[int] = list(subtasks[subtask_index].depends_on)
+    producers: dict[str, list[int]] = {}
+
+    while queue:
+        i = queue.pop(0)
+        if i in visited:
+            continue
+        visited.add(i)
+        if i < 0 or i >= len(subtasks):
+            continue
+        predecessor = subtasks[i]
+        for key in predecessor.output_schema.keys():
+            producers.setdefault(key, []).append(i)
+        queue.extend(predecessor.depends_on)
+
+    # Sort producer lists for deterministic output (tests and log messages).
+    return {k: sorted(v) for k, v in producers.items()}
+
+
+def _detect_upstream_key_collisions(subtasks: list[SubTask]) -> list[str]:
+    """Return a list of soft-warning messages for upstream key collisions.
+
+    A collision is a top-level ``output_schema`` key produced by more than
+    one transitive predecessor of some downstream subtask. At runtime the
+    MCP_TOOL executor merges predecessor outputs into a flat ``upstream_data``
+    dict via ``_upstream.update(_data)`` in the glob-sorted order
+    ``step_0_output.json``, ``step_1_output.json``, ... — last-write-wins.
+    Earlier producers' values for the colliding key are silently dropped.
+
+    **These are soft warnings, not hard violations.** A colliding chain can
+    accidentally work at runtime if the downstream subtask happens to want
+    the last-writing producer's value. The check is still useful because:
+
+    - It surfaces decomposition-quality issues (two predecessors naming
+      different semantic outputs the same top-level key).
+    - It explains otherwise-mysterious silent data loss when two parses
+      of different inputs both land under e.g. ``'records'``.
+    - It's free: the infrastructure added for
+      :func:`_validate_chain_coherence` (the ``requires_upstream_keys``
+      structured contract) makes this detection a simple walk of the DAG.
+
+    **Deduplication.** The same collision (same key, same set of producers)
+    is reported at most once — at the FIRST downstream subtask whose
+    transitive predecessor walk encounters both producers. If subtasks 2
+    and 3 both have 0 and 1 as transitive predecessors and 0/1 collide on
+    key ``'records'``, the collision is reported at subtask 2 only.
+
+    See ``docs/MASTER_PLAN_2026_04_13.md`` §14.10 for the full rationale
+    and the Option A vs Option B decision. Current implementation is
+    Option A (warning-only); post-eval data will determine whether to
+    upgrade to Option B (hard violation).
+    """
+    warnings_list: list[str] = []
+
+    if len(subtasks) <= 1:
+        return warnings_list
+
+    # Deduplicate collisions across subtasks: the same (key, frozen_producers)
+    # pair is reported only at the first successor that sees it.
+    seen: set[tuple[str, tuple[int, ...]]] = set()
+
+    for i, subtask in enumerate(subtasks):
+        if not subtask.depends_on:
+            # Root subtasks have no transitive predecessors — no collisions
+            # possible.
+            continue
+
+        producers = _collect_transitive_key_producers(subtasks, i)
+        collision_items: list[tuple[str, list[int]]] = [
+            (key, prods) for key, prods in sorted(producers.items())
+            if len(prods) > 1
+        ]
+        if not collision_items:
+            continue
+
+        # Filter out collisions already reported at an earlier successor.
+        new_collisions: list[tuple[str, list[int]]] = []
+        for key, prods in collision_items:
+            fingerprint = (key, tuple(prods))
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            new_collisions.append((key, prods))
+
+        if not new_collisions:
+            continue
+
+        cap = subtask.required_capabilities[0] if subtask.required_capabilities else "?"
+        collision_descriptions = [
+            f"'{key}' (produced by subtasks {prods})"
+            for key, prods in new_collisions
+        ]
+        warnings_list.append(
+            f"Subtask {i} ({cap}) has transitive predecessors with colliding "
+            f"output_schema keys: {', '.join(collision_descriptions)}. "
+            f"At runtime the MCP_TOOL executor merges predecessor outputs via "
+            f"last-write-wins (``_upstream.update``), so earlier producers' "
+            f"values for these keys will be silently overwritten. Rename one "
+            f"of the colliding keys in the decomposition to disambiguate."
+        )
+
+    return warnings_list
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +521,29 @@ def decomposition_node(
                 {
                     "violation_count": len(coherence_violations),
                     "violations": coherence_violations,
+                    "subtask_count": len(subtasks),
+                },
+            )
+
+        # Soft warnings — upstream key collisions that won't necessarily
+        # break the chain but indicate silent last-write-wins data loss at
+        # runtime. Reported as warnings in the errors list and logged, but
+        # deliberately do NOT trip ``decomposition_succeeded=False`` (Option
+        # A per master plan §14.10). If post-eval data shows colliding
+        # chains actually firing in production, upgrade to Option B (hard
+        # violation).
+        collision_warnings = _detect_upstream_key_collisions(subtasks)
+        if collision_warnings:
+            for warning in collision_warnings:
+                errors.append(f"Chain coherence warning: {warning}")
+                logger.warning("DecompositionAgent: %s", warning)
+            emit_langfuse_event(
+                langfuse_handler,
+                "decomposition.upstream_key_collision",
+                "WARNING",
+                {
+                    "warning_count": len(collision_warnings),
+                    "warnings": collision_warnings,
                     "subtask_count": len(subtasks),
                 },
             )
