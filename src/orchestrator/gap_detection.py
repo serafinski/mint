@@ -78,7 +78,12 @@ def gap_detection_node(
 
         taxonomy = DomainTaxonomy(get_taxonomy_path())
         if taxonomy.list_categories():
-            query_llm = init_chat_model(DEFAULT_LLM_MODEL, temperature=0)
+            # reasoning_effort="minimal" — same rationale as taxonomy.py
+            # classify_and_tag_artifacts: picking one category from a short
+            # list is pattern matching, not reasoning. Drops ~8s → ~1s.
+            query_llm = init_chat_model(
+                DEFAULT_LLM_MODEL, temperature=0, reasoning_effort="minimal"
+            )
             structured_query_llm = query_llm.with_structured_output(
                 QueryDomainChoice, method="function_calling"
             )

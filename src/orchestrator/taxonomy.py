@@ -553,10 +553,10 @@ _TAXONOMY_PATH: Path | None = None
 def set_taxonomy_path(path: Path | str) -> None:
     """Override the default taxonomy file path.
 
-    The evaluation harness calls this during setup to redirect from the
-    CLI default (``data/cli/domains.json``) to the evaluation path
-    (``data/eval/domains.json``). The CLI does not call this — it uses
-    the default. Mirrors the ``set_skills_output_dir()`` pattern.
+    The CLI runner calls this to redirect from the evaluation default
+    (``data/eval/domains.json``) to the CLI path (``data/cli/domains.json``).
+    The evaluation harness leaves the default alone. Mirrors the
+    ``set_skills_output_dir()`` pattern in ``generators/skill.py``.
     """
     global _TAXONOMY_PATH  # noqa: PLW0603
     _TAXONOMY_PATH = Path(path)
@@ -565,14 +565,16 @@ def set_taxonomy_path(path: Path | str) -> None:
 def get_taxonomy_path() -> Path:
     """Return the currently-configured taxonomy file path.
 
-    Defaults to ``<project-root>/data/cli/domains.json`` if the path
-    has not been overridden via :func:`set_taxonomy_path`.
+    Defaults to ``<project-root>/data/eval/domains.json`` if the path
+    has not been overridden via :func:`set_taxonomy_path`. This matches
+    the skills pattern (eval is the default, CLI overrides) so the
+    evaluation harness stays hermetic without needing harness wiring,
+    and the CLI runner flips it explicitly.
     """
     if _TAXONOMY_PATH is not None:
         return _TAXONOMY_PATH
-    # Default: data/cli/domains.json relative to project root
     project_root = Path(__file__).parent.parent.parent
-    return project_root / "data" / "cli" / "domains.json"
+    return project_root / "data" / "eval" / "domains.json"
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +623,14 @@ def classify_and_tag_artifacts(artifacts: list[GeneratedArtifact]) -> None:
 
         from src.config import DEFAULT_LLM_MODEL
 
-        llm = init_chat_model(DEFAULT_LLM_MODEL, temperature=0)
+        # reasoning_effort="minimal" drops gpt-5-mini latency on trivial
+        # classification from ~193s to ~10s per call (observed 2026-04-14
+        # on trace b4c2488d/obs 8dfb032e — 320 reasoning tokens on a single
+        # boolean + category pick). Taxonomy classification is pure pattern
+        # matching, not a creative task — reasoning mode is pure overhead.
+        llm = init_chat_model(
+            DEFAULT_LLM_MODEL, temperature=0, reasoning_effort="minimal"
+        )
         structured_llm = llm.with_structured_output(
             CapabilityDomainClassification, method="function_calling"
         )
@@ -633,18 +642,36 @@ def classify_and_tag_artifacts(artifacts: list[GeneratedArtifact]) -> None:
         )
         return
 
-    for artifact in pending:
-        try:
-            result = taxonomy.get_or_create_for_capability(artifact, structured_llm)
-            artifact.domain = result.domain
-            artifact.is_generic = result.is_generic
-            logger.info(
-                "classify_and_tag_artifacts: %s -> domain=%s is_generic=%s",
-                artifact.capability_name, result.domain, result.is_generic,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "classify_and_tag_artifacts: classification failed for %s: %s "
-                "— artifact left with domain=None",
-                artifact.capability_name, exc,
-            )
+    # Parallelize classification with a thread pool so N artifacts don't
+    # stack N × per-call latency serially. ChatOpenAI is thread-safe — each
+    # .invoke() fires an independent HTTP request. The mild race on
+    # _commit_new_category (two threads proposing different names for the
+    # same concept with an empty taxonomy) is acceptable: the first writer
+    # wins and later calls see the committed category. Worst case is a few
+    # near-duplicate categories which is inherent to any evolutionary
+    # taxonomy.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _classify_one(artifact: GeneratedArtifact) -> tuple[GeneratedArtifact, Any]:
+        return artifact, taxonomy.get_or_create_for_capability(
+            artifact, structured_llm
+        )
+
+    max_workers = min(len(pending), 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_classify_one, a) for a in pending]
+        for future in as_completed(futures):
+            try:
+                artifact, result = future.result()
+                artifact.domain = result.domain
+                artifact.is_generic = result.is_generic
+                logger.info(
+                    "classify_and_tag_artifacts: %s -> domain=%s is_generic=%s",
+                    artifact.capability_name, result.domain, result.is_generic,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "classify_and_tag_artifacts: classification failed: %s "
+                    "— artifact left with domain=None",
+                    exc,
+                )

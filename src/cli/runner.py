@@ -439,6 +439,15 @@ def _create_infra(*, seed: bool = True) -> tuple[Any, Any, Any]:
     from src.orchestrator.generators.skill import set_skills_output_dir
     set_skills_output_dir(cli_skills_dir)
 
+    # CLI uses its own evolutionary-taxonomy file for the same reason:
+    # keep CLI vocabulary separate from eval vocabulary so the harness's
+    # snapshot/restore cycle doesn't stomp on CLI state. Default in
+    # get_taxonomy_path() is data/eval/domains.json; the CLI flips it.
+    cli_taxonomy_path = data / "cli" / "domains.json"
+    cli_taxonomy_path.parent.mkdir(parents=True, exist_ok=True)
+    from src.orchestrator.taxonomy import set_taxonomy_path
+    set_taxonomy_path(cli_taxonomy_path)
+
     return registry, loader, metrics_store
 
 
