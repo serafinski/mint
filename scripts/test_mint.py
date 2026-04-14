@@ -307,7 +307,11 @@ def main() -> int:
     sys.stderr = _Tee(sys.__stderr__, _log_file)
     print(f"Logging to {log_path}\n")
 
-    # Reset CLI state before pipeline tests (clean registry + metrics)
+    # Reset CLI state before pipeline tests (clean registry + metrics +
+    # taxonomy + skills + last_run). Mirrors `mint reset --force` from
+    # src/cli/app.py — kept as inline code here instead of invoking the
+    # CLI command directly because test_mint wants silent reset and
+    # doesn't need the confirmation prompt infrastructure.
     if not (args.quick or args.formats_only):
         print("\nResetting MINT CLI state (clean registry + metrics)...")
         import shutil
@@ -318,13 +322,25 @@ def main() -> int:
         data = _data_dir()
         chroma_path = data / "cli" / "chroma"
         metrics_path = data / "cli" / "metrics.duckdb"
-        last_run_path = data / "last_run.json"
+        metrics_wal_path = data / "cli" / "metrics.duckdb.wal"
+        # last_run.json lives at data/cli/last_run.json (written by
+        # runner.py::save_last_run). Earlier versions used data/last_run.json
+        # here, which silently failed to wipe the real file. Fixed 2026-04-14.
+        last_run_path = data / "cli" / "last_run.json"
+        taxonomy_path = data / "cli" / "domains.json"
+        skills_path = data / "cli" / "skills"
         if chroma_path.exists():
             shutil.rmtree(chroma_path)
         if metrics_path.exists():
             metrics_path.unlink()
+        if metrics_wal_path.exists():
+            metrics_wal_path.unlink()
         if last_run_path.exists():
             last_run_path.unlink()
+        if taxonomy_path.exists():
+            taxonomy_path.unlink()
+        if skills_path.exists():
+            shutil.rmtree(skills_path)
         _create_infra(seed=True)
         print("Done — clean registry with seeded capabilities.\n")
 

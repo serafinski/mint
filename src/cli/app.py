@@ -209,13 +209,36 @@ def reset(
     data = _data_dir()
     chroma_path = data / "cli" / "chroma"
     metrics_path = data / "cli" / "metrics.duckdb"
-    last_run_path = data / "last_run.json"
+    # DuckDB write-ahead log — sits alongside metrics.duckdb. If a metrics
+    # operation crashed or was interrupted, the WAL is left orphaned next
+    # to the main database file. Unlink both so the reset is truly clean.
+    metrics_wal_path = data / "cli" / "metrics.duckdb.wal"
+    # last_run.json is written by src/cli/runner.py at
+    # ``_data_dir() / "cli" / "last_run.json"``. An earlier version of this
+    # reset command looked at ``data / "last_run.json"`` (no ``cli``
+    # subdirectory), which meant the reset silently failed to wipe the
+    # real file on every invocation — confirmed 2026-04-14 via
+    # ``ls data/cli/`` showing last_run.json surviving a reset. The unit
+    # test for reset was hiding the bug because the test fixture was
+    # written against the same wrong path as the production code. Both
+    # are fixed in this commit. See docs/perf_fixes_2026_04_14.md §4.9.
+    last_run_path = data / "cli" / "last_run.json"
     # Evolutionary domain taxonomy file — wiped on reset so a "clean slate"
     # genuinely means clean slate. Without this, categories grown in prior
     # sessions survive the reset and influence the next run's gap_detection
     # filter against a freshly-seeded registry, which muddles the taxonomy
     # evolution story for the thesis. See docs/perf_fixes_2026_04_14.md §2d.
     taxonomy_path = data / "cli" / "domains.json"
+    # Generated skills directory — holds both SKILL and AGENT artifacts
+    # (agent.py mirrors skill.py's SKILLS_OUTPUT_DIR via set_skills_output_dir).
+    # Wiped on reset for the same reason as the taxonomy file: without this,
+    # SKILL.md directories from prior sessions accumulate in data/cli/skills/
+    # unboundedly, and post-mortem inspection becomes confused because skills
+    # from multiple runs are mixed. The registry is wiped above, so any
+    # references to these directories are dangling anyway. Surfaced
+    # 2026-04-14 end of day after the 21:38 test_mint run left 6 skill
+    # directories from 2-3 different runs in data/cli/skills/.
+    skills_path = data / "cli" / "skills"
 
     if not force:
         console.print(
@@ -241,12 +264,20 @@ def reset(
     if metrics_path.exists():
         metrics_path.unlink()
         removed.append("invocation history")
+    if metrics_wal_path.exists():
+        metrics_wal_path.unlink()
+        # Don't add to the removed list — it's a DuckDB internal file, not
+        # user-facing state. Silent cleanup so the confirmation message
+        # stays focused on the semantically meaningful items.
     if last_run_path.exists():
         last_run_path.unlink()
         removed.append("last run config")
     if taxonomy_path.exists():
         taxonomy_path.unlink()
         removed.append("domain taxonomy")
+    if skills_path.exists():
+        shutil.rmtree(skills_path)
+        removed.append("generated skills")
 
     # Re-seed unless --no-seed
     if not no_seed:
