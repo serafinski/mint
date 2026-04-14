@@ -329,42 +329,96 @@ class TestExtractLastJsonObject:
 
 
 class TestFixturesToWorkspaceFiles:
-    """Regression tests for the T16 AGENT execution filesystem-isolation bug.
+    """Regression tests for solo-AGENT fixture file access (T16 bug).
 
-    Before the fix, ``execute_agent_artifact`` only placed the SKILL.md in
-    the agent's workspace. Fixture files were embedded as strings in the
-    user message but never exposed as workspace files, so when the generated
-    SKILL.md told the agent to ``read_file("t16_system_metrics.csv")``,
-    ``read_file`` errored out. Earlier runs sometimes recovered via an LLM
-    fallback to ``sandbox_execute`` with inline data, but that was
-    non-deterministic — the 2026-04-08 test_mint.py run showed a case where
-    the LLM gave up instead and returned ``{"result": {}, "error": ...}``.
+    Keys MUST be absolute virtual paths (leading ``/``). DeepAgents'
+    ``validate_path`` normalizes every ``read_file`` argument to start with
+    ``/`` before ``StateBackend.read`` does a dict lookup, so bare-basename
+    keys will never match. The T16 agent trace on 2026-04-15
+    (``45a39ccd95d0edbedaa7bae3f71b4290``) showed the exact failure mode:
+    the agent called ``read_file("t16_incident.yaml")`` and got back
+    ``"Error: File '/t16_incident.yaml' not found"``, then fabricated an
+    answer via ``sandbox_execute`` on no data.
 
-    The fix: convert fixtures into DeepAgents ``StateBackend`` format
-    (``{filename: {"content": [lines]}}``) and merge them into the workspace
-    files alongside the skill. Then ``read_file("t16_system_metrics.csv")``
-    works as the skill instructs.
+    An earlier version of this helper stored fixtures under bare basenames
+    and these tests codified that wrong behavior. The test suite thus
+    passed while the runtime silently failed — a case of tests enshrining
+    the bug the code introduced.
     """
 
     def test_empty_fixtures(self):
         assert _fixtures_to_workspace_files({}) == {}
 
-    def test_single_fixture(self):
+    def test_single_fixture_keyed_by_absolute_path(self):
         fixtures = {"t16_incident.yaml": "onset_time: '2024-07-01 05:00:00'\naffected: api"}
         result = _fixtures_to_workspace_files(fixtures)
-        assert "t16_incident.yaml" in result
-        assert result["t16_incident.yaml"] == {
+        # Key MUST start with "/" to match validate_path normalization.
+        assert "/t16_incident.yaml" in result
+        assert "t16_incident.yaml" not in result
+        assert result["/t16_incident.yaml"] == {
             "content": ["onset_time: '2024-07-01 05:00:00'", "affected: api"]
         }
 
-    def test_multiple_fixtures(self):
+    def test_multiple_fixtures_all_absolute(self):
         fixtures = {
             "t16_system_metrics.csv": "ts,cpu,mem\n0,10,50\n1,11,52",
             "t16_incident.yaml": "onset: '2024-07-01'",
         }
         result = _fixtures_to_workspace_files(fixtures)
-        assert set(result.keys()) == {"t16_system_metrics.csv", "t16_incident.yaml"}
-        assert result["t16_system_metrics.csv"]["content"] == ["ts,cpu,mem", "0,10,50", "1,11,52"]
+        assert set(result.keys()) == {"/t16_system_metrics.csv", "/t16_incident.yaml"}
+        assert result["/t16_system_metrics.csv"]["content"] == ["ts,cpu,mem", "0,10,50", "1,11,52"]
+
+    def test_already_absolute_path_not_double_prefixed(self):
+        """If a caller passes a key that already starts with ``/``, the
+        helper must not turn it into ``//filename``.
+        """
+        fixtures = {"/already_absolute.txt": "hello"}
+        result = _fixtures_to_workspace_files(fixtures)
+        assert "/already_absolute.txt" in result
+        assert "//already_absolute.txt" not in result
+
+    def test_keys_round_trip_through_validate_path(self):
+        """Every key this helper produces must equal what DeepAgents'
+        ``validate_path`` returns for the corresponding filename. This is
+        the direct invariant the T16 bug violated.
+        """
+        from deepagents.backends.utils import validate_path
+
+        fixtures = {
+            "t16_incident.yaml": "x",
+            "t16_system_metrics.csv": "y",
+            "nested/not_really_nested.txt": "z",
+        }
+        result = _fixtures_to_workspace_files(fixtures)
+        for original_name in fixtures:
+            expected_key = validate_path(original_name)
+            assert expected_key in result, (
+                f"Fixture {original_name!r} stored under a key that "
+                f"validate_path() will never produce. validate_path "
+                f"returned {expected_key!r}, stored keys: {list(result)}"
+            )
+
+    def test_statebackend_lookup_simulation(self):
+        """End-to-end simulation: mimic what DeepAgents' ``StateBackend.read``
+        does — call ``validate_path`` on the LLM's file_path argument, then
+        do a plain dict lookup against the files dict. This must return a
+        match for every original fixture filename.
+        """
+        from deepagents.backends.utils import validate_path
+
+        fixtures = {"t16_incident.yaml": "onset: x"}
+        files = _fixtures_to_workspace_files(fixtures)
+
+        # Agent calls read_file("t16_incident.yaml") — the bare form.
+        validated = validate_path("t16_incident.yaml")
+        assert files.get(validated) is not None, (
+            "StateBackend lookup would fail — bare-basename read_file call "
+            "does not resolve. This is the T16 bug."
+        )
+
+        # Agent calls read_file("/t16_incident.yaml") — the absolute form.
+        validated = validate_path("/t16_incident.yaml")
+        assert files.get(validated) is not None
 
     def test_statebackend_format(self):
         """Each entry must be a dict with a 'content' key whose value is a
@@ -372,7 +426,7 @@ class TestFixturesToWorkspaceFiles:
         """
         fixtures = {"data.csv": "col1\nval1"}
         result = _fixtures_to_workspace_files(fixtures)
-        entry = result["data.csv"]
+        entry = result["/data.csv"]
         assert isinstance(entry, dict)
         assert "content" in entry
         assert isinstance(entry["content"], list)
@@ -385,17 +439,17 @@ class TestFixturesToWorkspaceFiles:
         fixtures = {"config.yaml": "key: value\n\nother: value2\n"}
         result = _fixtures_to_workspace_files(fixtures)
         # splitlines() on "a\n\nb\n" → ["a", "", "b"]
-        assert result["config.yaml"]["content"] == ["key: value", "", "other: value2"]
+        assert result["/config.yaml"]["content"] == ["key: value", "", "other: value2"]
 
     def test_empty_file_content(self):
         fixtures = {"empty.txt": ""}
         result = _fixtures_to_workspace_files(fixtures)
-        assert result["empty.txt"] == {"content": []}
+        assert result["/empty.txt"] == {"content": []}
 
     def test_single_line_no_trailing_newline(self):
         fixtures = {"oneline.txt": "just one line"}
         result = _fixtures_to_workspace_files(fixtures)
-        assert result["oneline.txt"] == {"content": ["just one line"]}
+        assert result["/oneline.txt"] == {"content": ["just one line"]}
 
 
 # ---------------------------------------------------------------------------
@@ -455,16 +509,18 @@ class TestAgentInvokeInput:
                     ):
                         exec_mod._execute_agent_inner(artifact, task, fixture_contents)
 
-        # invoke_input['files'] must contain both fixture filenames
+        # invoke_input['files'] must contain both fixtures under their
+        # absolute virtual paths (leading "/" — matches validate_path
+        # normalization, see TestFixturesToWorkspaceFiles).
         assert "files" in captured_invoke_input
         files = captured_invoke_input["files"]
-        assert "t16_incident.yaml" in files
-        assert "t16_system_metrics.csv" in files
+        assert "/t16_incident.yaml" in files
+        assert "/t16_system_metrics.csv" in files
         # Content must be in StateBackend list-of-lines format
-        assert files["t16_incident.yaml"]["content"] == [
+        assert files["/t16_incident.yaml"]["content"] == [
             "onset_time: '2024-07-01 05:00:00'"
         ]
-        assert files["t16_system_metrics.csv"]["content"] == ["timestamp,cpu", "0,10"]
+        assert files["/t16_system_metrics.csv"]["content"] == ["timestamp,cpu", "0,10"]
 
     def test_user_message_lists_workspace_filenames(self, tmp_path):
         """Agent's user message must tell the LLM which workspace filenames
@@ -547,7 +603,10 @@ class TestAgentInvokeInput:
                 captured_invoke_input.update(invoke_input)
                 return {"structured_response": None}
 
-        existing_skill = {"SKILL.md": {"content": ["# Skill from skills dir"]}}
+        # The skill file is stored at the absolute key the fixture would
+        # normalize to (``/SKILL.md``) — simulating a collision between a
+        # pre-existing skill and an incoming fixture of the same basename.
+        existing_skill = {"/SKILL.md": {"content": ["# Skill from skills dir"]}}
         with patch("deepagents.create_deep_agent", lambda **kw: _MockAgent()):
             with patch("src.orchestrator.generators.skill.SKILLS_OUTPUT_DIR", tmp_path):
                 with patch.object(
@@ -559,5 +618,5 @@ class TestAgentInvokeInput:
                         exec_mod._execute_agent_inner(artifact, task, fixture_contents)
 
         files = captured_invoke_input["files"]
-        # The skill's SKILL.md must win, not the fixture's
-        assert files["SKILL.md"]["content"] == ["# Skill from skills dir"]
+        # The pre-existing skill must win — the fixture is filtered out.
+        assert files["/SKILL.md"]["content"] == ["# Skill from skills dir"]

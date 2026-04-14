@@ -149,25 +149,47 @@ def _format_fixture_message(fixture_contents: dict[str, str]) -> str:
 def _fixtures_to_workspace_files(fixture_contents: dict[str, str]) -> dict:
     """Convert fixtures to DeepAgents ``StateBackend`` workspace-file format.
 
-    Each fixture becomes an entry keyed by its bare filename (no path prefix)
-    with ``{"content": [lines]}`` — the format DeepAgents' ``read_file`` tool
-    expects when reading from the in-memory workspace.
+    Each fixture becomes an entry keyed by an **absolute** virtual path
+    (``/<filename>``) with ``{"content": [lines]}`` — the format DeepAgents'
+    ``read_file`` tool expects when reading from the in-memory workspace.
 
-    This is the fix for the AGENT execution filesystem-isolation bug: before,
-    fixtures were only embedded as strings in the user message, so when the
-    generated SKILL.md told the agent to ``read_file("t16_system_metrics.csv")``,
-    the workspace had no such file and ``read_file`` errored out. With this
-    helper, fixtures are placed in the workspace alongside the SKILL.md, and
-    ``read_file`` works as the skill instructs. The user message still contains
-    inline copies too (for LLMs that prefer inline context), which makes the
-    agent robust to either access pattern.
+    **Why absolute paths.** DeepAgents' ``validate_path`` (in
+    ``deepagents.backends.utils``) normalizes every ``read_file`` argument
+    by prepending ``/`` if it's not already there — then ``StateBackend.read``
+    does a plain dict lookup against that normalized path. So a bare-basename
+    key like ``"t16_incident.yaml"`` will never match: the agent calls
+    ``read_file("t16_incident.yaml")``, validate_path turns it into
+    ``"/t16_incident.yaml"``, the backend's ``files.get("/t16_incident.yaml")``
+    returns None, and the tool reports ``"Error: File '/t16_incident.yaml'
+    not found"``. The T16 AGENT trace on 2026-04-15 showed this exact
+    failure (trace ``45a39ccd95d0edbedaa7bae3f71b4290``) — the agent tried
+    to read the incident YAML, got the error, then fabricated an answer
+    via ``sandbox_execute`` on no data.
+
+    Storing with the leading slash makes the lookup match. The agent can
+    call ``read_file("t16_incident.yaml")`` OR
+    ``read_file("/t16_incident.yaml")`` — validate_path normalizes both to
+    the same key.
+
+    **Why this wasn't caught earlier.** SKILL execution uses a plain
+    ``init_chat_model().bind_tools([sandbox_execute])`` — no DeepAgent, no
+    StateBackend, no ``read_file``. Lead-with-subagents AGENT execution
+    (the ≥2-AGENT-gaps path) embeds fixture content directly into
+    ``task(description="...content...")`` calls and bypasses ``read_file``
+    too. Only the **solo AGENT** path (one gap classified as AGENT → one
+    DeepAgent with no subagents) actually exercises this code, and the
+    decomposer only started reliably producing solo-AGENT outputs for
+    multi-file investigation tasks after the 2026-04 decomposition-prompt
+    updates (Rule 11 + Example 4 + Example 7).
     """
     files: dict = {}
     for filename, content in fixture_contents.items():
+        # Prepend "/" to match what validate_path() produces at read time.
+        key = filename if filename.startswith("/") else f"/{filename}"
         # StateBackend expects splitlines for content. Use keepends=False
         # (default) so the lines don't carry trailing newlines — matches
         # how ``_collect_skill_files`` writes skills.
-        files[filename] = {"content": content.splitlines()}
+        files[key] = {"content": content.splitlines()}
     return files
 
 
@@ -914,15 +936,22 @@ def _execute_agent_inner(
             workspace_files[filename] = entry
 
     # Update the user message to explicitly list the workspace filenames so
-    # the LLM knows exactly what to pass to `read_file`. Inline copies of the
-    # file contents are still included below for LLMs that prefer inline
-    # context or that want to skip the read_file round-trip.
+    # the LLM knows exactly what to pass to `read_file`. Paths are shown with
+    # the leading "/" because DeepAgents requires absolute paths and the
+    # workspace files are keyed by the validate_path-normalized form
+    # (see ``_fixtures_to_workspace_files`` for the full rationale).
+    # Inline copies of the file contents are still included below for LLMs
+    # that prefer inline context or want to skip the read_file round-trip.
     fixture_filenames = list(fixture_contents.keys())
     if fixture_filenames:
         workspace_note = (
             "The following input files are available in your workspace "
-            "(readable via `read_file(\"<filename>\")`):\n"
-            + "\n".join(f"  - {name}" for name in fixture_filenames)
+            "(readable via `read_file(\"/<filename>\")` — paths MUST start "
+            "with `/`):\n"
+            + "\n".join(
+                f"  - {name if name.startswith('/') else '/' + name}"
+                for name in fixture_filenames
+            )
             + "\n\nInline copies of the files are also provided below for "
             "convenience."
         )
