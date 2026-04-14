@@ -406,6 +406,14 @@ def generate_mcp_tool(
             len(failed_queries), len(gaps_to_generate), failed_queries,
         )
 
+    # Evolutionary taxonomy classification (B1 Step 3.5f). Tags each newly
+    # generated artifact with domain + is_generic so gap_detection can apply
+    # the domain filter with generic-cap bypass on subsequent runs. Never
+    # raises — failures leave artifact.domain=None and downstream code falls
+    # back to "generated".
+    from src.orchestrator.taxonomy import classify_and_tag_artifacts
+    classify_and_tag_artifacts(artifacts)
+
     return Command(
         update={
             "generated_artifacts": artifacts,

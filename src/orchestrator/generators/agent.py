@@ -640,6 +640,11 @@ def generate_agent(
                 if err is not None:
                     errors.append(err)
 
+    # Evolutionary taxonomy classification (B1 Step 3.5f). Tags each newly
+    # generated artifact with domain + is_generic. Never raises.
+    from src.orchestrator.taxonomy import classify_and_tag_artifacts
+    classify_and_tag_artifacts(artifacts)
+
     return Command(
         update={
             "generated_artifacts": artifacts,
