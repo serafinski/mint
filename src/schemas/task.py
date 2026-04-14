@@ -153,6 +153,32 @@ class GeneratedArtifact(BaseModel):
             "schema they will receive."
         ),
     )
+    domain: str | None = Field(
+        default=None,
+        description=(
+            "Business sub-domain category assigned by the evolutionary "
+            "taxonomy (B1 Step 3.5f). Populated by each generator after "
+            "structured-output generation by calling "
+            "DomainTaxonomy.get_or_create_for_capability(). None for "
+            "pre-B1 artifacts and during pipeline warm-up before the "
+            "taxonomy is wired; tool_loader / loading_node fall back to "
+            "domain='general' when forwarding None onto CapabilityDescriptor."
+        ),
+    )
+    is_generic: bool = Field(
+        default=False,
+        description=(
+            "Set True by the evolutionary taxonomy when the implementation "
+            "has NO hardcoded business vocabulary and would serve any "
+            "business sub-domain (e.g. parse_csv_and_return_stats, "
+            "fibonacci, format_date_string). Generic caps BYPASS the "
+            "domain-equality filter at gap detection time, so they stay "
+            "available to queries regardless of which business sub-domain "
+            "the query is classified into. Without this flag, Phase E on "
+            "2026-04-14 showed that strict domain filtering produces false "
+            "recall losses on generic caps."
+        ),
+    )
     generated_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="When this artifact was generated",

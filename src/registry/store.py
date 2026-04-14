@@ -119,6 +119,7 @@ class SkillRegistry:
             "raw_description": capability.description,
             # New fields — use getattr for schema compatibility
             "domain": getattr(capability, "domain", "general"),
+            "is_generic": getattr(capability, "is_generic", False),
             "is_active": getattr(capability, "is_active", True),
             "tags": ",".join(getattr(capability, "tags", [])),
             "input_schema": json.dumps(getattr(capability, "input_schema", {})),
@@ -153,6 +154,8 @@ class SkillRegistry:
         # Conditionally add fields the schema supports
         if "domain" in model_fields and "domain" in meta:
             kwargs["domain"] = meta["domain"]
+        if "is_generic" in model_fields and "is_generic" in meta:
+            kwargs["is_generic"] = meta["is_generic"]
         if "is_active" in model_fields and "is_active" in meta:
             kwargs["is_active"] = meta["is_active"]
         if "tags" in model_fields and "tags" in meta:
@@ -274,6 +277,7 @@ class SkillRegistry:
         min_confidence: float = 0.0,
         is_active: bool | None = True,
         domain: str | None = None,
+        include_generic: bool = True,
     ) -> list[tuple[CapabilityDescriptor, float]]:
         """Semantic search. Returns (capability, score) pairs sorted by relevance.
 
@@ -286,20 +290,37 @@ class SkillRegistry:
             is_active: Filter by active status. ``True`` (default) returns only
                 active capabilities; ``False`` returns only inactive
                 capabilities; ``None`` returns all regardless of status.
-            domain: Optional domain filter applied at the ChromaDB ``where``
-                level — restricts the search to capabilities whose ``domain``
-                metadata matches exactly. When ``None`` (default) the search
-                is unrestricted, preserving the pre-B1 behaviour. This is the
-                proposal's "hierarchical embeddings (domain → capability →
-                specific skill)" criterion realised as a cheap pre-filter
-                rather than a multi-level cascaded search. Used by the
-                domain-filter experiment in Phase 2 Step 3.5 of the master
-                plan; also available for production gap detection if the
-                experiment shows a false-positive reduction.
+            domain: Optional domain filter. When set, restricts results to
+                capabilities whose ``domain`` metadata matches (with the
+                ``include_generic`` exception below). When ``None`` (default)
+                no domain filtering is applied — pre-B1 behaviour preserved.
+                Realises the proposal's "hierarchical embeddings (domain →
+                capability → specific skill)" criterion as a cheap pre-filter.
+            include_generic: When ``True`` (default), capabilities flagged
+                ``is_generic=True`` are always included in results regardless
+                of the ``domain`` filter. This handles the generic-capability
+                edge case surfaced by Phase E (B1 Step 3.5b): a genuinely
+                generic cap like ``parse_csv_and_return_stats`` would be
+                falsely rejected by strict domain-equality filtering on
+                queries inferred as ``inventory`` / ``operations`` / etc.,
+                even though the cap's implementation has zero hardcoded
+                business assumptions. Set ``False`` to disable the bypass
+                (useful for diagnostic measurements). Has no effect when
+                ``domain`` is ``None``.
         """
         query_kwargs: dict = {"query_texts": [query], "n_results": n_results}
         if domain is not None:
-            query_kwargs["where"] = {"domain": {"$eq": domain}}
+            if include_generic:
+                # Include caps matching the domain OR flagged as generic.
+                # ChromaDB's where clause supports $or over equality checks.
+                query_kwargs["where"] = {
+                    "$or": [
+                        {"domain": {"$eq": domain}},
+                        {"is_generic": {"$eq": True}},
+                    ]
+                }
+            else:
+                query_kwargs["where"] = {"domain": {"$eq": domain}}
         results = self._collection.query(**query_kwargs)
 
         pairs: list[tuple[CapabilityDescriptor, float]] = []
@@ -326,6 +347,7 @@ class SkillRegistry:
         *,
         threshold: float = 0.6,
         domain: str | None = None,
+        include_generic: bool = True,
     ) -> tuple[list[tuple[CapabilityDescriptor, float, str]], list[tuple[str, str]]]:
         """For each query, search the registry and classify as match or gap.
 
@@ -335,6 +357,10 @@ class SkillRegistry:
             domain: Optional domain filter threaded through to :meth:`search`.
                 When ``None`` (default) the search is unrestricted. See
                 :meth:`search` for rationale.
+            include_generic: Threaded through to :meth:`search`. When True
+                (default), capabilities flagged ``is_generic=True`` bypass
+                the domain filter. See :meth:`search` docstring for the
+                Phase E rationale.
 
         Returns:
             matches: list of (capability, score, original_query) above threshold
@@ -346,9 +372,15 @@ class SkillRegistry:
         for query in queries:
             # search() filters out is_active=False, so also query unfiltered
             # to detect deactivated capabilities and produce accurate gap reasons.
-            results = self.search(query, n_results=1, domain=domain)
+            results = self.search(
+                query, n_results=1, domain=domain, include_generic=include_generic
+            )
             unfiltered = self.search(
-                query, n_results=1, is_active=None, domain=domain
+                query,
+                n_results=1,
+                is_active=None,
+                domain=domain,
+                include_generic=include_generic,
             )
 
             if results and results[0][1] >= threshold:

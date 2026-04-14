@@ -324,12 +324,19 @@ class ToolLoader:
             if not output_schema:
                 output_schema = dict(ast_outputs)
 
+        # Forward domain / is_generic from artifact if populated (B1 Step 3.5f
+        # evolutionary taxonomy). If the generator hasn't set them yet (None),
+        # fall back to the caller-provided `domain` default and is_generic=False.
+        effective_domain = artifact.domain if artifact.domain is not None else domain
+        effective_is_generic = bool(artifact.is_generic)
+
         fallback_desc = artifact.capability_name.replace("-", " ").replace("_", " ")
         descriptor = CapabilityDescriptor(
             name=artifact.capability_name,
             description=description or artifact.description or fallback_desc,
             capability_type=CapabilityType.MCP_TOOL,
-            domain=domain,
+            domain=effective_domain,
+            is_generic=effective_is_generic,
             tags=tags or [],
             input_schema=input_schema,
             output_schema=output_schema,
@@ -341,8 +348,11 @@ class ToolLoader:
         )
         registry.add(descriptor)
         logger.info(
-            "Registered MCP tool %r in registry (input_schema=%d keys, output_schema=%d keys)",
+            "Registered MCP tool %r in registry (domain=%s, is_generic=%s, "
+            "input_schema=%d keys, output_schema=%d keys)",
             artifact.capability_name,
+            effective_domain,
+            effective_is_generic,
             len(input_schema),
             len(output_schema),
         )

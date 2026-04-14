@@ -147,11 +147,22 @@ def loading_node(
                         if derived_inputs:
                             input_schema = derived_inputs
 
+            # Forward domain / is_generic from the artifact if the generator
+            # set them (B1 Step 3.5f evolutionary taxonomy). Fall back to the
+            # historical "generated" default when the generator hasn't run
+            # through taxonomy classification yet (pre-3.5f integration, or
+            # when the taxonomy call failed and returned a fallback).
+            effective_domain = (
+                artifact.domain if artifact.domain is not None else "generated"
+            )
+            effective_is_generic = bool(artifact.is_generic)
+
             descriptor = CapabilityDescriptor(
                 name=artifact.capability_name,
                 description=artifact.description or artifact.capability_name,
                 capability_type=artifact.capability_type,
-                domain="generated",
+                domain=effective_domain,
+                is_generic=effective_is_generic,
                 input_schema=input_schema,
                 output_schema=output_schema,
                 metadata=metadata,

@@ -32,6 +32,16 @@ class CapabilityDescriptor(BaseModel):
     domain: str = Field(
         default="general", description="Domain category for hierarchical embeddings"
     )
+    is_generic: bool = Field(
+        default=False,
+        description=(
+            "True if this capability has no hardcoded business vocabulary "
+            "and should bypass the domain filter at gap detection time. "
+            "Set by the evolutionary taxonomy (B1 Step 3.5f). Generic caps "
+            "(e.g. parse_csv_and_return_stats, fibonacci) serve any "
+            "business sub-domain regardless of the query's inferred domain."
+        ),
+    )
     is_active: bool = Field(
         default=True, description="Whether capability is active in registry"
     )
