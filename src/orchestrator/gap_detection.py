@@ -60,7 +60,52 @@ def gap_detection_node(
     del metrics_store  # Stage 1: matches are no longer recorded as fake invocations.
     errors: list[str] = list(state.errors)
 
-    matches_raw, gaps_raw = registry.detect_gaps(state.required_capabilities)
+    # Evolutionary taxonomy (B1 Step 3.5f): pick the best existing category
+    # for this task's description, then thread into detect_gaps with
+    # include_generic=True so generic caps bypass the filter. On any failure
+    # (empty taxonomy, LLM error) get_for_query returns None and detect_gaps
+    # runs unfiltered — the pre-3.5f behavior.
+    selected_domain: str | None = None
+    try:
+        from langchain.chat_models import init_chat_model
+
+        from src.config import DEFAULT_LLM_MODEL
+        from src.orchestrator.taxonomy import (
+            DomainTaxonomy,
+            QueryDomainChoice,
+            get_taxonomy_path,
+        )
+
+        taxonomy = DomainTaxonomy(get_taxonomy_path())
+        if taxonomy.list_categories():
+            query_llm = init_chat_model(DEFAULT_LLM_MODEL, temperature=0)
+            structured_query_llm = query_llm.with_structured_output(
+                QueryDomainChoice, method="function_calling"
+            )
+            selected_domain = taxonomy.get_for_query(
+                state.task_description, structured_query_llm
+            )
+            if selected_domain is not None:
+                logger.info(
+                    "gap_detection: taxonomy filter → domain='%s' (include_generic=True)",
+                    selected_domain,
+                )
+            else:
+                logger.info(
+                    "gap_detection: taxonomy filter → unfiltered (no matching category)"
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "gap_detection: taxonomy filter setup failed (%s) — running unfiltered",
+            exc,
+        )
+        selected_domain = None
+
+    matches_raw, gaps_raw = registry.detect_gaps(
+        state.required_capabilities,
+        domain=selected_domain,
+        include_generic=True,
+    )
 
     matches = [
         MatchItem(capability=cap, score=score, query=query)

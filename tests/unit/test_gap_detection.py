@@ -152,7 +152,9 @@ def test_empty_required_capabilities():
     assert cmd.goto == "classifier_node"
     assert cmd.update["matches"] == []
     assert cmd.update["gaps"] == []
-    registry.detect_gaps.assert_called_once_with([])
+    registry.detect_gaps.assert_called_once_with(
+        [], domain=None, include_generic=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +171,11 @@ def test_passes_required_capabilities_to_registry():
 
     gap_detection_node(state, registry)
 
-    registry.detect_gaps.assert_called_once_with(["capability A", "capability B", "capability C"])
+    registry.detect_gaps.assert_called_once_with(
+        ["capability A", "capability B", "capability C"],
+        domain=None,
+        include_generic=True,
+    )
 
 
 # ---------------------------------------------------------------------------
