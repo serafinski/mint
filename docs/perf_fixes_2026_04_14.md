@@ -507,6 +507,125 @@ Reading the decomposition in `run.json`:
 
 ---
 
+## 4.6. Third finding from the 2026-04-14 20:53 test_mint run — seeded-cap retrieval is structurally broken
+
+**Added end of day 2026-04-14, after running test_mint a third time (20:53) to validate Step 14 decomposition coherence check.** A new failure mode surfaced that's unrelated to anything we've fixed today: the T01 MCP CSV test (literally labelled *"seeded capability match"*) did NOT match the `csv-parser` seed in the registry. Instead it generated a duplicate `parse_csv_and_return_stats_7f373a`. The user's observation was that this is the normal case — the 19:01 run's match was the exception, not the rule.
+
+**Root cause, measured empirically:** the ChromaDB semantic-search threshold of 0.6 is too high for the combination of short slug-style decomposer queries against long prose-style embedded documents. For csv-parser specifically:
+
+| Query | Similarity | Above 0.6? |
+|---|---|---|
+| `parse-csv-and-return-stats` (slug — current behavior) | 0.5425 | ❌ |
+| `csv-parser` (literal cap name) | 0.5544 | ❌ — can't find the cap by its own name |
+| `Parse the CSV file and return a dict with 'row_count' (int) and 'column_names' (list[str]).` (natural description) | 0.7622 | ✅ |
+
+Three compounding factors: (a) decomposer produces short hyphen-case slugs for `required_capabilities`, (b) `_build_document` prepends `"{domain} > {type} > {name}:"` which dilutes the embedding signal, (c) `all-MiniLM-L6-v2` + 0.6 threshold is high for slug-vs-prose length asymmetry.
+
+**Impact on Phase 5 eval if unfixed:** reuse rate metric artificially near-zero for seeded caps, `static` baseline looks artificially weak vs `full`, token cost inflated by duplicate generation, Chapter 6 retrieval-rate analysis can't distinguish "genuinely novel" from "retrieval bug". **Cannot be deferred to post-eval.**
+
+**Fix:** dual-query search in `detect_gaps` — query with both the slug AND the corresponding `SubTask.description`, take the max. The decomposer already produces both; we just don't use the description for retrieval. Strictly additive, zero downside.
+
+**Full plan:** `docs/registry_retrieval_fix_plan.md` — contains empirical evidence, root cause, ranked fix options, concrete implementation scope, and five open questions to resolve before implementation.
+
+**Tracked in master plan:** Phase 2 **Step 14.5 — Registry dual-query search**, positioned after Step 14 (decomposition coherence) and before Step 13 (AGENT execution timeout). ~2.5-3 hours including an empirical sweep across all 11 seeded caps.
+
+**Not a Step 14 regression:** Step 14 (decomposition coherence check) is independent from this retrieval issue. Step 14 handles DAG contract coherence at decomposition time; this fix handles query-to-document similarity at registry lookup time. Different layer, different fix. Step 14 can still be committed as planned; Step 14.5 happens next.
+
+---
+
+## 4.7. Fourth finding from the 2026-04-14 20:52 test_mint run — Step 14 validator false positive
+
+**Added end of day 2026-04-14 after running test_mint a second time to validate Step 14 decomposition coherence check.** The validator I wrote for Step 14 correctly caught the T14 TSV incoherent-chain pattern (the target case from the 19:01 run) but also **false-flagged two runs that produced correct output end-to-end**:
+
+- **T11 Excel SKILL integration** — subtask 2 (`compare-region-revenues-to-targets`) had `regions_meeting_target` in its own `output_schema` but the validator flagged it as a missing upstream key. Output was correct: `{summary_row_count: 60, region_revenues: {...}, regions_meeting_target: 2}`. Confirmed via langfuse trace `1c61e8cb6f12a2c0bb87fe2e720ca3fc`.
+- **T14 TSV MCP_TOOL aggregation** — subtask 1 (`aggregate-spending-by-department`) had `department_count` and `department_spending` in its own `output_schema` but the validator flagged them as missing upstream keys. Output was correct: `{department_count: 5, department_spending: {5 departments with correct totals}}`. Confirmed via langfuse trace `ba87434f89ec0ff3b0de401124d345db`.
+
+**Root cause:** `_extract_upstream_key_references` uses a regex that walks from an "upstream_data" anchor phrase to the next sentence-ending period, extracting every quoted identifier in that span. For descriptions like *"Aggregate `upstream_data['transactions']` by department. Return a dict with 'department_count' and 'department_spending'."* with no intervening period between the anchor and the output-key discussion, the regex extracts all three quoted identifiers as supposed upstream references. The validator then compares them against the transitive upstream set and incorrectly flags the output keys as missing upstream producers.
+
+**Fix (applied in the same Step 14 commit):** before comparing `referenced_keys` against transitive upstream availability, subtract the subtask's own `output_schema` keys. A key in own `output_schema` is an output, not an input, regardless of description text near an upstream anchor phrase. This preserves the T14 TSV positive catch from the 19:01 run because the catch's failing key (`transactions`) is NOT in the subtask's own output_schema.
+
+**Known edge case accepted:** hallucinated pass-through (key declared in own output_schema AND referenced in description AND no predecessor produces it) — the subtraction skips the check. Requires the decomposer to invent an invalid pass-through from scratch, which is unlikely. Better than the false-positive alternative, which was blocking every multi-step aggregation run.
+
+**Three regression tests added** in `TestValidateChainCoherence`:
+- `test_final_aggregation_step_not_false_flagged_tsv_pattern` — mirrors the T14 TSV case
+- `test_comparison_step_not_false_flagged_excel_pattern` — mirrors the T11 Excel case
+- `test_t14_catch_still_works_after_false_positive_fix` — regression guard that the original T14 catch still fires
+
+**Status: fix included in Step 14 commit.** Verified by the 2026-04-14 21:38 test_mint re-run: T14 TSV and T11 Excel both passed the validator (no coherence violation), though T11 Excel hit a separate failure documented in §4.8 below.
+
+---
+
+## 4.8. Fifth finding from the 2026-04-14 21:38 test_mint run — MCP_TOOL generator signature bug
+
+**Added end of day 2026-04-14 after re-running test_mint a third time to validate the Step 14 false-positive fix.** The false-positive fix worked — T14 TSV and T11 Excel both passed the validator cleanly. But T11 Excel then hit a **different failure mode at chain execution time**:
+
+```
+Chain MCP_TOOL join_sales_with_products_on_product_id_a_a8e6f6 raised:
+join_sales_with_products_on_product_id_a_a8e6f6() missing 1 required positional argument: 'upstream_data'
+```
+
+Confirmed via trace `d8d92cca1d3f4715c97a5a72e96f9daa` and run.json at `data/cli/mint_output/compare_region_revenues_to_targets_025451_20260414_215154/`.
+
+**Root cause:** the MCP_TOOL generator produced a step-0 function with `upstream_data` as a **required positional argument**, despite the subtask having `depends_on: []`. The executor's dispatch logic in `tests/evaluation/execution.py::execute_mcp_tool_in_chain` correctly does NOT pass `upstream_data` on step 0 (only on steps with `step_index > 0`). Python then raised the missing-argument error at call time.
+
+**Why the LLM got it wrong:** the decomposer named subtask 0 `join-sales-with-products-on-product_id-and-parse-targets` — bundling file parsing and joining into one step (legitimate). The generator LLM saw "join" in the name, pattern-matched it to middle-step semantics, and produced a signature expecting upstream data despite the structured `depends_on=[]` signal.
+
+**The MCP_TOOL generator prompt already has the rule** distinguishing step-0 (per-key file-path params) from middle/last-step (`upstream_data` param) — but the LLM didn't follow it reliably on this run. The decomposer's non-determinism in subtask naming caused the generator to violate its own contract.
+
+**MCP_TOOL-only scope — verified, not assumed:**
+
+- **SKILL and AGENT don't have this bug class.** They use `fixture_contents` injection via the LLM task message rather than Python function signatures. `_execute_skill_step` and `_execute_agent_step` in `composition.py` build `fixture_contents` from upstream outputs and pass it as a parameter to `execute_skill_artifact` / `execute_agent_artifact`. The SKILL/AGENT runtime LLM executor reads whatever keys are present in `fixture_contents` — empty on step 0, populated on non-step-0. **No signature to mismatch.**
+- Grep confirms neither `src/orchestrator/prompts/skill_generator.py` nor `src/orchestrator/prompts/agent_generator.py` mentions `fixture_contents`, `upstream_data`, `first step`, or `depends_on` — because the mechanism is architecturally invisible to them.
+- Commit `1283f68` (chain schema contracts, the commit that introduced the `upstream_data` mechanism for MCP_TOOL) explicitly notes *"SKILL/AGENT steps unaffected (fixture_contents injection already robust)"*. The two types were considered and deliberately not touched.
+
+**Fix:** tracked as Phase 2 **Step 14.7** in `docs/MASTER_PLAN_2026_04_13.md`, positioned between Step 14.6 and Step 13. Recommended approach (Option A in the plan): make `upstream_data: dict | None = None` always-optional in the MCP_TOOL generator prompt rule, so the generator produces a uniform signature for all steps regardless of what the LLM infers from the subtask name. The executor's dispatch already handles both cases. Removing the step-0 vs non-step-0 decision from the LLM's hands eliminates the verb-pattern-matching failure mode. **~1 hour of work.**
+
+**Pre-existing since commit `1283f68`** (2026-04-12). Not caused by any of the four performance fixes or Step 14. The bug was latent on any run where the decomposer happened to name a step-0 subtask with a verb like "join", "aggregate", "combine", or "merge" that triggered the LLM's middle-step pattern matching.
+
+---
+
+## 4.9. Sixth finding — `mint reset` path bug on `last_run.json` + missing skills/WAL cleanup
+
+**Added end of day 2026-04-14 while reviewing the 21:38 test_mint run's leftover state.** The user noticed `data/cli/skills/` had 6 leftover skill directories from 2-3 prior runs and asked whether the same reset-cleanup gap applied to chroma, metrics.duckdb, and last_run.json. Investigation surfaced **three distinct problems** in the reset command:
+
+**Problem 1: `last_run.json` path bug — reset was never actually wiping it.**
+
+The writer at `src/cli/runner.py:67` saves to `_data_dir() / "cli" / "last_run.json"` (correctly under the `cli` subdirectory). The reset command at `src/cli/app.py:212` (pre-fix) looked at `data / "last_run.json"` — **without the `cli` subdirectory**. On every reset, it tried to delete a file that didn't exist, the real file at `data/cli/last_run.json` survived untouched, and the user kept seeing it in ls output after reset.
+
+The unit test was complicit: `tests/unit/test_cli_reset.py:29` (pre-fix) created the fixture at `data / "last_run.json"`, asserted the reset wiped it there, and passed — because the test and the production code shared the same wrong path assumption. This is the canonical *"test mirrors the bug"* anti-pattern: the test validates the path assumption that the production code holds, not whether that assumption is correct.
+
+Same bug also present in `scripts/test_mint.py:321` (its inline reset replicates the production reset and copied the path error).
+
+**Fix:** production path corrected to `data / "cli" / "last_run.json"` in both `src/cli/app.py` and `scripts/test_mint.py`. Test fixture corrected to write at the correct path. New regression test `test_reset_deletes_last_run_at_correct_path` explicitly asserts reset wipes the file at `data/cli/last_run.json` so a future regression to the wrong path would fail the test instead of hiding.
+
+**Problem 2: `metrics.duckdb.wal` was never cleaned up.**
+
+DuckDB writes a write-ahead log file next to the main database file. On graceful shutdown DuckDB cleans up the WAL, but if a metrics operation is interrupted or a process crashes, the `.wal` file can be left orphaned next to `metrics.duckdb`. The reset command only unlinked `metrics.duckdb`, leaving any orphan WAL behind. User's ls confirmed: `metrics.duckdb.wal` was present alongside `metrics.duckdb`.
+
+**Fix:** reset now also unlinks `metrics.duckdb.wal` if present. Silent cleanup — not added to the `removed` list because the WAL is a DuckDB internal file, not user-facing state. New regression test `test_reset_deletes_metrics_wal` covers it.
+
+**Problem 3: `data/cli/skills/` was never wiped** (surfaced earlier — the original user observation).
+
+Already covered in the reset-skills fix committed separately. Mentioned here for completeness: the three problems were noticed together while auditing the reset command after the 21:38 run.
+
+**Why all three bugs persisted undetected until today:**
+- `last_run.json` path bug: the test fixture matched the wrong path, so the test passed
+- `metrics.duckdb.wal`: not covered by any test
+- `skills/` directory: not covered by any test
+
+**The common pattern:** the reset command grew incrementally (chroma → metrics → last_run → taxonomy → skills) without a holistic audit of "what does data/cli/ contain and what should survive a reset?". Each addition only tested the new item, not the total state. An inventory-based approach — list everything in `data/cli/` after a session, compare against what reset deletes, flag the delta — would have caught all three at once.
+
+**Process nugget for Chapter 4 methodology section:** *"Test fixtures that hold the same assumptions as production code can mask bugs that both depend on. We observed this pattern on the mint reset command's `last_run.json` path — the test passed because it created the file at the same wrong path the production code deleted, validating the internal consistency of the mistake rather than whether the mistake was correct. A regression test that explicitly writes the file at the path the writer uses, then asserts the reset wipes it there, catches this class of bug by construction."*
+
+**Total scope of the fix (one small commit):**
+- `src/cli/app.py`: last_run_path corrected, metrics_wal_path added, both wired into the unlink block. 3 edits, ~15 lines total counting comments.
+- `scripts/test_mint.py`: same path fixes in the inline reset block + add WAL/taxonomy/skills cleanup for parity with app.py reset. ~15 lines.
+- `tests/unit/test_cli_reset.py`: fixture writes at correct path, two new regression tests (last_run path + WAL cleanup), existing sweep test updated. ~30 lines.
+
+**Full suite: 1073/1073 unit tests passing** (was 1071 before, +2 regression tests minus 0 replaced).
+
+---
+
 ## 5. What the user will see after the fixes
 
 Updated with real numbers from the 2026-04-14 14:44 test_mint run (6 tests, wall time ~38 min total).

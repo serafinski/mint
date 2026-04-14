@@ -128,6 +128,9 @@ This is the work that was queued before today started. It's unchanged by the Pil
 |---|---|---|---|---|
 | 1 | **Commit the four performance fixes** | Commits A (Fix 2a), B (Fix 2b), C (Fix 2c), D (Fix 2d) + docs commit per `docs/perf_fixes_2026_04_14.md` §4 | ~15 min | Unblocks everything. Working tree is dirty with validated fixes. |
 | 2 | **Step 14 — Decomposition coherence check** | Phase 2 Step 14 (below) | ~2-3 h | **Highest priority.** TSV failure in the 19:01 test_mint run showed decomposer produces incoherent chain contracts. If left unfixed, Phase 5 eval will have failures that can't be distinguished from other failure modes, making Chapter 6 analysis noisier. |
+| **2.5** | **Step 14.5 — Registry dual-query search + reusable descriptions** | `docs/registry_retrieval_fix_plan.md` | **~3.5-4 h** (A+B bundled) or **~5-5.5 h** (if Q6 needs refactor) | **Added 2026-04-14 end of day, revised later same day to add Part B.** The 20:52 test_mint run surfaced a structural retrieval bug: seeded capabilities silently don't match their intended queries because short slug-style decomposer queries fall below 0.6 cosine threshold against prose documents (0.5425 measured on csv-parser). **Part A — Dual-query search:** pass both slug and `SubTask.description` to `detect_gaps`, take max. **Part B — Reusable descriptions:** add a decomposer prompt rule forbidding absolute paths / per-run values in subtask descriptions. Part B benefits Pillar 3 convergence at Chapter 5 level too (optimizer merge-candidate detection can only recognize semantic duplicates when their descriptions don't encode per-run state). **Prerequisite Q6:** grep generators + composition.py to verify they don't pull paths from subtask descriptions. If clean, bundle A+B. If not, ship A alone pre-eval and defer B. **Cannot be deferred entirely** — Chapter 6 reuse numbers and static baseline depend on Part A. Full plan at `docs/registry_retrieval_fix_plan.md`. |
+| **2.6** | **Step 14.6 — Task-level output key validation** | Phase 2 Step 14.6 (below) | **~1-1.5 h** | **Added 2026-04-14 end of day.** The 20:52 test_mint run surfaced a silent wrong-output gap in T16 AGENT: the decomposer invented a `request-file-access-or-upload` subagent for a task with pre-provided files; the subagent found a data quirk and output `{next_action: "Please fix and re-upload"}`; the CLI reported "OK: Pipeline completed successfully" because the pipeline didn't crash. The user-requested keys (`root_cause_metric`, `cascade_chain`, `n_metrics_investigated`) were nowhere in the output. **Root cause:** the CLI's pass/fail classifier is exit-code based and doesn't check output content against expected keys. Fix: extract the user's expected output keys from the task prompt (either via simple regex on "Return a dict with keys 'X', 'Y', 'Z'" or a one-shot LLM extraction at task entry), validate at CLI terminal state that all expected keys are present in the output dict. When keys are missing, print a distinct warning and return a new exit code 3 (distinct from 0/success, 1/crash, 2/decomposition-failed). Same sticky-flag pattern as Fix 2b, different layer. **This closes the last silent-failure hole in the CLI pass/fail contract.** |
+| **2.7** | **Step 14.7 — MCP_TOOL generator signature bug (step-0 `upstream_data` false-required)** | Phase 2 Step 14.7 (below) | **~1 h** | **Added 2026-04-14 end of day after the 21:38 test_mint T11 Excel failure.** The MCP_TOOL generator sometimes produces step-0 functions with `upstream_data` as a **required positional argument** even though step 0 has no upstream dependencies. When the executor calls the function (correctly, without `upstream_data` since there's nothing upstream), Python raises `missing 1 required positional argument: 'upstream_data'`. Empirically observed on T11 where the decomposer named step 0 `join-sales-with-products-on-product_id-and-parse-targets` and the word "join" pattern-matched to middle-step semantics in the generator LLM's understanding, overriding the `depends_on=[]` signal. **MCP_TOOL-only scope** — SKILL and AGENT use `fixture_contents` injection into the LLM task message (runtime mechanism, not a function signature), which degrades gracefully on step 0 (empty dict) and non-step-0 (populated dict). Neither generator prompt even mentions `fixture_contents` because it's architecturally invisible to them. Only MCP_TOOL has a Python function signature that can be mismatched at call time. Fix: either (a) pass `is_first_step: bool` explicitly to the MCP_TOOL generator as hard context, or (b) make `upstream_data: dict \| None = None` always-optional in the MCP_TOOL prompt rule, plus a post-generation AST check that validates step-0 functions don't require `upstream_data`. **Pre-existing since commit 1283f68** (chain schema contracts, 2026-04-12). |
 | 3 | **Step 13 — AGENT execution timeout + sticky flag** | Phase 2 Step 13 (below) | ~1.5-2 h | Pattern-matched to Fix 2b. AGENT test failure in 19:01 run was a timeout on `execute_agent_artifact`. Same surgical approach: bump the ceiling, add a sticky flag, surface it in CLI + harness. |
 | 4 | **Steps 4–11 — B1 / Pillar 3 main block** | Phase 2 Steps 4-11 (below) | ~20 h | The big pre-eval work item. Extend `InvocationRecord`, write `verify_and_register_or_rollback`, implement per-type merge/split/Tier 4 coverage verifier, rewrite optimizer tests to assert on real content. Ordered internally by dependency. |
 | 5 | **Step 12 — Proposal-vs-implementation audit** | Phase 2 Step 12 (below) | ~3-5 h | **After Step 11, not before.** Waits for Pillar 3 to be in final form so the audit doesn't have to re-check merge/split/prune across all three types mid-flux. Expected output: 2-5 drift findings beyond Tier 3 and the known Pillar 3 ones. Each gets classified and routed (fix pre-eval / fix post-eval / disclose in Chapter 4 or 7). |
@@ -135,7 +138,7 @@ This is the work that was queued before today started. It's unchanged by the Pil
 | 7 | **Phase 4 Step 18 — The 400-record eval** | Phase 4 (below) | ~18 h unattended | `run_pilot --all-tasks --all-conditions --n-runs 5`. Starts the thesis's Chapter 6 data. |
 | 8 | Phase 4 Step 19 — Longitudinal run (optional) | Phase 4 (below) | Several hours unattended | Optimizer convergence numbers for Chapter 6. Optional but strongly recommended if time permits — makes the Pillar 3 story in Chapter 5 measurable. |
 
-**Total pre-eval hands-on time: ~30-35 hours (~4-4.5 focused working days).**
+**Total pre-eval hands-on time: ~36-42 hours (~4.5-5 focused working days)** — revised upward 2026-04-14 end of day to include Step 14.5 with Part A+B bundled (~3.5-4 h best case, ~5-5.5 h if Q6 needs a refactor), Step 14.6 (~1-1.5 h), and Step 14.7 (~1 h).
 
 **What's deferred explicitly:** the proposal-aligned black-box Tier 3 rewrite (~3-5 additional days). Tracked in `docs/perf_fixes_2026_04_14.md` §3e as Chapter 7 future work. Would move into this list between steps 5 and 6 if you decide to pull it forward, but the current recommendation is to leave it deferred.
 
@@ -246,6 +249,121 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
 
     **Priority:** high, because this is a real correctness gap for Phase 5 eval. Without it, runs that fail due to incoherent decomposition look identical to runs that fail due to wrong generation or wrong verification — the eval harness can't distinguish them and the thesis analysis gets noisier. Fixing it before Phase 5 eval runs means the failure-mode distribution in Chapter 6 is cleaner.
 
+14.5. **Registry dual-query search — fix seeded-cap retrieval below threshold.** (~2.5-3 hours, added 2026-04-14 end of day after the 20:53 test_mint run surfaced a structural retrieval bug.) Full plan in `docs/registry_retrieval_fix_plan.md` — this row is a pointer, not a duplication of the plan.
+
+    **One-line summary:** seeded capabilities silently don't match their intended queries in most runs because short slug-style decomposer queries (e.g. `parse-csv-and-return-stats`) fall below the 0.6 cosine-similarity threshold against prose-style embedded documents (e.g. `"data-processing > mcp_tool > csv-parser: Parse a CSV file..."`). Empirically measured on csv-parser: 0.5425 for the slug, 0.7622 for the full natural-language description. The decomposer already produces both — we just don't use the description for retrieval. Fix is dual-query search in `registry.detect_gaps`: search with the slug AND the corresponding `SubTask.description`, take the max score against the threshold. Strictly additive — can only increase recall, never decrease it.
+
+    **Why this is Step 14.5 and not deferred:**
+    - Phase 5 eval correctness: Chapter 6 reuse rate, static-baseline success rate, token cost, and registry convergence metrics all depend on retrieval actually working. If seeded caps silently don't match, those metrics are wrong in ways a reviewer would immediately challenge.
+    - The fix is orthogonal to everything else (Steps 13, 4–11, 12) and can't be safely deferred until after the eval without re-running.
+    - Estimated 2.5-3 hours including an empirical sweep of all 11 seeded caps, the implementation, and validation.
+
+    **Open questions to resolve before implementation** (per `docs/registry_retrieval_fix_plan.md` §6):
+    - Q1: How many of the 11 seeded caps have the same structural issue? Empirical sweep needed before committing. Expected pattern: parsing/processing caps affected; math/arithmetic caps (fibonacci) may match fine.
+    - Q2: What's the right auxiliary-query data source for gap_detection — `SubTask.description` (recommended, per-subtask) or `state.task_description` (simpler, whole-task)?
+    - Q3: Should the fallback path (when decomposition fails via Fix 2b's sticky flag) also dual-query? Probably not — fallback is already known-broken.
+    - Q4: Does the fix interact with the Step 3.5f domain filter? Test confirms no interaction (both primary and auxiliary queries go through the same filter).
+    - Q5: One match per gap or two if both primary and auxiliary hit the same cap? One — the function returns best-scoring match per gap, not per query.
+
+    **Scope:** touches `src/registry/store.py::detect_gaps` (signature extension + dual-query logic), `src/orchestrator/gap_detection.py` (pass descriptions alongside slugs), new tests in `tests/unit/test_registry.py` and `tests/unit/test_gap_detection.py`. `search()` stays unchanged — dual-query logic lives in `detect_gaps`. Empirical sweep script lives in `scripts/` but need not be committed.
+
+    **Priority:** **ship before Step 13.** The retrieval bug affects every Phase 5 eval run; the AGENT execution timeout (Step 13) affects a narrower edge case. Sequencing is Step 14 → Step 14.5 → Step 14.6 → Step 14.7 → Step 13 → Steps 4–11.
+
+14.6. **Task-level output key validation — close the last silent-failure hole in the CLI pass/fail contract.** (~1-1.5 hours, added 2026-04-14 end of day after the 20:52 test_mint run surfaced the T16 AGENT silent wrong-output.)
+
+    **Motivating failure (concrete, from langfuse trace `7abeb2fe07f5cb9c9ef6b374dc95e610`):** T16 AGENT incident investigation. Task asked for `{root_cause_metric, cascade_chain, n_metrics_investigated}`. The decomposer created 3 subagents, the FIRST of which was named `request-file-access-or-upload` with description *"request the required incident files or validate them"* — despite the files being pre-provided on the CLI. When executed, that subagent found a data quirk in the CSV (`'0:0095'` instead of `'0.0095'` at row 4:30) and produced `{"next_action": "Please fix the CSV error_rate value and re-upload..."}` as its output. The pipeline took that dict as the final output, returned exit code 0, and test_mint reported `OK: Pipeline completed successfully`. **The user-requested keys were nowhere in the output and the pipeline silently claimed success.**
+
+    **Why current safeguards don't catch it:**
+    - Fix 2b's `decomposition_succeeded` flag is True (3 valid subtasks were produced — decomposition technically succeeded from the pipeline's perspective).
+    - Step 14's chain coherence validator doesn't fire (each subtask's `output_schema` is internally consistent).
+    - Verification gate passed (each artifact is valid code/prose in isolation).
+    - Chain execution didn't crash (the subagents ran to completion and returned dicts).
+    - The CLI's exit-code classifier returns 0 because nothing raised an exception.
+    - **None of the existing safeguards compare the final output against the keys the user asked for.** That's a structural gap in the pass/fail contract.
+
+    **Root cause:** the decomposer produced a semantically wrong plan. The pipeline faithfully executed a wrong plan. The CLI reported "OK" because the pipeline didn't crash. There's no layer that verifies *"did the pipeline produce what the user asked for?"* — only *"did it not crash?"*.
+
+    **Fix design — two parts:**
+
+    Part A — Extract expected output keys at task entry. In `src/cli/runner.py::execute_task`, after the task prompt is built but before the pipeline runs, extract the set of output keys the user requested. Two options for the extractor:
+    - **(a) Regex-based**: parse patterns like `"Return a dict with keys 'X', 'Y', 'Z'"`, `"return a dict containing 'X' (int) and 'Y' (str)"`, `"return {'X': ..., 'Y': ...}"`. Cheap, deterministic, covers maybe 70% of task prompts.
+    - **(b) One-shot LLM extraction**: one gpt-5-mini call at task entry with a small prompt: *"What are the output keys the user is asking for in this task prompt? Return as a JSON list of strings."* 100% coverage, ~1-2s latency, ~$0.001 per task. More robust to phrasing variation.
+
+    Recommend (b) because the 30% of tasks where regex fails are exactly the complex natural-language phrasings we care about. Also more future-proof for tasks that use indirect phrasing like *"the final output should include a summary..."*.
+
+    Part B — Validate at terminal state. After execution completes and the CLI has the final output dict, compare its keys against the extracted expected keys. When keys are missing:
+    - Print a distinct **blue/magenta** warning: `⚠ OUTPUT MISSING EXPECTED KEYS — partial or wrong answer`
+    - List the missing keys and the keys that WERE produced so the user can see what happened
+    - Return a new exit code **3** (distinct from 0/success, 1/crash, 2/decomposition-failed)
+    - test_mint treats exit code 3 as FAIL with a specific error message
+
+    **This is NOT a perfect fix** — an adversarial decomposer could still produce a plan that outputs the right keys with wrong values. But it closes the specific silent-failure pattern where the output SHAPE is wrong, which is what T16 actually exhibited. A content-correctness check would require per-task ground truth (which the evaluation harness has via `output_in_range` but the CLI doesn't).
+
+    **Scope:**
+    - `src/cli/runner.py`: add `_extract_expected_output_keys(task_prompt)` helper calling gpt-5-mini; add a check block at the terminal state similar to the Fix 2b decomposition-failure block; return exit code 3 on missing keys.
+    - `scripts/test_mint.py`: treat exit code 3 as FAIL with `"output missing expected keys"` message, mirroring the existing exit code 2 handling.
+    - Optionally: store the extracted keys in `TaskState.expected_output_keys` so downstream nodes / the evaluation harness can also read them. This enables the harness's `output_in_range` check to reuse the same extraction without a separate LLM call. Probably worth doing.
+    - Tests: unit test for the extractor (regex/LLM), unit test for the terminal-state check, integration test with a known-good task and a known-bad task (like the T16 pattern).
+
+    **Why this priority:** ship between Step 14.5 (retrieval) and Step 13 (AGENT execution timeout). It's smaller than Step 14.5 (~1-1.5h vs ~2.5-3h) and directly addresses a silent failure that would pollute Chapter 6 numbers. Without it, every task where the decomposer or agent produces the wrong plan gets silently scored as "success" by test_mint and potentially by the harness.
+
+    **Scope NOT covered by this fix (Chapter 7 future work):**
+    - Content correctness (wrong values for the right keys): out of scope. Requires per-task ground truth.
+    - Nested-key validation (the user asks for `{'stats': {'mean': float, 'median': float}}` and the tool returns `{'stats': 'wrong'}`): out of scope. Shape check is top-level keys only.
+    - Recovery / retry: if the extractor says keys are missing, the current pipeline just fails out. A more sophisticated version would trigger a regeneration with the missing-keys hint. Out of scope — the retry loop is already load-bearing and adding more retry paths risks infinite loops.
+
+14.7. **MCP_TOOL generator signature bug — step-0 `upstream_data` false-required parameter.** (~1 hour, added 2026-04-14 end of day after the 21:38 test_mint T11 Excel failure.)
+
+    **Motivating failure (concrete, from trace `d8d92cca1d3f4715c97a5a72e96f9daa` and the T11 run.json at `data/cli/mint_output/compare_region_revenues_to_targets_025451_20260414_215154/`):** The decomposer produced a 3-subtask plan for T11 where subtask 0 was named `join-sales-with-products-on-product_id-and-parse-targets` with `depends_on: []`. The decomposer correctly bundled file parsing + joining into step 0 — the subtask description says *"Parse the sales CSV and the products Excel sheet, perform an inner join... and parse the regional targets CSV"*, clearly a step-0 operation. The MCP_TOOL generator produced code with `upstream_data` as a **required positional argument** anyway. When the compositional executor called the function at step 0 (with no `upstream_data` because there's nothing upstream), Python raised `missing 1 required positional argument: 'upstream_data'`. The chain crashed at step 0 and the pipeline failed out.
+
+    **Why the LLM generator got it wrong:** the MCP_TOOL generator prompt at `src/orchestrator/prompts/mcp_tool_generator.py` lines 168-180 already has an explicit rule distinguishing first-step from middle/last-step signatures:
+
+    > *"**First step (no depends_on):** receives raw file paths as parameters. Read them using appropriate libraries... **Middle steps (depends_on earlier steps):** receive **all upstream data as a single `upstream_data` parameter**... Your function signature MUST include `upstream_data: Annotated[dict, Field(...)]` as its ONLY required parameter... **Last step (nothing depends on it):** same as middle steps."*
+
+    The rule is there. The LLM didn't follow it because the subtask name contained the verb "join", which pattern-matched in the LLM's understanding to *"middle step that joins upstream data"*, overriding the `depends_on=[]` signal carried in the structured context. The LLM produced middle-step-shaped code for a step-0 subtask.
+
+    **MCP_TOOL-only scope — architectural justification** (verified empirically in the code, not assumed):
+
+    This bug class is MCP_TOOL-specific because **only MCP_TOOL has a Python function signature that can mismatch the executor's call pattern**. SKILL and AGENT use a fundamentally different upstream-data mechanism:
+
+    - **MCP_TOOL** (`tests/evaluation/execution.py::execute_mcp_tool_in_chain` lines 572-583): `upstream_data` is threaded through the Python function signature. The executor's dispatch is `if step_index > 0 and "upstream_data" in _valid: _kwargs = {"upstream_data": _upstream} else: _kwargs = {per-key file paths}`. If the generator produces a step-0 function with `upstream_data` as a required arg, the `step_index == 0` branch doesn't pass it, Python raises `missing positional argument`, chain dies.
+
+    - **SKILL** (`src/orchestrator/composition.py::_execute_skill_step` lines 393-414): upstream data is passed as `fixture_contents: dict` into the SKILL LLM executor's task message via `execute_skill_artifact(artifact, task, fixture_contents, ...)`. There is no Python function signature. The SKILL is a markdown file with prose instructions. On step 0, `fixture_contents` is empty; on non-step-0, it's populated. The LLM executor reads whatever is there. **No signature to mismatch.**
+
+    - **AGENT** (`src/orchestrator/composition.py::_execute_agent_step`): same mechanism as SKILL — `fixture_contents` injection into the DeepAgent's initial task message via `execute_agent_artifact(artifact, task, fixture_contents, ...)`. No signature.
+
+    - **Confirmed via grep**: neither `src/orchestrator/prompts/skill_generator.py` nor `src/orchestrator/prompts/agent_generator.py` mentions `fixture_contents`, `upstream_data`, `first step`, `depends_on`, or any chain-execution contract. The one "upstream" hit in each file is unrelated documentation prose ("upstream callers" in SKILL for error-report retries, "upstream steps" in AGENT for context-bloat rationale for subagents). The generators don't know about the runtime upstream-data mechanism because it's transparent to them.
+
+    - **Commit `1283f68` explicitly says it**: *"upstream_data parameter for robust MCP_TOOL chain data flow: Middle/last MCP_TOOL steps receive all upstream data as a single upstream_data dict... **SKILL/AGENT steps unaffected (fixture_contents injection already robust).**"* The author considered SKILL/AGENT and decided they didn't need an analogous change.
+
+    **Conclusion: the fix is MCP_TOOL-only. SKILL and AGENT generators do not need any changes for this bug class.** The analogous failure for SKILL/AGENT (instructions that reference upstream keys no predecessor produces) is a different bug class caught by Step 14's chain coherence validator, which walks descriptions for any capability type.
+
+    **Fix design — three options, ranked by cleanliness:**
+
+    **Option A (recommended): always-optional `upstream_data`.** Change the MCP_TOOL generator prompt rule from *"Your function signature MUST include `upstream_data: Annotated[dict, Field(...)]` as its ONLY required parameter"* to *"Your function signature MUST include `upstream_data: dict \| None = None` as an OPTIONAL parameter with default None. Read it only when it's not None (i.e., on non-step-0 calls). On step 0, `upstream_data` will be None or missing and you should read files from per-key parameters instead."*
+
+    Rationale: removes the step-0 vs non-step-0 decision from the LLM entirely. The generator produces a uniform signature for all steps. The executor's dispatch logic in `execute_mcp_tool_in_chain` already handles both cases — step 0 falls back to per-key matching, step 1+ passes `upstream_data`. With an optional parameter, a step-0 function that happens to have `upstream_data` in its signature just gets `upstream_data=None` (or not passed at all — optional parameter) and reads its file inputs normally. A non-step-0 function gets `upstream_data={...}` and reads from it.
+
+    **Why Option A is cleaner than hardening the rule:** the decomposer's subtask naming is non-deterministic. We observed *"join-..."* confusing the LLM in this run; next run it might be *"aggregate-..."*, *"combine-..."*, *"merge-..."*. Any verb that pattern-matches to middle-step semantics. Option A makes the LLM's verb-based inference irrelevant because the signature is uniform either way.
+
+    **Option B (fallback): explicit `is_first_step: bool` in generator context.** Thread the `is_first_step` boolean (derived from `subtask.depends_on == []`) into the MCP_TOOL generator prompt as a hard constraint. Something like *"THIS SUBTASK IS STEP 0 (is_first_step=True). Do NOT include `upstream_data` as a parameter. Read files directly from per-key file-path parameters."* Tighter than the current prompt rule because it's a per-call explicit constraint rather than a general instruction the LLM has to remember and apply.
+
+    **Why Option B is worse than Option A:** requires adding new context plumbing between `generate_mcp_tool` and the generator prompt, the LLM still has to honor the rule, and the rule was already in the prompt — strengthening it doesn't guarantee compliance.
+
+    **Option C (belt-and-suspenders): post-generation AST validation.** After generation, parse the generated function's AST and check the signature. For `depends_on == []`, assert `upstream_data` is not a required positional argument. On violation, trigger retry with the mismatch as feedback. Uses the existing Fix 2c retry loop. Can combine with Option A or B.
+
+    **Recommendation: Option A alone.** Simpler, removes the LLM decision point, tests are trivial (just verify the emitted signature uses `upstream_data: dict | None = None`).
+
+    **Scope:**
+    - `src/orchestrator/prompts/mcp_tool_generator.py` — update the first-step/middle-step/last-step rule block (lines 168-180) to mandate `upstream_data: dict \| None = None` as optional across the board
+    - Update at least one example in the prompt to use the new signature style
+    - Verify the executor's dispatch logic in `tests/evaluation/execution.py::execute_mcp_tool_in_chain` still works — the current `if step_index > 0 and "upstream_data" in _valid` branch should still fire on non-step-0 calls. Should work without changes because optional parameters still appear in `_valid`.
+    - Tests: (a) unit test for the prompt rule — mock a step-0 generation, assert `upstream_data` is NOT a required positional argument, (b) regression test with the T11 pattern (subtask name contains "join", depends_on=[], verify the function still runs at step 0), (c) integration test with a 2-step chain where step 0 reads files and step 1 consumes upstream_data.
+
+    **Priority:** ship between Step 14.6 and Step 13. Narrow fix, ~1 hour of work, directly addresses a pre-eval correctness gap. Without this fix, any multi-step task where the decomposer happens to name step 0 with a verb like "join", "aggregate", "merge", "combine" etc. will crash in the compositional executor, which would corrupt Phase 5 eval results on chained tasks.
+
+    **What this does NOT address (deferred):** the decomposer's non-determinism in subtask naming itself. Fixing that would require either deterministic slug generation or a post-decomposition validation that rejects bundled-operation names. Out of scope — Option A makes the decomposer's naming choice irrelevant.
+
 **Phase 3 — Remaining pre-eval and validation (~3–4 hours).**
 
 12. File output fix for SKILL/AGENT last steps per `docs/file_output_fix_plan.md`. (~1 hour)
@@ -283,6 +401,7 @@ To help you find things without re-reading everything, here is what each existin
 - **`archive/pre_eval_readiness.md`** — The short-form readiness checklist. **Moved to archive 2026-04-14** because this master plan's Phase 2 and Phase 3 sections fully supersede it. Kept in archive for git history and the already-done items it lists.
 - **`b1_enriched_embedding_plan.md`** — The B1 plan with today's pivot history and the Iter-4 gap discovery. **Superseded** by this master plan for the fix list, but still the best place to read about the embedding-enrichment experiment that got reverted and why.
 - **`file_output_fix_plan.md`** — The SKILL/AGENT file output plan. Still live. Referenced from Phase 3 step 12.
+- **`registry_retrieval_fix_plan.md`** — The dual-query search plan for fixing the seeded-cap retrieval bug. **Live, added 2026-04-14 end of day.** Referenced from Phase 2 Step 14.5. Contains the empirical similarity measurements, three-factor root cause analysis, ranked fix options, and five open questions to resolve before implementation.
 - **`chain_schema_contracts_plan.md`** — Already implemented in Phase 3.5c. Historical.
 - **`compositional_synthesis_plan.md`** — Already implemented in Phase 3. Historical.
 - **`test_suite_audit_2026_04_13.md`** — Import-level test audit from today. Findings: no deletions needed. Superseded by the behavioral audit below. **Caveat noted 2026-04-13 post-audit:** this doc also contains the `scripts/` categorization where `test_auto_optimizer.py` was labeled "Critical — exercises merge/split via pipeline; directly tests Iter-4 Gap 2/3 fixes." That label was forward-looking (it described what the script *will* do once Phase 2 lands) and did not flag that the script *currently* passes for the wrong reason against today's stub-producing `operations.py`. The same blind spot applies to `scripts/test_split_merge.py`, which the earlier audit categorized as healthy. Both scripts are now known to suffer from the same false-pass bug as the unit tests, and both are rewritten in Phase 2 step 9.5. Consider the scripts-directory categorization in this doc **amended** by Section 4 point 4 of this master plan.
