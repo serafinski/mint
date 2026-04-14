@@ -246,6 +246,70 @@ class TestDecompositionNode:
         errors = cmd.update["errors"]
         assert any("0 subtasks" in e for e in errors)
 
+    # ------------------------------------------------------------------
+    # Sticky decomposition_succeeded flag (Fix 2b)
+    # ------------------------------------------------------------------
+    # These tests verify the sticky failure flag added to TaskState so the
+    # user-facing CLI and the evaluation harness can distinguish a real
+    # success from a fallback-path "success" where the decomposer bailed out
+    # and the pipeline produced whatever it could from a single-sentence
+    # fallback query. See docs/perf_fixes_2026_04_14.md §2b.
+
+    def test_success_sets_decomposition_succeeded_true(self, state):
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(description="A", required_capabilities=["cap-a"]),
+            ]
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is True
+
+    def test_timeout_sets_decomposition_succeeded_false(self, state):
+        mock_tpe, _ = _make_mock_pool(
+            future_raises=concurrent.futures.TimeoutError()
+        )
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is False
+
+    def test_no_structured_response_sets_decomposition_succeeded_false(self, state):
+        mock_tpe, _ = _make_mock_pool({"structured_response": None})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is False
+
+    def test_empty_subtasks_sets_decomposition_succeeded_false(self, state):
+        structured = DecompositionResult(subtasks=[], reasoning="trivial")
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is False
+
+    def test_generic_exception_sets_decomposition_succeeded_false(self, state):
+        mock_tpe, _ = _make_mock_pool(
+            future_raises=RuntimeError("Connection refused")
+        )
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is False
+
     def test_duplicate_required_capabilities_deduplicated(self, state):
         """Shared capability names across subtasks appear only once in required_capabilities."""
         structured = DecompositionResult(

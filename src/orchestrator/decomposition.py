@@ -32,7 +32,17 @@ logger = logging.getLogger(__name__)
 # Operational boundaries
 # ---------------------------------------------------------------------------
 
-DECOMPOSITION_TIMEOUT_S = 120
+# Bumped 120 → 240 on 2026-04-14 after a test_mint run surfaced repeated
+# timeouts on the T04 5-stage inventory reorder task. Empirical data (LangFuse
+# traces across April 7 → April 14) shows the DeepAgent routinely completes
+# its real work in 87–180s of LLM wall time on complex tasks, but tail variance
+# in gpt-5-mini reasoning mode pushes wall clock to 200–400s intermittently.
+# The 120s ceiling was tipping over on the unlucky tail. Reducing reasoning
+# effort on the decomposer itself was rejected because it affects every task
+# (including the easy ones that currently work) with quality impact on the
+# entire downstream pipeline. Bumping the timeout is surgical — only the tail
+# pays. See docs/perf_fixes_2026_04_14.md §2b.
+DECOMPOSITION_TIMEOUT_S = 240
 DECOMPOSITION_RECURSION_LIMIT = 50
 
 # Two-stage circuit breaker for capability count.
@@ -227,6 +237,15 @@ def decomposition_node(
     # Fallback: if no subtasks were produced, use the first sentence of the task
     # description as a capability query (the full description is too long for
     # effective semantic search in the registry).
+    #
+    # Sticky-failure flag: if we reach this branch, decomposition effectively
+    # failed — the pipeline will continue running through the fallback path so
+    # the user sees whatever partial output is achievable, but the terminal CLI
+    # display and the evaluation harness's success classifier MUST classify the
+    # run as failed. We carry this as a dedicated boolean on TaskState because
+    # `status` is transitioned forward by every downstream node and cannot
+    # carry a sticky signal. See docs/perf_fixes_2026_04_14.md §2b.
+    decomposition_succeeded = bool(subtasks)
     if not subtasks:
         first_sentence = state.task_description.split(".")[0].strip()
         required_caps = [first_sentence[:200] if first_sentence else state.task_description[:200]]
@@ -237,6 +256,7 @@ def decomposition_node(
             "required_capabilities": required_caps,
             "status": TaskStatus.DECOMPOSING,
             "errors": errors,
+            "decomposition_succeeded": decomposition_succeeded,
         },
         goto="gap_detection",
     )

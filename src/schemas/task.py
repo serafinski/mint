@@ -302,6 +302,19 @@ class TaskState(BaseModel):
             "Used to enforce the 3-strike limit before failing open."
         ),
     )
+    decomposition_succeeded: bool = Field(
+        default=True,
+        description=(
+            "Sticky flag set to False by decomposition_node whenever the "
+            "DeepAgent times out, errors, or returns zero subtasks. Downstream "
+            "nodes MUST NOT read or write this field — it is consumed only by "
+            "the terminal CLI display and the evaluation harness's success "
+            "classifier so the pipeline can continue through its fallback path "
+            "without the user-facing layer mistaking a fallback-produced wrong "
+            "output for success. The enum `status` field transitions forward "
+            "through every node and so cannot carry a sticky failure signal."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 

@@ -119,6 +119,12 @@ def _run_mint(
         verbose=False,
     )
 
+    if exit_code == 2:
+        # Soft failure: pipeline ran but decomposition fell back to the
+        # single-sentence path, so output is almost certainly wrong. Surface
+        # it as a FAIL in the smoke test so regressions are caught.
+        print("\n  FAIL: decomposition failed — output is fallback-only")
+        return False
     if exit_code != 0:
         print(f"\n  FAIL: exit code {exit_code}")
         return False

@@ -1853,17 +1853,43 @@ def execute_task(
             pipeline_metrics=_pmx,
         )
 
+    # Sticky decomposition-failure flag: if decomposition_node bailed out
+    # (timeout / exception / empty subtasks), the fallback path still produced
+    # whatever it could — but the output is unreliable because the pipeline
+    # ran on a single-sentence fallback query instead of a real decomposition.
+    # Surface this to the user distinctly AND return a non-zero exit code so
+    # scripts like test_mint and run_pilot classify the run as a failure.
+    # See docs/perf_fixes_2026_04_14.md §2b.
+    if isinstance(final_state, dict):
+        _get_final = final_state.get
+    else:
+        _get_final = lambda k, d=None: getattr(final_state, k, d)  # noqa: E731
+
+    decomposition_ok = _get_final("decomposition_succeeded", True)
+    if not decomposition_ok:
+        err_console.print(
+            "\n[bold yellow]⚠ DECOMPOSITION FAILED — "
+            "partial output only[/bold yellow]"
+        )
+        err_console.print(
+            "[yellow]The task decomposer hit its timeout or errored. "
+            "The pipeline ran through a single-sentence fallback path, so "
+            "the output above is almost certainly incomplete. "
+            "Results should be treated as a diagnostic, not a successful "
+            "run.[/yellow]"
+        )
+        _errs = _get_final("errors", []) or []
+        if _errs:
+            err_console.print(f"[dim]Errors: {'; '.join(_errs[:3])}[/dim]")
+        return 2  # distinct from 1 (hard failure) and 0 (success)
+
     # Success: artifact executed with output, or registry matched (even
     # without source_code — the system found a relevant capability)
     if artifact is not None and output:
         return 0
     # Registry matched but couldn't execute (seeded descriptor without
     # source code) — still a valid match, not a pipeline failure
-    if isinstance(final_state, dict):
-        _get = final_state.get
-    else:
-        _get = lambda k, d=None: getattr(final_state, k, d)  # noqa: E731
-    if (_get("matches", None) or []) and not (_get("gaps", None) or []):
+    if (_get_final("matches", None) or []) and not (_get_final("gaps", None) or []):
         return 0
     return 1
 
