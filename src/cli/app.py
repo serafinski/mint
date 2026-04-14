@@ -210,6 +210,12 @@ def reset(
     chroma_path = data / "cli" / "chroma"
     metrics_path = data / "cli" / "metrics.duckdb"
     last_run_path = data / "last_run.json"
+    # Evolutionary domain taxonomy file — wiped on reset so a "clean slate"
+    # genuinely means clean slate. Without this, categories grown in prior
+    # sessions survive the reset and influence the next run's gap_detection
+    # filter against a freshly-seeded registry, which muddles the taxonomy
+    # evolution story for the thesis. See docs/perf_fixes_2026_04_14.md §2d.
+    taxonomy_path = data / "cli" / "domains.json"
 
     if not force:
         console.print(
@@ -238,6 +244,9 @@ def reset(
     if last_run_path.exists():
         last_run_path.unlink()
         removed.append("last run config")
+    if taxonomy_path.exists():
+        taxonomy_path.unlink()
+        removed.append("domain taxonomy")
 
     # Re-seed unless --no-seed
     if not no_seed:
