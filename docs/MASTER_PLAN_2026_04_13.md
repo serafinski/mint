@@ -118,6 +118,35 @@ This is the work that was queued before today started. It's unchanged by the Pil
 
 ## 6. The ordered fix list
 
+### 6.0 Priority-adjusted execution order (revised 2026-04-14 end of day)
+
+**Read this first.** After the 2026-04-14 test_mint run and the Tier 3 drift discovery, the work items below are the same as before but the execution priority has shifted. Steps 13 and 14 were added and Step 14 is now promoted to run before the main B1 Pillar 3 work block, because the test_mint run revealed that decomposition non-determinism produces incoherent chain contracts intermittently — that's a direct correctness gap for Phase 5 eval and has to be fixed before other Phase 2 work so the eval failure distribution in Chapter 6 is interpretable.
+
+**Execute in this order:**
+
+| # | Action | File(s) / Step # | Time | Why this position |
+|---|---|---|---|---|
+| 1 | **Commit the four performance fixes** | Commits A (Fix 2a), B (Fix 2b), C (Fix 2c), D (Fix 2d) + docs commit per `docs/perf_fixes_2026_04_14.md` §4 | ~15 min | Unblocks everything. Working tree is dirty with validated fixes. |
+| 2 | **Step 14 — Decomposition coherence check** | Phase 2 Step 14 (below) | ~2-3 h | **Highest priority.** TSV failure in the 19:01 test_mint run showed decomposer produces incoherent chain contracts. If left unfixed, Phase 5 eval will have failures that can't be distinguished from other failure modes, making Chapter 6 analysis noisier. |
+| 3 | **Step 13 — AGENT execution timeout + sticky flag** | Phase 2 Step 13 (below) | ~1.5-2 h | Pattern-matched to Fix 2b. AGENT test failure in 19:01 run was a timeout on `execute_agent_artifact`. Same surgical approach: bump the ceiling, add a sticky flag, surface it in CLI + harness. |
+| 4 | **Steps 4–11 — B1 / Pillar 3 main block** | Phase 2 Steps 4-11 (below) | ~20 h | The big pre-eval work item. Extend `InvocationRecord`, write `verify_and_register_or_rollback`, implement per-type merge/split/Tier 4 coverage verifier, rewrite optimizer tests to assert on real content. Ordered internally by dependency. |
+| 5 | **Step 12 — Proposal-vs-implementation audit** | Phase 2 Step 12 (below) | ~3-5 h | **After Step 11, not before.** Waits for Pillar 3 to be in final form so the audit doesn't have to re-check merge/split/prune across all three types mid-flux. Expected output: 2-5 drift findings beyond Tier 3 and the known Pillar 3 ones. Each gets classified and routed (fix pre-eval / fix post-eval / disclose in Chapter 4 or 7). |
+| 6 | **Phase 3 Steps 15-17 — Pre-eval validation** | Phase 3 (below) | ~3-4 h | File output fix for SKILL/AGENT + test augmentations from the behavioral audit + full smoke tests including a 20-task pilot at one run per task. |
+| 7 | **Phase 4 Step 18 — The 400-record eval** | Phase 4 (below) | ~18 h unattended | `run_pilot --all-tasks --all-conditions --n-runs 5`. Starts the thesis's Chapter 6 data. |
+| 8 | Phase 4 Step 19 — Longitudinal run (optional) | Phase 4 (below) | Several hours unattended | Optimizer convergence numbers for Chapter 6. Optional but strongly recommended if time permits — makes the Pillar 3 story in Chapter 5 measurable. |
+
+**Total pre-eval hands-on time: ~30-35 hours (~4-4.5 focused working days).**
+
+**What's deferred explicitly:** the proposal-aligned black-box Tier 3 rewrite (~3-5 additional days). Tracked in `docs/perf_fixes_2026_04_14.md` §3e as Chapter 7 future work. Would move into this list between steps 5 and 6 if you decide to pull it forward, but the current recommendation is to leave it deferred.
+
+**What to do between step 7 and step 8 (if time permits):** start drafting Chapter 4's verification writeup while the eval is running. The drift disclosures for Tier 3 and any Step 12 findings are already decided — the writing can happen in parallel with the unattended eval.
+
+**When the plan is stale:** if any step takes significantly longer than estimated, or if Step 12 surfaces a drift that requires code-level fix, update this table first before doing the work. That way the "what's next" pointer stays accurate.
+
+---
+
+### 6.1 Full step detail (dependency-ordered, grouped by phase)
+
 Here is the actual dependency-ordered sequence. I've grouped it into three phases because different phases can commit separately and the commit history stays clean.
 
 **Phase 1 — Housekeeping commit (no logic changes, ~0 hours — just commit what's in-tree).**
@@ -166,6 +195,57 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
 10. Snapshot `data/cli/chroma` as a tarball, run the migration script to populate schemas on the existing 11 generated capabilities, run the verification experiment to confirm merge-candidate count increased from zero. (~1.5 hours)
 11. Update `docs/proposal_vs_implementation_v2.md` flipping Pillar 3 Merge and Split back to ✅ and recording the methodology nugget about code, **unit tests, integration scripts, and comments** drifting together from the same incomplete reading. (~30 min)
 
+12. **Proposal-vs-implementation audit, section by section.** (~3-5 hours, added 2026-04-14 after the Tier 3 drift was surfaced accidentally during a performance investigation.)
+
+   **Why this step exists.** On 2026-04-14, during a performance investigation triggered by slow test_mint runs, we accidentally discovered that the adversarial Tier 3 implementation drifts from the proposal in a structural way (white-box code inspection vs. the proposal's black-box behavioral probing). The drift had been latent for weeks — the code worked, the tests passed, and the only reason it surfaced was that AGENT Tier 3 showed 0.0s in a trace and made me read `adversarial.py` and `thesis_proposal.md` side-by-side. See `docs/perf_fixes_2026_04_14.md` §3e for the full write-up.
+
+   **The worry:** if one structural drift was sitting in the code for weeks without anyone noticing, **there are probably more**. The existing `docs/proposal_vs_implementation_v2.md` audit doc was written by reading proposal sections and asking "is this implemented somewhere?" — that's too weak. It catches missing features but not drift where something *is* implemented but with a narrower or different architecture than the proposal describes. The Tier 3 case is the canonical example: the proposal says "black-box red-team agent with behavioral probing", the code has "white-box LLM-driven SAST", both look like Tier 3 at a glance, both report passing findings, and the audit doc happily ticked it off as ✅.
+
+   **What this step does.** Go through `docs/thesis_proposal.md` section by section. For each substantive claim the proposal makes, do three things:
+   1. **Quote the exact text** from the proposal.
+   2. **Point to the code path that implements it** — file and function, not a vague module reference.
+   3. **Compare the mechanism, not just the existence.** If the proposal says "the verifier agent probes X by doing Y", check whether the code actually does Y or does something that merely achieves a similar goal. Record both the match and the mismatch.
+
+   Sections to audit (adjust as the proposal's section list evolves):
+   - **Pillar 1 — JIT Capability Pipeline.** Task decomposition, skill gap detection, capability classification, generation, sandboxed integration, structured state communication. Especially check: does the decomposer actually "break the input task into subtasks, each annotated with the capabilities required to complete it"? Does the skill gap detector use "hierarchical embeddings (domain → capability → specific skill)"? The evolutionary taxonomy we shipped satisfies this partially; verify the claim is defensible.
+   - **Pillar 2 — Verification Layer.** Tier 1 static analysis, Tier 2 behavioral testing, Tier 3 adversarial probing. **Tier 3 is known to drift (§3e of perf_fixes_2026_04_14.md)** — but also check Tier 1 and Tier 2 to see if they drift similarly. For Tier 2, does the behavioral tester actually do nonexistent-entity tests, consistency tests, boundary tests, and latency analysis? For Tier 1, does the static scanner catch all five failure categories the proposal lists (hardcoded data, silent exception handling, mock artifacts, synthetic data indicators, missing external calls) at the severity levels the proposal specifies?
+   - **Pillar 3 — Granularity Optimizer.** Split / merge / prune across all three capability types. We already know this has drift (B1 fix list covers it); confirm that after Steps 4-11 of this phase land, the implementation matches the proposal's description of all three operations as uniform across capability types. Do NOT tick this off before Steps 4-11 are actually complete.
+   - **Structured State Communication Protocol** (proposal section 3.4). Does the pipeline actually use "strictly typed JSON schemas representing the world state at each handoff point"? The Pydantic schemas in `src/schemas/` satisfy this, but verify the claim about "protocol-buffer-style contract" is accurate (Pydantic isn't protobuf, though it's a reasonable stand-in — worth noting in Chapter 3).
+   - **Evaluation Strategy** (proposal section on testbed, baselines, metrics). Does the testbed match the "Business Analytics Pipeline" option? Are the four baselines (`static`, `no_verification`, `no_optimization`, `full`) implemented correctly? Are all six metrics (task success rate, mock contamination rate, reuse distribution, token cost, time to correct execution, registry convergence) actually computed by the harness? The metrics list is especially worth checking — some of these may not be computed at all.
+   - **Tech Stack Mapping** (proposal table). Low-priority — mostly implementation detail, but worth a quick scan to confirm every row in the proposal's tech-stack table has a corresponding concrete use in the repo. Look for rows where the proposal mentions a technology that was never actually adopted (e.g., if the proposal says "A2A protocol" and we only use LangGraph message passing, that's a minor drift worth noting).
+
+   **How findings are tracked.** Each drift found goes into `docs/proposal_vs_implementation_v2.md` with:
+   - Proposal quote
+   - Code path that implements (or partially implements) it
+   - Classification: **faithful**, **strengthened** (implementation is stronger than proposal), **refined** (implementation is narrower but the narrowing is explicit and justified), **drift** (implementation differs without justification — this is the bad category), **missing** (proposal claim has no implementation at all).
+   - For drift entries: decision — fix before eval, fix after eval, or disclose in Chapter 4 / Chapter 7.
+
+   **Expected outcome.** Realistically, expect 2-5 drift findings beyond Tier 3 and the B1 Pillar 3 ones already known. That's not a failure state — it's the point of the audit. Every drift found before the eval is one less thing that would embarrass the thesis during a viva. Every drift found after the eval is a Chapter 4 footnote. The audit is cheap insurance.
+
+   **When to do this.** After Steps 4-11 land (so Pillar 3 is in its final form and doesn't need re-auditing), but before Phase 3 Step 14 (smoke tests and pilot). The audit output informs what gets fixed in Phase 3 and what gets disclosed in Chapter 4 writing post-eval.
+
+13. **AGENT execution timeout + sticky-flag pattern.** (~1.5-2 hours, added 2026-04-14 after the 19:01 test_mint run surfaced this.) Same class of bug as the decomposition timeout that Fix 2b addressed — a hard cutoff on a variance-prone runtime, this time inside `tests/evaluation/execution.py::execute_agent_artifact`. The generated incident-triage agent completed pipeline generation + verification fine, then hit the 480s agent-execution hard timeout during its adaptive investigation (reasoning-mode wall-clock variance on a long-running DeepAgent, same story we already saw on decomposition). The previous 14:44 run passed at 584.4s total because the agent happened to fit under 480s that time; the 19:01 run didn't.
+
+    Scope:
+    - Bump `AGENT_EXECUTION_TIMEOUT_S` in `tests/evaluation/execution.py` from 480 → 720 (or whatever matches the observed wall-clock distribution). Same surgical reasoning as the decomposition bump: the agent's real work fits on the body of the variance distribution, but the 480s ceiling tips over on the tail. Don't reduce agent reasoning effort — agents need reasoning for their core task.
+    - Add a sticky failure flag (`agent_execution_succeeded: bool = True` on the execution result, or an equivalent shape in whatever struct `execute_agent_artifact` returns) so the CLI and harness can distinguish "agent ran and produced output" from "agent timed out and produced nothing". Must not be silently masked as `success=True` with empty output.
+    - The CLI in `runner.py` already handles empty output by returning exit code 1 (the 19:01 run shows this — the AGENT test correctly reported FAIL). This is good. But the evaluation harness needs the sticky flag so Phase 5 can classify timed-out agents as failures without depending on output-shape validation alone.
+    - Unit tests for the timeout path and the sticky-flag propagation.
+
+14. **Decomposition coherence check — validate chain schema contracts.** (~2-3 hours, added 2026-04-14 after the 19:01 test_mint run surfaced this.) The decomposer produces a `DecompositionResult` where each `SubTask` declares an `output_schema`, but the pipeline never validates that the **union of upstream `output_schema` keys** contains every key the downstream generators reference. Surfaced on the TSV test: the 19:01 run decomposed the departments/transactions task into 3 subtasks where step 2's generator wrote code expecting `upstream_data['transactions']` but step 1's `output_schema` only produced `{'departments': ...}`. Nothing parsed the TSV anywhere. Chain execution crashed at step 2 with `upstream_data must include a 'transactions' key with a list of transaction dicts`.
+
+    The 14:44 run had decomposed the same task into 2 coherent subtasks instead. **This is decomposition non-determinism producing incoherent chain contracts.** The decomposer prompt should enforce coherence, but LLM reasoning paths vary run-to-run and the prompt is not strict enough to guarantee it.
+
+    Scope — two complementary fixes:
+    - **Prompt tightening.** Add a rule to the decomposition system prompt: *"Every key that any downstream subtask references via upstream_data must appear in the output_schema of an earlier subtask. Before returning your decomposition, trace every upstream key consumed by each subtask and verify it is produced by a predecessor. Incoherent chains (where a subtask references a key no earlier subtask produces) are invalid and must be restructured."* Plus an example showing what an incoherent chain looks like and why it's wrong. Medium risk — prompt changes can have unintended effects on other tasks.
+    - **Pipeline-side validation.** Between `decomposition_node` and `gap_detection`, add a validation pass that walks the subtask DAG, collects the union of output_schema keys across each subtask's transitive predecessors, and flags any `required_capabilities` or downstream subtask description that references a key not in that union. On failure: either retry decomposition (up to the existing `MAX_ATTEMPTS=3` budget) or mark `decomposition_succeeded=False` using the Fix 2b sticky flag. Low risk — additive validation, fail-open by default.
+
+    Recommend both together. Prompt tightening reduces the rate of incoherent chains; pipeline validation catches the remainder. Either alone is weaker than both.
+
+    Tests: unit tests with mocked decomposition outputs covering (a) coherent chain — passes, (b) incoherent chain with one missing key — caught by validator, (c) incoherent chain where the missing key is derivable from a transitive predecessor — passes, (d) intentional cycle — rejected. Plus an integration test against the T14-class fixture so we have a regression guard.
+
+    **Priority:** high, because this is a real correctness gap for Phase 5 eval. Without it, runs that fail due to incoherent decomposition look identical to runs that fail due to wrong generation or wrong verification — the eval harness can't distinguish them and the thesis analysis gets noisier. Fixing it before Phase 5 eval runs means the failure-mode distribution in Chapter 6 is cleaner.
+
 **Phase 3 — Remaining pre-eval and validation (~3–4 hours).**
 
 12. File output fix for SKILL/AGENT last steps per `docs/file_output_fix_plan.md`. (~1 hour)
@@ -179,7 +259,9 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
 
 **Phase 5 — Post-eval analysis (happens after eval lands).** Covered by `docs/pre_eval_execution_plan.md` and not re-specified here.
 
-**Total hands-on time through Phase 3: roughly 21–24 hours, or about three focused working days.** Plus the Phase 4 evaluation wall time, which is unattended.
+**Total hands-on time through Phase 3: roughly 27–34 hours, or about four focused working days** (revised upward 2026-04-14 again to include Steps 13 and 14 — AGENT execution timeout + decomposition coherence check, ~3.5-5 hours combined — on top of the earlier +Step 12 revision). Plus the Phase 4 evaluation wall time, which is unattended.
+
+**Update 2026-04-14 (end of day): the `docs/perf_fixes_2026_04_14.md` doc covers the four performance fixes (Fix 2a–2d) which are all implemented, unit-tested (1048/1048 passing), and validated end-to-end by a test_mint smoke run. The canary test (T04 SKILL inventory reorder) passed with correct output — the silent-failure path that was poisoning T04 runs is closed. Fixes are ready to commit. The 19:01 test_mint run surfaced two pre-existing bugs unrelated to the fix pass: AGENT execution timeout (Step 13 above) and decomposition chain contract mismatch (Step 14 above). The doc also contains the Tier 3 white-box/black-box drift disclosure in §3e that motivated the new Step 12 audit here.**
 
 ## 7. Open decisions that need your input
 
@@ -198,7 +280,7 @@ To help you find things without re-reading everything, here is what each existin
 - **`thesis_proposal.md`** — The contract. The rolled-back original. Do not modify.
 - **`proposal_vs_implementation_v2.md`** — Living audit of what each proposal claim maps to in the code. Will be updated in Phase 2 step 11 after the Pillar 3 fixes land.
 - **`pre_eval_execution_plan.md`** — The long-form pre-eval checklist written before today. Phases 0–3.5c are already marked done there. Phases 4–7 (smoke tests, eval, post-eval analysis, chapter drafting) are still the authoritative reference for those later phases. This master plan doesn't replicate it.
-- **`pre_eval_readiness.md`** — The short-form readiness checklist. Section E (test suite audit) was added earlier today and is now **superseded** by this master plan's Phase 2 and Phase 3 sections. The rest of the doc is still accurate for items that were already marked done.
+- **`archive/pre_eval_readiness.md`** — The short-form readiness checklist. **Moved to archive 2026-04-14** because this master plan's Phase 2 and Phase 3 sections fully supersede it. Kept in archive for git history and the already-done items it lists.
 - **`b1_enriched_embedding_plan.md`** — The B1 plan with today's pivot history and the Iter-4 gap discovery. **Superseded** by this master plan for the fix list, but still the best place to read about the embedding-enrichment experiment that got reverted and why.
 - **`file_output_fix_plan.md`** — The SKILL/AGENT file output plan. Still live. Referenced from Phase 3 step 12.
 - **`chain_schema_contracts_plan.md`** — Already implemented in Phase 3.5c. Historical.
@@ -206,7 +288,7 @@ To help you find things without re-reading everything, here is what each existin
 - **`test_suite_audit_2026_04_13.md`** — Import-level test audit from today. Findings: no deletions needed. Superseded by the behavioral audit below. **Caveat noted 2026-04-13 post-audit:** this doc also contains the `scripts/` categorization where `test_auto_optimizer.py` was labeled "Critical — exercises merge/split via pipeline; directly tests Iter-4 Gap 2/3 fixes." That label was forward-looking (it described what the script *will* do once Phase 2 lands) and did not flag that the script *currently* passes for the wrong reason against today's stub-producing `operations.py`. The same blind spot applies to `scripts/test_split_merge.py`, which the earlier audit categorized as healthy. Both scripts are now known to suffer from the same false-pass bug as the unit tests, and both are rewritten in Phase 2 step 9.5. Consider the scripts-directory categorization in this doc **amended** by Section 4 point 4 of this master plan.
 - **`test_suite_behavioral_audit_2026_04_13.md`** — Behavioral test audit from today. Five critical findings, drove the test-augmentation list in Phase 3 step 13. Note: this audit covered `tests/unit/` and `tests/integration/` but did not extend to `scripts/`, which is why the false-pass bug in `test_split_merge.py` and `test_auto_optimizer.py` was not caught here either. The behavioral audit's conclusion that *"the suite is testing the right things"* applies to the pytest suite; the integration scripts were out of scope.
 - **`test_audit_cluster_{A,B,C,D}_2026_04_13.md`** — Detailed per-cluster findings that back the synthesis in the behavioral audit. Reference material; no action items come from them directly.
-- **`test_mint_20260412_analysis.md`** — The 2026-04-12 test_mint run analysis (pre-B1). Historical.
+- **`archive/test_mint_20260412_analysis.md`** — The 2026-04-12 test_mint run analysis (pre-B1). **Moved to archive 2026-04-14** because the authoritative test_mint analysis is now `perf_fixes_2026_04_14.md` §4.5 (the 19:01 run that validated the four performance fixes).
 - **`context_engineering_mapping.md`** — Reference mapping for the context engineering chapter. No action items.
 - **`CLAUDE.md`** (project root, not in docs/) — Project context for AI assistants. Was edited earlier today to remove stale `run_task.py` references.
 - **This document (`MASTER_PLAN_2026_04_13.md`)** — The single source of truth for the pre-eval fix sequence. Supersedes the sections noted above until Phase 5 eval lands.
