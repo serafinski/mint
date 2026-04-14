@@ -153,7 +153,7 @@ def test_empty_required_capabilities():
     assert cmd.update["matches"] == []
     assert cmd.update["gaps"] == []
     registry.detect_gaps.assert_called_once_with(
-        [], domain=None, include_generic=True
+        [], auxiliary_queries=[], domain=None, include_generic=True
     )
 
 
@@ -163,6 +163,10 @@ def test_empty_required_capabilities():
 
 
 def test_passes_required_capabilities_to_registry():
+    """Slugs are threaded to detect_gaps. When no subtasks carry descriptions
+    (empty subtasks list, fallback path), auxiliary_queries is a list of Nones
+    — the single-query pre-Step-14.5 behaviour is preserved.
+    """
     registry = _make_registry()
     state = TaskState(
         task_description="multi-step task",
@@ -173,9 +177,125 @@ def test_passes_required_capabilities_to_registry():
 
     registry.detect_gaps.assert_called_once_with(
         ["capability A", "capability B", "capability C"],
+        auxiliary_queries=[None, None, None],
         domain=None,
         include_generic=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 14.5 Part A — dual-query wiring: gap_detection_node builds
+# auxiliary_queries from state.subtasks descriptions
+# ---------------------------------------------------------------------------
+
+
+def test_dual_query_wires_subtask_descriptions_as_auxiliary():
+    """When state.subtasks is populated, each slug's auxiliary is the
+    description of the subtask whose required_capabilities contains it.
+    """
+    from src.schemas.task import SubTask
+
+    registry = _make_registry()
+    state = TaskState(
+        task_description="T14 TSV aggregation",
+        required_capabilities=["parse-files", "aggregate-spending"],
+        subtasks=[
+            SubTask(
+                description="Parse the provided CSV and TSV into structured records.",
+                required_capabilities=["parse-files"],
+                depends_on=[],
+                output_schema={"departments": "list[dict]", "transactions": "list[dict]"},
+            ),
+            SubTask(
+                description="Aggregate upstream_data['transactions'] by department.",
+                required_capabilities=["aggregate-spending"],
+                depends_on=[0],
+                output_schema={"department_count": "int", "department_spending": "dict"},
+            ),
+        ],
+    )
+
+    gap_detection_node(state, registry)
+
+    # The call should have auxiliary_queries populated with each subtask's
+    # description in the same order as the slugs.
+    call = registry.detect_gaps.call_args
+    assert call.args[0] == ["parse-files", "aggregate-spending"]
+    aux = call.kwargs["auxiliary_queries"]
+    assert aux == [
+        "Parse the provided CSV and TSV into structured records.",
+        "Aggregate upstream_data['transactions'] by department.",
+    ]
+
+
+def test_dual_query_missing_subtask_for_slug_uses_none_auxiliary():
+    """A slug that isn't in any subtask's required_capabilities gets None."""
+    from src.schemas.task import SubTask
+
+    registry = _make_registry()
+    state = TaskState(
+        task_description="unusual decomposition",
+        required_capabilities=["matched-slug", "orphan-slug"],
+        subtasks=[
+            SubTask(
+                description="Handle the matched slug.",
+                required_capabilities=["matched-slug"],
+                depends_on=[],
+                output_schema={"result": "dict"},
+            ),
+        ],
+    )
+
+    gap_detection_node(state, registry)
+
+    aux = registry.detect_gaps.call_args.kwargs["auxiliary_queries"]
+    assert aux == ["Handle the matched slug.", None]
+
+
+def test_dual_query_fallback_path_empty_subtasks_all_none_auxiliary():
+    """When decomposition failed (empty subtasks, fallback required_caps),
+    every auxiliary is None — single-query behaviour preserved.
+    """
+    registry = _make_registry()
+    state = TaskState(
+        task_description="Parse this CSV.",
+        required_capabilities=["Parse this CSV"],  # first-sentence fallback
+        subtasks=[],  # empty — decomposition failed
+    )
+
+    gap_detection_node(state, registry)
+
+    aux = registry.detect_gaps.call_args.kwargs["auxiliary_queries"]
+    assert aux == [None]
+
+
+def test_dual_query_multiple_slugs_in_one_subtask():
+    """A subtask with multiple required_capabilities shares its description
+    as the auxiliary for each slug.
+    """
+    from src.schemas.task import SubTask
+
+    registry = _make_registry()
+    state = TaskState(
+        task_description="multi-cap subtask",
+        required_capabilities=["cap-a", "cap-b"],
+        subtasks=[
+            SubTask(
+                description="Shared description for multi-capability subtask.",
+                required_capabilities=["cap-a", "cap-b"],
+                depends_on=[],
+                output_schema={"result": "dict"},
+            ),
+        ],
+    )
+
+    gap_detection_node(state, registry)
+
+    aux = registry.detect_gaps.call_args.kwargs["auxiliary_queries"]
+    assert aux == [
+        "Shared description for multi-capability subtask.",
+        "Shared description for multi-capability subtask.",
+    ]
 
 
 # ---------------------------------------------------------------------------

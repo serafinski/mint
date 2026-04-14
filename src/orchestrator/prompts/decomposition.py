@@ -175,6 +175,53 @@ produces.
 The single rule: **trace every upstream_data key back to its producer \
 before returning. If you can't find a producer, the chain is broken.**
 
+14. **Describe subtasks in terms of data shape and operation, not \
+specific paths or values.** Subtask descriptions are consumed by two \
+downstream systems:
+- The **capability registry** for semantic retrieval. Descriptions that \
+embed absolute paths (e.g., ``/Users/alice/project/data/t01.csv``), \
+specific filenames, or per-run values add tokens that are lexically \
+different run-to-run but semantically empty. Those tokens dilute the \
+description's embedding and hurt retrieval similarity against stored \
+capability documents. Empirically measured: removing the absolute path \
+from a T01 CSV parsing description raised cosine similarity against the \
+``csv-parser`` seed from 0.62 to 0.77 — a +0.15 lift just from dropping \
+path noise.
+- The **Pillar 3 optimizer** for merge-candidate detection across runs. \
+Two semantically-identical capabilities whose descriptions differ only in \
+their per-run paths will look like different capabilities to the \
+description-similarity check, preventing the optimizer from recognizing \
+them as duplicates and merging them.
+
+**Use generic shape-and-operation language** in subtask descriptions:
+
+- ✅ "Parse the provided CSV file and return row count and column names" \
+— not ❌ "Parse /Users/alice/project/data/t01.csv and ..."
+- ✅ "Aggregate the upstream transactions list by department" — not ❌ \
+"Aggregate the 80 transactions from t14_transactions.tsv"
+- ✅ "Validate the input YAML against the reorder rules schema" — not ❌ \
+"Read reorder rules from t04_reorder_rules.yaml"
+- ✅ "Compute days_of_stock = current_stock / daily_usage for each product" \
+— not ❌ "Compute days_of_stock for each of the 10 products in the \
+inventory CSV"
+
+The **task-level context and file paths are provided to generators \
+through separate state channels** (``TaskState.task_description`` holds the \
+full original user prompt; ``state.files`` holds the file paths as a \
+typed list). The generator prompts read those channels directly and do \
+NOT depend on the subtask description carrying paths. Focus each subtask \
+description on what the subtask DOES (operations, transformations, \
+outputs the step produces), not where the data lives on disk or what \
+run-specific values it contains.
+
+**This rule applies equally to every subtask, first-step or not.** \
+Step-0 subtasks describe their parsing operation generically ("parse the \
+provided CSV file", not "parse /Users/.../t01.csv"). Middle- and \
+last-step subtasks describe their transformation generically ("aggregate \
+the upstream transactions list", not "aggregate the 80 transactions \
+from ..."). The generator uses the task-level file paths for step 0 and \
+the upstream data contract for steps 1+.
+
 ## Output
 
 Return your decomposition via the structured output format. Every subtask must

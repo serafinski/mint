@@ -106,8 +106,39 @@ def gap_detection_node(
         )
         selected_domain = None
 
+    # Step 14.5 Part A — dual-query retrieval. The decomposer produces
+    # short hyphen-case slugs in ``required_capabilities`` which systematically
+    # fall below the 0.6 cosine threshold against the registry's prose-style
+    # ``_build_document()`` output (measured 0.5425 on csv-parser vs 0.7653
+    # for a natural-language description of the same task). Build an
+    # auxiliary-query list using ``SubTask.description`` for each slug —
+    # ``detect_gaps`` runs both searches and takes the max-scoring hit,
+    # which lifts seeded caps that would otherwise be undiscoverable.
+    #
+    # Association: each slug belongs to exactly one subtask. For each
+    # subtask, every slug in its ``required_capabilities`` list uses the
+    # SAME subtask description as its auxiliary. On the fallback path
+    # (decomposition failed, ``state.subtasks`` is empty), every slug gets
+    # None as its auxiliary — the single-query behaviour is preserved.
+    #
+    # See ``docs/registry_retrieval_fix_plan.md`` for the empirical
+    # evidence, ranked options, and methodology notes.
+    slug_to_description: dict[str, str] = {}
+    for subtask in state.subtasks:
+        for slug in subtask.required_capabilities:
+            # First subtask that claims a slug wins if the decomposer
+            # happens to put the same slug under multiple subtasks — rare
+            # but possible. Same-slug-across-subtasks is a decomposition
+            # quality issue caught elsewhere.
+            slug_to_description.setdefault(slug, subtask.description)
+
+    auxiliary_queries: list[str | None] = [
+        slug_to_description.get(slug) for slug in state.required_capabilities
+    ]
+
     matches_raw, gaps_raw = registry.detect_gaps(
         state.required_capabilities,
+        auxiliary_queries=auxiliary_queries,
         domain=selected_domain,
         include_generic=True,
     )

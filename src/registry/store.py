@@ -345,6 +345,7 @@ class SkillRegistry:
         self,
         queries: list[str],
         *,
+        auxiliary_queries: list[str | None] | None = None,
         threshold: float = 0.6,
         domain: str | None = None,
         include_generic: bool = True,
@@ -352,7 +353,21 @@ class SkillRegistry:
         """For each query, search the registry and classify as match or gap.
 
         Args:
-            queries: Required-capability query strings.
+            queries: Required-capability query strings (typically short
+                hyphen-case slugs produced by the decomposer).
+            auxiliary_queries: Optional per-query auxiliary search strings
+                (typically the natural-language ``SubTask.description``
+                produced alongside each slug). When provided, ``detect_gaps``
+                runs TWO searches per gap — one on the primary slug, one on
+                the auxiliary description — and takes the MAX score for the
+                threshold check. Strictly additive: setting an auxiliary to
+                None or passing ``auxiliary_queries=None`` reproduces the
+                pre-fix single-query behaviour exactly. Use this to work
+                around the short-slug-vs-prose-document embedding asymmetry
+                where short slugs systematically fall below the 0.6
+                threshold against prose-style ``_build_document()`` output
+                even when semantically equivalent. See
+                ``docs/registry_retrieval_fix_plan.md`` Part A.
             threshold: Minimum similarity score to count as a match.
             domain: Optional domain filter threaded through to :meth:`search`.
                 When ``None`` (default) the search is unrestricted. See
@@ -363,16 +378,33 @@ class SkillRegistry:
                 Phase E rationale.
 
         Returns:
-            matches: list of (capability, score, original_query) above threshold
-            gaps: list of (query, reason) below threshold
+            matches: list of (capability, score, original_query) above threshold.
+                The score reflects whichever of primary/auxiliary won the
+                max comparison; ``original_query`` is always the primary
+                (slug) for attribution continuity with metrics and traces.
+            gaps: list of (query, reason) below threshold. The reason string
+                shows both primary and auxiliary scores for debugging.
         """
         matches: list[tuple[CapabilityDescriptor, float, str]] = []
         gaps: list[tuple[str, str]] = []
 
-        for query in queries:
-            # search() filters out is_active=False, so also query unfiltered
-            # to detect deactivated capabilities and produce accurate gap reasons.
-            results = self.search(
+        # Normalise auxiliary_queries to the same length as queries. None
+        # entries are treated as "no auxiliary — single-query behaviour".
+        if auxiliary_queries is None:
+            aux_list: list[str | None] = [None] * len(queries)
+        else:
+            if len(auxiliary_queries) != len(queries):
+                raise ValueError(
+                    f"auxiliary_queries length ({len(auxiliary_queries)}) "
+                    f"must match queries length ({len(queries)})"
+                )
+            aux_list = list(auxiliary_queries)
+
+        for query, auxiliary in zip(queries, aux_list):
+            # Primary search on the slug — search() filters out is_active=False,
+            # so also query unfiltered to detect deactivated capabilities and
+            # produce accurate gap reasons.
+            primary_results = self.search(
                 query, n_results=1, domain=domain, include_generic=include_generic
             )
             unfiltered = self.search(
@@ -382,21 +414,57 @@ class SkillRegistry:
                 domain=domain,
                 include_generic=include_generic,
             )
+            best_primary_score = primary_results[0][1] if primary_results else 0.0
+            best_primary_cap = primary_results[0][0] if primary_results else None
 
-            if results and results[0][1] >= threshold:
-                cap, score = results[0]
-                matches.append((cap, score, query))
+            # Auxiliary search on the description (if provided) — same filter
+            # semantics, independent search.
+            best_aux_score = 0.0
+            best_aux_cap: CapabilityDescriptor | None = None
+            if auxiliary and auxiliary.strip():
+                aux_results = self.search(
+                    auxiliary,
+                    n_results=1,
+                    domain=domain,
+                    include_generic=include_generic,
+                )
+                if aux_results:
+                    best_aux_cap, best_aux_score = aux_results[0]
+
+            # Take the max-scoring hit. On ties, primary wins (slug
+            # attribution preserved in the match tuple for metrics continuity).
+            if best_primary_score >= best_aux_score:
+                best_cap = best_primary_cap
+                best_score = best_primary_score
             else:
-                # Check whether a deactivated capability would have matched.
+                best_cap = best_aux_cap
+                best_score = best_aux_score
+
+            if best_cap is not None and best_score >= threshold:
+                matches.append((best_cap, best_score, query))
+            else:
+                # Check whether a deactivated capability would have matched on
+                # the primary (slug) query. The deactivated-check intentionally
+                # only considers the primary for consistency with existing
+                # behaviour — augmenting it with auxiliary searches for
+                # deactivated caps would add noise without changing outcomes.
                 if (
                     unfiltered
                     and unfiltered[0][1] >= threshold
                     and not unfiltered[0][0].is_active
                 ):
                     reason = f"capability '{unfiltered[0][0].name}' is deactivated"
+                elif auxiliary and auxiliary.strip():
+                    reason = (
+                        f"best score {best_score:.2f} below threshold "
+                        f"{threshold:.2f} (primary {best_primary_score:.2f}, "
+                        f"auxiliary {best_aux_score:.2f})"
+                    )
                 else:
-                    best_score = results[0][1] if results else 0.0
-                    reason = f"best score {best_score:.2f} below threshold {threshold:.2f}"
+                    reason = (
+                        f"best score {best_primary_score:.2f} below threshold "
+                        f"{threshold:.2f}"
+                    )
                 gaps.append((query, reason))
 
         return matches, gaps
