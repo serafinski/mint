@@ -129,6 +129,52 @@ task prompt asks for (e.g., if the task asks for ``row_count`` and \
 - For single-subtask decompositions, output_schema should list the final \
 output keys the task prompt requests.
 
+13. **Chain coherence — every consumed key must be produced upstream.** \
+This is the most load-bearing rule in this prompt for multi-step chains. \
+When a subtask's description mentions it consumes a value from \
+``upstream_data`` (e.g., *"Aggregates total spending per department from \
+upstream parsed data"*), that key MUST appear in the ``output_schema`` of \
+at least one of its transitive predecessors (walk the ``depends_on`` edges \
+recursively). Every key a subtask reads from ``upstream_data['...']`` must \
+be traceable back to an earlier subtask that produced it.
+
+Before returning your decomposition, mentally walk every subtask S with \
+``depends_on`` = [i, j, ...] and verify: for each ``upstream_data`` key \
+that S's description says it reads or aggregates from, check that the key \
+is present in the output_schema of subtask i or j (or any of their own \
+transitive predecessors). If any key S consumes is not produced by any \
+predecessor, the chain is **incoherent** and must be restructured — \
+either by adding a step that parses the missing input, or by rewriting S \
+to read the raw input file directly instead of expecting pre-parsed \
+upstream data.
+
+**Incoherent chains crash at execution time** with errors like \
+``upstream_data must include a 'transactions' key``. They pass \
+verification-tier checks on each subtask in isolation because each \
+generated artifact compiles and its schema is self-consistent — but the \
+chain as a whole is broken. The pipeline has no way to recover from this \
+at runtime; your job as the decomposer is to get it right at decomposition \
+time.
+
+**The canonical failure mode** (from a real test_mint run 2026-04-14) \
+is a CSV + TSV task where the decomposer produced:
+- Step 1: ``parse-csv-file`` → ``{'departments': [...]}`` — parses only \
+  the CSV
+- Step 2: ``parse-tsv-and-aggregate-by-department`` → expects \
+  ``upstream_data`` to contain both ``'departments'`` AND \
+  ``'transactions'``
+
+Nothing parsed the TSV file anywhere. Step 2 crashed. The correct \
+decomposition was 2 subtasks where step 1 parsed BOTH files in one pass \
+(``{'departments': [...], 'transactions': [...]}``), OR 3 subtasks where \
+step 1 parsed CSV, step 2 parsed TSV separately, and step 3 did the \
+aggregation over both. Either is coherent; the 3-subtask version above is \
+not because step 2 reads data it doesn't produce and no predecessor \
+produces.
+
+The single rule: **trace every upstream_data key back to its producer \
+before returning. If you can't find a producer, the chain is broken.**
+
 ## Output
 
 Return your decomposition via the structured output format. Every subtask must
@@ -265,4 +311,71 @@ CORRECT decomposition (1 subtask):
   "reasoning": "This is a single straightforward operation: read a file, extract two pieces of information, return them. Splitting into read+parse+format creates three tools to do one tool's job."
 }
 ```
+
+### Example 6 (chain coherence — incoherent vs coherent chain):
+Task: "Read the departments CSV and the transactions TSV (tab-separated). \
+Aggregate total spending per department. Return a dict with keys \
+'department_count' (int) and 'department_spending' (dict mapping department \
+name to total spending float)."
+
+WRONG decomposition (3 subtasks — incoherent chain, step 2 reads a key no \
+predecessor produces):
+```json
+{
+  "subtasks": [
+    {
+      "description": "Parses the departments CSV file and returns a dict with key 'departments' containing a list of {department, annual_budget} records.",
+      "required_capabilities": ["parse-csv-file"],
+      "depends_on": [],
+      "output_schema": {"departments": "list[dict] — each dict has 'department' (str) and 'annual_budget' (float)"}
+    },
+    {
+      "description": "Aggregates total spending per department from upstream parsed data. Expects upstream_data to include 'departments' (list of department dicts) and 'transactions' (list of transaction dicts). Returns {'department_spending': {department: total_spending}}.",
+      "required_capabilities": ["parse-tsv-and-aggregate-by-department"],
+      "depends_on": [0],
+      "output_schema": {"department_spending": "dict[str, float] — department name to total spending"}
+    },
+    {
+      "description": "Formats the final result dict.",
+      "required_capabilities": ["format-final-result-dict"],
+      "depends_on": [1],
+      "output_schema": {"department_count": "int", "department_spending": "dict[str, float]"}
+    }
+  ]
+}
+```
+This is WRONG because step 2's description says it *"expects upstream_data \
+to include 'departments' AND 'transactions'"*, but step 1's output_schema \
+only produces ``departments``. **No subtask anywhere parses the TSV file or \
+produces a ``transactions`` key.** Step 2 will crash at execution time with \
+``upstream_data must include a 'transactions' key``. Each individual \
+subtask passes verification in isolation, but the chain as a whole is \
+broken.
+
+CORRECT decomposition (2 subtasks — step 1 parses both files in one pass):
+```json
+{
+  "subtasks": [
+    {
+      "description": "Parses the departments CSV and the transactions TSV into structured records. Returns 'departments' (list of {department, annual_budget} dicts) and 'transactions' (list of {department, amount, ...} dicts).",
+      "required_capabilities": ["parse-departments-csv-and-transactions-tsv"],
+      "depends_on": [],
+      "output_schema": {"departments": "list[dict] — each dict has 'department' (str) and 'annual_budget' (float)", "transactions": "list[dict] — each dict has 'department' (str) and 'amount' (float)"}
+    },
+    {
+      "description": "Aggregates total spending per department by summing transactions.amount grouped by transactions.department. Consumes upstream_data['transactions']. Returns 'department_count' and 'department_spending'.",
+      "required_capabilities": ["aggregate-spending-by-department"],
+      "depends_on": [0],
+      "output_schema": {"department_count": "int — number of distinct departments", "department_spending": "dict[str, float] — department name to total spending"}
+    }
+  ],
+  "reasoning": "Two subtasks. Step 1 parses BOTH input files in one pass, producing both 'departments' and 'transactions' in its output_schema. Step 2 consumes 'transactions' from upstream_data — and that key IS produced by step 1's output_schema, so the chain is coherent. The task has no intermediate stage that requires the two parses to be separate, so keeping them together is simpler and correct."
+}
+```
+
+The same task could also be decomposed into 3 coherent subtasks (step 1 \
+parses CSV, step 2 parses TSV, step 3 aggregates) — that's also fine \
+because every key step 3 consumes is produced by step 1 or step 2. The \
+rule isn't "minimise subtask count"; the rule is **"every consumed key \
+must have a producer upstream"**.
 """
