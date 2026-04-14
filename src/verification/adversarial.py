@@ -130,12 +130,13 @@ conversion, date formatting, math operations):
 - If the tool's domain is not deterministically verifiable, note that and skip.
 
 ## Instructions
-1. Use `write_todos` to plan your attack approach.
+1. Execute the three attack patterns above directly. Do NOT use `write_todos` \
+— your plan is already fixed and listed in this prompt. Skip any planning \
+ceremony and jump straight to running `sandbox_execute` for each attack.
 2. Read the tool source code carefully before probing.
 3. For each attack pattern, write a Python snippet that imports/executes the \
 tool and checks the behavior. Pass it to `sandbox_execute`.
-4. Write intermediate analysis to files to manage context.
-5. Return your structured findings via the response format.
+4. Return your structured findings via the response format.
 
 ## Important
 - The tool source code will be provided in the user message.
@@ -144,6 +145,23 @@ your snippet (the sandbox is ephemeral and has no pre-installed tools).
 - If the tool source contains ``if __name__ == "__main__":`` (e.g., ``mcp.run()``), \
 prepend ``__name__ = "not_main"`` before the inlined source so the server loop \
 does not start and block execution.
+- **Sandbox filesystem is NOT shared with your workspace.** Your `write_file`, \
+`read_file`, and `ls` tools operate on an in-memory agent workspace. The \
+Docker sandbox inside `sandbox_execute` has its own ephemeral filesystem that \
+does NOT share state with your workspace. A file you `write_file` is NOT \
+visible inside a later `sandbox_execute` call, and a file the sandbox writes \
+is NOT readable via `read_file`. Consequence: **keep every test \
+self-contained within a single `sandbox_execute` call** — inline the tool \
+source, run the test, and `print()` the results to stdout. Parse stdout in \
+your next reasoning step. Never attempt to pass data between the sandbox and \
+the agent workspace via files.
+- Do NOT call `ls`, `read_file`, or `write_file` for filesystem discovery. \
+The agent workspace starts empty and the Docker sandbox is ephemeral — there \
+is nothing to explore.
+- If you write intermediate files inside a `sandbox_execute` call (e.g. for \
+your own organisation within that single snippet), use `/tmp/` as the target \
+directory. Other paths may be read-only or outside the sandbox's writable \
+area.
 - Be thorough but efficient — you have limited steps.
 - Mark non-applicable attack patterns as not suspicious with a note.
 """
@@ -155,7 +173,19 @@ does not start and block execution.
 
 
 def _create_adversarial_agent():
-    """Create a fresh adversarial DeepAgent for each invocation."""
+    """Create a fresh adversarial DeepAgent for each invocation.
+
+    ``reasoning_effort="low"`` is set on the model: the three attack patterns
+    are fixed in both the system prompt and the ``AdversarialFinding.attack_pattern``
+    schema (the LLM cannot invent new attack names and have them pass structured-
+    output validation), so reasoning mode at default effort burns tokens on
+    planning ceremony rather than producing novel attacks. ``"low"`` preserves
+    the reasoning that genuinely helps when writing the Python test snippets
+    inside each ``sandbox_execute`` call, while dropping the ~2k reasoning
+    tokens per call that were restating the system prompt back at itself.
+    Drops typical probe latency ~120-230s → ~40-90s.
+    See docs/perf_fixes_2026_04_14.md §2c-1.
+    """
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
 
@@ -164,7 +194,7 @@ def _create_adversarial_agent():
     from src.config import DEFAULT_LLM_MODEL
 
     return create_deep_agent(
-        model=init_chat_model(DEFAULT_LLM_MODEL),
+        model=init_chat_model(DEFAULT_LLM_MODEL, reasoning_effort="low"),
         tools=[sandbox_execute],
         system_prompt=ADVERSARIAL_SYSTEM_PROMPT,
         response_format=AdversarialFindings,
@@ -246,6 +276,87 @@ def _error_report(capability_name: str, error: str) -> VerificationReport:
 # ---------------------------------------------------------------------------
 
 
+def _skip_report(capability_name: str, reason: str) -> VerificationReport:
+    """Return an INFO-severity skip report for Tier 3.
+
+    Used when the artifact has no probe-able executable content. The skip is
+    fail-open (``overall_passed=True``) because absence of Python to probe is
+    not itself evidence of deceptive behavior — Tier 1 and Tier 2 are still
+    responsible for catching prose-level issues.
+    """
+    return VerificationReport(
+        capability_name=capability_name,
+        findings=[
+            VerificationFinding(
+                tier=3,
+                category="adversarial_skip",
+                severity=Severity.INFO,
+                message=reason,
+            )
+        ],
+        overall_passed=True,
+        tier_reached=3,
+    )
+
+
+def _extract_probe_source(artifact: GeneratedArtifact) -> str | None:
+    """Return the Python source to feed to the adversarial agent.
+
+    Dispatch by capability type so Tier 3 probes the same executable surface
+    that Tier 1's layered static scanner already targets. See
+    ``src/verification/gate.py::_extract_python_fences`` for the reused
+    extractor, and docs/perf_fixes_2026_04_14.md §2c-3 for the completeness
+    rationale — pre-fix, AGENT Tier 3 unconditionally hit the empty-source
+    skip path because ``artifact.source_code`` and ``artifact.skill_content``
+    are both empty for AGENTs.
+
+    Returns:
+        * For MCP_TOOL: ``artifact.source_code`` (unchanged pre-fix behavior).
+        * For SKILL: concatenated ```python fences extracted from
+          ``skill_content``, or ``None`` if no fences exist (pure-prose skill).
+        * For AGENT: concatenated ```python fences extracted from
+          ``agent_config["system_prompt"]`` and ``agent_config["skill_content"]``,
+          or ``None`` if no fences exist in either.
+        * For any unknown type: fall back to the legacy
+          ``source_code or skill_content`` union so the behavior is strictly
+          additive.
+
+    ``None`` means "no Python to probe — Tier 3 should skip with an honest
+    explanation of why". The caller turns that into a ``_skip_report``.
+    """
+    from src.schemas.capability import CapabilityType
+    from src.verification.gate import _extract_python_fences
+
+    cap_type = artifact.capability_type
+
+    if cap_type == CapabilityType.MCP_TOOL:
+        src = artifact.source_code or ""
+        return src if src.strip() else None
+
+    if cap_type == CapabilityType.SKILL:
+        fences = _extract_python_fences(artifact.skill_content or "")
+        if not fences:
+            return None
+        return "\n\n# --- fence separator ---\n\n".join(fences)
+
+    if cap_type == CapabilityType.AGENT:
+        config = artifact.agent_config or {}
+        fences: list[str] = []
+        system_prompt = config.get("system_prompt")
+        if isinstance(system_prompt, str):
+            fences.extend(_extract_python_fences(system_prompt))
+        skill_content = config.get("skill_content")
+        if isinstance(skill_content, str):
+            fences.extend(_extract_python_fences(skill_content))
+        if not fences:
+            return None
+        return "\n\n# --- fence separator ---\n\n".join(fences)
+
+    # Unknown capability type: strictly additive fallback to legacy behavior.
+    legacy = artifact.source_code or artifact.skill_content or ""
+    return legacy if legacy.strip() else None
+
+
 def probe(artifact: GeneratedArtifact) -> VerificationReport:
     """Run the adversarial DeepAgent on a generated artifact.
 
@@ -253,22 +364,30 @@ def probe(artifact: GeneratedArtifact) -> VerificationReport:
     Never raises -- timeout and recursion failures return a partial report.
     """
     capability_name = artifact.capability_name
-    source_code = artifact.source_code or artifact.skill_content or ""
+    source_code = _extract_probe_source(artifact)
 
-    if not source_code.strip():
-        return VerificationReport(
-            capability_name=capability_name,
-            findings=[
-                VerificationFinding(
-                    tier=3,
-                    category="adversarial_skip",
-                    severity=Severity.INFO,
-                    message="No source code to probe.",
-                )
-            ],
-            overall_passed=True,
-            tier_reached=3,
-        )
+    if source_code is None or not source_code.strip():
+        # Dispatch a type-aware skip message so post-mortem inspection can
+        # distinguish "AGENT with no Python fences" from "MCP_TOOL with empty
+        # source_code" from "SKILL with pure-prose content". Pre-fix this
+        # was a single opaque "No source code to probe." message; the new
+        # form makes the verification completeness story visible in
+        # verification.json.
+        from src.schemas.capability import CapabilityType
+        if artifact.capability_type == CapabilityType.SKILL:
+            reason = (
+                "No executable Python in skill_content — skill is pure prose. "
+                "Tier 3 not applicable; rely on Tier 1 prose checks."
+            )
+        elif artifact.capability_type == CapabilityType.AGENT:
+            reason = (
+                "No executable Python in agent_config.system_prompt or "
+                "agent_config.skill_content — agent is prose-configured. "
+                "Tier 3 not applicable; rely on Tier 1 prose checks."
+            )
+        else:
+            reason = "No source code to probe."
+        return _skip_report(capability_name, reason)
 
     try:
         agent = _create_adversarial_agent()

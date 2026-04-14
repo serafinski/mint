@@ -258,17 +258,145 @@ class TestProbe:
         assert report.tier_reached == 3
         assert report.findings[0].category == "adversarial_skip"
 
-    def test_none_source_code_with_skill_content(self):
+    # ------------------------------------------------------------------
+    # Fence-extraction dispatch (Fix 2c-3)
+    # ------------------------------------------------------------------
+    # These tests verify the new type-aware source extraction that routes
+    # SKILL/AGENT artifacts through ``_extract_python_fences`` instead of
+    # feeding raw markdown prose to the adversarial agent. See
+    # docs/perf_fixes_2026_04_14.md §2c-3 for the completeness rationale —
+    # pre-fix, AGENT Tier 3 always skipped unconditionally because
+    # ``artifact.source_code or artifact.skill_content`` is empty for AGENTs.
+
+    def test_skill_with_python_fence_probes(self):
+        """SKILL whose skill_content has a ```python fence is probed."""
+        skill_body = (
+            "---\nname: my-skill\ndescription: does stuff\n---\n"
+            "# My Skill\n\n"
+            "Do this computation:\n\n"
+            "```python\n"
+            "def compute(x: int) -> int:\n    return x * 2\n"
+            "```\n"
+        )
         artifact = GeneratedArtifact(
             capability_name="my-skill",
             capability_type=CapabilityType.SKILL,
-            skill_content="---\nname: my-skill\ndescription: does stuff\n---\n# My Skill",
+            skill_content=skill_body,
         )
-        # This should attempt to probe (not skip) since skill_content is present
         with patch("src.verification.adversarial._create_adversarial_agent") as mock_create:
             mock_create.return_value = _mock_agent_invoke(_clean_findings())
             report = probe(artifact)
+        # Agent was created and invoked — no skip.
+        mock_create.assert_called_once()
         assert report.tier_reached == 3
+        # Should not be an adversarial_skip — real probe happened.
+        assert not any(
+            f.category == "adversarial_skip" for f in report.findings
+        )
+
+    def test_skill_pure_prose_skips_with_specific_message(self):
+        """SKILL with no Python fences skips Tier 3 with SKILL-specific message."""
+        artifact = GeneratedArtifact(
+            capability_name="prose-skill",
+            capability_type=CapabilityType.SKILL,
+            skill_content="---\nname: prose-skill\ndescription: pure prose\n---\n# Prose Only",
+        )
+        with patch("src.verification.adversarial._create_adversarial_agent") as mock_create:
+            report = probe(artifact)
+        # Agent must NOT be created for a pure-prose skill.
+        mock_create.assert_not_called()
+        assert report.tier_reached == 3
+        assert report.overall_passed is True
+        assert report.findings[0].category == "adversarial_skip"
+        assert "skill_content" in report.findings[0].message.lower() or \
+               "pure prose" in report.findings[0].message.lower()
+
+    def test_agent_with_python_fence_in_system_prompt_probes(self):
+        """AGENT whose agent_config.system_prompt has a ```python fence is probed.
+
+        This is the critical completeness-fix test: pre-fix, every AGENT hit
+        the unconditional skip path because the probe function only looked at
+        ``artifact.source_code`` and ``artifact.skill_content``, which are
+        empty for AGENTs. Post-fix, probe() extracts Python fences from
+        ``agent_config.system_prompt`` (and ``agent_config.skill_content``)
+        and feeds them to the adversarial agent.
+        """
+        agent_config = {
+            "system_prompt": (
+                "You are a math agent. Use this helper:\n\n"
+                "```python\n"
+                "def fib(n: int) -> int:\n"
+                "    a, b = 0, 1\n"
+                "    for _ in range(n):\n        a, b = b, a + b\n"
+                "    return a\n"
+                "```\n"
+            ),
+            "subagents": [],
+        }
+        artifact = GeneratedArtifact(
+            capability_name="math-agent",
+            capability_type=CapabilityType.AGENT,
+            agent_config=agent_config,
+        )
+        with patch("src.verification.adversarial._create_adversarial_agent") as mock_create:
+            mock_create.return_value = _mock_agent_invoke(_clean_findings())
+            report = probe(artifact)
+        mock_create.assert_called_once()
+        assert report.tier_reached == 3
+        assert not any(
+            f.category == "adversarial_skip" for f in report.findings
+        )
+
+    def test_agent_with_python_fence_in_skill_content_probes(self):
+        """AGENT fences can also live under ``agent_config.skill_content``."""
+        agent_config = {
+            "system_prompt": "You are a domain expert. Follow the skill below.",
+            "skill_content": (
+                "---\nname: x\ndescription: y\n---\n"
+                "```python\nvalue = 42\n```\n"
+            ),
+            "subagents": [],
+        }
+        artifact = GeneratedArtifact(
+            capability_name="skill-agent",
+            capability_type=CapabilityType.AGENT,
+            agent_config=agent_config,
+        )
+        with patch("src.verification.adversarial._create_adversarial_agent") as mock_create:
+            mock_create.return_value = _mock_agent_invoke(_clean_findings())
+            report = probe(artifact)
+        mock_create.assert_called_once()
+        assert report.tier_reached == 3
+        assert not any(
+            f.category == "adversarial_skip" for f in report.findings
+        )
+
+    def test_agent_without_python_fences_skips_with_specific_message(self):
+        """AGENT with no Python fences anywhere skips with AGENT-specific message.
+
+        This is the honest reporting of what pre-fix was silently happening on
+        every AGENT — but now the skip message explains WHY, and it only fires
+        when the agent_config genuinely has no executable Python content.
+        """
+        agent_config = {
+            "system_prompt": "You are a plain prose agent. No code here.",
+            "skill_content": "---\nname: x\n---\n# Prose\n\nNo fences.",
+            "subagents": [],
+        }
+        artifact = GeneratedArtifact(
+            capability_name="prose-agent",
+            capability_type=CapabilityType.AGENT,
+            agent_config=agent_config,
+        )
+        with patch("src.verification.adversarial._create_adversarial_agent") as mock_create:
+            report = probe(artifact)
+        mock_create.assert_not_called()
+        assert report.tier_reached == 3
+        assert report.overall_passed is True
+        assert report.findings[0].category == "adversarial_skip"
+        # The skip message must mention agent_config so post-mortem can tell
+        # this apart from a SKILL skip or an MCP_TOOL empty-source skip.
+        assert "agent_config" in report.findings[0].message.lower()
 
     @patch("src.verification.adversarial._create_adversarial_agent")
     def test_agent_creation_failure(self, mock_create):
