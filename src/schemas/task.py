@@ -48,6 +48,19 @@ class SubTaskItem(BaseModel):
             "input contract. Example: {'inventory': 'list[dict] with product records'}"
         ),
     )
+    requires_upstream_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Top-level keys this subtask consumes from ``upstream_data`` at "
+            "runtime. Each key here MUST appear in the ``output_schema`` of a "
+            "transitive predecessor (direct or indirect via ``depends_on``). "
+            "This is the structured contract used by the chain-coherence check "
+            "— list ONLY top-level keys, not nested fields. For example, if "
+            "this subtask reads ``upstream_data['rules']['min_days_of_stock']``, "
+            "list 'rules', NOT 'min_days_of_stock'. Root subtasks (no "
+            "``depends_on``) leave this empty."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -79,6 +92,14 @@ class SubTask(BaseModel):
         description=(
             "Keys this step MUST include in its output dict, mapped to type "
             "descriptions. Downstream steps use these exact key names."
+        ),
+    )
+    requires_upstream_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Top-level keys this subtask consumes from ``upstream_data`` at "
+            "runtime. Each key MUST appear in the ``output_schema`` of a "
+            "transitive predecessor. Top-level keys only — not nested fields."
         ),
     )
     status: TaskStatus = Field(

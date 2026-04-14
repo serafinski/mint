@@ -1575,12 +1575,11 @@ def execute_task(
                     node_visit_count[node_name] = node_visit_count.get(node_name, 0) + 1
 
                     # On retry, allow nodes to be re-printed by removing
-                    # them from printed_nodes, and reset the timing baseline
-                    # so the retried node's elapsed time is accurate.
+                    # them from printed_nodes. Do NOT reset _prev_event_time —
+                    # the delta from the previous event (the failed
+                    # verification) is exactly the retried node's wall time.
                     if node_visit_count[node_name] > 1:
                         printed_nodes.discard(node_name)
-                        _prev_event_time = event_time
-                        stage_start = event_time
 
                     # Capture timing for this node IMMEDIATELY — even if
                     # printing is deferred (generator nodes). This is the

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import re
 from typing import Literal
 
 from deepagents import create_deep_agent
@@ -81,128 +80,36 @@ def _get_agent():
 # Chain coherence validation (Phase 2 Step 14 — decomposition coherence check)
 # ---------------------------------------------------------------------------
 #
-# The 2026-04-14 19:01 test_mint run surfaced a class of decomposition failures
-# where the decomposer produces a DAG of subtasks that is internally
-# incoherent: a downstream subtask's description declares it reads a key from
-# ``upstream_data['...']`` that no transitive predecessor produces in its
-# ``output_schema``. Each subtask passes verification in isolation, but the
-# chain crashes at execution time with errors like
-# ``upstream_data must include a 'transactions' key``.
+# The decomposer can produce a DAG of subtasks that is internally incoherent:
+# a downstream subtask claims to consume an ``upstream_data`` key that no
+# transitive predecessor produces in its ``output_schema``. Each subtask
+# passes verification in isolation, but the chain crashes at execution time
+# with errors like ``upstream_data must include a 'transactions' key``.
 #
-# The canonical failure mode (T14 TSV task, 2026-04-14):
+# The canonical failure (T14 TSV task):
 #   Step 1 ``parse-csv-file`` → output_schema={'departments': ...}
-#   Step 2 ``parse-tsv-and-aggregate-by-department`` with depends_on=[0],
-#          description says it consumes upstream_data['departments'] AND
-#          upstream_data['transactions']. Step 1 produces 'departments' but
-#          nothing produces 'transactions'. Chain crashes.
+#   Step 2 ``aggregate-by-department`` with depends_on=[0],
+#          requires_upstream_keys=['departments', 'transactions'].
+#          Step 1 produces 'departments' but nothing produces 'transactions'.
 #
-# This helper walks the subtask DAG, collects transitive upstream output_schema
-# keys per subtask, and flags any subtask whose description references an
-# ``upstream_data['...']``-style key that no predecessor produces.
+# Implementation: **structured contract**, not prose parsing. The subtask
+# schema carries an explicit ``requires_upstream_keys: list[str]`` field.
+# The decomposer fills it in; validation is a set comparison against the
+# union of transitive predecessors' ``output_schema`` keys. No regex, no
+# natural-language heuristics.
 #
-# Design choice: pattern-match on the subtask description rather than adding a
-# new ``requires_upstream_keys`` field to ``SubTaskItem``. Reason: adding a
-# schema field doubles the decomposer's structured-output surface (another
-# thing the LLM must populate correctly) without eliminating the source of
-# error (the description and the field could still disagree). Description-
-# based pattern matching catches the failure mode we actually observed in
-# production traces (generators that were written to expect pre-parsed
-# upstream data) without changing the decomposer's output contract.
+# This aligns with the "Structured State Communication" section of the
+# thesis proposal (docs/thesis_proposal.md): typed contracts over lossy
+# natural-language parsing. An earlier version of this check parsed
+# subtask descriptions for ``upstream_data['key']`` patterns, which
+# false-positived on nested accesses (T04 inventory, 2026-04-14) and was
+# fundamentally brittle — the LLM could defeat the check by rephrasing
+# the same dependency in prose. The structured field removes that failure
+# mode entirely.
 #
-# This is a fail-open check: validation failures append to ``state.errors``
-# and set ``decomposition_succeeded=False`` via the Fix 2b sticky-flag
-# infrastructure, but the pipeline continues with the (incoherent) subtasks
-# because the downstream nodes already handle partial failure gracefully and
-# we don't want to throw away work that might still produce a partial result.
-# The user-facing CLI display at ``runner.execute_task`` will show the yellow
-# decomposition-failure warning, the eval harness will classify the run as
-# a failure, and the error list will include the coherence violation so
-# post-mortem inspection is possible.
-#
-# See docs/perf_fixes_2026_04_14.md §4.5 for the original 19:01 TSV failure
-# trace and docs/MASTER_PLAN_2026_04_13.md Phase 2 Step 14 for the full plan.
-
-
-# Pattern to extract quoted identifiers from subtask descriptions that look
-# like ``upstream_data`` key references. Examples it matches:
-#
-#   upstream_data['transactions']
-#   upstream_data["transactions"]
-#   upstream_data.get('transactions')
-#   "'transactions' (list of transaction dicts)"     — quoted key phrase
-#
-# The regex is intentionally narrow: it looks for either a literal
-# ``upstream_data[...]``-style reference OR a quoted short identifier that
-# appears in an "upstream"/"expects"/"consumes"/"from upstream" clause in the
-# description. This avoids false positives on quoted phrases that happen to
-# contain a word but aren't key references (e.g. documentation strings that
-# quote an example value).
-_UPSTREAM_DATA_ACCESS_RE = re.compile(
-    r"""
-    upstream_data           # literal prefix
-    (?:
-        \s*\[\s*['"](?P<bracket_key>[a-zA-Z_][a-zA-Z0-9_]*)['"]\s*\]  # [...]
-      | \.get\(\s*['"](?P<get_key>[a-zA-Z_][a-zA-Z0-9_]*)['"]        # .get(...)
-      | \[\s*(?P<raw_key>[a-zA-Z_][a-zA-Z0-9_]*)\s*\]                # [bare]
-    )
-    """,
-    re.VERBOSE,
-)
-
-# Pattern to find the START of an "upstream"-anchored clause. When we find
-# one, we extract the text from that position to the next sentence-ending
-# period (or end of string) and scan it for quoted identifiers. This is
-# simpler and more robust than a single monolithic regex.
-_UPSTREAM_ANCHOR_RE = re.compile(
-    r"(?:upstream_data|upstream\s+data|from\s+upstream)",
-    re.IGNORECASE,
-)
-
-# Extract individual quoted identifiers (single or double quoted) from a
-# text fragment. The identifier must look like a Python variable name.
-_QUOTED_IDENT_RE = re.compile(r"""['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]""")
-
-
-def _extract_upstream_key_references(description: str) -> set[str]:
-    """Return the set of upstream_data key names referenced in a description.
-
-    Conservative extraction — only keys that are clearly upstream_data
-    references (via ``upstream_data[...]``, ``upstream_data.get(...)``, or
-    quoted identifiers inside an "upstream"-anchored clause). Avoids false
-    positives on quoted values that happen to look like identifiers but
-    aren't key references.
-
-    Strategy:
-    1. Find direct ``upstream_data[...]`` / ``.get(...)`` style accesses via
-       the code-style regex (handles explicit code-fragment references).
-    2. Find every "upstream"-anchored clause in the description text, extract
-       the clause body up to the next period, and scan each clause for
-       single-word quoted identifiers. This catches natural-language
-       descriptions like *"Expects upstream_data to include 'departments'
-       and 'transactions'"*.
-    """
-    keys: set[str] = set()
-
-    # Direct upstream_data[...] / .get(...) references — unambiguous code fragments.
-    for match in _UPSTREAM_DATA_ACCESS_RE.finditer(description):
-        for group_name in ("bracket_key", "get_key", "raw_key"):
-            key = match.group(group_name)
-            if key:
-                keys.add(key)
-                break
-
-    # Quoted identifiers in upstream-anchored clauses. For each anchor match,
-    # take the substring from the anchor to the next period (end-of-sentence)
-    # or end-of-string, and extract all quoted identifiers from that window.
-    for anchor_match in _UPSTREAM_ANCHOR_RE.finditer(description):
-        clause_start = anchor_match.start()
-        next_period = description.find(".", clause_start)
-        clause_end = next_period if next_period != -1 else len(description)
-        clause_body = description[clause_start:clause_end]
-        for ident_match in _QUOTED_IDENT_RE.finditer(clause_body):
-            keys.add(ident_match.group(1))
-
-    return keys
+# Fail-open semantics: validation failures append to ``state.errors`` and
+# set ``decomposition_succeeded=False`` (Fix 2b sticky flag), but the
+# pipeline continues so downstream nodes can produce partial results.
 
 
 def _collect_transitive_upstream_keys(
@@ -241,46 +148,12 @@ def _collect_transitive_upstream_keys(
 def _validate_chain_coherence(subtasks: list[SubTask]) -> list[str]:
     """Return a list of coherence violation messages for the subtask DAG.
 
-    Empty list means the chain is coherent — every key any downstream subtask
-    references via an ``upstream_data``-style pattern in its description is
-    produced by a transitive predecessor's ``output_schema``.
+    For each subtask, every key listed in ``requires_upstream_keys`` must
+    appear in the ``output_schema`` of at least one transitive predecessor
+    (walked via ``depends_on``). Empty list means the chain is coherent.
 
-    Non-empty list means at least one subtask references a key no predecessor
-    produces. Each message describes one violation with the subtask index,
-    the missing key, and the transitive-predecessor output_schema keys that
-    WERE available (for diagnostic clarity).
-
-    Single-subtask chains and subtasks with no ``depends_on`` are trivially
-    coherent — the check returns early.
-
-    **False-positive prevention — subtract own output_schema keys.** The
-    regex in :func:`_extract_upstream_key_references` can't distinguish
-    natural-language mentions of an "upstream" input from mentions of the
-    subtask's own output in descriptions where both live in the same
-    sentence. For example, a subtask description like *"Aggregate
-    upstream_data['transactions'] by department. Return a dict with
-    'department_count' and 'department_spending'."* causes the regex to
-    extract ``department_count`` and ``department_spending`` as supposed
-    upstream references, but they're clearly the subtask's own outputs.
-
-    Fix: before comparing against transitive-predecessor availability,
-    subtract the subtask's own ``output_schema`` keys from the referenced
-    set. Any key that appears in the subtask's own outputs is an output,
-    not an input — regardless of what the description text says near any
-    anchor word. This eliminates false positives on the aggregation /
-    final-step pattern surfaced by the 2026-04-14 20:52 test_mint run
-    (Excel SKILL + TSV MCP_TOOL tests both ran correctly end-to-end but
-    were flagged by the pre-fix validator).
-
-    **Known edge case: hallucinated pass-through.** If a subtask declares
-    a key in its own output_schema AND references it as an upstream input
-    in its description, AND no predecessor actually produces it, the
-    subtract-own-outputs fix skips the check and misses the violation.
-    Accepted trade — the false-positive case was blocking every run
-    with a multi-step aggregation, while this false negative requires a
-    specific hallucination pattern (declaring pass-through without an
-    upstream source) that the decomposer would have to invent from
-    scratch. See docs/perf_fixes_2026_04_14.md §4.7 for the full writeup.
+    Single-subtask chains and subtasks with empty ``requires_upstream_keys``
+    are trivially coherent — the check returns early.
     """
     violations: list[str] = []
 
@@ -288,43 +161,31 @@ def _validate_chain_coherence(subtasks: list[SubTask]) -> list[str]:
         return violations
 
     for i, subtask in enumerate(subtasks):
+        required = list(subtask.requires_upstream_keys)
+        if not required:
+            continue
+
         if not subtask.depends_on:
-            # Root subtask — no upstream to check against. Any upstream_data
-            # references in the description are nonsensical but not caught
-            # here; the generator for this subtask will either produce code
-            # that ignores the bogus reference or fail at generation time.
-            continue
-
-        referenced_keys = _extract_upstream_key_references(subtask.description)
-        if not referenced_keys:
-            # Subtask doesn't obviously reference upstream keys in its
-            # description. Nothing to check.
-            continue
-
-        # Subtract the subtask's own output_schema keys — they're outputs,
-        # not inputs, even if mentioned near upstream anchor words in the
-        # description text. See docstring for rationale and the edge case
-        # this accepts.
-        own_output_keys = set(subtask.output_schema.keys())
-        referenced_keys = referenced_keys - own_output_keys
-
-        if not referenced_keys:
-            # After subtracting own outputs, nothing left to check. The
-            # description's quoted identifiers were all about the subtask's
-            # own outputs, not about upstream consumption.
+            # Root subtask with upstream requirements is inherently broken:
+            # nothing runs before it, so no output_schema could satisfy the
+            # requirement. Flag it explicitly rather than silently ignoring.
+            cap = subtask.required_capabilities[0] if subtask.required_capabilities else "?"
+            violations.append(
+                f"Subtask {i} ({cap}) has no depends_on but declares "
+                f"requires_upstream_keys={sorted(required)}. Root subtasks "
+                f"must not require upstream keys."
+            )
             continue
 
         available_keys = _collect_transitive_upstream_keys(subtasks, i)
-        missing = referenced_keys - available_keys
+        missing = set(required) - available_keys
 
         if missing:
-            missing_list = sorted(missing)
-            available_list = sorted(available_keys)
+            cap = subtask.required_capabilities[0] if subtask.required_capabilities else "?"
             violations.append(
-                f"Subtask {i} ({subtask.required_capabilities[0] if subtask.required_capabilities else '?'}) "
-                f"references upstream_data key(s) {missing_list} in its description, "
+                f"Subtask {i} ({cap}) requires upstream key(s) {sorted(missing)}, "
                 f"but no transitive predecessor's output_schema produces them. "
-                f"Available upstream keys from predecessors: {available_list}. "
+                f"Available upstream keys from predecessors: {sorted(available_keys)}. "
                 f"This chain is incoherent and will crash at execution time."
             )
 
@@ -407,6 +268,7 @@ def decomposition_node(
                         required_capabilities=item.required_capabilities,
                         depends_on=item.depends_on,
                         output_schema=item.output_schema,
+                        requires_upstream_keys=item.requires_upstream_keys,
                     )
                 )
                 required_caps.extend(item.required_capabilities)

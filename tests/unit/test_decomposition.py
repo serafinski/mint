@@ -419,60 +419,6 @@ class TestCircuitBreaker:
 # docs/MASTER_PLAN_2026_04_13.md Phase 2 Step 14.
 
 
-class TestExtractUpstreamKeyReferences:
-    """Unit tests for the description → upstream-key extraction helper."""
-
-    def test_bracket_access_extracted(self):
-        from src.orchestrator.decomposition import _extract_upstream_key_references
-
-        desc = "Aggregates upstream_data['transactions'] by department."
-        assert _extract_upstream_key_references(desc) == {"transactions"}
-
-    def test_get_access_extracted(self):
-        from src.orchestrator.decomposition import _extract_upstream_key_references
-
-        desc = "Reads upstream_data.get('departments') from the previous step."
-        assert _extract_upstream_key_references(desc) == {"departments"}
-
-    def test_double_quote_variant_extracted(self):
-        from src.orchestrator.decomposition import _extract_upstream_key_references
-
-        desc = 'Consumes upstream_data["sales"] for region grouping.'
-        assert _extract_upstream_key_references(desc) == {"sales"}
-
-    def test_quoted_keys_in_upstream_clause_extracted(self):
-        """Natural-language descriptions with quoted keys in upstream clauses."""
-        from src.orchestrator.decomposition import _extract_upstream_key_references
-
-        desc = (
-            "Aggregates total spending per department from upstream parsed data. "
-            "Expects upstream_data to include 'departments' (list of department "
-            "dicts) and 'transactions' (list of transaction dicts)."
-        )
-        keys = _extract_upstream_key_references(desc)
-        assert "departments" in keys
-        assert "transactions" in keys
-
-    def test_no_upstream_reference_returns_empty(self):
-        from src.orchestrator.decomposition import _extract_upstream_key_references
-
-        desc = "Parses the departments CSV and returns a list of records."
-        assert _extract_upstream_key_references(desc) == set()
-
-    def test_random_quoted_word_not_flagged(self):
-        """Quoted words outside upstream-anchored clauses should not be flagged."""
-        from src.orchestrator.decomposition import _extract_upstream_key_references
-
-        desc = (
-            "Parses the CSV and returns a dict with 'row_count' and "
-            "'column_names' as the output keys."
-        )
-        # 'row_count' and 'column_names' are OUTPUT keys, not upstream keys.
-        # They should not be extracted because the sentence has no upstream
-        # anchor phrase.
-        assert _extract_upstream_key_references(desc) == set()
-
-
 class TestCollectTransitiveUpstreamKeys:
     """Unit tests for the DAG walker that collects transitive predecessor keys."""
 
@@ -606,6 +552,7 @@ class TestValidateChainCoherence:
         assert _validate_chain_coherence(subtasks) == []
 
     def test_coherent_two_step_chain(self):
+        """Step 1 produces 'rows'; step 2 declares it requires 'rows'."""
         from src.orchestrator.decomposition import _validate_chain_coherence
 
         subtasks = [
@@ -616,41 +563,39 @@ class TestValidateChainCoherence:
                 output_schema={"rows": "list[dict]"},
             ),
             SubTask(
-                description="Aggregate upstream_data['rows'] by category.",
+                description="Aggregate the upstream rows by category.",
                 required_capabilities=["aggregate"],
                 depends_on=[0],
                 output_schema={"aggregated": "dict"},
+                requires_upstream_keys=["rows"],
             ),
         ]
         assert _validate_chain_coherence(subtasks) == []
 
     def test_t14_tsv_incoherent_chain_is_flagged(self):
-        """The exact failure pattern from the 2026-04-14 19:01 TSV run."""
+        """T14 TSV pattern: subtask 1 declares 'transactions' but no predecessor produces it."""
         from src.orchestrator.decomposition import _validate_chain_coherence
 
         subtasks = [
             SubTask(
-                description="Parses the departments CSV file and returns a dict with key 'departments'.",
+                description="Parse the departments CSV.",
                 required_capabilities=["parse-csv-file"],
                 depends_on=[],
                 output_schema={"departments": "list[dict]"},
             ),
             SubTask(
-                description=(
-                    "Aggregates total spending per department from upstream parsed data. "
-                    "Expects upstream_data to include 'departments' (list of department dicts) "
-                    "and 'transactions' (list of transaction dicts). "
-                    "Returns {'department_spending': {department: total_spending}}."
-                ),
+                description="Aggregate spending per department.",
                 required_capabilities=["parse-tsv-and-aggregate-by-department"],
                 depends_on=[0],
                 output_schema={"department_spending": "dict[str, float]"},
+                requires_upstream_keys=["departments", "transactions"],
             ),
             SubTask(
-                description="Formats the final result dict.",
+                description="Format the final result dict.",
                 required_capabilities=["format-final-result-dict"],
                 depends_on=[1],
                 output_schema={"department_count": "int", "department_spending": "dict[str, float]"},
+                requires_upstream_keys=["department_spending"],
             ),
         ]
         violations = _validate_chain_coherence(subtasks)
@@ -660,7 +605,7 @@ class TestValidateChainCoherence:
         assert "parse-tsv-and-aggregate-by-department" in violations[0]
 
     def test_transitive_coherent_chain_passes(self):
-        """Step 3 references a key produced by step 1 (grandparent via step 2)."""
+        """Step 3 declares a requirement produced by step 1 (grandparent via step 2)."""
         from src.orchestrator.decomposition import _validate_chain_coherence
 
         subtasks = [
@@ -675,19 +620,22 @@ class TestValidateChainCoherence:
                 required_capabilities=["normalize"],
                 depends_on=[0],
                 output_schema={"normalized": "list[dict]"},
+                requires_upstream_keys=["raw_data"],
             ),
             SubTask(
-                description="Generate a report from upstream_data['raw_data'] and upstream_data['normalized'].",
+                description="Generate a report.",
                 required_capabilities=["report"],
                 depends_on=[1],
                 output_schema={"report": "str"},
+                requires_upstream_keys=["raw_data", "normalized"],
             ),
         ]
-        # 'raw_data' comes from step 0 (transitive predecessor via step 1),
-        # 'normalized' comes from step 1 (direct predecessor). Both available.
+        # 'raw_data' comes from step 0 (transitive via step 1), 'normalized'
+        # comes from step 1. Both available.
         assert _validate_chain_coherence(subtasks) == []
 
-    def test_description_with_no_upstream_reference_trivially_passes(self):
+    def test_empty_requires_upstream_keys_trivially_passes(self):
+        """A subtask with no upstream requirements needs no validation."""
         from src.orchestrator.decomposition import _validate_chain_coherence
 
         subtasks = [
@@ -698,37 +646,79 @@ class TestValidateChainCoherence:
                 output_schema={"a_out": "int"},
             ),
             SubTask(
-                description="Step B runs some computation and returns its own output.",
+                description="Step B runs independently and returns its own output.",
                 required_capabilities=["b"],
                 depends_on=[0],
                 output_schema={"b_out": "str"},
+                # Intentionally empty — step B doesn't consume from upstream.
+                requires_upstream_keys=[],
             ),
         ]
-        # Step B's description doesn't mention upstream_data at all.
-        # Nothing to validate.
         assert _validate_chain_coherence(subtasks) == []
 
-    # ------------------------------------------------------------------
-    # False-positive regression tests (2026-04-14 20:52 test_mint run)
-    # ------------------------------------------------------------------
-    # These two tests cover the Excel SKILL and TSV MCP_TOOL false positives
-    # surfaced by a test_mint run that produced correct output end-to-end
-    # but got flagged by the pre-fix validator because the decomposer's
-    # subtask description mentioned the subtask's own output_schema keys
-    # in the same sentence as an ``upstream_data`` anchor. The fix (subtract
-    # own output_schema keys from referenced_keys before comparing against
-    # upstream availability) preserves the T14 TSV catch above while
-    # eliminating these false positives. See docs/perf_fixes_2026_04_14.md
-    # §4.7 for the full writeup.
+    def test_root_subtask_with_requires_upstream_keys_is_flagged(self):
+        """A root subtask (no depends_on) cannot legally declare upstream keys."""
+        from src.orchestrator.decomposition import _validate_chain_coherence
 
-    def test_final_aggregation_step_not_false_flagged_tsv_pattern(self):
-        """The TSV test's subtask 1: aggregates upstream AND produces the final dict.
+        subtasks = [
+            SubTask(
+                description="Root step that nonsensically claims an upstream key.",
+                required_capabilities=["bad-root"],
+                depends_on=[],
+                output_schema={"out": "int"},
+                requires_upstream_keys=["nonexistent"],
+            ),
+            SubTask(
+                description="Downstream step.",
+                required_capabilities=["downstream"],
+                depends_on=[0],
+                output_schema={"final": "int"},
+                requires_upstream_keys=["out"],
+            ),
+        ]
+        violations = _validate_chain_coherence(subtasks)
+        assert len(violations) == 1
+        assert "Root subtasks must not require upstream keys" in violations[0]
 
-        Description mentions both the upstream key (transactions) and the
-        subtask's own output keys (department_count, department_spending)
-        in the same sentence. Pre-fix validator would flag department_count
-        and department_spending as missing upstream keys; post-fix it
-        correctly recognises them as the subtask's own outputs.
+    def test_nested_key_access_uses_top_level_only(self):
+        """T04 regression: nested accesses list the top-level key, not the nested field.
+
+        The decomposer reads upstream_data['rules']['min_days_of_stock'] at
+        runtime, but requires_upstream_keys lists 'rules' only. The
+        predecessor declares 'rules' in its output_schema, so the chain is
+        coherent — nested fields are opaque to the contract by design.
+        """
+        from src.orchestrator.decomposition import _validate_chain_coherence
+
+        subtasks = [
+            SubTask(
+                description="Parse the inventory CSV and reorder rules YAML.",
+                required_capabilities=["parse-inventory-and-rules"],
+                depends_on=[],
+                output_schema={
+                    "inventory": "list[dict]",
+                    "rules": "dict",
+                },
+            ),
+            SubTask(
+                description="Compute per-product days_of_stock and flag below-threshold items.",
+                required_capabilities=["compute-days-of-stock-and-flag"],
+                depends_on=[0],
+                output_schema={
+                    "reorder_candidates": "list[dict]",
+                    "product_count": "int",
+                },
+                requires_upstream_keys=["inventory", "rules"],
+            ),
+        ]
+        assert _validate_chain_coherence(subtasks) == []
+
+    def test_aggregation_with_own_outputs_not_false_flagged(self):
+        """A subtask can produce output keys that happen to share names with
+        domain concepts from upstream without the validator confusing them —
+        the structured field only tracks explicit ``requires_upstream_keys``,
+        not prose. Regression guard for the false-positive class the prose-
+        parsing predecessor of this check produced.
         """
         from src.orchestrator.decomposition import _validate_chain_coherence
 
@@ -743,108 +733,17 @@ class TestValidateChainCoherence:
                 },
             ),
             SubTask(
-                description=(
-                    "Aggregate upstream_data['transactions'] by department. "
-                    "Return a dict with 'department_count' (int) and "
-                    "'department_spending' (dict mapping department to total)."
-                ),
+                description="Aggregate transactions by department.",
                 required_capabilities=["aggregate-spending-by-department"],
                 depends_on=[0],
                 output_schema={
                     "department_count": "int",
                     "department_spending": "dict[str, float]",
                 },
-            ),
-        ]
-        # Pre-fix: flagged department_count and department_spending as missing
-        # upstream keys (they're not in any predecessor's output_schema).
-        # Post-fix: those are the subtask's own outputs and get subtracted
-        # before the missing-key check. No violation.
-        assert _validate_chain_coherence(subtasks) == []
-
-    def test_comparison_step_not_false_flagged_excel_pattern(self):
-        """The Excel test's subtask 2: compares upstream values AND returns a count.
-
-        Description mentions regions_meeting_target (the subtask's own
-        output) alongside region_revenues and targets (real upstream keys).
-        Pre-fix validator flagged regions_meeting_target as missing; post-fix
-        recognises it as the subtask's own output.
-        """
-        from src.orchestrator.decomposition import _validate_chain_coherence
-
-        subtasks = [
-            SubTask(
-                description="Parse sales, products, and targets files.",
-                required_capabilities=["parse-multi-source"],
-                depends_on=[],
-                output_schema={
-                    "sales": "list[dict]",
-                    "products": "list[dict]",
-                    "targets": "list[dict]",
-                },
-            ),
-            SubTask(
-                description="Join sales with products and aggregate revenue by region.",
-                required_capabilities=["join-and-aggregate"],
-                depends_on=[0],
-                output_schema={
-                    "summary_row_count": "int",
-                    "region_revenues": "dict[str, float]",
-                },
-            ),
-            SubTask(
-                description=(
-                    "Compare upstream_data['region_revenues'] against "
-                    "upstream_data['targets'] and return 'regions_meeting_target' "
-                    "(int)."
-                ),
-                required_capabilities=["compare-region-revenues-to-targets"],
-                depends_on=[1, 0],
-                output_schema={
-                    "summary_row_count": "int",
-                    "region_revenues": "dict[str, float]",
-                    "regions_meeting_target": "int",
-                },
+                requires_upstream_keys=["transactions"],
             ),
         ]
         assert _validate_chain_coherence(subtasks) == []
-
-    def test_t14_catch_still_works_after_false_positive_fix(self):
-        """Regression guard: the T14 TSV incoherent-chain catch still fires
-        after the own-output-subtraction fix. The T14 case is distinct from
-        the false positives above because its referenced key ('transactions')
-        is NOT in the subtask's own output_schema — so the subtraction
-        doesn't affect it and the missing-upstream-producer check still
-        catches the violation.
-        """
-        from src.orchestrator.decomposition import _validate_chain_coherence
-
-        subtasks = [
-            SubTask(
-                description="Parses the departments CSV file and returns a dict with key 'departments'.",
-                required_capabilities=["parse-csv-file"],
-                depends_on=[],
-                output_schema={"departments": "list[dict]"},
-            ),
-            SubTask(
-                description=(
-                    "Aggregates total spending per department from upstream parsed data. "
-                    "Expects upstream_data to include 'departments' (list of department dicts) "
-                    "and 'transactions' (list of transaction dicts). "
-                    "Returns {'department_spending': {department: total_spending}}."
-                ),
-                required_capabilities=["parse-tsv-and-aggregate-by-department"],
-                depends_on=[0],
-                # NOTE: own output is only department_spending, NOT transactions.
-                # This is the key difference from the false-positive cases above.
-                output_schema={"department_spending": "dict[str, float]"},
-            ),
-        ]
-        violations = _validate_chain_coherence(subtasks)
-        assert len(violations) == 1
-        assert "transactions" in violations[0]
-        # Must NOT flag department_spending (subtask's own output)
-        assert "department_spending" not in violations[0]
 
 
 class TestDecompositionNodeCoherenceIntegration:
@@ -859,19 +758,17 @@ class TestDecompositionNodeCoherenceIntegration:
         structured = DecompositionResult(
             subtasks=[
                 SubTaskItem(
-                    description="Parses the CSV file and returns a dict with key 'departments'.",
+                    description="Parse the CSV file into a list of departments.",
                     required_capabilities=["parse-csv"],
                     depends_on=[],
                     output_schema={"departments": "list[dict]"},
                 ),
                 SubTaskItem(
-                    description=(
-                        "Aggregates total spending from upstream_data. "
-                        "Expects upstream_data to include 'departments' and 'transactions'."
-                    ),
+                    description="Aggregate total spending by department.",
                     required_capabilities=["aggregate"],
                     depends_on=[0],
                     output_schema={"result": "dict"},
+                    requires_upstream_keys=["departments", "transactions"],
                 ),
             ]
         )
@@ -896,16 +793,17 @@ class TestDecompositionNodeCoherenceIntegration:
         structured = DecompositionResult(
             subtasks=[
                 SubTaskItem(
-                    description="Parse both files. Returns 'a' and 'b'.",
+                    description="Parse both files.",
                     required_capabilities=["parse"],
                     depends_on=[],
                     output_schema={"a": "list", "b": "list"},
                 ),
                 SubTaskItem(
-                    description="Combines upstream_data['a'] and upstream_data['b'].",
+                    description="Combine the upstream 'a' and 'b' lists.",
                     required_capabilities=["combine"],
                     depends_on=[0],
                     output_schema={"result": "dict"},
+                    requires_upstream_keys=["a", "b"],
                 ),
             ]
         )

@@ -129,51 +129,44 @@ task prompt asks for (e.g., if the task asks for ``row_count`` and \
 - For single-subtask decompositions, output_schema should list the final \
 output keys the task prompt requests.
 
-13. **Chain coherence — every consumed key must be produced upstream.** \
-This is the most load-bearing rule in this prompt for multi-step chains. \
-When a subtask's description mentions it consumes a value from \
-``upstream_data`` (e.g., *"Aggregates total spending per department from \
-upstream parsed data"*), that key MUST appear in the ``output_schema`` of \
-at least one of its transitive predecessors (walk the ``depends_on`` edges \
-recursively). Every key a subtask reads from ``upstream_data['...']`` must \
-be traceable back to an earlier subtask that produced it.
+13. **Declare upstream requirements via ``requires_upstream_keys``.** \
+For every subtask that consumes data from a predecessor, list the \
+**top-level** keys it reads from ``upstream_data`` in the \
+``requires_upstream_keys`` field. This is a structured contract, NOT \
+prose — it's a ``list[str]`` of bare key names. Each key you list MUST \
+appear in the ``output_schema`` of at least one transitive predecessor \
+(walk ``depends_on`` edges recursively). If you can't trace a listed key \
+back to a producer upstream, the chain is **incoherent** and must be \
+restructured — either by adding a step that produces the missing key, \
+or by removing the unjustified requirement.
 
-Before returning your decomposition, mentally walk every subtask S with \
-``depends_on`` = [i, j, ...] and verify: for each ``upstream_data`` key \
-that S's description says it reads or aggregates from, check that the key \
-is present in the output_schema of subtask i or j (or any of their own \
-transitive predecessors). If any key S consumes is not produced by any \
-predecessor, the chain is **incoherent** and must be restructured — \
-either by adding a step that parses the missing input, or by rewriting S \
-to read the raw input file directly instead of expecting pre-parsed \
-upstream data.
+**Top-level keys only.** If you access a nested field like \
+``upstream_data['rules']['min_days_of_stock']``, list ``'rules'``, NOT \
+``'min_days_of_stock'``. The predecessor's output_schema only declares \
+the top-level key (``'rules': 'dict'``); nested fields are an internal \
+detail of that predecessor's output.
 
-**Incoherent chains crash at execution time** with errors like \
-``upstream_data must include a 'transactions' key``. They pass \
-verification-tier checks on each subtask in isolation because each \
-generated artifact compiles and its schema is self-consistent — but the \
-chain as a whole is broken. The pipeline has no way to recover from this \
-at runtime; your job as the decomposer is to get it right at decomposition \
-time.
+**Root subtasks** (no ``depends_on``) MUST leave \
+``requires_upstream_keys`` empty — they run first, so there is no \
+upstream to read from.
 
-**The canonical failure mode** (from a real test_mint run 2026-04-14) \
-is a CSV + TSV task where the decomposer produced:
-- Step 1: ``parse-csv-file`` → ``{'departments': [...]}`` — parses only \
-  the CSV
-- Step 2: ``parse-tsv-and-aggregate-by-department`` → expects \
-  ``upstream_data`` to contain both ``'departments'`` AND \
-  ``'transactions'``
+Before returning your decomposition, verify: for every subtask S with \
+``requires_upstream_keys=[k1, k2, ...]``, every ``ki`` appears in the \
+``output_schema`` of some transitive predecessor. If not, the chain will \
+crash at execution time with errors like ``upstream_data must include a \
+'transactions' key`` — fix it in the decomposition, not at runtime.
 
-Nothing parsed the TSV file anywhere. Step 2 crashed. The correct \
-decomposition was 2 subtasks where step 1 parsed BOTH files in one pass \
-(``{'departments': [...], 'transactions': [...]}``), OR 3 subtasks where \
-step 1 parsed CSV, step 2 parsed TSV separately, and step 3 did the \
-aggregation over both. Either is coherent; the 3-subtask version above is \
-not because step 2 reads data it doesn't produce and no predecessor \
-produces.
+**The canonical failure mode** is a CSV + TSV task where the decomposer \
+produces:
+- Step 1: ``parse-csv-file`` → output_schema=``{'departments': [...]}`` \
+  (parses only the CSV)
+- Step 2: ``aggregate-by-department`` → \
+  requires_upstream_keys=``['departments', 'transactions']``
 
-The single rule: **trace every upstream_data key back to its producer \
-before returning. If you can't find a producer, the chain is broken.**
+Nothing produces ``transactions``. Step 2 must either drop the \
+``'transactions'`` requirement (and read the TSV itself) or step 1 must \
+be changed to parse BOTH files and declare both keys in its \
+output_schema.
 
 14. **Describe subtasks in terms of data shape and operation, not \
 specific paths or values.** Subtask descriptions are consumed by two \
@@ -239,19 +232,22 @@ return the groups sorted by group size descending."
       "description": "Walk the input folder and compute a perceptual hash for each image file, returning a list of (filename, phash) pairs.",
       "required_capabilities": ["phash-image-folder"],
       "depends_on": [],
-      "output_schema": {"image_hashes": "list[dict] — each dict has 'filename' (str) and 'phash' (str)"}
+      "output_schema": {"image_hashes": "list[dict] — each dict has 'filename' (str) and 'phash' (str)"},
+      "requires_upstream_keys": []
     },
     {
       "description": "Cluster the phash list by Hamming distance threshold 5, returning a list of groups where each group is a list of filenames.",
       "required_capabilities": ["cluster-phashes-by-hamming-distance"],
       "depends_on": [0],
-      "output_schema": {"groups": "list[list[str]] — each inner list is a cluster of similar filenames"}
+      "output_schema": {"groups": "list[list[str]] — each inner list is a cluster of similar filenames"},
+      "requires_upstream_keys": ["image_hashes"]
     },
     {
       "description": "Sort the groups by group size descending and return the ordered list.",
       "required_capabilities": ["sort-groups-by-size"],
       "depends_on": [1],
-      "output_schema": {"groups": "list[list[str]] — same structure, sorted by length descending"}
+      "output_schema": {"groups": "list[list[str]] — same structure, sorted by length descending"},
+      "requires_upstream_keys": ["groups"]
     }
   ],
   "reasoning": "Three distinct compute stages with no domain rules: hash, cluster, sort. Each stage produces a distinct intermediate output that feeds the next. No policy inputs, no domain thresholds — this is a straightforward image-deduplication pipeline."
@@ -272,19 +268,22 @@ principal. Return summary statistics."
       "description": "Parse the applicant records and the underwriting policy input into structured form: a list of applicants and a policy dict containing the credit-score floor, debt-to-income ceiling, and collateral haircut percentage.",
       "required_capabilities": ["parse-applicants-and-underwriting-policy"],
       "depends_on": [],
-      "output_schema": {"applicants": "list[dict] — each dict has credit_score, income, debt, collateral_value", "policy": "dict — keys: credit_score_floor (int), dti_ceiling (float), haircut_pct (float)"}
+      "output_schema": {"applicants": "list[dict] — each dict has credit_score, income, debt, collateral_value", "policy": "dict — keys: credit_score_floor (int), dti_ceiling (float), haircut_pct (float)"},
+      "requires_upstream_keys": []
     },
     {
       "description": "Apply the underwriting policy to every applicant: reject applicants below the credit-score floor or above the debt-to-income ceiling, compute the approved principal as collateral value minus the haircut percentage, and return one decision record per applicant.",
       "required_capabilities": ["apply-underwriting-policy-to-applicants"],
       "depends_on": [0],
-      "output_schema": {"decisions": "list[dict] — each dict has applicant_id, approved (bool), approved_principal (float)"}
+      "output_schema": {"decisions": "list[dict] — each dict has applicant_id, approved (bool), approved_principal (float)"},
+      "requires_upstream_keys": ["applicants", "policy"]
     },
     {
       "description": "Aggregate approval statistics across the decision records: total applicants, number approved, number denied, and total approved principal.",
       "required_capabilities": ["aggregate-approval-statistics"],
       "depends_on": [1],
-      "output_schema": {"total_applicants": "int", "approved_count": "int", "denied_count": "int", "total_approved_principal": "float"}
+      "output_schema": {"total_applicants": "int", "approved_count": "int", "denied_count": "int", "total_approved_principal": "float"},
+      "requires_upstream_keys": ["decisions"]
     }
   ],
   "reasoning": "This is a domain workflow driven by an underwriting policy input. Stage 1 is pure I/O (parsing records and a policy). Stage 2 is the domain-logic core — it applies the three policy knobs (credit-score floor, debt-to-income ceiling, collateral haircut) and is where the 'how to do underwriting' knowledge lives; its name preserves the 'underwriting-policy' signal so the downstream classifier can see the domain policy. Stage 3 is a trivial aggregate over the stage-2 output."
@@ -301,7 +300,8 @@ Task: "Fuzzy-join two CSV files on the company_name column."
       "description": "Fuzzy-join two CSV files on the company_name column, applying normalisation and similarity threshold internally, returning matched row pairs.",
       "required_capabilities": ["fuzzy-join-csvs"],
       "depends_on": [],
-      "output_schema": {"row_count": "int — number of matched rows", "null_count_on_key": "int — null company_name values in join result"}
+      "output_schema": {"row_count": "int — number of matched rows", "null_count_on_key": "int — null company_name values in join result"},
+      "requires_upstream_keys": []
     }
   ],
   "reasoning": "The entire task is a single coherent operation. Normalisation (lowercase, trim, regex), similarity scoring, and joining are all implementation details of one fuzzy-join capability — not separate capabilities. Splitting this into 'normalise' + 'score' + 'join' would be fine-grained atomization, not meaningful decomposition."
@@ -321,7 +321,8 @@ form hypotheses, test them against symptoms, and revise."
       "description": "Triage the incoming patient case: read the intake form and recent vitals, form hypotheses about the most likely acute condition, test those hypotheses against the symptom profile, and recommend the appropriate specialist with a confidence score.",
       "required_capabilities": ["patient-case-triage"],
       "depends_on": [],
-      "output_schema": {"condition": "str — most likely acute condition", "specialist": "str — recommended specialist to page", "confidence": "float — confidence score 0-1"}
+      "output_schema": {"condition": "str — most likely acute condition", "specialist": "str — recommended specialist to page", "confidence": "float — confidence score 0-1"},
+      "requires_upstream_keys": []
     }
   ],
   "reasoning": "This is an adaptive investigation — the reasoning path depends on what the intake and vitals reveal. Reading the intake form is part of the triage, not a separate capability. The agent must examine inputs, form hypotheses, test them, and revise. Splitting this into 'read intake' + 'analyze vitals' + 'recommend specialist' would atomize an inherently adaptive task into rigid tool calls."
@@ -352,77 +353,98 @@ CORRECT decomposition (1 subtask):
       "description": "Parse the CSV file and return a dict with 'row_count' (int) and 'column_names' (list of str).",
       "required_capabilities": ["parse-csv-and-return-stats"],
       "depends_on": [],
-      "output_schema": {"row_count": "int — number of data rows", "column_names": "list[str] — header column names"}
+      "output_schema": {"row_count": "int — number of data rows", "column_names": "list[str] — header column names"},
+      "requires_upstream_keys": []
     }
   ],
   "reasoning": "This is a single straightforward operation: read a file, extract two pieces of information, return them. Splitting into read+parse+format creates three tools to do one tool's job."
 }
 ```
 
-### Example 6 (chain coherence — incoherent vs coherent chain):
+### Example 6 (chain coherence via ``requires_upstream_keys``):
 Task: "Read the departments CSV and the transactions TSV (tab-separated). \
 Aggregate total spending per department. Return a dict with keys \
 'department_count' (int) and 'department_spending' (dict mapping department \
 name to total spending float)."
 
-WRONG decomposition (3 subtasks — incoherent chain, step 2 reads a key no \
-predecessor produces):
+WRONG decomposition (step 2 declares a requirement no predecessor produces):
 ```json
 {
   "subtasks": [
     {
-      "description": "Parses the departments CSV file and returns a dict with key 'departments' containing a list of {department, annual_budget} records.",
+      "description": "Parse the departments CSV into a list of {department, annual_budget} records.",
       "required_capabilities": ["parse-csv-file"],
       "depends_on": [],
-      "output_schema": {"departments": "list[dict] — each dict has 'department' (str) and 'annual_budget' (float)"}
+      "output_schema": {"departments": "list[dict] — each dict has 'department' (str) and 'annual_budget' (float)"},
+      "requires_upstream_keys": []
     },
     {
-      "description": "Aggregates total spending per department from upstream parsed data. Expects upstream_data to include 'departments' (list of department dicts) and 'transactions' (list of transaction dicts). Returns {'department_spending': {department: total_spending}}.",
-      "required_capabilities": ["parse-tsv-and-aggregate-by-department"],
+      "description": "Aggregate total spending per department.",
+      "required_capabilities": ["aggregate-by-department"],
       "depends_on": [0],
-      "output_schema": {"department_spending": "dict[str, float] — department name to total spending"}
-    },
-    {
-      "description": "Formats the final result dict.",
-      "required_capabilities": ["format-final-result-dict"],
-      "depends_on": [1],
-      "output_schema": {"department_count": "int", "department_spending": "dict[str, float]"}
+      "output_schema": {"department_count": "int", "department_spending": "dict[str, float]"},
+      "requires_upstream_keys": ["departments", "transactions"]
     }
   ]
 }
 ```
-This is WRONG because step 2's description says it *"expects upstream_data \
-to include 'departments' AND 'transactions'"*, but step 1's output_schema \
-only produces ``departments``. **No subtask anywhere parses the TSV file or \
-produces a ``transactions`` key.** Step 2 will crash at execution time with \
-``upstream_data must include a 'transactions' key``. Each individual \
-subtask passes verification in isolation, but the chain as a whole is \
-broken.
+WRONG because step 2 lists ``transactions`` in ``requires_upstream_keys``, \
+but no predecessor produces it. The coherence check will flag this before \
+execution.
 
-CORRECT decomposition (2 subtasks — step 1 parses both files in one pass):
+CORRECT decomposition (step 1 parses both files in one pass):
 ```json
 {
   "subtasks": [
     {
-      "description": "Parses the departments CSV and the transactions TSV into structured records. Returns 'departments' (list of {department, annual_budget} dicts) and 'transactions' (list of {department, amount, ...} dicts).",
+      "description": "Parse the departments CSV and the transactions TSV into structured records.",
       "required_capabilities": ["parse-departments-csv-and-transactions-tsv"],
       "depends_on": [],
-      "output_schema": {"departments": "list[dict] — each dict has 'department' (str) and 'annual_budget' (float)", "transactions": "list[dict] — each dict has 'department' (str) and 'amount' (float)"}
+      "output_schema": {
+        "departments": "list[dict] — each dict has 'department' (str) and 'annual_budget' (float)",
+        "transactions": "list[dict] — each dict has 'department' (str) and 'amount' (float)"
+      },
+      "requires_upstream_keys": []
     },
     {
-      "description": "Aggregates total spending per department by summing transactions.amount grouped by transactions.department. Consumes upstream_data['transactions']. Returns 'department_count' and 'department_spending'.",
+      "description": "Aggregate total spending per department by summing amounts grouped by department.",
       "required_capabilities": ["aggregate-spending-by-department"],
       "depends_on": [0],
-      "output_schema": {"department_count": "int — number of distinct departments", "department_spending": "dict[str, float] — department name to total spending"}
+      "output_schema": {"department_count": "int — number of distinct departments", "department_spending": "dict[str, float] — department name to total spending"},
+      "requires_upstream_keys": ["departments", "transactions"]
     }
   ],
-  "reasoning": "Two subtasks. Step 1 parses BOTH input files in one pass, producing both 'departments' and 'transactions' in its output_schema. Step 2 consumes 'transactions' from upstream_data — and that key IS produced by step 1's output_schema, so the chain is coherent. The task has no intermediate stage that requires the two parses to be separate, so keeping them together is simpler and correct."
+  "reasoning": "Step 1 parses both input files and produces both top-level keys. Step 2 declares it needs both, and both are produced upstream — chain is coherent."
 }
 ```
 
-The same task could also be decomposed into 3 coherent subtasks (step 1 \
-parses CSV, step 2 parses TSV, step 3 aggregates) — that's also fine \
-because every key step 3 consumes is produced by step 1 or step 2. The \
-rule isn't "minimise subtask count"; the rule is **"every consumed key \
-must have a producer upstream"**.
+### Example 7 (nested key access — list only the TOP-LEVEL key):
+Task: "Build an inventory reorder pipeline. Load the inventory CSV and \
+reorder rules YAML. For each product, compute days_of_stock and flag \
+items below the rules' min_days_of_stock threshold. Return counts."
+
+```json
+{
+  "subtasks": [
+    {
+      "description": "Parse the inventory CSV and reorder rules YAML into structured records.",
+      "required_capabilities": ["parse-inventory-and-reorder-rules"],
+      "depends_on": [],
+      "output_schema": {
+        "inventory": "list[dict] — each dict has product_id, current_stock, daily_usage",
+        "rules": "dict — keys: min_days_of_stock (int), reorder_days_supply (int), max_order_value (float)"
+      },
+      "requires_upstream_keys": []
+    },
+    {
+      "description": "Compute per-product days_of_stock and flag items whose days_of_stock falls below the rules' min_days_of_stock threshold.",
+      "required_capabilities": ["compute-days-of-stock-and-flag-below-threshold"],
+      "depends_on": [0],
+      "output_schema": {"product_count": "int", "items_below_threshold": "int"},
+      "requires_upstream_keys": ["inventory", "rules"]
+    }
+  ],
+  "reasoning": "Step 2 reads upstream_data['rules']['min_days_of_stock'] at runtime, but the coherence contract tracks TOP-LEVEL keys only — so requires_upstream_keys lists 'rules', not 'min_days_of_stock'. The predecessor produces 'rules' as a dict; nested fields inside it are an internal detail of that producer."
+}
+```
 """
