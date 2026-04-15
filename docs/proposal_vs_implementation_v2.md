@@ -23,13 +23,14 @@ Legend:
 | **3. Classification** | Per-gap classification into MCP_TOOL / SKILL / AGENT | Per-gap classification via `classify_gap()` at temperature=0. Packaging-signal checklist. Agent-task collapse rule. | ✅ Faithful. Per-gap restored in Phase 2. |
 | **4. Generation** | Code-gen agent produces artifact per type | Three sequential generators (MCP_TOOL, SKILL, AGENT). Structured output + few-shot + repair pass. Lead-with-subagents mode for ≥2 AGENT gaps. Parallel generation (4 workers each). | ✅ Faithful + extended (subagents not in proposal). |
 | **5. Sandboxed integration** | Sandboxed MCP server, skill folder, contained agent session | importlib dynamic load + Docker execution (no persistent MCP servers). Skills to `data/*/skills/`. Agents via DeepAgent invocation. | 🟢 Kept deviation — avoids subprocess lifecycle complexity. |
-| **State communication** | Strictly typed JSON schemas | 18 Pydantic models in `src/schemas/` with `extra="forbid"`. All inter-node state typed. `Command[T]` routing. | ✅ Faithful. |
+| **State communication** | Strictly typed JSON schemas | 20 Pydantic models in `src/schemas/` with `extra="forbid"`. All inter-node state typed. `Command[T]` routing. Step 14 added `requires_upstream_keys: list[str]` on `SubTaskItem` (chain coherence). Step 14.6 added `OutputContract` (`required_keys` + `required_files`) and `ContractCheckResult`, both carried on `TaskState.output_contract` as a passenger field. Three explicit instances of the §Structured State Communication principle now in production: subtask chain contracts, output contracts at the system boundary, and the existing inter-node Pydantic models. | ✅ Faithful + ⭐ strengthened (Step 14 + Step 14.6 both pivoted away from regex prose parsing toward typed fields mid-implementation, applying the proposal principle structurally rather than as a one-off). |
 
 **Extensions not in proposal:**
 - Compositional executor (`composition.py`) — runs N artifacts in dependency order with workspace state passing
 - Lead-with-subagents for AGENT chains — context isolation via DeepAgents `task()` tool
 - Resolution map — links subtask required_capabilities to registry matches or generated artifacts
 - LangFuse chain-executor traces with per-step spans
+- **Output contract resolver** (`src/orchestrator/output_contract_resolver.py`, Step 14.6) — single shared boundary adapter used by both the harness and the CLI runner to populate `TaskState.output_contract` at task entry. Three tiers: authored shortcut (harness passes `task_definition=`), known-task prompt match (CLI re-run of a T-task), LLM extractor (CLI free-form). Same code path means "the eval is representative of CLI behavior" is structurally true rather than a Chapter 6 caveat.
 
 ---
 
@@ -81,6 +82,29 @@ Legend:
 **Gate cost ladder:** Tier 0 → Tier 1 → Tier 2 → Tier 3. Critical blocks immediately. ✅
 **Tier 2 clearance:** Tier 1 HIGH findings downgraded to MEDIUM if Tier 2 passes. ⭐ Enhancement not in proposal.
 **Never-raises contract:** `verify()`, `sandbox_execute()`, `behavioral.run()`, `adversarial.probe()` all return results, never raise. ✅
+
+### Beyond Artifact Verification — Task Outcome Checking (Step 14.6, ⭐ extension)
+
+The proposal's verification layer (Tiers 1–3 above) certifies that each generated capability is correct *as a standalone artifact*. T16 surfaced a failure mode the three-tier gate is structurally blind to: **a pipeline can pass every Pillar 2 tier on every individual artifact and still produce a wrong-shape final answer if the decomposer assembles correct parts into the wrong plan.** Step 14.6 (commit `3b349f9`) closes this gap by adding a complementary axis of verification.
+
+| Item | Proposal | Implementation | Status |
+|---|---|---|---|
+| Task outcome verification | (not in proposal — proposal only covers artifact verification) | `OutputContract` Pydantic schema (`required_keys` + `required_files`) carried on `TaskState.output_contract` as a passenger field. Populated at task entry by a single shared `resolve_output_contract()` function used by both the harness and CLI runner — three tiers: authored shortcut (harness `task_definition=task`), known-task prompt match (CLI re-run of a T-task), LLM extractor (CLI free-form). Terminal-state check via `OutputContract.check()` → `ContractCheckResult`. New CLI exit code 3, harness `EvaluationRecord.output_shape_mismatch` field with DuckDB migration. | ⭐ Strengthened — adds an orthogonal axis the proposal does not name. |
+| Extractor validation | (n/a — task outcome check not in proposal) | `scripts/validate_contract_extractor.py` (Fix B) runs the LLM extractor against all 20 authored T-task contracts and asserts agreement. **Result: 20/20.** Same epistemic move as Pillar 2 applied to the *measurement instrument* itself. | ⭐ Strengthened — applies the verification philosophy to the eval's own measurement. |
+| Token cost honesty | Proposal §164: *"Token cost per task — total tokens consumed including capability definitions, generation, verification, and execution"* | Harness runs the LLM extractor at task entry inside a LangFuse-tagged span and discards the result; only its tokens count toward the per-task budget. Authored contract still drives the actual check, so the measurement remains deterministic while the metric reflects real CLI usage. ~$0.40 over the full 400-record eval. | ✅ Faithful — keeps the metric honest without compromising deterministic measurement. |
+
+**Two-axis correctness — thesis Chapter 4 framing:**
+
+- **Pillar 2** answers: *"Is this generated capability correct as a standalone artifact?"* — verifies the *thing that was generated*.
+- **Step 14.6** answers: *"Did the pipeline as a whole produce what the user asked for?"* — verifies the *task outcome at the system boundary*.
+
+These are **orthogonal** axes. T16 is the canonical case where Pillar 2 said yes to every artifact and Step 14.6 catches the assembly-level wrong shape. Both are needed; neither subsumes the other. Chapter 4 should add a short subsection making this explicit.
+
+**Empirical validation (test_mint smoke 2026-04-15 post-commit):** 6/7 baseline preserved. The 1 fail is the known langchain_openai 400 serdes bug from §14.9 (out of scope, library-level). Zero false positives — the LLM extractor produced contracts on six free-form CLI prompts and the terminal check correctly didn't fire on any of them. The exit-3 path is empirically validated by 12 helper integration tests in `tests/unit/test_output_contract.py` covering every branch (missing keys, missing files, satisfied, no-contract, hard-crash output=None, no-artifact, dict-state vs TaskState, non-dict output, the canonical T16 silent-failure pattern).
+
+**Aligned with `docs/thesis_proposal.md`:**
+- §Structured State Communication (lines 90-92): the contract is a typed Pydantic schema, populated once at the system boundary, read by a deterministic set comparison at the terminal state. Replaces the previous "expected outputs buried inside per-task validator closures and prose `task_prompt` strings" with a typed handle every reader can parse without executing code.
+- §Pillar 2 verification philosophy: applied here to the LLM-based contract extractor itself via Fix B (20/20 agreement), so the measurement instrument is calibrated against the same standard the artifacts are.
 
 ---
 

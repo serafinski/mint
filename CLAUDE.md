@@ -227,11 +227,11 @@ The sandbox resolves dependencies dynamically — no hardcoded package lists. Th
 
 Import from these; avoid modifying unless explicitly required. These are the modules an agent is most likely to need:
 
-- **`src/schemas/`** — Pydantic state schemas. Every inter-node state transition uses one.
+- **`src/schemas/`** — Pydantic state schemas. Every inter-node state transition uses one. Includes `OutputContract` + `ContractCheckResult` (Step 14.6 — task-level output shape verification, carried on `TaskState.output_contract`).
 - **`src/orchestrator/pipeline.py`** — `create_pipeline(registry, loader, *, run_optimizer=False, metrics_store=None, verification_enabled=True)` — 9-node pipeline with real three-tier gate.
 - **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` — LangGraph nodes chained to `verification_node`.
 - **`src/orchestrator/classifier.py`** — `classify_gap(gap, task_description, required_capabilities)` is primary (per-gap); `classifier_node()` iterates `state.gaps`. `classify_task()` is a legacy wrapper preserved for one integration test.
-- **`src/verification/gate.py`** — `verify(artifact) -> VerificationReport` — never raises; fail-open on gate errors.
+- **`src/verification/gate.py`** — `verify(artifact) -> VerificationReport` — never raises; fail-open on gate errors. Verifies generated capabilities *as artifacts*; complemented by `src/orchestrator/output_contract_resolver.py::resolve_output_contract` (Step 14.6) which verifies *task outcomes* at the system boundary — orthogonal axes, both needed.
 - **`src/registry/store.py`** — `SkillRegistry` (CRUD + hierarchical embedding search); `seed_registry()`.
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + granularity metric queries).
 - **`src/config.py`** — `DEFAULT_LLM_MODEL` (env: `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env: `JIT_SANDBOX_IMAGE`), `FILE_SIZE_LIMIT_BYTES`, `BINARY_EXTENSIONS`, `AUTO_OPTIMIZER_THRESHOLD`.
