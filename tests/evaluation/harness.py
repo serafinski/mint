@@ -50,11 +50,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from src.orchestrator.output_contract_resolver import (
+    _extract_output_contract_llm,
+    resolve_output_contract,
+)
 from src.orchestrator.tool_loader import ToolLoader
 from src.registry.evaluation_store import EvaluationStore
 from src.registry.store import SkillRegistry, seed_registry
 from src.schemas.evaluation import EvaluationRecord
-from src.schemas.task import TaskState
+from src.schemas.task import OutputContract, TaskState
 from tests.evaluation.snapshots import restore_clean_snapshot, take_clean_snapshot
 from tests.evaluation.tasks import TaskDefinition
 
@@ -342,6 +346,9 @@ class EvaluationHarness:
             capability_types=result.get("capability_types", []),
             failed_step_index=result.get("failed_step_index"),
             failed_step_name=result.get("failed_step_name"),
+            output_shape_mismatch=result.get("output_shape_mismatch", False),
+            output_shape_missing_keys=result.get("output_shape_missing_keys", []),
+            output_shape_missing_files=result.get("output_shape_missing_files", []),
         )
 
     # -- condition implementations -------------------------------------------
@@ -442,7 +449,33 @@ class EvaluationHarness:
                 "file_formats": _file_formats,
             }
 
-        initial_state = TaskState(task_description=task.task_prompt)
+        # Step 14.6 — resolve the output contract via the shared boundary
+        # adapter. The harness path hits tier-1 (authored shortcut) by passing
+        # ``task_definition=task``; zero LLM calls. CLI free-form prompts go
+        # through the same function with ``task_definition=None`` and fall to
+        # the LLM extractor. Same code path, different inputs.
+        contract = resolve_output_contract(task.task_prompt, task_definition=task)
+
+        # Option 1 — token-cost honesty. The CLI's free-form path runs the
+        # LLM extractor at task entry, which costs tokens. The eval would
+        # under-count per-task token cost (one of the four thesis metrics)
+        # if the harness skipped this call. Run the extractor inside the
+        # LangFuse-tagged invocation context so its tokens count toward the
+        # per-task budget; discard the result. The authored ``contract``
+        # above remains the deterministic measurement instrument.
+        try:
+            _extract_output_contract_llm(task.task_prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Token-accounting extractor call failed for %s: %s",
+                task.task_id,
+                exc,
+            )
+
+        initial_state = TaskState(
+            task_description=task.task_prompt,
+            output_contract=contract,
+        )
         try:
             final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
         except Exception as exc:  # noqa: BLE001
@@ -551,6 +584,11 @@ def _extract_result_compositional(
             "capability_types": cap_types,
             "failed_step_index": None,
             "failed_step_name": None,
+            # Step 14.6: gate-blocked runs never reached terminal state, so
+            # the contract check is not meaningfully evaluated here.
+            "output_shape_mismatch": False,
+            "output_shape_missing_keys": [],
+            "output_shape_missing_files": [],
         }
 
     # Run the compositional chain
@@ -571,6 +609,7 @@ def _extract_result_compositional(
     # Validate final output
     output_in_range = False
     failure_reason = "generation_failed"
+    final_output: dict | None = None
     if chain_result.chain_success and chain_result.step_results:
         final_output = chain_result.step_results[-1]
         try:
@@ -587,6 +626,12 @@ def _extract_result_compositional(
             failure_reason = "output_rejected"
     elif not chain_result.chain_success:
         failure_reason = "chain_step_failed"
+
+    # Step 14.6 — output contract check (orthogonal to validator).
+    # Set comparison on the typed contract; never raises.
+    shape_check = task.output_contract.check(
+        final_output, chain_result.output_files,
+    ) if task.output_contract else None
 
     # Count how many registry matches vs generated artifacts were executed
     matched_count = sum(
@@ -614,6 +659,15 @@ def _extract_result_compositional(
         "capability_types": cap_types,
         "failed_step_index": chain_result.failed_step_index,
         "failed_step_name": chain_result.failed_step_name,
+        "output_shape_mismatch": (
+            shape_check is not None and not shape_check.satisfied
+        ),
+        "output_shape_missing_keys": (
+            shape_check.missing_keys if shape_check is not None else []
+        ),
+        "output_shape_missing_files": (
+            shape_check.missing_files if shape_check is not None else []
+        ),
     }
 
 
@@ -738,6 +792,7 @@ def _extract_result(
 
     # Execute the artifact against fixture data to check output_in_range
     output_in_range = False
+    output: dict | None = None
     if gate_passed and artifacts:
         # artifact already set by priority sort above (artifacts[0])
         try:
@@ -857,6 +912,13 @@ def _extract_result(
         matched_and_executed_count = 0
     capability_types_list = [capability_type] if capability_type is not None else []
 
+    # Step 14.6 — output contract check on the single-artifact path.
+    # Single-artifact execution does not surface a separate output_files
+    # mapping (file outputs only appear in compositional chains today),
+    # so the file-presence check uses an empty dict here. T07/T11 — the
+    # only file-producing tasks — go through the compositional path.
+    shape_check = task.output_contract.check(output, {}) if task.output_contract else None
+
     return {
         "gate_passed": gate_passed,
         "output_in_range": output_in_range,
@@ -875,6 +937,15 @@ def _extract_result(
         "capability_types": capability_types_list,
         "failed_step_index": None,
         "failed_step_name": None,
+        "output_shape_mismatch": (
+            shape_check is not None and not shape_check.satisfied
+        ),
+        "output_shape_missing_keys": (
+            shape_check.missing_keys if shape_check is not None else []
+        ),
+        "output_shape_missing_files": (
+            shape_check.missing_files if shape_check is not None else []
+        ),
     }
 
 

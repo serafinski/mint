@@ -163,6 +163,40 @@ class EvaluationRecord(BaseModel):
         description="Name of the failed step (None on success).",
     )
 
+    # --- Output contract (Step 14.6) ---
+    # Records the result of comparing the pipeline's final output against
+    # the task's authored OutputContract (`required_keys` + `required_files`).
+    # Independent of `output_in_range` (which checks value correctness via the
+    # bespoke validator); these fields check shape correctness via a pure set
+    # comparison. A run can pass `output_in_range` but still fail the contract
+    # check if the validator is lenient about shape, or vice versa.
+    output_shape_mismatch: bool = Field(
+        default=False,
+        description=(
+            "True iff the final output dict was missing one or more "
+            "required_keys, OR the chain output_files mapping was missing "
+            "one or more required_files declared in the task's "
+            "OutputContract. Default False covers legacy rows from before "
+            "Step 14.6 landed and runs where no contract was declared."
+        ),
+    )
+    output_shape_missing_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Required dict keys that were absent from the final output. "
+            "Empty list when the contract is satisfied OR when no contract "
+            "was declared. Sorted for stable diffing."
+        ),
+    )
+    output_shape_missing_files: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Required filenames that were absent from chain_output_files. "
+            "Empty list when the contract is satisfied OR when no file "
+            "outputs were declared. Sorted for stable diffing."
+        ),
+    )
+
     # --- Reproducibility ---
     seed: int = Field(..., description="Random seed used for task ordering in this run")
     is_pilot: bool = Field(

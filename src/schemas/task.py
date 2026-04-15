@@ -270,6 +270,114 @@ class MatchItem(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class OutputContract(BaseModel):
+    """Declared shape of a task's expected output (Step 14.6).
+
+    First-class typed contract for "what should the pipeline produce?" — the
+    counterpart to ``task_description`` (which says *what to do*). Promotes the
+    expected-output shape from prose buried inside ``task_prompt`` strings and
+    imperative logic buried inside per-task ``validator`` closures into a single
+    structured field that the CLI terminal-state check, the evaluation harness,
+    and any future regeneration loop can read deterministically.
+
+    The contract carries two orthogonal shapes:
+
+    - ``required_keys``: top-level dict keys the pipeline's final output dict
+      must contain (covers tasks like T01, T16 where the answer IS the dict).
+    - ``required_files``: filenames that must appear in the execution backend's
+      ``output_files`` mapping (covers tasks like T07, T11 that produce CSV /
+      Excel outputs alongside a metadata dict).
+
+    A task may declare either, both, or (for legacy / free-form CLI prompts
+    where extraction failed) neither — when ``required_keys`` and
+    ``required_files`` are both empty the contract check is a no-op and the
+    pipeline falls back to its current exit-code-only success classification.
+
+    Aligns with ``docs/thesis_proposal.md`` §Structured State Communication:
+    inter-stage handoffs use strictly typed schemas, not natural-language
+    prose or opaque callables. See ``docs/MASTER_PLAN_2026_04_13.md`` §14.6
+    for the full motivating failure (T16 silent wrong-output) and design
+    rationale.
+    """
+
+    required_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Top-level dict keys that must be present in the pipeline's final "
+            "output dict. Set comparison only — nested-key validation is out "
+            "of scope. Empty list means 'no key requirements declared'."
+        ),
+    )
+    required_files: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Filenames that must be present in the execution backend's "
+            "output_files mapping (e.g. ['output.csv', 'output.xlsx']). "
+            "Empty list means 'no file requirements declared'. Composes "
+            "with the future file-returning-MCP-tool work without coupling: "
+            "this field declares WHAT must exist, not HOW it gets produced."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+    def is_empty(self) -> bool:
+        """True when neither keys nor files are declared (legacy fall-through)."""
+        return not self.required_keys and not self.required_files
+
+    def check(
+        self,
+        output: object,
+        output_files: dict[str, bytes] | None = None,
+    ) -> "ContractCheckResult":
+        """Set-compare the contract against an actual output dict + files map.
+
+        Pure function — no IO, no LLM, no exceptions. Used by both the CLI
+        terminal-state check and the evaluation harness's result assembly.
+        """
+        produced_keys: set[str] = set()
+        if isinstance(output, dict):
+            produced_keys = set(output.keys())
+        produced_files = set((output_files or {}).keys())
+
+        missing_keys = sorted(set(self.required_keys) - produced_keys)
+        missing_files = sorted(set(self.required_files) - produced_files)
+        return ContractCheckResult(
+            satisfied=not missing_keys and not missing_files,
+            missing_keys=missing_keys,
+            missing_files=missing_files,
+            produced_keys=sorted(produced_keys),
+            produced_files=sorted(produced_files),
+        )
+
+
+class ContractCheckResult(BaseModel):
+    """Result of comparing an OutputContract against actual outputs (Step 14.6)."""
+
+    satisfied: bool = Field(
+        ...,
+        description="True iff every required key and required file is present.",
+    )
+    missing_keys: list[str] = Field(
+        default_factory=list,
+        description="Required dict keys absent from the actual output.",
+    )
+    missing_files: list[str] = Field(
+        default_factory=list,
+        description="Required filenames absent from the output_files mapping.",
+    )
+    produced_keys: list[str] = Field(
+        default_factory=list,
+        description="Keys actually present in the output dict (for diagnostics).",
+    )
+    produced_files: list[str] = Field(
+        default_factory=list,
+        description="Filenames actually present in output_files (for diagnostics).",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
 class TaskState(BaseModel):
     """Full pipeline state for capability synthesis tasks."""
 
@@ -334,6 +442,22 @@ class TaskState(BaseModel):
             "without the user-facing layer mistaking a fallback-produced wrong "
             "output for success. The enum `status` field transitions forward "
             "through every node and so cannot carry a sticky failure signal."
+        ),
+    )
+    output_contract: OutputContract | None = Field(
+        default=None,
+        description=(
+            "Declared shape of the task's expected output (Step 14.6). "
+            "Populated at task entry by the harness (directly from "
+            "TaskDefinition.output_contract) or by the CLI boundary adapter "
+            "(known-task shortcut, then LLM extractor for free-form prompts). "
+            "Pipeline nodes MUST NOT read or write this field — it is a "
+            "passenger that flows from task entry to the terminal-state "
+            "contract check, where a pure set comparison against the final "
+            "output dict and output_files mapping classifies the run as "
+            "success / shape-violation. None means no contract was declared "
+            "or extraction failed; the check degrades to legacy exit-code-only "
+            "behavior in that case."
         ),
     )
 

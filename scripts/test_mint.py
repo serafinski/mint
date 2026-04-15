@@ -125,6 +125,14 @@ def _run_mint(
         # it as a FAIL in the smoke test so regressions are caught.
         print("\n  FAIL: decomposition failed — output is fallback-only")
         return False
+    if exit_code == 3:
+        # Step 14.6: pipeline ran to completion but the final output is
+        # missing keys / files the task asked for (output contract not
+        # satisfied). The CLI runner already printed the missing-keys /
+        # missing-files diagnostics to stderr; we surface it as a FAIL
+        # here so test_mint catches T16-style silent wrong-shape outputs.
+        print("\n  FAIL: output contract not satisfied — wrong-shape answer")
+        return False
     if exit_code != 0:
         print(f"\n  FAIL: exit code {exit_code}")
         return False

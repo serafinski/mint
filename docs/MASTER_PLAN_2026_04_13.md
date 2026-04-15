@@ -140,7 +140,7 @@ This is the work that was queued before today started. It's unchanged by the Pil
 | 2 | ✅ **Step 14 — Decomposition coherence check** | Phase 2 Step 14 (below) | ~2-3 h | **DONE 2026-04-15** (commit `125cd12`). **Major design pivot from original plan** — final implementation uses a structured `requires_upstream_keys: list[str]` field on `SubTaskItem`/`SubTask` instead of a regex-based prose parser. See §14 below for the updated description and the progress block above for the pivot rationale. |
 | **2.5** | ✅ **Step 14.5 — Registry dual-query search + reusable descriptions** | `docs/registry_retrieval_fix_plan.md` | **~3.5-4 h** (A+B bundled) or **~5-5.5 h** (if Q6 needs refactor) | **DONE 2026-04-15** (commit `fd8d118`). Part A + Part B bundled as originally planned. 9 new dual-query tests + 4 wiring tests. |
 | **2.8** | ✅ **T16 solo-AGENT fixture absolute-path fix** | §14.8 (below) | ~1.5 h | **DONE 2026-04-15** (commit `2d94813`). **Not originally in the plan** — discovered while diagnosing a T16 silent correctness regression (wrong `root_cause_metric` from fabricated data). Root cause: `_fixtures_to_workspace_files` keyed fixtures by bare basename; DeepAgents' `validate_path` prepends `/` before StateBackend lookup. Fix prepends `/` to every fixture key. Existing tests were enshrining the bug — rewrote and added three regression guards. Complements but does NOT replace §14.6 — 14.6 is a CLI output-shape check; this is a runtime path-keying fix. |
-| **2.6** | **Step 14.6 — Task-level output key validation** | Phase 2 Step 14.6 (below) | **~1-1.5 h** | **Added 2026-04-14 end of day.** The 20:52 test_mint run surfaced a silent wrong-output gap in T16 AGENT: the decomposer invented a `request-file-access-or-upload` subagent for a task with pre-provided files; the subagent found a data quirk and output `{next_action: "Please fix and re-upload"}`; the CLI reported "OK: Pipeline completed successfully" because the pipeline didn't crash. The user-requested keys (`root_cause_metric`, `cascade_chain`, `n_metrics_investigated`) were nowhere in the output. **Root cause:** the CLI's pass/fail classifier is exit-code based and doesn't check output content against expected keys. Fix: extract the user's expected output keys from the task prompt (either via simple regex on "Return a dict with keys 'X', 'Y', 'Z'" or a one-shot LLM extraction at task entry), validate at CLI terminal state that all expected keys are present in the output dict. When keys are missing, print a distinct warning and return a new exit code 3 (distinct from 0/success, 1/crash, 2/decomposition-failed). Same sticky-flag pattern as Fix 2b, different layer. **This closes the last silent-failure hole in the CLI pass/fail contract.** |
+| **2.6** | **Step 14.6 — Task-level output contract validation** | Phase 2 Step 14.6 (below) | **~2-2.5 h** (revised 2026-04-15 from ~1-1.5h via two refinement passes — first widened to `OutputContract`, second added shared resolver + extractor validation + token-cost honesty) | **Added 2026-04-14 end of day, refined twice 2026-04-15.** The 20:52 test_mint run surfaced a silent wrong-output gap in T16 AGENT: the decomposer invented a `request-file-access-or-upload` subagent for a task with pre-provided files; the subagent found a data quirk and output `{next_action: "Please fix and re-upload"}`; the CLI reported "OK: Pipeline completed successfully" because the pipeline didn't crash. The user-requested keys (`root_cause_metric`, `cascade_chain`, `n_metrics_investigated`) were nowhere in the output. **Root cause:** the expected-output contract lives only as prose inside `task_prompt` and inside bespoke validator closures in `tests/evaluation/tasks.py`, and nowhere at all in the CLI path — no layer can ask "did we produce what the user asked for?". **Fix (final design after two refinement passes):** add an `OutputContract` Pydantic schema (`required_keys: list[str]`, `required_files: list[str]`) as a first-class typed field on both `TaskDefinition` and `TaskState`. **Single shared `resolve_output_contract()` function (Fix A)** in a new `src/orchestrator/output_contract_resolver.py` module, used by BOTH harness and CLI — three tiers: authored shortcut (harness passes `task_definition=`), known-task prompt match (CLI re-run of a T-task), LLM extractor (CLI free-form). Same code path means "the eval is representative of CLI behavior" is structurally true, not a Chapter 6 caveat. **Extractor agreement validation (Fix B)** via `scripts/validate_contract_extractor.py` — a one-shot script that runs the LLM extractor against all 20 authored T-task contracts and asserts agreement; same epistemic move as Pillar 2 applied to the measurement instrument. **Token-cost honesty (Option 1)** — harness ALSO runs the extractor at task entry (~$0.001/task, ~$0.40 over the full eval) so the per-task token-cost metric reflects real CLI usage; result discarded, only tokens counted; authored contract still used for the actual check. Terminal-state check is `state.output_contract.check(output, output_files)` — pure set comparison via a `ContractCheckResult` returning `satisfied`/`missing_keys`/`missing_files`. Missing keys OR missing files → new exit code 3. **Two-axis correctness:** Step 14.6 is *complementary* to Pillar 2 — Pillar 2 verifies generated artifacts in isolation; Step 14.6 verifies task outcomes at the system boundary. T16 is the canonical case where every artifact passed Pillar 2 but the assembly produced wrong-shape output. Adds a clean two-axis verification story to Chapter 4. **Option (a) regex prose parser from the original plan is struck** — repeats the §14 mistake that the `project_thesis_proposal_pivot_lens.md` memory was written to prevent. Same sticky-flag pattern as Fix 2b, different layer. **This closes the last silent-failure hole in the CLI pass/fail contract** and aligns it with `docs/thesis_proposal.md` §Structured State Communication AND §Pillar 2 verification philosophy. |
 | **2.7** | **Step 14.7 — MCP_TOOL generator signature bug (step-0 `upstream_data` false-required)** | Phase 2 Step 14.7 (below) | **~1 h** | **Added 2026-04-14 end of day after the 21:38 test_mint T11 Excel failure.** The MCP_TOOL generator sometimes produces step-0 functions with `upstream_data` as a **required positional argument** even though step 0 has no upstream dependencies. When the executor calls the function (correctly, without `upstream_data` since there's nothing upstream), Python raises `missing 1 required positional argument: 'upstream_data'`. Empirically observed on T11 where the decomposer named step 0 `join-sales-with-products-on-product_id-and-parse-targets` and the word "join" pattern-matched to middle-step semantics in the generator LLM's understanding, overriding the `depends_on=[]` signal. **MCP_TOOL-only scope** — SKILL and AGENT use `fixture_contents` injection into the LLM task message (runtime mechanism, not a function signature), which degrades gracefully on step 0 (empty dict) and non-step-0 (populated dict). Neither generator prompt even mentions `fixture_contents` because it's architecturally invisible to them. Only MCP_TOOL has a Python function signature that can be mismatched at call time. Fix: either (a) pass `is_first_step: bool` explicitly to the MCP_TOOL generator as hard context, or (b) make `upstream_data: dict \| None = None` always-optional in the MCP_TOOL prompt rule, plus a post-generation AST check that validates step-0 functions don't require `upstream_data`. **Pre-existing since commit 1283f68** (chain schema contracts, 2026-04-12). |
 | 3 | **Step 13 — AGENT execution timeout + sticky flag** | Phase 2 Step 13 (below) | ~1.5-2 h | Pattern-matched to Fix 2b. AGENT test failure in 19:01 run was a timeout on `execute_agent_artifact`. Same surgical approach: bump the ceiling, add a sticky flag, surface it in CLI + harness. **Reconfirmed 2026-04-15** via langfuse trace `aec201273d7aef62c675ce5b4cb9a2ef`: agent ran 598s of genuine forward progress (5 sequential subagent calls, all making real headway, produced a correct `db_connections` answer on that run). 480s cap killed a working agent 118s before completion. Recommended bump: 480 → 900s. |
 | **3.5** | ✅ **T11 adversarial sandbox `pip_packages` inheritance** | §14.9 (below) | ~30 min | **DONE 2026-04-15** (commit `d266d26`). `_make_probe_sandbox_execute` closure wraps `sandbox_execute` to auto-union artifact-declared `pip_packages` into every probe call's `extra_packages`. `_create_adversarial_agent` takes an optional `pip_packages` kwarg; `probe()` reads `artifact.pip_packages` and threads it through. 10 new regression tests. Does NOT fix the library-level langchain_openai 400 on follow-up calls, but removes the most common trigger (sandbox crashes on missing imports). |
@@ -151,9 +151,9 @@ This is the work that was queued before today started. It's unchanged by the Pil
 | 7 | **Phase 4 Step 18 — The 400-record eval** | Phase 4 (below) | ~18 h unattended | `run_pilot --all-tasks --all-conditions --n-runs 5`. Starts the thesis's Chapter 6 data. |
 | 8 | Phase 4 Step 19 — Longitudinal run (optional) | Phase 4 (below) | Several hours unattended | Optimizer convergence numbers for Chapter 6. Optional but strongly recommended if time permits — makes the Pillar 3 story in Chapter 5 measurable. |
 
-**Total pre-eval hands-on time: ~36-42 hours (~4.5-5 focused working days)** — revised upward 2026-04-14 end of day to include Step 14.5 with Part A+B bundled (~3.5-4 h best case, ~5-5.5 h if Q6 needs a refactor), Step 14.6 (~1-1.5 h), and Step 14.7 (~1 h).
+**Total pre-eval hands-on time: ~36-42 hours (~4.5-5 focused working days)** — revised upward 2026-04-14 end of day to include Step 14.5 with Part A+B bundled (~3.5-4 h best case, ~5-5.5 h if Q6 needs a refactor), Step 14.6 (originally ~1-1.5 h; revised 2026-04-15 first pass to ~1.5-2 h after scope widened to an `OutputContract` schema covering both dict keys and required file outputs; revised again 2026-04-15 second pass to **~2-2.5 h** after Fix A + Fix B + Option 1 added a shared resolver function, an extractor validation script, and harness-side token accounting), and Step 14.7 (~1 h).
 
-**Revised 2026-04-15 (end of session):** Steps 14, 14.5, 14.8 (T16 solo-AGENT fixture fix, not originally in plan), **14.9** (adversarial sandbox pip_packages), and **14.10** (upstream key collision detection) have all landed. Approximately **8-9 hours of the estimate are now closed**. Updated estimate for remaining work: **~28-33 hours** (~3.5-4 focused working days). Remaining Phase 2 work: **14.6, 14.7, 13, 4-11, 12**. Remaining Phase 3-4: unchanged. **Next session entry point:** Step 14.6 (task-level output key validation) — complements today's §14.8 T16 fixture fix by adding a CLI-layer contract check that catches any silent wrong-output regardless of root cause. Full design spec in §14.6 below.
+**Revised 2026-04-15 (end of session):** Steps 14, 14.5, 14.8 (T16 solo-AGENT fixture fix, not originally in plan), **14.9** (adversarial sandbox pip_packages), and **14.10** (upstream key collision detection) have all landed. Approximately **8-9 hours of the estimate are now closed**. Updated estimate for remaining work: **~28-33.5 hours** (~3.5-4 focused working days; +1h absorbed from the 14.6 scope-widening below — first refinement pass added ~30 min for `OutputContract` schema, second refinement pass added another ~30-45 min for shared resolver + extractor validation + harness token accounting). Remaining Phase 2 work: **14.6, 14.7, 13, 4-11, 12**. Remaining Phase 3-4: unchanged. **Next session entry point:** Step 14.6 (task-level output contract validation) — complements the §14.8 T16 fixture fix by adding a CLI- and harness-layer contract check that catches any silent wrong-output regardless of root cause. **§14.6 scope refined twice 2026-04-15:** (1) first refinement struck the regex-prose-parser option (repeats the §14 mistake the pivot-lens memory was written to prevent) and widened the typed field from a bare `list[str]` to an `OutputContract` Pydantic schema carrying both `required_keys` and `required_files` — needed so T07/T11 file-producing tasks compose cleanly under the same contract, and so the future file-returning-MCP-tool execution work has a backend-agnostic success criterion ready. (2) Second refinement — triggered by the user asking *"will this fake our results? does it work the same as the CLI?"* — added (Fix A) a single shared `resolve_output_contract()` function used by BOTH harness and CLI, eliminating code-path divergence as a methodology critique; (Fix B) `scripts/validate_contract_extractor.py` to validate the LLM extractor against the 20 authored contracts before Phase 5 (same epistemic move as Pillar 2 applied to the measurement instrument); and (Option 1) a side-effect-only extractor call in the harness so the per-task token-cost metric reflects real CLI usage (~$0.40 over the full eval). Together these close the eval/CLI methodology gap structurally rather than via Chapter 6 caveats and add a "two-axis correctness" thesis-writing note that frames Step 14.6 as complementary to Pillar 2 (Pillar 2 verifies artifacts; 14.6 verifies task outcomes — orthogonal). Net cost over original: ~1 hour (~30 min first pass + ~30-45 min second pass). Full refined design spec in §14.6 below.
 
 **What's deferred explicitly:** the proposal-aligned black-box Tier 3 rewrite (~3-5 additional days). Tracked in `docs/perf_fixes_2026_04_14.md` §3e as Chapter 7 future work. Would move into this list between steps 5 and 6 if you decide to pull it forward, but the current recommendation is to leave it deferred.
 
@@ -302,7 +302,7 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
 
     **Priority:** **ship before Step 13.** The retrieval bug affects every Phase 5 eval run; the AGENT execution timeout (Step 13) affects a narrower edge case. Sequencing is Step 14 → Step 14.5 → Step 14.6 → Step 14.7 → Step 13 → Steps 4–11.
 
-14.6. **Task-level output key validation — close the last silent-failure hole in the CLI pass/fail contract.** (~1-1.5 hours, added 2026-04-14 end of day after the 20:52 test_mint run surfaced the T16 AGENT silent wrong-output.)
+14.6. **Task-level output contract validation — close the last silent-failure hole in the CLI pass/fail contract.** (~1.5-2 hours, added 2026-04-14 end of day after the 20:52 test_mint run surfaced the T16 AGENT silent wrong-output. **Scope widened and design refined 2026-04-15 end of session** after a thesis-proposal alignment check — see "Design evolution" block below. Original ~1-1.5h scope assumed a bare `list[str]` field; the widened scope adds a small `OutputContract` Pydantic schema that also carries required file outputs, costing ~30 extra minutes but unifying dict-producing and file-producing tasks under one uniform contract.)
 
     **Motivating failure (concrete, from langfuse trace `7abeb2fe07f5cb9c9ef6b374dc95e610`):** T16 AGENT incident investigation. Task asked for `{root_cause_metric, cascade_chain, n_metrics_investigated}`. The decomposer created 3 subagents, the FIRST of which was named `request-file-access-or-upload` with description *"request the required incident files or validate them"* — despite the files being pre-provided on the CLI. When executed, that subagent found a data quirk in the CSV (`'0:0095'` instead of `'0.0095'` at row 4:30) and produced `{"next_action": "Please fix the CSV error_rate value and re-upload..."}` as its output. The pipeline took that dict as the final output, returned exit code 0, and test_mint reported `OK: Pipeline completed successfully`. **The user-requested keys were nowhere in the output and the pipeline silently claimed success.**
 
@@ -314,36 +314,219 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
     - The CLI's exit-code classifier returns 0 because nothing raised an exception.
     - **None of the existing safeguards compare the final output against the keys the user asked for.** That's a structural gap in the pass/fail contract.
 
-    **Root cause:** the decomposer produced a semantically wrong plan. The pipeline faithfully executed a wrong plan. The CLI reported "OK" because the pipeline didn't crash. There's no layer that verifies *"did the pipeline produce what the user asked for?"* — only *"did it not crash?"*.
+    **Root cause:** the decomposer produced a semantically wrong plan. The pipeline faithfully executed a wrong plan. The CLI reported "OK" because the pipeline didn't crash. There's no layer that verifies *"did the pipeline produce what the user asked for?"* — only *"did it not crash?"*. More structurally: the expected-output contract currently lives only as prose inside `task_prompt` strings, as imperative logic buried inside per-task validator closures in `tests/evaluation/tasks.py` (e.g. `_validate_t01` references `row_count`/`column_names`, `_file_validate_t11` references `output.xlsx`), and **nowhere at all in the CLI path**. No reader — human or agent — can discover "what keys/files is this task supposed to produce?" without executing or AST-walking Python closures. This violates `docs/thesis_proposal.md` §Structured State Communication: inter-stage handoffs should use strictly typed schemas each agent parses deterministically, not prose or opaque callables.
 
-    **Fix design — two parts:**
+    **Design evolution (2026-04-15 end of session):** The original plan text (preserved below under "Original plan, superseded") proposed a bare `expected_output_keys: list[str]` field with a choice between (a) regex prose parser and (b) one-shot LLM extractor on `task_prompt`. A thesis-proposal alignment pass flagged two problems:
 
-    Part A — Extract expected output keys at task entry. In `src/cli/runner.py::execute_task`, after the task prompt is built but before the pipeline runs, extract the set of output keys the user requested. Two options for the extractor:
-    - **(a) Regex-based**: parse patterns like `"Return a dict with keys 'X', 'Y', 'Z'"`, `"return a dict containing 'X' (int) and 'Y' (str)"`, `"return {'X': ..., 'Y': ...}"`. Cheap, deterministic, covers maybe 70% of task prompts.
-    - **(b) One-shot LLM extraction**: one gpt-5-mini call at task entry with a small prompt: *"What are the output keys the user is asking for in this task prompt? Return as a JSON list of strings."* 100% coverage, ~1-2s latency, ~$0.001 per task. More robust to phrasing variation.
+    1. **Option (a) repeats the §14 mistake.** The regex prose parser is exactly the pattern the `project_thesis_proposal_pivot_lens.md` memory was written to prevent — §14 pivoted from regex prose parsing to a structured `requires_upstream_keys: list[str]` field mid-implementation for the same reason. **Option (a) is struck from this plan.** Only the LLM-extractor option survives, and only as a boundary adapter for free-form CLI prompts (see below).
 
-    Recommend (b) because the 30% of tasks where regex fails are exactly the complex natural-language phrasings we care about. Also more future-proof for tasks that use indirect phrasing like *"the final output should include a summary..."*.
+    2. **A bare `list[str]` doesn't compose with file-producing tasks.** T07 and T11 already use `TaskDefinition.file_validator: Callable[[dict, dict[str, bytes]], bool]` and assert on `output_files["output.csv"]` / `output_files["output.xlsx"]` respectively. `TaskState.output_files: dict[str, bytes]` already exists as a typed state field (`src/schemas/task.py:386`) — it's the carrier for file bytes. But the *declared* expected filenames live inside validator closures (`_file_validate_t07:343`, `_file_validate_t11:558`), exactly the same buried-in-code pattern as the dict keys. If 14.6 only promotes dict keys to typed and leaves file outputs in closures, we'll hit the same alignment problem on T07/T11 that we're trying to fix on T16. The contract must carry both shapes from day one.
 
-    Part B — Validate at terminal state. After execution completes and the CLI has the final output dict, compare its keys against the extracted expected keys. When keys are missing:
-    - Print a distinct **blue/magenta** warning: `⚠ OUTPUT MISSING EXPECTED KEYS — partial or wrong answer`
-    - List the missing keys and the keys that WERE produced so the user can see what happened
-    - Return a new exit code **3** (distinct from 0/success, 1/crash, 2/decomposition-failed)
-    - test_mint treats exit code 3 as FAIL with a specific error message
+    **Fix design (refined) — three parts:**
 
-    **This is NOT a perfect fix** — an adversarial decomposer could still produce a plan that outputs the right keys with wrong values. But it closes the specific silent-failure pattern where the output SHAPE is wrong, which is what T16 actually exhibited. A content-correctness check would require per-task ground truth (which the evaluation harness has via `output_in_range` but the CLI doesn't).
+    Part A — New `OutputContract` Pydantic schema, first-class typed field on task contract and task state:
 
-    **Scope:**
-    - `src/cli/runner.py`: add `_extract_expected_output_keys(task_prompt)` helper calling gpt-5-mini; add a check block at the terminal state similar to the Fix 2b decomposition-failure block; return exit code 3 on missing keys.
-    - `scripts/test_mint.py`: treat exit code 3 as FAIL with `"output missing expected keys"` message, mirroring the existing exit code 2 handling.
-    - Optionally: store the extracted keys in `TaskState.expected_output_keys` so downstream nodes / the evaluation harness can also read them. This enables the harness's `output_in_range` check to reuse the same extraction without a separate LLM call. Probably worth doing.
-    - Tests: unit test for the extractor (regex/LLM), unit test for the terminal-state check, integration test with a known-good task and a known-bad task (like the T16 pattern).
+    ```python
+    # src/schemas/task.py
+    class OutputContract(BaseModel):
+        required_keys: list[str] = Field(default_factory=list,
+            description="Top-level dict keys that must be present in the pipeline's final output dict")
+        required_files: list[str] = Field(default_factory=list,
+            description="Filenames that must be present in TaskState.output_files")
 
-    **Why this priority:** ship between Step 14.5 (retrieval) and Step 13 (AGENT execution timeout). It's smaller than Step 14.5 (~1-1.5h vs ~2.5-3h) and directly addresses a silent failure that would pollute Chapter 6 numbers. Without it, every task where the decomposer or agent produces the wrong plan gets silently scored as "success" by test_mint and potentially by the harness.
+    class TaskState(BaseModel):
+        task_description: str
+        output_contract: OutputContract | None = None   # NEW — passenger field, set at task entry
+        output_files: dict[str, bytes] = {}              # already exists
+        ...
+    ```
+
+    And on the harness-side task definition:
+
+    ```python
+    # tests/evaluation/tasks.py
+    @dataclass
+    class TaskDefinition:
+        task_prompt: str
+        output_contract: OutputContract                  # NEW — authored, first-class, required
+        validator: Callable[[dict], bool]                # unchanged — handles value correctness
+        file_validator: Callable[[dict, dict[str, bytes]], bool] | None = None   # unchanged
+        ...
+    ```
+
+    All 20 T-tasks get an authored `output_contract` populated by reading the existing validator closures once and promoting the key/file names to the declared field. Examples:
+
+    ```python
+    T01 = TaskDefinition(
+        task_prompt="Parse the CSV... return a dict with keys 'row_count' and 'column_names'.",
+        output_contract=OutputContract(required_keys=["row_count", "column_names"]),
+        validator=_validate_t01,
+    )
+    T11 = TaskDefinition(
+        task_prompt="Compare region revenues to targets... write the result to output.xlsx.",
+        output_contract=OutputContract(
+            required_keys=["regions_analyzed", "n_above_target"],  # read from _validate_t11
+            required_files=["output.xlsx"],                         # read from _file_validate_t11
+        ),
+        validator=_validate_t11,
+        file_validator=_file_validate_t11,
+    )
+    T16 = TaskDefinition(
+        task_prompt="Investigate the incident... return root_cause_metric, cascade_chain, n_metrics_investigated.",
+        output_contract=OutputContract(
+            required_keys=["root_cause_metric", "cascade_chain", "n_metrics_investigated"],
+        ),
+        validator=_validate_t16,
+    )
+    ```
+
+    Part B — Populate `TaskState.output_contract` at task entry via a single shared resolver function used by BOTH the CLI and the harness (Fix A from the second refinement pass — see "Second refinement (2026-04-15)" block below for the methodology rationale). The resolver lives in a small new module so neither side imports the other:
+
+    ```python
+    # src/orchestrator/output_contract_resolver.py  (new module)
+    def resolve_output_contract(
+        task_prompt: str,
+        *,
+        task_definition: "TaskDefinition | None" = None,
+    ) -> OutputContract | None:
+        """Resolve a task's output contract at the system boundary.
+
+        Single entry point shared by CLI and harness. Three tiers, in order:
+        1. Authored shortcut: if a TaskDefinition is supplied, return its
+           authored output_contract directly (0 LLM calls).
+        2. Known-task shortcut: if the prompt string-matches a TaskDefinition
+           in the catalogue, return its authored contract (0 LLM calls).
+        3. Free-form fallback: one gpt-5-mini call with response_format=
+           OutputContract. On any failure, return None — the terminal-state
+           check then falls through to legacy exit-code-only behavior.
+        """
+        if task_definition is not None:
+            return task_definition.output_contract
+        known = _match_known_task(task_prompt)
+        if known is not None:
+            return known.output_contract
+        try:
+            return _extract_output_contract_llm(task_prompt)
+        except Exception:
+            return None
+    ```
+
+    Both call sites use the same function:
+
+    - **Harness path** (`tests/evaluation/harness.py:445`): `contract = resolve_output_contract(task.task_prompt, task_definition=task)`. Hits tier 1 (authored shortcut). Zero LLM calls. Deterministic.
+    - **CLI path** (`src/cli/runner.py::execute_task` around line 1373): `contract = resolve_output_contract(task_prompt)`. Tries tier 2 (known-task shortcut), falls through to tier 3 (LLM extractor) for genuinely free-form prompts.
+
+    Both then construct `TaskState(task_description=task_prompt, output_contract=contract)` identically. **The harness and the CLI execute the same code path** — the only difference is which tier of the resolver they hit, driven by the arguments. This eliminates "the eval and the CLI use different code" as a methodology critique (see "Second refinement" block below).
+
+    Part C — Validate at terminal state. One check site, identical code path for CLI and harness:
+
+    ```python
+    contract = state.output_contract
+    if contract is not None:
+        produced_keys = set(final_output.keys()) if isinstance(final_output, dict) else set()
+        missing_keys = set(contract.required_keys) - produced_keys
+        missing_files = [f for f in contract.required_files if f not in state.output_files]
+        if missing_keys or missing_files:
+            # CLI: distinct blue/magenta warning, list missing + produced, exit code 3
+            # Harness: EvaluationRecord.output_shape_mismatch = True, status = "fail",
+            #          reason string lists what's missing
+            ...
+    ```
+
+    Pure set operations on typed fields. No regex, no prose re-parsing, no LLM at check time. If `contract is None` (free-form CLI prompt where the extractor itself failed, or a legacy path), the check degrades to the current exit-code-only behavior — fail open, never blocks legitimate runs.
+
+    Part D — **Extractor agreement validation** (Fix B from the second refinement pass, ~10 min). Before running the Phase 5 eval, run a one-shot validation script:
+
+    ```python
+    # scripts/validate_contract_extractor.py
+    from src.orchestrator.output_contract_resolver import _extract_output_contract_llm
+    from tests.evaluation.tasks import ALL_TASKS
+
+    mismatches = []
+    for task in ALL_TASKS:
+        extracted = _extract_output_contract_llm(task.task_prompt)
+        if (set(extracted.required_keys) != set(task.output_contract.required_keys)
+            or set(extracted.required_files) != set(task.output_contract.required_files)):
+            mismatches.append((task.task_id, extracted, task.output_contract))
+
+    print(f"Extractor agreement: {20 - len(mismatches)}/20 tasks")
+    for tid, ext, auth in mismatches:
+        print(f"  {tid}: extracted keys={ext.required_keys} files={ext.required_files}")
+        print(f"  {tid}: authored  keys={auth.required_keys} files={auth.required_files}")
+    ```
+
+    **Why this is required, not optional:** the extractor is itself an LLM call. The thesis is centrally about not trusting LLM output without verification (`docs/thesis_proposal.md` §Pillar 2). Validating the extractor against authored contracts is *the same epistemic move as the three-tier verification gate*, applied to the measurement instrument instead of the artifact. The script's output gets recorded in the thesis appendix as: *"Contract extractor validated against authored contracts on 20 testbed tasks; agreement N/20."* If N < 20, the disagreement cases get listed and either (a) the extractor prompt is tightened and the script re-run until N = 20, or (b) the specific tasks where agreement fails are disclosed in Chapter 4.
+
+    Part E — **Token-cost honesty: run the extractor in the harness too** (Option 1 from the second refinement pass, ~5 min). The CLI extractor adds ~1 gpt-5-mini call (~$0.001, ~1-2s) at task entry. If the eval skips this call, the *Token cost per task* metric (one of the four thesis metrics, proposal §164) undercounts real CLI usage. Two fixes considered:
+
+    - **Option 1 (chosen):** the harness ALSO runs `_extract_output_contract_llm(task.task_prompt)` at task entry, but uses the authored `task.output_contract` for the actual terminal check. The extractor's tokens are counted into the per-task token-cost metric. The authored contract still serves as the deterministic measurement instrument. Cost: 400 extra cheap LLM calls during the full eval (~$0.40 total). Implementation: the harness calls `resolve_output_contract(task.task_prompt, task_definition=task)` for the contract used by the check, AND separately calls `_extract_output_contract_llm(task.task_prompt)` in a wrapped LangFuse span so its tokens count against the per-task budget. The extractor result is discarded; only its token count is recorded.
+    - **Option 2 (rejected):** report the extractor cost only on the CLI path and disclose the eval's omission in Chapter 6 as a caveat. Rejected because it leaves the methodology open to the critique "the eval doesn't measure what users actually pay" — exactly the methodology gap that motivated this refinement pass.
+
+    The chosen option fixes the metric without compromising the deterministic measurement.
+
+    **Two-axis correctness — thesis-writing note (added in second refinement, 2026-04-15):** Step 14.6's contract check is **complementary** to Pillar 2's three-tier verification gate, not redundant. They certify different things along orthogonal axes:
+
+    - **Pillar 2** answers: *"Is this generated capability correct as a standalone artifact?"* — verifies the *thing that was generated* (the MCP tool, the skill, the agent).
+    - **Step 14.6** answers: *"Did the pipeline as a whole produce what the user asked for?"* — verifies the *task outcome* at the system boundary.
+
+    A pipeline can pass every Pillar 2 tier on every individual artifact and still produce a wrong-shape final answer if the decomposer assembles correct parts into the wrong plan. T16 demonstrated this empirically: every artifact was structurally valid in isolation; the decomposer plan was semantically wrong; the assembly produced `{next_action: ...}` instead of `{root_cause_metric, cascade_chain, n_metrics_investigated}`. Pillar 2 was structurally blind to this failure mode because Pillar 2 inspects parts, not outcomes.
+
+    **For Chapter 4:** add a short subsection at the end titled *"Beyond Artifact Verification: Task Outcome Checking"*. Two paragraphs. Frame Step 14.6 as the boundary-layer counterpart to the three-tier gate, references §Structured State Communication, cites the T16 trace as the motivating example.
+
+    **For Chapter 6:** add one paragraph in the methodology section: *"Output contracts are authored for the 20 testbed tasks and validated against the CLI extractor (agreement N/20 — see Appendix). The harness runs the extractor at task entry for token-cost accounting but uses the authored contract for the terminal check, so the per-task token-cost metric reflects end-to-end CLI usage while the success classification remains deterministic."*
+
+    **Second refinement (2026-04-15, after Fix A + Fix B + Option 1 alignment pass):** the first refinement (above, dated 2026-04-15 end of session) widened the bare `list[str]` to an `OutputContract` schema with `required_keys` and `required_files`, and introduced the known-task shortcut + LLM extractor as a two-tier CLI boundary adapter. A second pass — triggered by the user asking *"will this fake our results? does it work the same as the CLI?"* — flagged that the harness reading `task.output_contract` directly while the CLI ran the extractor created two methodology gaps:
+
+    1. **Code-path divergence:** the eval and CLI used literally different code, so "the eval is representative of CLI behavior" was a claim that would need defending in Chapter 6 with no structural backstop. **Fix A** routes both through the same `resolve_output_contract()` function — different inputs, identical implementation. The claim becomes literally true.
+    2. **Token-cost undercount:** the CLI extractor (~$0.001/task, ~1-2s) was not counted in the eval's per-task token-cost metric, undercounting real CLI usage on a thesis metric. **Option 1** runs the extractor in the harness path too (token cost recorded), then uses the authored contract for the actual check (measurement remains deterministic).
+    3. **Extractor was an unverified LLM call.** The thesis is about not trusting LLM output without verification, but the original design used an LLM extractor without validating it. **Fix B** adds `scripts/validate_contract_extractor.py` as a one-shot agreement check against the 20 authored contracts — the same epistemic move as Pillar 2 applied to the measurement instrument.
+
+    Together these three fixes close the eval/CLI methodology gap structurally rather than via Chapter 6 caveats. Net cost: ~30-45 extra minutes (single resolver function, one validation script, one harness LangFuse span). New time estimate: **~2-2.5 h** (up from ~1.5-2 h after the first refinement, and ~1-1.5 h originally).
+
+    **New CLI exit code:**
+
+    | Code | Meaning |
+    |---|---|
+    | 0 | Pipeline completed, contract satisfied (or no contract declared) |
+    | 1 | Pipeline crashed |
+    | 2 | Decomposition failed (Fix 2b sticky flag) |
+    | **3** | **NEW** — pipeline completed but output contract not satisfied (missing keys and/or files) |
+
+    `scripts/test_mint.py` gets a new branch: exit code 3 → `FAIL: output contract not satisfied: missing keys={...}, missing files={...}`.
+
+    **Composition with the "MCP tools returning files" TODO** (tracked separately as a future Phase 3 execution-layer improvement, see `memory/project_file_output_limitation.md`): the `required_files` field deliberately makes no assumption about *how* files end up in `state.output_files`. That is an execution-backend concern. When the file-returning MCP tool feature lands, it just populates `state.output_files["output.xlsx"] = b"..."` at execution time; the 14.6 terminal check finds the filename in the set and passes. If the execution backend fails to emit the file, the check fires and returns exit 3 — the same path as a missing dict key. 14.6 does not block and does not need to be rewritten when the file-returning-tool work lands later; it *enables* that future work to have a clean backend-agnostic success criterion from day one. Right now, testing a new execution backend would require rewiring each task's `file_validator` by hand; with `OutputContract` the declaration is data and the check is backend-agnostic.
+
+    **This is NOT a perfect fix** — an adversarial decomposer could still produce a plan that outputs the right keys with wrong values. But it closes the specific silent-failure pattern where the output SHAPE is wrong, which is what T16 actually exhibited. A content-correctness check would require per-task ground truth (which the evaluation harness has via the existing `validator` callable but the CLI doesn't).
+
+    **Scope (revised after second refinement, 2026-04-15):**
+    - `src/schemas/task.py`: add `OutputContract` Pydantic model with `required_keys` + `required_files` + an `is_empty()` helper; add a `check(output, output_files)` method returning a `ContractCheckResult`; add `ContractCheckResult` Pydantic model with `(satisfied, missing_keys, missing_files, produced_keys, produced_files)`; add `output_contract: OutputContract | None = None` field to `TaskState`.
+    - `tests/evaluation/tasks.py`: add `output_contract: OutputContract` field to `TaskDefinition` (required, with `OutputContract()` factory default); populate for all 20 T-tasks by reading the existing validator closures.
+    - **`src/orchestrator/output_contract_resolver.py` (new module — Fix A):** the shared `resolve_output_contract(task_prompt, *, task_definition=None) -> OutputContract | None` helper plus its two private dependencies `_match_known_task(task_prompt) -> TaskDefinition | None` and `_extract_output_contract_llm(task_prompt) -> OutputContract`. The extractor uses `init_chat_model(DEFAULT_LLM_MODEL).with_structured_output(OutputContract)`. Both CLI and harness call ONLY `resolve_output_contract()` — they do not import the underlying helpers directly.
+    - `tests/evaluation/harness.py:445`: pass `output_contract=resolve_output_contract(task.task_prompt, task_definition=task)` into the initial `TaskState`. **Also** (Option 1 — token-cost honesty) wrap a side-effect-only call to `_extract_output_contract_llm(task.task_prompt)` in a LangFuse span so its tokens count toward the per-task budget; the result is discarded. This adds 1 extractor call per task per run (~$0.001), bringing the full eval cost to ~$0.40 extra and making the per-task token-cost metric reflect end-to-end CLI usage.
+    - `src/cli/runner.py`: import `resolve_output_contract`; replace `TaskState(task_description=task_prompt)` with `TaskState(task_description=task_prompt, output_contract=resolve_output_contract(task_prompt))`; add the terminal-state check block (mirroring Fix 2b's decomposition-failure block) using `state.output_contract.check(output, chain_output_files)`; return exit code 3 on contract violation.
+    - Mirror the terminal-state check in the harness result assembly (on `EvaluationRecord`). Add new `output_shape_mismatch: bool` field + `output_shape_missing_keys: list[str]` + `output_shape_missing_files: list[str]` to `EvaluationRecord` with a DuckDB migration.
+    - `scripts/test_mint.py`: treat exit code 3 as FAIL with a contract-violation message, mirroring the existing exit code 2 handling.
+    - **`scripts/validate_contract_extractor.py` (new — Fix B, ~10 min):** one-shot validation script that runs `_extract_output_contract_llm` on every `task_prompt` in `ALL_TASKS` and asserts agreement with the authored contract. Reports `N/20` agreement count and lists any disagreements. Run before Phase 5 eval; record the result in the thesis appendix. If N < 20, tighten the extractor prompt and re-run.
+    - Tests:
+        - Unit test: `OutputContract` schema validation + `is_empty()` + `check()` method (4 cases: satisfied, missing keys, missing files, missing both, plus an empty contract that always passes).
+        - Unit test: `resolve_output_contract` — three tiers (authored shortcut via `task_definition`, known-task shortcut via prompt match, LLM fallback), plus the `try/except → None` legacy-fall-through path.
+        - Unit test: `_match_known_task` — positive (known T-task), negative (free-form prompt), edge cases (substring vs exact match).
+        - Unit test: `_extract_output_contract_llm` — mocked LLM return, both keys-only and keys+files shapes, malformed-output repair path.
+        - Unit test: `test_all_tasks_have_output_contract_consistent_with_validator` — every TaskDefinition in `ALL_TASKS` has a non-empty contract whose `required_keys` are referenced by the validator closure source. (Uses `inspect.getsource` to pull the validator body and asserts each key string appears.)
+        - Integration test: T16-like free-form prompt where the output dict is `{"next_action": "..."}` → exit 3 with a contract-violation message naming all three missing keys.
+        - Integration test: T11-like task where the dict is correct but `output.xlsx` is missing from `chain_output_files` → exit 3 with a missing-files message.
+        - Integration test: T01-like task with contract satisfied → exit 0 (no false positives on legitimate runs).
+        - Harness regression test: `EvaluationRecord` correctly populates `output_shape_mismatch` and the `output_shape_missing_*` lists when the contract fails.
+
+    **Why this priority:** ship between Step 14.5 (retrieval) and Step 13 (AGENT execution timeout). Directly addresses a silent failure that would pollute Chapter 6 numbers. Without it, every task where the decomposer or agent produces the wrong plan gets silently scored as "success" by test_mint and potentially by the harness. The revised scope (~1.5-2 h, +30 min over the original) is the cost of doing it right per `docs/thesis_proposal.md` §Structured State Communication; doing it as a bare `list[str]` would have required a second rewrite when file-producing tasks got audited.
 
     **Scope NOT covered by this fix (Chapter 7 future work):**
-    - Content correctness (wrong values for the right keys): out of scope. Requires per-task ground truth.
+    - Content correctness (wrong values for the right keys): out of scope. Requires per-task ground truth. The existing `validator` / `file_validator` callables handle this for the harness.
     - Nested-key validation (the user asks for `{'stats': {'mean': float, 'median': float}}` and the tool returns `{'stats': 'wrong'}`): out of scope. Shape check is top-level keys only.
-    - Recovery / retry: if the extractor says keys are missing, the current pipeline just fails out. A more sophisticated version would trigger a regeneration with the missing-keys hint. Out of scope — the retry loop is already load-bearing and adding more retry paths risks infinite loops.
+    - Recovery / retry: if the terminal check fires, the current pipeline just fails out. A more sophisticated version would trigger a regeneration with the missing-contract hint. Out of scope — the retry loop is already load-bearing and adding more retry paths risks infinite loops.
+    - File-returning MCP tools / SKILL/AGENT file emission (tracked in `memory/project_file_output_limitation.md`): separate execution-layer concern. `OutputContract` is designed to compose with it — see "Composition" block above.
+
+    **Original plan, superseded 2026-04-15 (preserved for audit trail):** the earlier version of this section proposed `expected_output_keys: list[str]` with two extractor options, (a) regex on `task_prompt` and (b) one-shot LLM extraction. Option (a) was struck because it repeats the §14 regex-prose-parser mistake that the `project_thesis_proposal_pivot_lens.md` memory was written to prevent. The bare `list[str]` field was widened to an `OutputContract` Pydantic schema because T07 and T11 already produce file outputs and the original design couldn't carry them. Net cost of the revision: ~30 extra minutes of implementation (schema + harness `file_validator` integration) in exchange for one uniform contract across dict-producing and file-producing tasks, and proper composition with the future file-returning-tool work.
 
 14.7. **MCP_TOOL generator signature bug — step-0 `upstream_data` false-required parameter.** (~1 hour, added 2026-04-14 end of day after the 21:38 test_mint T11 Excel failure.)
 

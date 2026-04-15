@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     capability_types          VARCHAR NOT NULL DEFAULT '[]',
     failed_step_index         INTEGER,
     failed_step_name          VARCHAR,
+    output_shape_mismatch     BOOLEAN NOT NULL DEFAULT FALSE,
+    output_shape_missing_keys VARCHAR NOT NULL DEFAULT '[]',
+    output_shape_missing_files VARCHAR NOT NULL DEFAULT '[]',
     timestamp                 TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -66,6 +69,10 @@ _MIGRATIONS = [
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS capability_types VARCHAR",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_index INTEGER",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_name VARCHAR",
+    # Step 14.6 — output contract check
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_mismatch BOOLEAN",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_missing_keys VARCHAR",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_missing_files VARCHAR",
 ]
 
 
@@ -113,8 +120,9 @@ class EvaluationStore:
                 chain_length, chain_success, matched_and_executed_count,
                 generated_artifact_count, capability_types,
                 failed_step_index, failed_step_name,
+                output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
                 timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 row_id,
@@ -144,6 +152,9 @@ class EvaluationStore:
                 json.dumps(record.capability_types),
                 record.failed_step_index,
                 record.failed_step_name,
+                record.output_shape_mismatch,
+                json.dumps(record.output_shape_missing_keys),
+                json.dumps(record.output_shape_missing_files),
                 record.timestamp,
             ],
         )
@@ -186,6 +197,7 @@ class EvaluationStore:
                    chain_length, chain_success, matched_and_executed_count,
                    generated_artifact_count, capability_types,
                    failed_step_index, failed_step_name,
+                   output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
                    timestamp
             FROM evaluation_runs
             {where}
@@ -285,6 +297,7 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         chain_length, chain_success, matched_and_executed_count,
         generated_artifact_count, capability_types,
         failed_step_index, failed_step_name,
+        output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
         timestamp,
     ) = row
     # DuckDB may return naive datetimes — normalise to UTC-aware
@@ -294,6 +307,16 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         capability_types_list = json.loads(capability_types) if capability_types else []
     except (ValueError, TypeError):
         capability_types_list = []
+
+    def _decode_str_list(blob: object) -> list[str]:
+        if not blob:
+            return []
+        try:
+            value = json.loads(blob) if isinstance(blob, str) else blob
+        except (ValueError, TypeError):
+            return []
+        return [str(x) for x in value] if isinstance(value, list) else []
+
     return EvaluationRecord(
         run_id=run_id,
         condition=BaselineCondition(condition),
@@ -321,5 +344,8 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         capability_types=capability_types_list,
         failed_step_index=failed_step_index,
         failed_step_name=failed_step_name,
+        output_shape_mismatch=bool(output_shape_mismatch) if output_shape_mismatch is not None else False,
+        output_shape_missing_keys=_decode_str_list(output_shape_missing_keys),
+        output_shape_missing_files=_decode_str_list(output_shape_missing_files),
         timestamp=timestamp,
     )

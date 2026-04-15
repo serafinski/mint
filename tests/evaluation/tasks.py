@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from src.schemas.task import OutputContract
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 _EV_PATH = FIXTURES_DIR / "expected_values.json"
 
@@ -60,6 +62,13 @@ class TaskDefinition:
     file_validator: Callable[[dict, dict[str, bytes]], bool] | None = field(
         default=None, compare=False,
     )
+    # Step 14.6: declared output shape — first-class typed contract counterpart
+    # to the prose task_prompt and the bespoke validator closures. Every task
+    # MUST declare a contract; an empty OutputContract is a deliberate signal
+    # that the task has no shape requirements (none currently do). The harness
+    # copies this directly into TaskState.output_contract at task entry, and
+    # the runner's terminal-state check set-compares against the actual output.
+    output_contract: OutputContract = field(default_factory=OutputContract)
     is_pilot: bool = False
 
 
@@ -108,6 +117,7 @@ T01 = TaskDefinition(
     static_capability_name="csv-parser",
     fixture_paths=[FIXTURES_DIR / "t01_standard.csv"],
     validator=_validate_t01,
+    output_contract=OutputContract(required_keys=["row_count", "column_names"]),
 )
 
 # ---------------------------------------------------------------------------
@@ -139,6 +149,7 @@ T02 = TaskDefinition(
     static_capability_name="json-validator",
     fixture_paths=[FIXTURES_DIR / "t02_config.json", FIXTURES_DIR / "t02_schema.json"],
     validator=_validate_t02,
+    output_contract=OutputContract(required_keys=["errors"]),
 )
 
 # ---------------------------------------------------------------------------
@@ -172,6 +183,7 @@ T03 = TaskDefinition(
     static_capability_name=None,
     fixture_paths=[FIXTURES_DIR / "t03_document.txt"],
     validator=_validate_t03,
+    output_contract=OutputContract(required_keys=["word_count", "readability_score"]),
 )
 
 # ---------------------------------------------------------------------------
@@ -226,6 +238,9 @@ T04 = TaskDefinition(
         FIXTURES_DIR / "t04_reorder_rules.yaml",
     ],
     validator=_validate_t04,
+    output_contract=OutputContract(
+        required_keys=["product_count", "items_below_threshold", "total_reorder_cost"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -260,6 +275,7 @@ T05 = TaskDefinition(
     static_capability_name="data-cleaning-workflow",
     fixture_paths=[FIXTURES_DIR / "t05_dirty.csv"],
     validator=_validate_t05,
+    output_contract=OutputContract(required_keys=["output_row_count", "null_count"]),
 )
 
 # ---------------------------------------------------------------------------
@@ -312,6 +328,7 @@ T06 = TaskDefinition(
         "k": 5,
     },
     validator=_validate_t06,
+    output_contract=OutputContract(required_keys=["null_count", "column_variances"]),
     is_pilot=False,
 )
 
@@ -374,6 +391,10 @@ T07 = TaskDefinition(
     fixture_paths=[FIXTURES_DIR / "t07_left.csv", FIXTURES_DIR / "t07_right.csv"],
     validator=_validate_t07,
     file_validator=_file_validate_t07,
+    output_contract=OutputContract(
+        required_keys=["row_count", "null_count_on_key", "output_file"],
+        required_files=["output.csv"],
+    ),
     is_pilot=True,  # pilot task
 )
 
@@ -429,6 +450,9 @@ T08 = TaskDefinition(
     static_capability_name=None,
     fixture_paths=[FIXTURES_DIR / "t08_messy_data.csv"],
     validator=_validate_t08,
+    output_contract=OutputContract(
+        required_keys=["n_rows", "n_columns", "quality_issues_found", "issue_categories"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -467,6 +491,7 @@ T09 = TaskDefinition(
     static_capability_name="report-generation",
     fixture_paths=[FIXTURES_DIR / "t09_report_data.xml"],
     validator=_validate_t09,
+    output_contract=OutputContract(required_keys=["summary", "stats_table", "anomalies"]),
 )
 
 # ---------------------------------------------------------------------------
@@ -520,6 +545,9 @@ T10 = TaskDefinition(
     static_capability_name=None,
     fixture_paths=[FIXTURES_DIR / "t10_weekly_sales.csv"],
     validator=_validate_t10,
+    output_contract=OutputContract(
+        required_keys=["n_weeks", "trend_direction", "has_seasonality", "forecast"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -600,6 +628,15 @@ T11 = TaskDefinition(
     ],
     validator=_validate_t11,
     file_validator=_file_validate_t11,
+    output_contract=OutputContract(
+        required_keys=[
+            "summary_row_count",
+            "region_revenues",
+            "regions_meeting_target",
+            "output_file",
+        ],
+        required_files=["output.xlsx"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -647,6 +684,9 @@ T12 = TaskDefinition(
         FIXTURES_DIR / "t12_rules.json",
     ],
     validator=_validate_t12,
+    output_contract=OutputContract(
+        required_keys=["clean_row_count", "violations_found", "rules_applied"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -699,6 +739,9 @@ T13 = TaskDefinition(
         FIXTURES_DIR / "t13_baselines.json",
     ],
     validator=_validate_t13,
+    output_contract=OutputContract(
+        required_keys=["anomaly_count", "anomalies", "metrics_analyzed"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -764,6 +807,14 @@ T14 = TaskDefinition(
         FIXTURES_DIR / "t14_rules.json",
     ],
     validator=_validate_t14,
+    output_contract=OutputContract(
+        required_keys=[
+            "department_count",
+            "department_spending",
+            "over_budget_count",
+            "flagged_transactions",
+        ],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -820,6 +871,9 @@ T15 = TaskDefinition(
         FIXTURES_DIR / "t15_agg_config.json",
     ],
     validator=_validate_t15,
+    output_contract=OutputContract(
+        required_keys=["n_days", "metrics_aggregated", "alert_days"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -884,6 +938,9 @@ T16 = TaskDefinition(
         FIXTURES_DIR / "t16_incident.yaml",
     ],
     validator=_validate_t16,
+    output_contract=OutputContract(
+        required_keys=["root_cause_metric", "cascade_chain", "n_metrics_investigated"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -962,6 +1019,9 @@ T17 = TaskDefinition(
         FIXTURES_DIR / "t17_alerts.json",
     ],
     validator=_validate_t17,
+    output_contract=OutputContract(
+        required_keys=["total_alerts", "high_severity_alerts", "fraud_customer_ids"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -1000,6 +1060,9 @@ T18 = TaskDefinition(
     static_capability_name=None,
     fixture_paths=[FIXTURES_DIR / "t18_orders_with_dupes.csv"],
     validator=_validate_t18,
+    output_contract=OutputContract(
+        required_keys=["total_rows", "unique_count", "duplicate_count"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -1046,6 +1109,9 @@ T19 = TaskDefinition(
     static_capability_name="data-analysis-agent",
     fixture_paths=[FIXTURES_DIR / "t19_product_sales.csv"],
     validator=_validate_t19,
+    output_contract=OutputContract(
+        required_keys=["n_rows", "n_categories", "categories"],
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -1100,6 +1166,14 @@ T20 = TaskDefinition(
         FIXTURES_DIR / "t20_eligibility_policy.json",
     ],
     validator=_validate_t20,
+    output_contract=OutputContract(
+        required_keys=[
+            "total_applications",
+            "eligible_count",
+            "ineligible_count",
+            "rules_applied",
+        ],
+    ),
 )
 
 # ---------------------------------------------------------------------------

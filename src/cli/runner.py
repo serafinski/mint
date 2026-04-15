@@ -354,6 +354,137 @@ def _build_task_prompt(task: str, file_paths: list[Path], params: dict[str, str]
     return prompt
 
 
+def _evaluate_output_contract(
+    final_state: Any,
+    artifact: Any,
+    output: dict | None,
+    chain_output_files: dict[str, bytes],
+    *,
+    err_console_ref: Any = None,
+) -> int | None:
+    """Step 14.6 — terminal-state output contract check.
+
+    Pure set comparison on the typed ``OutputContract`` carried on
+    ``TaskState.output_contract``; never raises. Returns the new CLI
+    exit code 3 when:
+
+    1. The pipeline state has a non-empty contract (authored shortcut at
+       task entry, or successful LLM extraction at task entry), AND
+    2. The pipeline produced an artifact AND a non-None output dict
+       (so the failure mode is "wrong shape", not "hard crash"), AND
+    3. The contract check finds at least one missing key or file.
+
+    Returns ``None`` in all other cases — caller falls through to its
+    legacy success / hard-fail exit logic. This gating is intentional:
+
+    - **Empty / missing contract** → fall through. Free-form CLI prompts
+      where the LLM extractor failed (or returned an empty contract) get
+      legacy exit-code-only behavior; we never block them with shape
+      complaints we can't justify.
+    - **Hard crash (output is None)** → fall through to exit 1. Step 14.6
+      catches "ran to completion with wrong shape" (the T16 motivator);
+      hard crashes are a different failure mode and get exit 1 from the
+      caller's existing logic.
+    - **No artifact** → fall through. Registry-match-without-execution
+      paths (seeded descriptors with no source code) take the legacy
+      success branch.
+
+    On a genuine contract violation, prints a distinct magenta warning
+    listing missing keys + files + produced keys so the user can see
+    what happened, then returns 3.
+
+    Extracted from ``execute_task`` so the exit-3 path is testable
+    end-to-end without standing up the full pipeline. See
+    ``tests/unit/test_output_contract.py::test_evaluate_output_contract_*``
+    for the integration tests that exercise it.
+    """
+    if isinstance(final_state, dict):
+        contract = final_state.get("output_contract")
+    else:
+        contract = getattr(final_state, "output_contract", None)
+
+    if contract is None or contract.is_empty():
+        return None
+    if artifact is None or output is None:
+        return None
+
+    check = contract.check(output, chain_output_files)
+    if check.satisfied:
+        return None
+
+    target = err_console_ref if err_console_ref is not None else err_console
+    target.print(
+        "\n[bold magenta]⚠ OUTPUT CONTRACT NOT SATISFIED — "
+        "wrong-shape answer[/bold magenta]"
+    )
+    target.print(
+        "[magenta]The pipeline ran to completion but the final "
+        "output is missing keys or files the task asked for. "
+        "This usually means the decomposer produced a plan that "
+        "doesn't deliver the requested shape — the artifacts ran, "
+        "but the assembly is wrong. Treat this as a failure.[/magenta]"
+    )
+    if check.missing_keys:
+        target.print(
+            f"[magenta]Missing keys:[/magenta] {', '.join(check.missing_keys)}"
+        )
+    if check.missing_files:
+        target.print(
+            f"[magenta]Missing files:[/magenta] {', '.join(check.missing_files)}"
+        )
+    target.print(
+        f"[dim]Produced keys: {', '.join(check.produced_keys) or '(none)'}[/dim]"
+    )
+    if check.produced_files:
+        target.print(
+            f"[dim]Produced files: {', '.join(check.produced_files)}[/dim]"
+        )
+    return 3  # distinct from 0/success, 1/hard-fail, 2/decomposition-fail
+
+
+def _match_known_task(raw_task: str, full_prompt: str) -> Any | None:
+    """Match the user's CLI task against the testbed catalogue (Step 14.6).
+
+    Cheap zero-LLM matcher used by the CLI boundary adapter to re-use an
+    authored ``TaskDefinition.output_contract`` when the user is running a
+    known T-task. Two match modes:
+
+    1. **Task ID** (most common): ``mint run T16`` → match T16. Case-insensitive
+       and tolerant of surrounding whitespace.
+    2. **Exact prompt copy-paste**: if the user's raw task string equals a
+       known task's ``task_prompt`` verbatim, match that task. Useful for
+       reproducing a specific eval run from the CLI.
+
+    Returns ``None`` for genuinely free-form prompts, in which case the
+    resolver falls through to its LLM extractor.
+    """
+    raw = raw_task.strip()
+    if not raw:
+        return None
+
+    # Lazy import so the CLI module doesn't pay the test-package import cost
+    # unless the matcher is actually called. Also avoids circulars in test
+    # collection — tests/evaluation/tasks.py imports from src/, and src/cli
+    # importing back at module load would create a cycle.
+    try:
+        from tests.evaluation.tasks import ALL_TASKS
+    except Exception:  # noqa: BLE001
+        return None
+
+    upper = raw.upper()
+    for task_def in ALL_TASKS:
+        if upper == task_def.task_id.upper():
+            return task_def
+
+    for task_def in ALL_TASKS:
+        if raw == task_def.task_prompt.strip():
+            return task_def
+        if full_prompt.strip() == task_def.task_prompt.strip():
+            return task_def
+
+    return None
+
+
 def _check_docker() -> bool:
     """Check if Docker is running. Returns True if available."""
     import subprocess
@@ -1402,6 +1533,7 @@ def execute_task(
         if run_optimizer:
             err_console.print(f"[dim]Optimizer auto-enabled ({count} invocations recorded).[/dim]")
 
+    from src.orchestrator.output_contract_resolver import resolve_output_contract
     from src.orchestrator.pipeline import create_pipeline
     from src.schemas.task import TaskState
 
@@ -1413,7 +1545,17 @@ def execute_task(
         verification_enabled=not skip_verification,
     ).compile()
 
-    initial_state = TaskState(task_description=task_prompt)
+    # Step 14.6 — resolve the output contract via the shared boundary adapter.
+    # CLI re-runs of T-tasks hit the known-task shortcut (0 LLM calls); free-
+    # form prompts fall to the LLM extractor inside resolve_output_contract.
+    # Same code path as the harness, just driven by different inputs.
+    _known_task = _match_known_task(task, task_prompt)
+    output_contract = resolve_output_contract(task_prompt, task_definition=_known_task)
+
+    initial_state = TaskState(
+        task_description=task_prompt,
+        output_contract=output_contract,
+    )
 
     # Build rich LangFuse tracing config
     import uuid as _uuid
@@ -1881,6 +2023,20 @@ def execute_task(
         if _errs:
             err_console.print(f"[dim]Errors: {'; '.join(_errs[:3])}[/dim]")
         return 2  # distinct from 1 (hard failure) and 0 (success)
+
+    # Step 14.6 — output contract check. Delegated to a small testable
+    # helper so the exit-3 wiring can be exercised end-to-end without
+    # standing up a live pipeline. Returns 3 if the check fires, None
+    # otherwise (in which case the legacy success / hard-fail logic below
+    # decides the exit code).
+    _contract_exit = _evaluate_output_contract(
+        final_state,
+        artifact,
+        output,
+        chain_output_files,
+    )
+    if _contract_exit is not None:
+        return _contract_exit
 
     # Success: artifact executed with output, or registry matched (even
     # without source_code — the system found a relevant capability)
