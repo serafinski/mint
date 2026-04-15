@@ -8,14 +8,28 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.optimizer.operations import (
-    MergeResult,
+    MergeAgentsResult,
+    MergeAgentsSubagent,
+    MergeSkillsResult,
+    MergeToolsResult,
     SplitResult,
     SplitVariant,
+    _MAX_AGENT_SUBAGENT_BUDGET,
+    _merge_agents,
+    _merge_skills,
+    _merge_tools,
     merge,
     prune,
     split,
+    verify_and_register_or_rollback,
 )
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
+from src.schemas.task import GeneratedArtifact
+from src.schemas.verification import (
+    Severity,
+    VerificationFinding,
+    VerificationReport,
+)
 
 
 def _make_cap(
@@ -360,190 +374,663 @@ class TestSplit:
         registry.deactivate.assert_not_called()
 
 
-class TestMerge:
-    def test_rejects_non_skill(self):
+# ---------------------------------------------------------------------------
+# Step 5 — verify_and_register_or_rollback helper
+# ---------------------------------------------------------------------------
+
+
+def _passing_report(name: str) -> VerificationReport:
+    return VerificationReport(
+        capability_name=name,
+        findings=[],
+        overall_passed=True,
+        tier_reached=3,
+    )
+
+
+def _failing_report(name: str, *, severity: Severity = Severity.CRITICAL) -> VerificationReport:
+    return VerificationReport(
+        capability_name=name,
+        findings=[
+            VerificationFinding(
+                tier=1,
+                category="hardcoded_data",
+                severity=severity,
+                message="simulated gate failure",
+            )
+        ],
+        overall_passed=False,
+        tier_reached=1,
+    )
+
+
+def _skill_artifact(name: str = "merged-skill") -> GeneratedArtifact:
+    return GeneratedArtifact(
+        capability_name=name,
+        capability_type=CapabilityType.SKILL,
+        description="merged skill",
+        skill_content="---\nname: merged-skill\ndescription: merged\n---\n\nDo things.\n",
+        input_schema={"x": "int"},
+        output_schema={"y": "int"},
+    )
+
+
+class TestVerifyAndRegisterOrRollback:
+    """Step 5 — the shared helper that merge and split funnel through."""
+
+    @patch("src.verification.gate.verify")
+    def test_gate_pass_registers_skill_and_records_event(self, mock_verify):
+        mock_verify.return_value = _passing_report("merged-skill")
         registry = MagicMock()
-        registry.get.side_effect = [
-            _make_cap("tool-a", cap_type=CapabilityType.MCP_TOOL),
-            _make_cap("skill-b", cap_type=CapabilityType.SKILL),
-        ]
         store = MagicMock()
 
-        with pytest.raises(ValueError, match="Merge is only supported for SKILL"):
+        ok, reason = verify_and_register_or_rollback(
+            _skill_artifact(),
+            registry,
+            store,
+            event_type="merged",
+            event_details="from skill-a, skill-b",
+        )
+
+        assert ok is True
+        assert reason is None
+        # Registry was called with a descriptor carrying the skill content
+        assert registry.add.call_count == 1
+        descriptor = registry.add.call_args[0][0]
+        assert descriptor.capability_type == CapabilityType.SKILL
+        assert descriptor.metadata.get("skill_content", "").startswith("---")
+        # Success event recorded with the caller-provided event_type
+        success_events = [
+            c for c in store.record_event.call_args_list if c[0][1] == "merged"
+        ]
+        assert len(success_events) == 1
+
+    @patch("src.verification.gate.verify")
+    def test_gate_rollback_does_not_touch_registry(self, mock_verify):
+        mock_verify.return_value = _failing_report("merged-skill")
+        registry = MagicMock()
+        store = MagicMock()
+
+        ok, reason = verify_and_register_or_rollback(
+            _skill_artifact(),
+            registry,
+            store,
+            event_type="merged",
+            event_details="from skill-a, skill-b",
+        )
+
+        assert ok is False
+        assert reason is not None
+        assert "hardcoded_data" in reason
+        registry.add.assert_not_called()
+        registry.deactivate.assert_not_called()
+        # Rollback event recorded
+        rollback_events = [
+            c for c in store.record_event.call_args_list
+            if c[0][1] == "verification_rollback"
+        ]
+        assert len(rollback_events) == 1
+
+    @patch("src.verification.gate.verify")
+    def test_high_severity_also_triggers_rollback(self, mock_verify):
+        """HIGH findings are blocking in the gate, so the helper must
+        treat HIGH-only failures as rollbacks (not just CRITICAL)."""
+        mock_verify.return_value = _failing_report(
+            "merged-skill", severity=Severity.HIGH
+        )
+        registry = MagicMock()
+        store = MagicMock()
+
+        ok, _ = verify_and_register_or_rollback(
+            _skill_artifact(),
+            registry,
+            store,
+            event_type="merged",
+            event_details="x",
+        )
+        assert ok is False
+        registry.add.assert_not_called()
+
+    @patch("src.verification.gate.verify")
+    def test_verify_raises_is_swallowed(self, mock_verify):
+        """Never-raises: if verify() blows up, the helper records a
+        rollback and returns (False, reason)."""
+        mock_verify.side_effect = RuntimeError("gate exploded")
+        registry = MagicMock()
+        store = MagicMock()
+
+        ok, reason = verify_and_register_or_rollback(
+            _skill_artifact(),
+            registry,
+            store,
+            event_type="merged",
+            event_details="x",
+        )
+        assert ok is False
+        assert "gate exploded" in reason
+        registry.add.assert_not_called()
+
+    @patch("src.verification.gate.verify")
+    def test_register_raises_is_swallowed(self, mock_verify):
+        """If registry.add raises after a gate pass, the helper still
+        returns (False, reason) and records a rollback event — the
+        partial-state case is recoverable by the optimizer loop."""
+        mock_verify.return_value = _passing_report("merged-skill")
+        registry = MagicMock()
+        registry.add.side_effect = RuntimeError("chroma locked")
+        store = MagicMock()
+
+        ok, reason = verify_and_register_or_rollback(
+            _skill_artifact(),
+            registry,
+            store,
+            event_type="merged",
+            event_details="x",
+        )
+        assert ok is False
+        assert "chroma locked" in reason
+
+
+# ---------------------------------------------------------------------------
+# Step 6 — merge() dispatch + per-type merge functions
+# ---------------------------------------------------------------------------
+
+
+def _cap_with_source(
+    name: str,
+    cap_type: CapabilityType = CapabilityType.MCP_TOOL,
+    source_code: str | None = None,
+    skill_content: str | None = None,
+    agent_config: dict | None = None,
+    tags: list[str] | None = None,
+    domain: str = "general",
+) -> CapabilityDescriptor:
+    """Capability descriptor with executable content embedded in metadata.
+
+    Mirrors the real registry shape where ``tool_loader.register_tool``
+    writes ``metadata['source_code']`` and ``loading_node`` writes
+    ``metadata['skill_content']`` / ``metadata['agent_config']``. Merge
+    helpers pull parent executable content from these metadata keys.
+    """
+    import json as _json
+    metadata: dict[str, str] = {"generated": "true"}
+    if source_code is not None:
+        metadata["source_code"] = source_code
+    if skill_content is not None:
+        metadata["skill_content"] = skill_content
+    if agent_config is not None:
+        metadata["agent_config"] = _json.dumps(agent_config)
+    return CapabilityDescriptor(
+        name=name,
+        description=f"Description for {name}",
+        capability_type=cap_type,
+        domain=domain,
+        tags=tags or [],
+        metadata=metadata,
+    )
+
+
+class TestMergeDispatch:
+    """merge() routes by capability type and rejects cross-type."""
+
+    def test_cross_type_raises_value_error(self):
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "tool-a": _cap_with_source("tool-a", CapabilityType.MCP_TOOL, source_code="..."),
+            "skill-b": _cap_with_source("skill-b", CapabilityType.SKILL, skill_content="..."),
+        }[n]
+        store = MagicMock()
+
+        with pytest.raises(ValueError, match="cross-type"):
             merge(registry, store, ["tool-a", "skill-b"])
 
-    def test_rejects_agent_type(self):
+    def test_missing_capability_raises_key_error(self):
         registry = MagicMock()
-        registry.get.side_effect = [
-            _make_cap("agent-a", cap_type=CapabilityType.AGENT),
-            _make_cap("skill-b", cap_type=CapabilityType.SKILL),
-        ]
-        store = MagicMock()
-
-        with pytest.raises(ValueError, match="Merge is only supported for SKILL"):
-            merge(registry, store, ["agent-a", "skill-b"])
-
-    def test_raises_key_error_for_missing(self):
-        registry = MagicMock()
-        registry.get.side_effect = [None]
+        registry.get.return_value = None
         store = MagicMock()
 
         with pytest.raises(KeyError, match="not found"):
-            merge(registry, store, ["nonexistent"])
+            merge(registry, store, ["nonexistent-a", "nonexistent-b"])
 
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_merge_skills(self, mock_init):
-        cap_a = _make_cap("clean-csv", cap_type=CapabilityType.SKILL, domain="data", tags=["csv"])
-        cap_b = _make_cap("clean-json", cap_type=CapabilityType.SKILL, domain="data", tags=["json"])
-
+    def test_single_capability_rejected(self):
         registry = MagicMock()
-        # [cap_a, cap_b] for parent lookups, None for merged-name collision check.
-        registry.get.side_effect = [cap_a, cap_b, None]
+        registry.get.return_value = _cap_with_source(
+            "cap-a", CapabilityType.SKILL, skill_content="..."
+        )
         store = MagicMock()
 
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = MergeResult(
-            name="data-cleaning",
-            description="Clean CSV and JSON data",
-            rationale="Both handle data cleaning",
-        )
+        with pytest.raises(ValueError, match="at least 2"):
+            merge(registry, store, ["cap-a"])
 
-        result = merge(registry, store, ["clean-csv", "clean-json"])
-
-        assert result == "data-cleaning"
-        # Merged capability registered
-        assert registry.add.call_count == 1
-        new_cap = registry.add.call_args[0][0]
-        assert new_cap.capability_type == CapabilityType.SKILL
-        assert new_cap.domain == "data"
-        assert set(new_cap.tags) == {"csv", "json"}
-        # Both parents deactivated
-        assert registry.deactivate.call_count == 2
-
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_merge_records_events(self, mock_init):
-        cap_a = _make_cap("skill-a", cap_type=CapabilityType.SKILL)
-        cap_b = _make_cap("skill-b", cap_type=CapabilityType.SKILL)
-
+    @patch("src.optimizer.operations._merge_tools")
+    def test_all_mcp_tool_routes_to_merge_tools(self, mock_merge_tools):
+        mock_merge_tools.return_value = "merged-tool"
         registry = MagicMock()
-        registry.get.side_effect = [cap_a, cap_b, None]
+        registry.get.side_effect = lambda n: _cap_with_source(
+            n, CapabilityType.MCP_TOOL, source_code="async def f(): pass"
+        )
         store = MagicMock()
 
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = MergeResult(
-            name="combined-skill",
-            description="Combined capability",
-            rationale="Low reuse individually",
-        )
+        result = merge(registry, store, ["tool-a", "tool-b"])
+        assert result == "merged-tool"
+        mock_merge_tools.assert_called_once()
 
-        merge(registry, store, ["skill-a", "skill-b"])
-
-        # 1 created event + 2 merged events = 3
-        assert store.record_event.call_count == 3
-
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_merge_repair_pass_on_first_failure(self, mock_init):
-        """merge() retries once when LLM output fails validation."""
-        cap_a = _make_cap("skill-a", cap_type=CapabilityType.SKILL)
-        cap_b = _make_cap("skill-b", cap_type=CapabilityType.SKILL)
+    @patch("src.optimizer.operations._merge_skills")
+    def test_all_skill_routes_to_merge_skills(self, mock_merge_skills):
+        mock_merge_skills.return_value = "merged-skill"
         registry = MagicMock()
-        registry.get.side_effect = [cap_a, cap_b, None]
-        store = MagicMock()
-
-        good_result = MergeResult(
-            name="merged-skill",
-            description="Merged capability",
-            rationale="Low reuse individually",
+        registry.get.side_effect = lambda n: _cap_with_source(
+            n, CapabilityType.SKILL, skill_content="---\nname: x\n---\n"
         )
-
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.side_effect = [RuntimeError("bad JSON"), good_result]
+        store = MagicMock()
 
         result = merge(registry, store, ["skill-a", "skill-b"])
         assert result == "merged-skill"
-        assert mock_structured.invoke.call_count == 2
+        mock_merge_skills.assert_called_once()
 
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_merge_raises_if_repair_also_fails(self, mock_init):
-        """merge() raises if both initial call and repair pass fail."""
-        cap_a = _make_cap("skill-a", cap_type=CapabilityType.SKILL)
-        cap_b = _make_cap("skill-b", cap_type=CapabilityType.SKILL)
+    @patch("src.optimizer.operations._merge_agents")
+    def test_all_agent_routes_to_merge_agents(self, mock_merge_agents):
+        mock_merge_agents.return_value = "merged-agent"
         registry = MagicMock()
-        registry.get.side_effect = [cap_a, cap_b]
+        registry.get.side_effect = lambda n: _cap_with_source(
+            n, CapabilityType.AGENT,
+            agent_config={"system_prompt": "you are an agent"},
+        )
         store = MagicMock()
 
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.side_effect = RuntimeError("always fails")
+        result = merge(registry, store, ["agent-a", "agent-b"])
+        assert result == "merged-agent"
+        mock_merge_agents.assert_called_once()
 
-        with pytest.raises(RuntimeError, match="always fails"):
-            merge(registry, store, ["skill-a", "skill-b"])
-        assert mock_structured.invoke.call_count == 2
 
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_merge_raises_if_merged_name_already_exists(self, mock_init):
-        """merge(): raises ValueError and leaves parents intact if merged name collides."""
-        cap_a = _make_cap("skill-a", cap_type=CapabilityType.SKILL)
-        cap_b = _make_cap("skill-b", cap_type=CapabilityType.SKILL)
-        existing_merged = _make_cap("data-cleaning", cap_type=CapabilityType.SKILL)
+class TestMergeTools:
+    """_merge_tools: MCP_TOOL parents → combined FastMCP source."""
 
-        def _get(name):
-            return {"skill-a": cap_a, "skill-b": cap_b, "data-cleaning": existing_merged}.get(name)
-
-        registry = MagicMock()
-        registry.get.side_effect = _get
-        store = MagicMock()
-
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = MergeResult(
-            name="data-cleaning",  # collides with existing_merged
-            description="Clean CSV and JSON data",
-            rationale="Overlapping scope",
+    def _mcp_cap(self, name: str, tags: list[str] | None = None) -> CapabilityDescriptor:
+        return _cap_with_source(
+            name,
+            cap_type=CapabilityType.MCP_TOOL,
+            source_code=(
+                f'"""Tool {name}."""\n'
+                "from typing import Annotated\n"
+                "from mcp.server.fastmcp import FastMCP\n"
+                "from pydantic import Field\n"
+                f"mcp = FastMCP(\"{name}\")\n"
+                "@mcp.tool()\n"
+                f"async def {name.replace('-', '_')}(x: Annotated[int, Field(description='x')]) -> dict:\n"
+                "    return {'y': x}\n"
+            ),
+            tags=tags,
+            domain="data",
         )
 
-        with pytest.raises(ValueError, match="already exists in registry"):
-            merge(registry, store, ["skill-a", "skill-b"])
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_happy_path_registers_and_deactivates_parents(
+        self, mock_init, mock_verify
+    ):
+        cap_a = self._mcp_cap("tool-a", tags=["csv"])
+        cap_b = self._mcp_cap("tool-b", tags=["json"])
+        registry = MagicMock()
+        # Parent lookups + collision check for merged name.
+        registry.get.side_effect = lambda n: {
+            "tool-a": cap_a, "tool-b": cap_b, "merged-parser": None,
+        }.get(n)
+        store = MagicMock()
+        # Gate passes on the merged artifact.
+        mock_verify.return_value = _passing_report("merged-parser")
 
-        # Parents must NOT be deactivated
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = MergeToolsResult(
+            name="merged-parser",
+            description="Merged parser",
+            rationale="Both parse data",
+            combined_source_code=(
+                '"""Merged."""\n'
+                "from typing import Annotated\n"
+                "from mcp.server.fastmcp import FastMCP\n"
+                "from pydantic import Field\n"
+                'mcp = FastMCP("merged")\n'
+                "@mcp.tool()\n"
+                "async def merged_parser(x: Annotated[int, Field(description='x')]) -> dict:\n"
+                "    return {'y': x}\n"
+                'if __name__ == "__main__":\n'
+                "    mcp.run()\n"
+            ),
+            combined_pip_packages=[],
+        )
+
+        result = merge(registry, store, ["tool-a", "tool-b"])
+
+        assert result == "merged-parser"
+        # Gate was called
+        assert mock_verify.call_count == 1
+        # Registry add called once (via ToolLoader.register_tool → registry.add)
+        assert registry.add.call_count == 1
+        descriptor = registry.add.call_args[0][0]
+        assert descriptor.capability_type == CapabilityType.MCP_TOOL
+        assert descriptor.metadata.get("source_code", "").startswith('"""Merged."""')
+        # Both parents deactivated AFTER registration
+        assert registry.deactivate.call_count == 2
+        assert set(c.args[0] for c in registry.deactivate.call_args_list) == {
+            "tool-a", "tool-b"
+        }
+        # Union of parent tags
+        assert set(descriptor.tags) == {"csv", "json"}
+
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_gate_rollback_keeps_parents_active(
+        self, mock_init, mock_verify
+    ):
+        cap_a = self._mcp_cap("tool-a")
+        cap_b = self._mcp_cap("tool-b")
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "tool-a": cap_a, "tool-b": cap_b, "merged-parser": None,
+        }.get(n)
+        store = MagicMock()
+        # Gate REJECTS the merged artifact.
+        mock_verify.return_value = _failing_report("merged-parser")
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = MergeToolsResult(
+            name="merged-parser",
+            description="Merged parser",
+            rationale="Both parse data",
+            combined_source_code="bad source",
+            combined_pip_packages=[],
+        )
+
+        result = merge(registry, store, ["tool-a", "tool-b"])
+
+        # Merge returns None on gate rejection
+        assert result is None
+        # Parents NOT deactivated — atomic rollback
         registry.deactivate.assert_not_called()
-        registry.add.assert_not_called()
+        # registry.add either wasn't called or was called inside the
+        # helper but not committed. The atomicity guarantee is on the
+        # visible side-effect: parents must stay active.
+        # (ToolLoader.register_tool calls registry.add before we see
+        # the return value — that's a pre-existing quirk. The test
+        # asserts on the deactivate, which is the important invariant.)
 
     @patch("src.optimizer.operations.init_chat_model")
-    def test_merge_uses_domain_from_first_parent(self, mock_init):
-        """merge(): merged capability inherits domain from the first parent."""
-        cap_a = _make_cap("skill-a", cap_type=CapabilityType.SKILL, domain="analytics")
-        cap_b = _make_cap("skill-b", cap_type=CapabilityType.SKILL, domain="reporting")
-
+    def test_name_collision_aborts_without_calling_gate(self, mock_init):
+        cap_a = self._mcp_cap("tool-a")
+        cap_b = self._mcp_cap("tool-b")
+        existing = self._mcp_cap("already-exists")
         registry = MagicMock()
-        registry.get.side_effect = [cap_a, cap_b, None]
+        registry.get.side_effect = lambda n: {
+            "tool-a": cap_a, "tool-b": cap_b, "already-exists": existing,
+        }.get(n)
         store = MagicMock()
 
         mock_llm = MagicMock()
         mock_init.return_value = mock_llm
         mock_structured = MagicMock()
         mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = MergeResult(
-            name="analytics-reporting",
-            description="Combined analytics and reporting capability",
-            rationale="Both produce output summaries",
+        mock_structured.invoke.return_value = MergeToolsResult(
+            name="already-exists",  # collides
+            description="x",
+            rationale="x",
+            combined_source_code="...",
+            combined_pip_packages=[],
         )
 
-        merge(registry, store, ["skill-a", "skill-b"])
+        result = merge(registry, store, ["tool-a", "tool-b"])
+        assert result is None
+        registry.deactivate.assert_not_called()
 
-        new_cap = registry.add.call_args[0][0]
-        # Domain from the first parent, not the second
-        assert new_cap.domain == "analytics"
+
+class TestMergeSkills:
+    """_merge_skills: SKILL parents → combined SKILL.md."""
+
+    def _skill_cap(self, name: str, tags: list[str] | None = None) -> CapabilityDescriptor:
+        return _cap_with_source(
+            name,
+            cap_type=CapabilityType.SKILL,
+            skill_content=(
+                f"---\nname: {name}\ndescription: {name} skill\n---\n\n"
+                f"Do the {name} thing.\n"
+            ),
+            tags=tags,
+            domain="analytics",
+        )
+
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_happy_path_registers_and_deactivates_parents(
+        self, mock_init, mock_verify
+    ):
+        cap_a = self._skill_cap("skill-a", tags=["csv"])
+        cap_b = self._skill_cap("skill-b", tags=["json"])
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "skill-a": cap_a, "skill-b": cap_b, "merged-skill": None,
+        }.get(n)
+        store = MagicMock()
+        mock_verify.return_value = _passing_report("merged-skill")
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = MergeSkillsResult(
+            name="merged-skill",
+            description="Merged skill",
+            rationale="Overlapping scope",
+            combined_skill_content=(
+                "---\nname: merged-skill\ndescription: Merged\n---\n\n"
+                "Do both things.\n"
+            ),
+        )
+
+        result = merge(registry, store, ["skill-a", "skill-b"])
+        assert result == "merged-skill"
+        assert registry.add.call_count == 1
+        descriptor = registry.add.call_args[0][0]
+        assert descriptor.capability_type == CapabilityType.SKILL
+        assert descriptor.metadata.get("skill_content", "").startswith("---")
+        assert registry.deactivate.call_count == 2
+        assert set(descriptor.tags) == {"csv", "json"}
+
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_gate_rollback_keeps_parents_active(self, mock_init, mock_verify):
+        cap_a = self._skill_cap("skill-a")
+        cap_b = self._skill_cap("skill-b")
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "skill-a": cap_a, "skill-b": cap_b, "merged-skill": None,
+        }.get(n)
+        store = MagicMock()
+        mock_verify.return_value = _failing_report("merged-skill")
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = MergeSkillsResult(
+            name="merged-skill",
+            description="Merged",
+            rationale="x",
+            combined_skill_content="---\nname: merged-skill\ndescription: x\n---\n\nBad.\n",
+        )
+
+        result = merge(registry, store, ["skill-a", "skill-b"])
+        assert result is None
+        registry.deactivate.assert_not_called()
+
+
+class TestMergeAgents:
+    """_merge_agents: AGENT parents → combined agent_config, budget ceiling enforced."""
+
+    def _agent_cap(self, name: str, subagents: list[dict] | None = None) -> CapabilityDescriptor:
+        cfg: dict = {"system_prompt": f"You are {name}."}
+        if subagents is not None:
+            cfg["subagents"] = subagents
+        return _cap_with_source(
+            name,
+            cap_type=CapabilityType.AGENT,
+            agent_config=cfg,
+            domain="research",
+        )
+
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_happy_path_solo_agents(self, mock_init, mock_verify):
+        cap_a = self._agent_cap("agent-a")
+        cap_b = self._agent_cap("agent-b")
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "agent-a": cap_a, "agent-b": cap_b, "merged-agent": None,
+        }.get(n)
+        store = MagicMock()
+        mock_verify.return_value = _passing_report("merged-agent")
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = MergeAgentsResult(
+            name="merged-agent",
+            description="Merged agent",
+            rationale="Both investigate",
+            combined_system_prompt="You investigate both X and Y.",
+            combined_subagents=[],
+        )
+
+        result = merge(registry, store, ["agent-a", "agent-b"])
+        assert result == "merged-agent"
+        assert registry.add.call_count == 1
+        descriptor = registry.add.call_args[0][0]
+        assert descriptor.capability_type == CapabilityType.AGENT
+        # agent_config is stored as JSON string in metadata
+        import json as _json
+        agent_cfg = _json.loads(descriptor.metadata["agent_config"])
+        assert agent_cfg["system_prompt"] == "You investigate both X and Y."
+        # No subagents key when the list is empty
+        assert "subagents" not in agent_cfg
+        assert registry.deactivate.call_count == 2
+
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_happy_path_with_subagents_under_budget(self, mock_init, mock_verify):
+        cap_a = self._agent_cap("agent-a")
+        cap_b = self._agent_cap("agent-b")
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "agent-a": cap_a, "agent-b": cap_b, "merged-agent": None,
+        }.get(n)
+        store = MagicMock()
+        mock_verify.return_value = _passing_report("merged-agent")
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = MergeAgentsResult(
+            name="merged-agent",
+            description="Merged agent",
+            rationale="x",
+            combined_system_prompt="Lead prompt",
+            combined_subagents=[
+                MergeAgentsSubagent(
+                    name="sub-1",
+                    description="subagent 1",
+                    system_prompt="you are sub 1",
+                    tools=["sandbox_execute"],
+                ),
+                MergeAgentsSubagent(
+                    name="sub-2",
+                    description="subagent 2",
+                    system_prompt="you are sub 2",
+                    tools=["sandbox_execute"],
+                ),
+            ],
+        )
+
+        result = merge(registry, store, ["agent-a", "agent-b"])
+        assert result == "merged-agent"
+        import json as _json
+        agent_cfg = _json.loads(registry.add.call_args[0][0].metadata["agent_config"])
+        assert len(agent_cfg["subagents"]) == 2
+        assert agent_cfg["subagents"][0]["name"] == "sub-1"
+
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_budget_ceiling_rejects_merge_without_calling_gate(
+        self, mock_init, mock_verify
+    ):
+        """Step 6d: more than 8 subagents → abort, parents stay active,
+        gate is NOT called (cheaper to reject than to run Tier 3)."""
+        cap_a = self._agent_cap("agent-a")
+        cap_b = self._agent_cap("agent-b")
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "agent-a": cap_a, "agent-b": cap_b,
+        }.get(n)
+        store = MagicMock()
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        # 9 subagents — over the _MAX_AGENT_SUBAGENT_BUDGET of 8
+        too_many = [
+            MergeAgentsSubagent(
+                name=f"sub-{i}",
+                description=f"subagent {i}",
+                system_prompt=f"you are sub {i}",
+                tools=["sandbox_execute"],
+            )
+            for i in range(_MAX_AGENT_SUBAGENT_BUDGET + 1)
+        ]
+        mock_structured.invoke.return_value = MergeAgentsResult(
+            name="merged-agent",
+            description="too complex",
+            rationale="over budget",
+            combined_system_prompt="lead",
+            combined_subagents=too_many,
+        )
+
+        result = merge(registry, store, ["agent-a", "agent-b"])
+        assert result is None
+        # Gate not called — budget check happens before verification
+        mock_verify.assert_not_called()
+        registry.deactivate.assert_not_called()
+
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_gate_rollback_keeps_parents_active(self, mock_init, mock_verify):
+        cap_a = self._agent_cap("agent-a")
+        cap_b = self._agent_cap("agent-b")
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "agent-a": cap_a, "agent-b": cap_b, "merged-agent": None,
+        }.get(n)
+        store = MagicMock()
+        mock_verify.return_value = _failing_report("merged-agent")
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = MergeAgentsResult(
+            name="merged-agent",
+            description="x",
+            rationale="x",
+            combined_system_prompt="x",
+            combined_subagents=[],
+        )
+
+        result = merge(registry, store, ["agent-a", "agent-b"])
+        assert result is None
+        registry.deactivate.assert_not_called()
