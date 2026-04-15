@@ -193,15 +193,17 @@ The gate uses fail-fast tiering to avoid wasting tokens:
 
 **Tier 1 scans Python source wherever it appears.** `static_scanner.scan()` runs AST + regex only on MCP_TOOL Python (prose-based SKILL/AGENT content false-flagged on words like "mock" and "placeholder" — T04 reproducer, 2026-04-08). However, `gate.py _static_scan()` wraps the scanner with a **layered code-fence extractor** (`_extract_python_fences`): for SKILL and AGENT artifacts, every ```python ... ``` block inside `skill_content` / `system_prompt` / embedded `skill_content` is extracted and fed back through the full MCP_TOOL AST + regex scan. Only the prose around code is skipped. Full methodology note in `docs/proposal_vs_implementation_v2.md`.
 
-### Pillar 3: Type-Scoped Operations (current state — in flight via B1)
+### Pillar 3: Type-Scoped Operations
 
 | Operation | MCP Tools | Skills | Agents |
 |---|---|---|---|
 | **Prune** | ✅ | ✅ | ✅ |
 | **Split** | ❌ raises ValueError | 🔴 metadata-only stubs | 🔴 metadata-only stubs |
-| **Merge** | ❌ raises ValueError | 🔴 metadata-only stubs | ❌ raises ValueError |
+| **Merge** | ✅ | ✅ | ✅ |
 
-**B1 fixes this to 9/9 coverage** — all three operations for all three types, routed through the verification gate with atomic rollback. Under implementation in `docs/MASTER_PLAN_2026_04_13.md` Section 6 Phase 2 Steps 4-11. Until B1 Steps 6-8 land, respect the current type guards — `merge()` and `split()` will raise `ValueError` for types outside the table.
+**Status:** Merge was closed to 3/3 coverage in B1 Step 6 (2026-04-15 commit). Merge for all three types produces `GeneratedArtifact` with real executable content and routes through the shared `verify_and_register_or_rollback` helper (Step 5) with atomic rollback on gate failure. Split is still in its pre-Step-8 state — MCP_TOOL guarded with `ValueError`, SKILL/AGENT producing metadata-only stubs. **Step 8 (in flight in `docs/MASTER_PLAN_2026_04_13.md` Phase 2) will close split to 3/3** using the same per-type pattern as merge. Until Step 8 lands, respect the current split type guards — `split()` will raise `ValueError` for MCP_TOOL.
+
+**Split coverage verification (Step 7, MCP_TOOL-only scope).** Step 8 couples split to a `verify_coverage` helper (`src/verification/coverage.py`, Step 7) that replays the parent's recorded failure cases against new split variants and asserts each failure mode is fixed. Coverage verification is **MCP_TOOL-only** by design, not by infrastructure complexity: the proposal's Pillar 1 classification explicitly labels MCP_TOOL as deterministic and SKILL/AGENT as LLM-mediated (procedural/stateful), and Pillar 3 Split's "input subspaces where the capability breaks" framing presupposes stable per-input failure semantics that only deterministic executors satisfy. SKILL and AGENT splits rely on the three-tier gate per variant without collective coverage verification (same as merge for those types). See §12 pre-registered finding #5 in `docs/MASTER_PLAN_2026_04_13.md` for the Pillar 1 × Pillar 3 tension analysis and Chapter 4 disclosure text. True coverage verification for nondeterministic executors (per-variant replay statistics or LLM-judged correctness) is Chapter 7 future work.
 
 ### LLM Output Robustness
 
