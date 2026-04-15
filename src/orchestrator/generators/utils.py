@@ -81,6 +81,38 @@ def build_task_context(state: TaskState) -> str:
     )
 
 
+def find_subtask_for_gap(
+    gap: ClassifiedGap,
+    subtasks: list[SubTask],
+) -> SubTask | None:
+    """Return the subtask whose ``required_capabilities`` contains the gap query.
+
+    Used by both :func:`build_schema_context` and :func:`is_first_step_for_gap`
+    so the lookup lives in one place.
+    """
+    for st in subtasks:
+        if gap.query in st.required_capabilities:
+            return st
+    return None
+
+
+def is_first_step_for_gap(
+    gap: ClassifiedGap,
+    subtasks: list[SubTask],
+) -> bool | None:
+    """Return True if the gap's subtask has no upstream dependencies.
+
+    Returns ``True`` for a step-0 (no ``depends_on``), ``False`` for a
+    downstream step, and ``None`` when the gap cannot be matched to a
+    subtask (in which case callers should skip position-specific directives
+    and validators).
+    """
+    subtask = find_subtask_for_gap(gap, subtasks)
+    if subtask is None:
+        return None
+    return len(subtask.depends_on) == 0
+
+
 def build_schema_context(
     gap: ClassifiedGap,
     subtasks: list[SubTask],
@@ -94,15 +126,7 @@ def build_schema_context(
     Returns an empty string if no matching subtask is found or if the subtask
     has no ``output_schema`` defined (backward-compatible with old decompositions).
     """
-    # Find the subtask matching this gap
-    target_subtask: SubTask | None = None
-    target_idx: int | None = None
-    for idx, st in enumerate(subtasks):
-        if gap.query in st.required_capabilities:
-            target_subtask = st
-            target_idx = idx
-            break
-
+    target_subtask = find_subtask_for_gap(gap, subtasks)
     if target_subtask is None or not target_subtask.output_schema:
         return ""
 

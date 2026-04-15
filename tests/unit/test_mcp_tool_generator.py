@@ -14,15 +14,26 @@ import pytest
 
 from src.orchestrator.generators.mcp_tool import (
     GeneratedToolCode,
+    _step_position_block,
     _validate_code,
+    _validate_step_signature,
     _validate_tool_name,
     generate_mcp_tool,
     generate_single_tool,
+)
+from src.orchestrator.generators.utils import (
+    find_subtask_for_gap,
+    is_first_step_for_gap,
+)
+from src.orchestrator.prompts.mcp_tool_generator import (
+    DOWNSTREAM_STEP_DIRECTIVE,
+    FIRST_STEP_DIRECTIVE,
 )
 from src.schemas.capability import CapabilityType
 from src.schemas.task import (
     ClassifiedGap,
     GeneratedArtifact,
+    SubTask,
     TaskState,
     TaskStatus,
 )
@@ -359,6 +370,300 @@ class TestValidateToolName:
         error = _validate_tool_name("_add_numbers")
         assert error is not None
         assert "snake_case" in error
+
+
+# ---------------------------------------------------------------------------
+# _validate_step_signature + step-position plumbing (Step 14.7)
+# ---------------------------------------------------------------------------
+
+
+def _make_tool_source(params: str, body: str = "    return {}") -> str:
+    """Build a minimal FastMCP tool source with the given parameter list."""
+    return (
+        '"""MCP tool stub."""\n'
+        "from typing import Annotated\n"
+        "from mcp.server.fastmcp import FastMCP\n"
+        "from pydantic import Field\n"
+        "mcp = FastMCP('stub')\n"
+        "@mcp.tool()\n"
+        f"async def run({params}) -> dict:\n"
+        '    """doc."""\n'
+        f"{body}\n"
+        'if __name__ == "__main__":\n'
+        "    mcp.run()\n"
+    )
+
+
+class TestValidateStepSignature:
+    """Step 14.7: catch step-0 functions that falsely require upstream_data."""
+
+    _FIRST_STEP_CORRECT = _make_tool_source(
+        'csv_path: Annotated[str, Field(description="Path to CSV")]'
+    )
+    _FIRST_STEP_WITH_REQUIRED_UPSTREAM = _make_tool_source(
+        'upstream_data: Annotated[dict, Field(description="Upstream")]'
+    )
+    _DOWNSTREAM_CORRECT = _make_tool_source(
+        'upstream_data: Annotated[dict, Field(description="Upstream")]'
+    )
+    _DOWNSTREAM_MISSING_UPSTREAM = _make_tool_source(
+        'value: Annotated[int, Field(description="A number")] = 0'
+    )
+    _DOWNSTREAM_OPTIONAL_UPSTREAM = _make_tool_source(
+        'upstream_data: Annotated[dict, Field(description="Upstream")] = None'
+    )
+
+    def test_first_step_without_upstream_ok(self):
+        assert _validate_step_signature(self._FIRST_STEP_CORRECT, is_first_step=True) is None
+
+    def test_first_step_with_required_upstream_rejected(self):
+        error = _validate_step_signature(
+            self._FIRST_STEP_WITH_REQUIRED_UPSTREAM, is_first_step=True
+        )
+        assert error is not None
+        assert "step-0" in error
+        assert "upstream_data" in error
+
+    def test_downstream_with_upstream_ok(self):
+        assert (
+            _validate_step_signature(self._DOWNSTREAM_CORRECT, is_first_step=False)
+            is None
+        )
+
+    def test_downstream_missing_upstream_rejected(self):
+        error = _validate_step_signature(
+            self._DOWNSTREAM_MISSING_UPSTREAM, is_first_step=False
+        )
+        assert error is not None
+        assert "upstream_data" in error
+
+    def test_downstream_with_optional_upstream_rejected(self):
+        # A downstream step that made upstream_data optional still fails —
+        # the executor only populates upstream_data when it's present as a
+        # parameter name, and an optional default masks a silently empty dict.
+        error = _validate_step_signature(
+            self._DOWNSTREAM_OPTIONAL_UPSTREAM, is_first_step=False
+        )
+        assert error is not None
+        assert "upstream_data" in error
+
+    def test_none_is_first_step_skips_check(self):
+        # Gap couldn't be matched to a subtask — skip position checks entirely.
+        assert _validate_step_signature(self._FIRST_STEP_CORRECT, is_first_step=None) is None
+        assert (
+            _validate_step_signature(self._FIRST_STEP_WITH_REQUIRED_UPSTREAM, is_first_step=None)
+            is None
+        )
+
+    def test_syntax_error_returns_none(self):
+        # Syntax errors are handled by _validate_code; this helper defers.
+        assert _validate_step_signature("def bad(\n", is_first_step=True) is None
+
+    def test_missing_async_function_returns_none(self):
+        # Missing function is handled by _validate_code; this helper defers.
+        code = (
+            '"""Stub."""\n'
+            "from mcp.server.fastmcp import FastMCP\n"
+            "mcp = FastMCP('stub')\n"
+        )
+        assert _validate_step_signature(code, is_first_step=True) is None
+
+    def test_private_async_helper_ignored(self):
+        # The AST walker uses the same public-function selection as _validate_code,
+        # so a private helper does not shadow the real tool.
+        code = (
+            '"""Stub."""\n'
+            "from typing import Annotated\n"
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from pydantic import Field\n"
+            "mcp = FastMCP('stub')\n"
+            "async def _helper(upstream_data: dict) -> dict:\n"
+            "    return upstream_data\n"
+            "@mcp.tool()\n"
+            'async def run(csv_path: Annotated[str, Field(description="p")]) -> dict:\n'
+            '    """doc."""\n'
+            "    return {}\n"
+        )
+        # Public function has csv_path only → valid as step 0.
+        assert _validate_step_signature(code, is_first_step=True) is None
+
+    def test_kwonly_required_upstream_also_flagged(self):
+        code = (
+            '"""Stub."""\n'
+            "from typing import Annotated\n"
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from pydantic import Field\n"
+            "mcp = FastMCP('stub')\n"
+            "@mcp.tool()\n"
+            "async def run(*, upstream_data: Annotated[dict, Field(description='u')]) -> dict:\n"
+            '    """doc."""\n'
+            "    return upstream_data\n"
+        )
+        error = _validate_step_signature(code, is_first_step=True)
+        assert error is not None
+        assert "upstream_data" in error
+
+
+class TestStepPositionBlock:
+    def test_first_step_returns_first_directive(self):
+        assert _step_position_block(True) == FIRST_STEP_DIRECTIVE
+
+    def test_downstream_returns_downstream_directive(self):
+        assert _step_position_block(False) == DOWNSTREAM_STEP_DIRECTIVE
+
+    def test_none_returns_empty(self):
+        assert _step_position_block(None) == ""
+
+    def test_first_directive_mentions_no_upstream_data(self):
+        assert "upstream_data" in FIRST_STEP_DIRECTIVE
+        assert "DO NOT" in FIRST_STEP_DIRECTIVE
+
+    def test_downstream_directive_mentions_required_upstream_data(self):
+        assert "upstream_data" in DOWNSTREAM_STEP_DIRECTIVE
+        assert "exactly ONE required parameter" in DOWNSTREAM_STEP_DIRECTIVE
+
+
+class TestIsFirstStepForGap:
+    """Subtask-matching helper used to decide the step-position directive."""
+
+    @staticmethod
+    def _gap(query: str = "parse_csv") -> ClassifiedGap:
+        return ClassifiedGap(
+            description="d",
+            query=query,
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="r",
+        )
+
+    def test_first_step_when_no_depends_on(self):
+        subtasks = [
+            SubTask(
+                description="parse",
+                required_capabilities=["parse_csv"],
+                depends_on=[],
+            ),
+        ]
+        assert is_first_step_for_gap(self._gap(), subtasks) is True
+
+    def test_downstream_when_depends_on_nonempty(self):
+        subtasks = [
+            SubTask(description="parse", required_capabilities=["parse_csv"]),
+            SubTask(
+                description="aggregate",
+                required_capabilities=["aggregate"],
+                depends_on=[0],
+            ),
+        ]
+        assert is_first_step_for_gap(self._gap("aggregate"), subtasks) is False
+
+    def test_none_when_gap_not_in_subtasks(self):
+        subtasks = [
+            SubTask(description="parse", required_capabilities=["parse_csv"]),
+        ]
+        assert is_first_step_for_gap(self._gap("unknown"), subtasks) is None
+
+    def test_none_when_subtasks_empty(self):
+        assert is_first_step_for_gap(self._gap(), []) is None
+
+    def test_find_subtask_returns_matching_entry(self):
+        st = SubTask(
+            description="aggregate",
+            required_capabilities=["aggregate", "sum"],
+            depends_on=[0],
+        )
+        subtasks = [
+            SubTask(description="parse", required_capabilities=["parse_csv"]),
+            st,
+        ]
+        assert find_subtask_for_gap(self._gap("sum"), subtasks) is st
+
+    def test_t11_join_first_step_regression(self):
+        """Regression guard for the T11 bug: decomposer named step 0
+        ``join-sales-with-products-on-product_id`` and the word "join"
+        pattern-matched to middle-step semantics in the LLM's understanding.
+        is_first_step_for_gap must return True because ``depends_on == []``.
+        """
+        gap = self._gap("join-sales-with-products-on-product_id")
+        subtasks = [
+            SubTask(
+                description="Join sales with products on product_id",
+                required_capabilities=["join-sales-with-products-on-product_id"],
+                depends_on=[],
+            ),
+            SubTask(
+                description="Compare revenue to targets",
+                required_capabilities=["compare-revenue-to-targets"],
+                depends_on=[0],
+            ),
+        ]
+        assert is_first_step_for_gap(gap, subtasks) is True
+
+
+class TestStepPositionInPrompt:
+    """Verify the step-position block actually lands in the user prompt."""
+
+    @staticmethod
+    def _capture_messages(recorded: list) -> type:
+        class _Structured:
+            def invoke(_self, messages, config=None):
+                recorded.extend(messages)
+                return GeneratedToolCode(
+                    tool_name="stub",
+                    source_code=VALID_TOOL_SOURCE,
+                    description="stub",
+                )
+
+        class _LLM:
+            def with_structured_output(_self, schema):
+                return _Structured()
+
+        return _LLM()
+
+    @staticmethod
+    def _gap() -> ClassifiedGap:
+        return ClassifiedGap(
+            description="add",
+            query="add_numbers",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="r",
+        )
+
+    def test_first_step_directive_in_prompt(self):
+        captured: list = []
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._capture_messages(captured),
+        ):
+            generate_single_tool(self._gap(), is_first_step=True)
+
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "THIS IS THE FIRST STEP" in user_msg["content"]
+        assert "DO NOT declare an ``upstream_data`` parameter" in user_msg["content"]
+
+    def test_downstream_directive_in_prompt(self):
+        captured: list = []
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._capture_messages(captured),
+        ):
+            generate_single_tool(self._gap(), is_first_step=False)
+
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "THIS IS A DOWNSTREAM STEP" in user_msg["content"]
+        assert "exactly ONE required parameter" in user_msg["content"]
+
+    def test_none_omits_directive(self):
+        captured: list = []
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._capture_messages(captured),
+        ):
+            generate_single_tool(self._gap(), is_first_step=None)
+
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "Step Position (HARD CONSTRAINT)" not in user_msg["content"]
 
 
 # ---------------------------------------------------------------------------

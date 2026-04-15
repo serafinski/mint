@@ -1,5 +1,62 @@
 """Prompts for the MCP tool generator."""
 
+# ---------------------------------------------------------------------------
+# Step position directive (Step 14.7 — step-0 upstream_data false-required fix)
+# ---------------------------------------------------------------------------
+#
+# The MCP_TOOL generator occasionally emitted step-0 functions with
+# ``upstream_data`` as a REQUIRED positional parameter even though step 0
+# has no upstream dependencies. The executor correctly calls step-0
+# functions WITHOUT ``upstream_data`` (only fixture paths), so the tool
+# crashed with ``missing 1 required positional argument: 'upstream_data'``.
+#
+# Empirically observed on T11 where the decomposer named step 0
+# ``join-sales-with-products-...`` — the word "join" pattern-matched to
+# middle-step semantics in the LLM's understanding, overriding the
+# ``depends_on=[]`` signal.
+#
+# Fix: inject an explicit step-position block into the user prompt so the
+# LLM cannot confuse step role based on the gap name, plus a post-generation
+# AST check that flags signature/position mismatches for the repair pass.
+
+FIRST_STEP_DIRECTIVE = """\
+
+## Step Position (HARD CONSTRAINT)
+
+**THIS IS THE FIRST STEP of the workflow. It has NO upstream dependencies.**
+
+Your function signature MUST follow these rules:
+- **DO NOT declare an ``upstream_data`` parameter.** There is no upstream
+  data for step 0. If you declare ``upstream_data`` as a required parameter,
+  the executor will crash with
+  ``missing 1 required positional argument: 'upstream_data'``.
+- The only required parameters are file path strings — e.g.
+  ``csv_path: Annotated[str, Field(description="...")]``,
+  ``yaml_path: Annotated[str, Field(description="...")]``.
+- Every non-path parameter MUST have a Python default value after the
+  closing ``Annotated[...]`` bracket.
+- Read each file using the appropriate library (csv, openpyxl, json,
+  yaml, etc.) and return a JSON-serializable dict with the parsed data.\
+"""
+
+DOWNSTREAM_STEP_DIRECTIVE = """\
+
+## Step Position (HARD CONSTRAINT)
+
+**THIS IS A DOWNSTREAM STEP of the workflow. It depends on earlier steps.**
+
+Your function signature MUST follow these rules:
+- Declare exactly ONE required parameter:
+  ``upstream_data: Annotated[dict, Field(description="Upstream step outputs")]``.
+- **DO NOT declare file path parameters.** The executor passes upstream
+  data as a parsed dict, not as files. The data is already JSON.
+- **DO NOT use ``open()``, ``pd.read_csv()``, or any file reader.**
+- Read upstream keys from ``upstream_data[...]`` (e.g.
+  ``inventory = upstream_data["inventory"]``).
+- Every other parameter MUST have a Python default value.\
+"""
+
+
 MCP_TOOL_SYSTEM_PROMPT = """\
 You are an expert Python developer specializing in MCP (Model Context Protocol)
 tool generation. You generate complete, working FastMCP tool implementations.
@@ -139,6 +196,7 @@ Your tool implements this step of the workflow:
 Focus on exactly this step. Do NOT try to solve the whole task in one tool. \
 If the workflow has other steps (parsing, aggregation, reporting, etc.) \
 those are handled by separate tools — you must NOT duplicate their work.
+{step_position}
 
 ## CRITICAL: Do Not Build a Monolith
 
