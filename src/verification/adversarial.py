@@ -10,9 +10,23 @@ and ``response_format=AdversarialFindings`` for structured output.
 
 Operational boundaries (from CLAUDE.md):
 - ``recursion_limit=50``
-- Node-level timeout: 300 s
+- Node-level timeout: 480 s (bumped 2026-04-15 from 300 s; Step 14.11)
 - Fresh agent per invocation
-- On timeout / error: return partial report with error flag, never raise
+- On timeout: return fail-CLOSED report (HIGH severity) so the
+  verification_node retry loop fires and regenerates the artifact
+  (Step 14.11 — aligns with ``docs/thesis_proposal.md`` §Pillar 2
+  *"Every generated capability must pass all three tiers before
+  entering the production skill registry."*). The previous fail-open
+  behavior silently classified timed-out probes as PASS, which
+  violated the "must pass" contract by letting un-verified artifacts
+  into the registry.
+- On non-timeout error: return fail-OPEN report (MEDIUM severity),
+  preserving the never-raises contract but NOT triggering retry.
+  Error-branch fail-closing is deliberately out of scope for Step
+  14.11 — provider errors are often transient and flipping them to
+  fail-closed would trigger regenerations for reasons the LLM can't
+  fix. If Phase 5 surfaces a pattern of silent-error fail-opens,
+  revisit in §12 or Chapter 7.
 """
 
 from __future__ import annotations
@@ -38,7 +52,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ADVERSARIAL_RECURSION_LIMIT = 50
-ADVERSARIAL_TIMEOUT_S = 300
+# Step 14.11 (2026-04-15): raised from 300 → 480 s. The 300 s ceiling
+# was an operational default not grounded in any proposal constraint;
+# the 2026-04-15 post-Step-13 test_mint run surfaced a T09 run where
+# the adversarial agent hit the 300 s cap and the gate fail-opened,
+# letting an un-verified artifact into the registry. Bump to 480 s
+# (1.6x, conservative match to Step 13's 480 → 900 ratio) gives
+# probes more room to converge without extending indefinite hangs.
+# See docs/MASTER_PLAN_2026_04_13.md §14.11 for the full rationale.
+ADVERSARIAL_TIMEOUT_S = 480
 
 # Module-level LangFuse metadata, set by verification_node before
 # spawning the ThreadPoolExecutor. probe() reads this since
@@ -319,21 +341,45 @@ def _findings_to_report(
 
 
 def _timeout_report(capability_name: str) -> VerificationReport:
-    """Return a partial report when the adversarial agent times out."""
+    """Return a fail-closed report when the adversarial agent times out.
+
+    Step 14.11 (2026-04-15): this used to be fail-open
+    (``overall_passed=True``, ``severity=MEDIUM``). That violated
+    ``docs/thesis_proposal.md`` §Pillar 2's *"Every generated
+    capability must pass all three tiers before entering the
+    production skill registry"* contract — a timed-out probe is
+    structurally *"couldn't reach a verdict"*, not *"pass"*.
+
+    The new behavior classifies the timeout as ``overall_passed=False``
+    with a HIGH severity ``adversarial_timeout`` finding, which
+    propagates through the verification gate and trips the
+    ``verification_node`` retry loop (MAX_ATTEMPTS=3). The retry
+    regenerates the artifact with fresh code and re-runs the full
+    three-tier gate; only an attempt that affirmatively passes Tier 3
+    enters the registry. After three timeouts, the artifact is
+    classified as ``generation_failed``.
+
+    HIGH (rather than CRITICAL) is the honest label: a timeout is
+    "inconclusive, needs further review", not "definitively
+    contaminated". Both severities trip the boolean retry gate
+    equivalently; HIGH is more accurate in Chapter 6 analytics.
+    """
     return VerificationReport(
         capability_name=capability_name,
         findings=[
             VerificationFinding(
                 tier=3,
                 category="adversarial_timeout",
-                severity=Severity.MEDIUM,
+                severity=Severity.HIGH,
                 message=(
                     f"Adversarial probing timed out after {ADVERSARIAL_TIMEOUT_S}s. "
-                    "Partial results only."
+                    "Classified as fail-closed per Step 14.11 — verification_node "
+                    "retry loop will regenerate the artifact and re-run Tier 3 "
+                    "on fresh code."
                 ),
             )
         ],
-        overall_passed=True,  # fail open on timeout
+        overall_passed=False,
         tier_reached=3,
     )
 
@@ -569,18 +615,25 @@ def probe(artifact: GeneratedArtifact) -> VerificationReport:
 
     except concurrent.futures.TimeoutError:
         pool.shutdown(wait=False)
-        logger.error(
-            "Adversarial agent timed out after %ds for %s",
+        # Step 14.11: downgraded from logger.error to logger.warning
+        # because a timeout is no longer a terminal error — the gate
+        # is fail-closed, so the verification_node retry loop will
+        # regenerate the artifact and try again. Grep for "fail-closed
+        # retry will trigger" in Phase 5 logs to count timeout events.
+        logger.warning(
+            "Adversarial Tier 3 timed out after %ds for %s — classified "
+            "as fail-closed, retry will trigger",
             ADVERSARIAL_TIMEOUT_S,
             capability_name,
         )
         emit_langfuse_event(
             None,
             "adversarial.timeout",
-            "ERROR",
+            "WARNING",
             {
                 "timeout_s": ADVERSARIAL_TIMEOUT_S,
                 "capability_name": capability_name,
+                "classification": "fail_closed",
             },
         )
         return _timeout_report(capability_name)

@@ -153,22 +153,42 @@ class TestFindingsToReport:
 
 
 class TestPartialReports:
-    def test_timeout_report(self):
+    def test_timeout_report_fail_closed_high_severity(self):
+        """Step 14.11: _timeout_report now returns fail-CLOSED with HIGH
+        severity so the verification_node retry loop fires. Was fail-open
+        with MEDIUM severity before 2026-04-15; see docs/thesis_proposal.md
+        §Pillar 2 'must pass all three tiers' — fail-open violated that
+        contract by letting un-verified artifacts into the registry."""
         report = _timeout_report("my-tool")
         assert report.capability_name == "my-tool"
-        assert report.overall_passed is True  # fail open
+        assert report.overall_passed is False  # fail-closed per Step 14.11
         assert report.tier_reached == 3
         assert len(report.findings) == 1
         assert report.findings[0].category == "adversarial_timeout"
-        assert report.findings[0].severity == Severity.MEDIUM
+        assert report.findings[0].severity == Severity.HIGH
+        assert "fail-closed" in report.findings[0].message.lower()
 
-    def test_error_report(self):
+    def test_error_report_still_fail_open(self):
+        """Error branch deliberately left fail-open by Step 14.11.
+        Provider errors (rate limits, transient 500s) would trigger
+        expensive regenerations for reasons the LLM can't fix. If
+        Phase 5 surfaces a silent-error fail-open pattern, revisit in
+        §12 or Chapter 7."""
         report = _error_report("my-tool", "Something broke")
         assert report.capability_name == "my-tool"
-        assert report.overall_passed is True  # fail open
+        assert report.overall_passed is True  # deliberately fail-open
         assert report.tier_reached == 3
         assert len(report.findings) == 1
         assert "Something broke" in report.findings[0].message
+        assert report.findings[0].severity == Severity.MEDIUM
+
+    def test_adversarial_timeout_ceiling_is_480s(self):
+        """Regression guard for the Step 14.11 bump 300 → 480. Any
+        change to this constant must be justified by a concrete
+        langfuse trace showing real probe work near the new ceiling,
+        same discipline as Step 13's AGENT_EXECUTION_TIMEOUT_S guard."""
+        from src.verification.adversarial import ADVERSARIAL_TIMEOUT_S
+        assert ADVERSARIAL_TIMEOUT_S == 480
 
 
 # ---------------------------------------------------------------------------
@@ -197,19 +217,13 @@ class TestProbe:
         assert "ground_truth" in categories
 
     @patch("src.verification.adversarial._create_adversarial_agent")
-    def test_timeout_returns_partial_report(self, mock_create):
-        mock_agent = MagicMock()
-        # Simulate timeout by making invoke block
-        import concurrent.futures
-
-        mock_agent.invoke.side_effect = lambda *a, **kw: (_ for _ in ()).throw(
-            concurrent.futures.TimeoutError()
-        )
-        mock_create.return_value = mock_agent
-
-        # Patch the timeout to be very short for testing
+    def test_timeout_returns_fail_closed_report(self, mock_create):
+        """Step 14.11: flipped from fail-open to fail-closed. A probe
+        that exceeds the ADVERSARIAL_TIMEOUT_S ceiling must return
+        overall_passed=False with a HIGH-severity adversarial_timeout
+        finding so the verification_node retry loop fires."""
+        # Patch the timeout to be very short and use a blocking invoke
         with patch("src.verification.adversarial.ADVERSARIAL_TIMEOUT_S", 0.01):
-            # The ThreadPoolExecutor will time out
             mock_agent_real = MagicMock()
             import time
 
@@ -221,12 +235,13 @@ class TestProbe:
             mock_create.return_value = mock_agent_real
             report = probe(_artifact())
 
-        assert report.overall_passed is True  # fail open
+        assert report.overall_passed is False  # Step 14.11: fail-closed
         assert report.tier_reached == 3
-        assert any(
-            "timeout" in f.category.lower() or "error" in f.category.lower()
-            for f in report.findings
-        )
+        timeout_findings = [
+            f for f in report.findings if f.category == "adversarial_timeout"
+        ]
+        assert len(timeout_findings) == 1
+        assert timeout_findings[0].severity == Severity.HIGH
 
     @patch("src.verification.adversarial._create_adversarial_agent")
     def test_agent_error_returns_error_report(self, mock_create):
@@ -418,6 +433,140 @@ class TestProbe:
         call_args = mock_agent.invoke.call_args
         config = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("config", {})
         assert config.get("recursion_limit") == ADVERSARIAL_RECURSION_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# Step 14.11 — fail-closed timeout triggers verification_node retry
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutTriggersRetry:
+    """End-to-end: a Tier 3 timeout must propagate through the gate and
+    trip the verification_node retry loop. This is the load-bearing
+    thesis-alignment test — Pillar 2's 'must pass all three tiers'
+    contract is only meaningful if a non-verdict routes to retry, not
+    to registry."""
+
+    def _failing_timeout_gate(self):
+        """Gate fn that returns the exact shape _timeout_report produces
+        on its fail-closed branch. Doesn't call the real adversarial
+        probe — tests the gate → verification_node → retry round-trip
+        in isolation."""
+
+        def gate(artifact):
+            return _timeout_report(artifact.capability_name)
+
+        return gate
+
+    def _passing_gate(self):
+        from src.schemas.verification import VerificationReport
+
+        def gate(artifact):
+            return VerificationReport(
+                capability_name=artifact.capability_name,
+                findings=[],
+                overall_passed=True,
+                tier_reached=3,
+            )
+
+        return gate
+
+    def test_timeout_report_trips_retry_loop(self):
+        """Step 14.11 regression guard: feeding _timeout_report's output
+        through verification_node must route to the generator for retry,
+        not to loading_node. This is the behavior Pillar 2 requires
+        ('must pass all three tiers' — a timeout isn't a pass)."""
+        from src.orchestrator.verification_node import verification_node
+        from src.schemas.task import GeneratedArtifact, TaskState
+
+        artifact = GeneratedArtifact(
+            capability_name="timed-out-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code="async def tool(): pass",
+            gap_query="timed-out-tool",
+        )
+        state = TaskState(
+            task_description="t",
+            generated_artifacts=[artifact],
+            attempt_count=0,
+        )
+
+        cmd = verification_node(state, gate_fn=self._failing_timeout_gate())
+
+        # Retry path: must route back to the generator, not forward to
+        # loading_node. The timed-out artifact must be stripped from
+        # state so the next attempt regenerates fresh code.
+        assert cmd.goto == "generate_mcp_tool"
+        assert cmd.update["attempt_count"] == 1
+        remaining = [
+            a.capability_name for a in cmd.update["generated_artifacts"]
+        ]
+        assert "timed-out-tool" not in remaining
+
+    def test_retry_converges_on_second_attempt(self):
+        """Attempt 1 times out (fail-closed), regeneration produces
+        fresh code, attempt 2 passes Tier 3 → final routing is to
+        loading_node with attempt_count=2. Simulates the full retry
+        round-trip the pipeline does across regeneration boundaries."""
+        from src.orchestrator.verification_node import verification_node
+        from src.schemas.task import GeneratedArtifact, TaskState
+
+        artifact_v1 = GeneratedArtifact(
+            capability_name="tool-v1",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code="async def tool(): pass  # slow",
+            gap_query="tool",
+        )
+        state_1 = TaskState(
+            task_description="t",
+            generated_artifacts=[artifact_v1],
+            attempt_count=0,
+        )
+        cmd_1 = verification_node(state_1, gate_fn=self._failing_timeout_gate())
+        assert cmd_1.goto == "generate_mcp_tool"
+        assert cmd_1.update["attempt_count"] == 1
+
+        # Simulate regeneration: pipeline produces a fresh artifact
+        # with the same gap_query but different source. attempt_count
+        # carries forward from cmd_1.update.
+        artifact_v2 = GeneratedArtifact(
+            capability_name="tool-v2",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code="async def tool(): pass  # fast",
+            gap_query="tool",
+        )
+        state_2 = TaskState(
+            task_description="t",
+            generated_artifacts=[artifact_v2],
+            attempt_count=cmd_1.update["attempt_count"],
+        )
+        cmd_2 = verification_node(state_2, gate_fn=self._passing_gate())
+        assert cmd_2.goto == "loading_node"
+        assert cmd_2.update["attempt_count"] == 2
+
+    def test_non_timeout_exception_still_fail_open(self):
+        """Step 14.11 deliberately does NOT fail-close the error branch.
+        A RuntimeError in the adversarial agent (e.g., provider 500 or
+        DeepAgents invocation crash) still returns a fail-open MEDIUM
+        report, preserving the never-raises contract. If this changes,
+        Phase 5 will see silent retries on transient provider errors."""
+        with patch(
+            "src.verification.adversarial._create_adversarial_agent"
+        ) as mock_create:
+            mock_agent = MagicMock()
+            mock_agent.invoke.side_effect = RuntimeError("LLM 500")
+            mock_create.return_value = mock_agent
+
+            report = probe(_artifact())
+
+        assert report.overall_passed is True  # deliberately fail-open
+        assert report.tier_reached == 3
+        error_findings = [
+            f for f in report.findings if f.category == "adversarial_error"
+        ]
+        assert len(error_findings) == 1
+        assert error_findings[0].severity == Severity.MEDIUM
+        assert "LLM 500" in error_findings[0].message
 
 
 # ---------------------------------------------------------------------------

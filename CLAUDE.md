@@ -145,7 +145,7 @@ The evaluation testbed is the **Business Analytics Pipeline** — data ingestion
 | `recursion_limit` (decomposition / adversarial) | 50 (~25 logical steps) |
 | `recursion_limit` (failure analysis) | 25 |
 | Node-level timeout (decomposition) | 120s |
-| Node-level timeout (adversarial) | 300s |
+| Node-level timeout (adversarial) | 480s (Step 14.11, fail-closed with HIGH severity → retry) |
 | Initialization | Fresh every invocation (no carried state) |
 | Output contract | `response_format=PydanticModel` |
 | Fallback on timeout/max_steps | Return partial result with error flag; pipeline continues |
