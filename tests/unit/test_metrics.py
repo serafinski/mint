@@ -213,3 +213,232 @@ def test_record_event(store: MetricsStore):
     # 'created' is not a maintenance event, 'regenerated' is
     burden = store.maintenance_burden("fibonacci", window_days=30)
     assert burden == pytest.approx(1.0 / 30.0)
+
+
+# -- Step 4 (B1 Pillar 3): input_args + actual_output + get_recent_failures ----
+
+
+class TestInvocationRecordFailureReplayFields:
+    """Step 4: InvocationRecord carries serialized input/output for the
+    Tier 4 coverage verifier's failure-case replay in Step 8 split."""
+
+    def test_input_args_defaults_to_none(self):
+        record = _make_record()
+        assert record.input_args is None
+        assert record.actual_output is None
+
+    def test_input_args_accepts_json_string(self):
+        record = _make_record(
+            input_args='{"n": 5, "mode": "fast"}',
+            actual_output='{"result": 8}',
+        )
+        assert record.input_args == '{"n": 5, "mode": "fast"}'
+        assert record.actual_output == '{"result": 8}'
+
+    def test_round_trip_through_record_invocation(self, store: MetricsStore):
+        """New fields survive the DuckDB write/read cycle."""
+        store.record_invocation(
+            _make_record(
+                input_args='{"file_path": "/tmp/input.csv"}',
+                actual_output='{"rows": 42}',
+            )
+        )
+        recent = store.recent_invocations("fibonacci", limit=1)
+        assert len(recent) == 1
+        assert recent[0].input_args == '{"file_path": "/tmp/input.csv"}'
+        assert recent[0].actual_output == '{"rows": 42}'
+
+    def test_recent_invocations_all_reads_new_fields(self, store: MetricsStore):
+        store.record_invocation(
+            _make_record(
+                capability_id="cap-a",
+                input_args='{"x": 1}',
+                actual_output='{"y": 2}',
+            )
+        )
+        recent = store.recent_invocations_all(limit=5)
+        assert len(recent) == 1
+        assert recent[0].input_args == '{"x": 1}'
+        assert recent[0].actual_output == '{"y": 2}'
+
+    def test_null_input_args_round_trip(self, store: MetricsStore):
+        """Legacy callers that don't populate the new fields still work."""
+        store.record_invocation(_make_record())  # no input_args / actual_output
+        recent = store.recent_invocations("fibonacci", limit=1)
+        assert recent[0].input_args is None
+        assert recent[0].actual_output is None
+
+
+class TestGetRecentFailures:
+    """Step 4: get_recent_failures is Step 8's failure-case query for
+    the Tier 4 coverage verifier."""
+
+    def test_empty_returns_empty_list(self, store: MetricsStore):
+        assert store.get_recent_failures("cap-a") == []
+
+    def test_filters_to_failures_only(self, store: MetricsStore):
+        store.record_invocation(
+            _make_record(
+                success=True,
+                input_args='{"x": 1}',
+                actual_output='{"y": 2}',
+            )
+        )
+        store.record_invocation(
+            _make_record(
+                task_id="task-2",
+                success=False,
+                error_message="boom",
+                input_args='{"x": 2}',
+                actual_output='{"error": "boom"}',
+            )
+        )
+        failures = store.get_recent_failures("fibonacci")
+        assert len(failures) == 1
+        assert failures[0].success is False
+        assert failures[0].error_message == "boom"
+
+    def test_filters_to_single_capability(self, store: MetricsStore):
+        store.record_invocation(
+            _make_record(
+                capability_id="cap-a",
+                success=False,
+                input_args='{"x": 1}',
+                actual_output='{"err": 1}',
+            )
+        )
+        store.record_invocation(
+            _make_record(
+                capability_id="cap-b",
+                success=False,
+                input_args='{"x": 2}',
+                actual_output='{"err": 2}',
+            )
+        )
+        assert len(store.get_recent_failures("cap-a")) == 1
+        assert len(store.get_recent_failures("cap-b")) == 1
+
+    def test_skips_rows_without_input_args(self, store: MetricsStore):
+        """A failure without captured input is useless as a replay probe
+        and must be skipped by the query."""
+        store.record_invocation(
+            _make_record(
+                success=False,
+                error_message="had no inputs captured",
+                input_args=None,
+                actual_output='{"err": 1}',
+            )
+        )
+        assert store.get_recent_failures("fibonacci") == []
+
+    def test_skips_rows_without_actual_output(self, store: MetricsStore):
+        store.record_invocation(
+            _make_record(
+                success=False,
+                error_message="had no output captured",
+                input_args='{"x": 1}',
+                actual_output=None,
+            )
+        )
+        assert store.get_recent_failures("fibonacci") == []
+
+    def test_orders_newest_first(self, store: MetricsStore):
+        base = datetime(2025, 1, 1, tzinfo=UTC)
+        for i in range(3):
+            store.record_invocation(
+                _make_record(
+                    task_id=f"task-{i}",
+                    success=False,
+                    error_message=f"err-{i}",
+                    input_args=f'{{"attempt": {i}}}',
+                    actual_output=f'{{"err": "err-{i}"}}',
+                    invoked_at=base + timedelta(hours=i),
+                )
+            )
+        failures = store.get_recent_failures("fibonacci", limit=5)
+        assert len(failures) == 3
+        assert failures[0].invoked_at > failures[1].invoked_at > failures[2].invoked_at
+        # Newest failure is task-2
+        assert failures[0].task_id == "task-2"
+
+    def test_honors_limit(self, store: MetricsStore):
+        base = datetime(2025, 1, 1, tzinfo=UTC)
+        for i in range(5):
+            store.record_invocation(
+                _make_record(
+                    task_id=f"task-{i}",
+                    success=False,
+                    input_args=f'{{"i": {i}}}',
+                    actual_output=f'{{"err": {i}}}',
+                    invoked_at=base + timedelta(hours=i),
+                )
+            )
+        assert len(store.get_recent_failures("fibonacci", limit=2)) == 2
+        assert len(store.get_recent_failures("fibonacci", limit=100)) == 5
+
+
+class TestDuckDBMigration:
+    """Step 4: ADD COLUMN IF NOT EXISTS migration runs on every init
+    so old databases pick up the new columns without data loss."""
+
+    def test_fresh_database_has_new_columns(self, store: MetricsStore):
+        """Fresh DBs get the columns via _INIT_SQL; no-op migration."""
+        store.record_invocation(
+            _make_record(input_args='{"x": 1}', actual_output='{"y": 2}')
+        )
+        recent = store.recent_invocations("fibonacci", limit=1)
+        assert recent[0].input_args == '{"x": 1}'
+
+    def test_migration_adds_columns_to_legacy_schema(self, tmp_path):
+        """Simulate a pre-Step-4 database by creating the invocations
+        table with the old schema, then reopen via MetricsStore and
+        verify the migration added the columns."""
+        db_file = str(tmp_path / "legacy.duckdb")
+
+        # Create a legacy table without input_args / actual_output.
+        import duckdb as _duckdb
+        _conn = _duckdb.connect(db_file)
+        _conn.execute(
+            """
+            CREATE TABLE invocations (
+                id VARCHAR PRIMARY KEY,
+                capability_id VARCHAR NOT NULL,
+                task_id VARCHAR NOT NULL,
+                success BOOLEAN NOT NULL,
+                token_cost INTEGER NOT NULL DEFAULT 0,
+                latency_ms DOUBLE NOT NULL DEFAULT 0.0,
+                error_message VARCHAR,
+                invoked_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        _conn.execute(
+            """
+            INSERT INTO invocations (id, capability_id, task_id, success,
+                                     token_cost, latency_ms, error_message, invoked_at)
+            VALUES ('legacy-1', 'fibonacci', 'task-old', TRUE, 100, 50.0, NULL, CURRENT_TIMESTAMP)
+            """
+        )
+        _conn.close()
+
+        # Open via MetricsStore — migration should run and add the columns.
+        with MetricsStore(db_path=db_file) as store:
+            # Legacy row reads cleanly with new fields as None.
+            recent = store.recent_invocations("fibonacci", limit=1)
+            assert len(recent) == 1
+            assert recent[0].task_id == "task-old"
+            assert recent[0].input_args is None
+            assert recent[0].actual_output is None
+
+            # New rows can populate the columns.
+            store.record_invocation(
+                _make_record(
+                    task_id="task-new",
+                    input_args='{"fresh": true}',
+                    actual_output='{"ok": 1}',
+                )
+            )
+            recent_all = store.recent_invocations("fibonacci", limit=5)
+            new_row = next(r for r in recent_all if r.task_id == "task-new")
+            assert new_row.input_args == '{"fresh": true}'
+            assert new_row.actual_output == '{"ok": 1}'

@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS invocations (
     token_cost INTEGER NOT NULL DEFAULT 0,
     latency_ms DOUBLE NOT NULL DEFAULT 0.0,
     error_message VARCHAR,
+    input_args VARCHAR,
+    actual_output VARCHAR,
     invoked_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -28,6 +30,19 @@ CREATE TABLE IF NOT EXISTS capability_events (
 );
 """
 
+# Step 4 (B1 Pillar 3, 2026-04-15): forward-migrate existing invocation
+# tables by adding ``input_args`` and ``actual_output`` as nullable
+# columns. ADD COLUMN IF NOT EXISTS is idempotent — no-op on fresh
+# databases (the columns are already in _INIT_SQL) and safe to run
+# on every MetricsStore construction. Old rows get NULL; new rows get
+# whatever the caller serialized. Needed by Step 8's split operation
+# which reads recent failures and replays their inputs against new
+# variants in the Tier 4 coverage verifier.
+_MIGRATION_SQL = """
+ALTER TABLE invocations ADD COLUMN IF NOT EXISTS input_args VARCHAR;
+ALTER TABLE invocations ADD COLUMN IF NOT EXISTS actual_output VARCHAR;
+"""
+
 
 class MetricsStore:
     """DuckDB-backed metrics store for capability invocations and granularity metrics."""
@@ -36,6 +51,10 @@ class MetricsStore:
         """Initialize DuckDB connection. If *db_path* is ``None``, use in-memory."""
         self._conn = duckdb.connect(db_path or ":memory:")
         self._conn.execute(_INIT_SQL)
+        # Forward-migrate existing invocation tables (Step 4). Idempotent
+        # via ADD COLUMN IF NOT EXISTS — safe to run on fresh databases
+        # and on databases created before 2026-04-15.
+        self._conn.execute(_MIGRATION_SQL)
 
     # -- lifecycle --------------------------------------------------------
 
@@ -62,8 +81,9 @@ class MetricsStore:
         self._conn.execute(
             """
             INSERT INTO invocations (id, capability_id, task_id, success,
-                                     token_cost, latency_ms, error_message, invoked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                     token_cost, latency_ms, error_message,
+                                     input_args, actual_output, invoked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 uuid.uuid4().hex,
@@ -73,6 +93,8 @@ class MetricsStore:
                 record.token_cost,
                 record.latency_ms,
                 record.error_message,
+                record.input_args,
+                record.actual_output,
                 record.invoked_at,
             ],
         )
@@ -222,7 +244,8 @@ class MetricsStore:
         rows = self._conn.execute(
             """
             SELECT capability_id, task_id, success,
-                   token_cost, latency_ms, error_message, invoked_at
+                   token_cost, latency_ms, error_message,
+                   input_args, actual_output, invoked_at
             FROM invocations
             WHERE capability_id = ?
             ORDER BY invoked_at DESC
@@ -238,7 +261,9 @@ class MetricsStore:
                 token_cost=r[3],
                 latency_ms=r[4],
                 error_message=r[5],
-                invoked_at=r[6],
+                input_args=r[6],
+                actual_output=r[7],
+                invoked_at=r[8],
             )
             for r in rows
         ]
@@ -248,7 +273,8 @@ class MetricsStore:
         rows = self._conn.execute(
             """
             SELECT capability_id, task_id, success,
-                   token_cost, latency_ms, error_message, invoked_at
+                   token_cost, latency_ms, error_message,
+                   input_args, actual_output, invoked_at
             FROM invocations
             ORDER BY invoked_at DESC
             LIMIT ?
@@ -263,7 +289,58 @@ class MetricsStore:
                 token_cost=r[3],
                 latency_ms=r[4],
                 error_message=r[5],
-                invoked_at=r[6],
+                input_args=r[6],
+                actual_output=r[7],
+                invoked_at=r[8],
+            )
+            for r in rows
+        ]
+
+    def get_recent_failures(
+        self, capability_id: str, *, limit: int = 10
+    ) -> list[InvocationRecord]:
+        """Most recent FAILED invocations for a capability, newest first.
+
+        Used by Step 8's split operation to pull recorded failure cases
+        for a high-reuse / low-success capability, which the Tier 4
+        coverage verifier then replays against newly-generated split
+        variants. A failure case is an invocation with ``success=False``;
+        ``error_message``, ``input_args``, and ``actual_output`` are all
+        available on the returned records for downstream use.
+
+        Only returns records where both ``input_args`` and
+        ``actual_output`` are populated — a failure case without a
+        captured input is useless as a replay probe, and a failure case
+        without a captured output tells us nothing about what the
+        capability got wrong. Rows missing either field are silently
+        skipped (counts may be less than ``limit``).
+        """
+        rows = self._conn.execute(
+            """
+            SELECT capability_id, task_id, success,
+                   token_cost, latency_ms, error_message,
+                   input_args, actual_output, invoked_at
+            FROM invocations
+            WHERE capability_id = ?
+              AND success = FALSE
+              AND input_args IS NOT NULL
+              AND actual_output IS NOT NULL
+            ORDER BY invoked_at DESC
+            LIMIT ?
+            """,
+            [capability_id, limit],
+        ).fetchall()
+        return [
+            InvocationRecord(
+                capability_id=r[0],
+                task_id=r[1],
+                success=r[2],
+                token_cost=r[3],
+                latency_ms=r[4],
+                error_message=r[5],
+                input_args=r[6],
+                actual_output=r[7],
+                invoked_at=r[8],
             )
             for r in rows
         ]
