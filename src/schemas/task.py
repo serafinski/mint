@@ -503,6 +503,19 @@ class ChainResult(BaseModel):
     step_results: list[dict] = Field(default_factory=list)
     failed_step_index: int | None = None
     failed_step_name: str | None = None
+    failed_step_reason: str | None = Field(
+        default=None,
+        description=(
+            "Structured reason for a chain step failure, orthogonal to "
+            "``failed_step_name`` (which carries the subtask description). "
+            "Populated from the execution backend's sticky meta — currently "
+            "``'agent_execution_timeout'`` and ``'agent_execution_error'`` "
+            "(Step 13). Harness reads this field to classify a chain failure "
+            "as a timeout vs a shape failure without relying on output-shape "
+            "validation alone. None for success, SKILL/MCP_TOOL failures, "
+            "or AGENT failures where no meta was recorded."
+        ),
+    )
     step_timings: list[StepTiming] = Field(
         default_factory=list,
         description="Per-step execution metrics (capability name, type, latency).",

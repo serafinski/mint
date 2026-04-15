@@ -18,8 +18,9 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel
 
@@ -30,8 +31,86 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SKILL_EXECUTION_TIMEOUT_S = 240
-AGENT_EXECUTION_TIMEOUT_S = 480
+# Step 13 (2026-04-15): raised from 480 → 900 after langfuse trace
+# `aec201273d7aef62c675ce5b4cb9a2ef` showed a T16 incident-triage agent
+# running 598s of genuine forward progress (5 sequential subagent calls,
+# all producing a correct root_cause_metric answer) before the 480s
+# ceiling killed it 118s before completion. 900s matches the observed
+# tail of the distribution with comfortable headroom.
+AGENT_EXECUTION_TIMEOUT_S = 900
 _RECURSION_LIMIT = 100
+
+
+# ---------------------------------------------------------------------------
+# Step 13 (2026-04-15) — sticky failure signal for agent execution
+# ---------------------------------------------------------------------------
+#
+# ``execute_agent_artifact`` returns a ``dict`` and falls back to ``{}`` on
+# timeout or error. Empty output is structurally indistinguishable from a
+# successful agent that happened to return no data, so the evaluation
+# harness could not classify a timed-out run as a timeout vs a shape
+# failure vs a legitimately-empty answer.
+#
+# The thread-local below records the outcome of the most recent
+# ``execute_agent_artifact`` call in the calling thread. The harness,
+# CLI, and compositional executor read it immediately after the call to
+# distinguish timeout from error from success. Thread-local scoping is
+# safe because all three callers invoke agent execution synchronously
+# from the same thread (no hidden thread hops between the call and the
+# meta read).
+
+
+AgentExecutionFailureReason = Literal["timeout", "error"]
+
+
+class AgentExecutionMeta(NamedTuple):
+    """Sticky failure signal attached to the last agent execution.
+
+    ``succeeded=True`` means the DeepAgent returned a structured response
+    (possibly empty). ``succeeded=False`` with ``failure_reason="timeout"``
+    means the thread-pool ``future.result(timeout=...)`` tripped the
+    ``AGENT_EXECUTION_TIMEOUT_S`` ceiling. ``failure_reason="error"``
+    covers every other exception path (including LLM provider errors,
+    DeepAgents invocation crashes, and LangFuse handler failures that
+    propagate out of the inner loop).
+    """
+
+    succeeded: bool
+    failure_reason: AgentExecutionFailureReason | None
+    timeout_seconds: int | None
+
+
+_agent_exec_state = threading.local()
+
+
+def _record_agent_execution_meta(
+    succeeded: bool,
+    failure_reason: AgentExecutionFailureReason | None = None,
+    timeout_seconds: int | None = None,
+) -> None:
+    """Stash the outcome of the current ``execute_agent_artifact`` call."""
+    _agent_exec_state.last = AgentExecutionMeta(
+        succeeded=succeeded,
+        failure_reason=failure_reason,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def get_last_agent_execution_meta() -> AgentExecutionMeta | None:
+    """Return the sticky meta written by the most recent ``execute_agent_artifact`` call.
+
+    Returns ``None`` when no call has happened in this thread yet or when
+    :func:`clear_last_agent_execution_meta` was called since the last one.
+    Callers in the same thread as ``execute_agent_artifact`` can read this
+    immediately after the call to distinguish timeout / error / success
+    without inspecting the output dict's shape.
+    """
+    return getattr(_agent_exec_state, "last", None)
+
+
+def clear_last_agent_execution_meta() -> None:
+    """Reset the thread-local meta (used by tests and chain callers)."""
+    _agent_exec_state.last = None
 
 # ---------------------------------------------------------------------------
 # Response models (harness-internal, not pipeline state)
@@ -825,17 +904,30 @@ def execute_agent_artifact(
     discovers available skills via progressive disclosure (metadata first,
     full content on activation).
 
-    Never raises — returns ``{}`` on any failure.
+    Never raises — returns ``{}`` on any failure. The sticky outcome
+    (success / timeout / error) is recorded via
+    :func:`_record_agent_execution_meta` and can be read by callers in
+    the same thread through :func:`get_last_agent_execution_meta`.
     """
+    clear_last_agent_execution_meta()
     try:
-        return _execute_agent_inner(
+        output = _execute_agent_inner(
             artifact, task, fixture_contents,
             langfuse_tags=langfuse_tags,
             langfuse_session_id=langfuse_session_id,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent execution failed for %s: %s", getattr(task, "task_id", "?"), exc)
+        _record_agent_execution_meta(succeeded=False, failure_reason="error")
         return {}
+
+    # _execute_agent_inner sets the meta on its timeout and exception
+    # branches itself; if none of those fired, it reached the structured-
+    # response return path, which counts as success regardless of whether
+    # the payload is empty.
+    if get_last_agent_execution_meta() is None:
+        _record_agent_execution_meta(succeeded=True)
+    return output
 
 
 def _execute_agent_inner(
@@ -1011,10 +1103,16 @@ def _execute_agent_inner(
             "Agent execution timed out after %ds for %s",
             AGENT_EXECUTION_TIMEOUT_S, task_id,
         )
+        _record_agent_execution_meta(
+            succeeded=False,
+            failure_reason="timeout",
+            timeout_seconds=AGENT_EXECUTION_TIMEOUT_S,
+        )
         return {}
 
     except Exception as exc:  # noqa: BLE001
         pool.shutdown(wait=False)
         task_id = getattr(task, "task_id", "?")
         logger.exception("Agent execution error for %s: %s", task_id, exc)
+        _record_agent_execution_meta(succeeded=False, failure_reason="error")
         return {}

@@ -634,6 +634,139 @@ class TestChainExecution:
         assert not known_ws.exists()
 
 
+    # --- Step 13: agent execution timeout/error propagation -----------
+
+    @patch("tests.evaluation.execution.execute_agent_artifact")
+    def test_agent_timeout_populates_failed_step_reason(self, mock_agent):
+        """An AGENT timeout must surface as ``failed_step_reason`` on the
+        ChainResult so the harness can classify it separately from a
+        generic chain-step failure."""
+        from tests.evaluation.execution import (
+            _record_agent_execution_meta,
+            clear_last_agent_execution_meta,
+        )
+
+        def _fake_agent(*args, **kwargs):
+            _record_agent_execution_meta(
+                succeeded=False, failure_reason="timeout", timeout_seconds=900,
+            )
+            return {}
+
+        mock_agent.side_effect = _fake_agent
+        clear_last_agent_execution_meta()
+
+        art = _make_artifact(
+            "investigator", CapabilityType.AGENT, gap_query="investigate",
+            agent_config={"system_prompt": "Investigate"},
+        )
+        subtasks = [_make_subtask("investigate", ["investigate"])]
+        resolution = {
+            "investigate": CapabilityReference(
+                source="generated", capability_name="investigator",
+                capability_type=CapabilityType.AGENT,
+            ),
+        }
+
+        ex = self._make_chain_executor(
+            subtasks=subtasks, resolution=resolution, artifacts=[art],
+        )
+        result = ex.run()
+
+        assert result.chain_success is False
+        assert result.failed_step_index == 0
+        assert result.failed_step_reason == "agent_execution_timeout"
+
+    @patch("tests.evaluation.execution.execute_agent_artifact")
+    def test_agent_error_populates_failed_step_reason(self, mock_agent):
+        from tests.evaluation.execution import (
+            _record_agent_execution_meta,
+            clear_last_agent_execution_meta,
+        )
+
+        def _fake_agent(*args, **kwargs):
+            _record_agent_execution_meta(succeeded=False, failure_reason="error")
+            return {}
+
+        mock_agent.side_effect = _fake_agent
+        clear_last_agent_execution_meta()
+
+        art = _make_artifact(
+            "investigator", CapabilityType.AGENT, gap_query="investigate",
+            agent_config={"system_prompt": "Investigate"},
+        )
+        ex = self._make_chain_executor(
+            subtasks=[_make_subtask("investigate", ["investigate"])],
+            resolution={
+                "investigate": CapabilityReference(
+                    source="generated", capability_name="investigator",
+                    capability_type=CapabilityType.AGENT,
+                ),
+            },
+            artifacts=[art],
+        )
+        result = ex.run()
+
+        assert result.chain_success is False
+        assert result.failed_step_reason == "agent_execution_error"
+
+    @patch("tests.evaluation.execution.execute_agent_artifact")
+    def test_agent_success_leaves_failed_step_reason_none(self, mock_agent):
+        from tests.evaluation.execution import (
+            _record_agent_execution_meta,
+            clear_last_agent_execution_meta,
+        )
+
+        def _fake_agent(*args, **kwargs):
+            _record_agent_execution_meta(succeeded=True)
+            return {"investigation": "done"}
+
+        mock_agent.side_effect = _fake_agent
+        clear_last_agent_execution_meta()
+
+        art = _make_artifact(
+            "investigator", CapabilityType.AGENT, gap_query="investigate",
+            agent_config={"system_prompt": "Investigate"},
+        )
+        ex = self._make_chain_executor(
+            subtasks=[_make_subtask("investigate", ["investigate"])],
+            resolution={
+                "investigate": CapabilityReference(
+                    source="generated", capability_name="investigator",
+                    capability_type=CapabilityType.AGENT,
+                ),
+            },
+            artifacts=[art],
+        )
+        result = ex.run()
+
+        assert result.chain_success is True
+        assert result.failed_step_reason is None
+
+    @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
+    def test_non_agent_failure_leaves_reason_none(self, mock_exec):
+        """An empty MCP_TOOL step output fails the chain but does NOT set
+        ``failed_step_reason`` — the reason slot is reserved for structured
+        backend meta, not generic "empty output" outcomes."""
+        mock_exec.return_value = {}
+
+        art = _make_artifact(
+            "tool", CapabilityType.MCP_TOOL, gap_query="do-thing",
+            source_code="async def tool(): pass",
+        )
+        ex = self._make_chain_executor(
+            subtasks=[_make_subtask("do thing", ["do-thing"])],
+            resolution={"do-thing": CapabilityReference(
+                source="generated", capability_name="tool",
+                capability_type=CapabilityType.MCP_TOOL,
+            )},
+            artifacts=[art],
+        )
+        result = ex.run()
+
+        assert result.chain_success is False
+        assert result.failed_step_reason is None
+
+
 # ---------------------------------------------------------------------------
 # match_to_artifact helper
 # ---------------------------------------------------------------------------

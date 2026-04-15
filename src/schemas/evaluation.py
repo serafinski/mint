@@ -42,6 +42,13 @@ class FailureReason(StrEnum):
     OUTPUT_REJECTED = "output_rejected"
     NO_SOURCE_CODE = "no_source_code"
     CHAIN_STEP_FAILED = "chain_step_failed"
+    # Step 13 (2026-04-15): distinguish an AGENT execution timeout from
+    # a generic chain step failure. The harness sets this when
+    # ChainResult.failed_step_reason == "agent_execution_timeout", which
+    # is populated from the thread-local meta recorded by
+    # execute_agent_artifact on the concurrent.futures TimeoutError path.
+    AGENT_EXECUTION_TIMEOUT = "agent_execution_timeout"
+    AGENT_EXECUTION_ERROR = "agent_execution_error"
 
 
 class HumanLabel(StrEnum):

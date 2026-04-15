@@ -625,7 +625,17 @@ def _extract_result_compositional(
             )
             failure_reason = "output_rejected"
     elif not chain_result.chain_success:
-        failure_reason = "chain_step_failed"
+        # Step 13: prefer the structured reason from the execution
+        # backend (currently only AGENT) over the generic
+        # ``chain_step_failed`` so Phase 5 analytics can separate
+        # "agent timed out" from "agent crashed" from "everything
+        # else that can go wrong in a chain step".
+        if chain_result.failed_step_reason == "agent_execution_timeout":
+            failure_reason = "agent_execution_timeout"
+        elif chain_result.failed_step_reason == "agent_execution_error":
+            failure_reason = "agent_execution_error"
+        else:
+            failure_reason = "chain_step_failed"
 
     # Step 14.6 — output contract check (orthogonal to validator).
     # Set comparison on the typed contract; never raises.

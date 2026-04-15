@@ -153,6 +153,13 @@ class CompositionalExecutor:
         for m in matches:
             self._match_by_name[m.capability.name] = m
 
+        # Step 13: per-step sticky failure reason (set by
+        # ``_execute_agent_step`` when the AGENT backend reports a
+        # timeout/error via thread-local meta). Reset at the start of
+        # every step in ``run()``; read by the failed-chain return
+        # path and propagated onto ``ChainResult.failed_step_reason``.
+        self._last_step_failure_reason: str | None = None
+
     # ------------------------------------------------------------------
     # DAG construction
     # ------------------------------------------------------------------
@@ -421,7 +428,10 @@ class CompositionalExecutor:
         workspace: Path,
         upstream_outputs: dict[int, dict],
     ) -> dict:
-        from tests.evaluation.execution import execute_agent_artifact
+        from tests.evaluation.execution import (
+            execute_agent_artifact,
+            get_last_agent_execution_meta,
+        )
 
         fixture_contents = self._build_chain_fixture_contents(workspace, upstream_outputs)
         artifact = (
@@ -430,13 +440,25 @@ class CompositionalExecutor:
             else self._match_to_artifact(artifact_or_match, ref)
         )
 
-        return execute_agent_artifact(
+        output = execute_agent_artifact(
             artifact,
             self.task,
             fixture_contents,
             langfuse_tags=self.langfuse_tags,
             langfuse_session_id=self.langfuse_session_id,
         )
+
+        # Step 13: capture the sticky meta on failure so ``run()`` can
+        # tag the ChainResult with a structured failure reason
+        # (``agent_execution_timeout`` vs ``agent_execution_error``).
+        meta = get_last_agent_execution_meta()
+        if meta is not None and not meta.succeeded:
+            if meta.failure_reason == "timeout":
+                self._last_step_failure_reason = "agent_execution_timeout"
+            elif meta.failure_reason == "error":
+                self._last_step_failure_reason = "agent_execution_error"
+
+        return output
 
     def _execute_step(
         self,
@@ -521,6 +543,12 @@ class CompositionalExecutor:
 
         try:
             for position, step_idx in enumerate(execution_order):
+                # Step 13: reset the per-step failure reason so a
+                # successful step doesn't inherit a stale signal from
+                # an earlier agent that timed out inside a lead cache
+                # lookup or a resolved capability swap.
+                self._last_step_failure_reason = None
+
                 subtask = self.subtasks[step_idx]
                 ref, artifact_or_match = self._resolve_step(subtask)
 
@@ -653,6 +681,7 @@ class CompositionalExecutor:
                         step_timings=step_timings,
                         failed_step_index=step_idx,
                         failed_step_name=subtask.description,
+                        failed_step_reason=self._last_step_failure_reason,
                     )
 
             # Collect any output files the last step wrote to the workspace

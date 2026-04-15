@@ -913,6 +913,7 @@ def _execute_skill_or_agent(
         if fp.exists():
             fixture_contents[fp.name] = fp.read_text(encoding="utf-8", errors="replace")
 
+    agent_meta: Any | None = None
     try:
         cap_type = artifact.capability_type
         if cap_type == CapabilityType.SKILL:
@@ -927,6 +928,10 @@ def _execute_skill_or_agent(
                 langfuse_tags=langfuse_tags,
                 langfuse_session_id=langfuse_session_id,
             )
+            # Step 13: read the sticky meta immediately so a later
+            # agent call can't overwrite it before we surface the
+            # failure reason.
+            agent_meta = _exec_mod.get_last_agent_execution_meta()
     finally:
         _exec_mod.SKILL_EXECUTION_TIMEOUT_S = _orig_skill_timeout
         _exec_mod.AGENT_EXECUTION_TIMEOUT_S = _orig_agent_timeout
@@ -937,11 +942,31 @@ def _execute_skill_or_agent(
             if artifact.capability_type == CapabilityType.SKILL
             else _orig_agent_timeout
         )
-        err_console.print(
-            f"[yellow]SKILL/AGENT execution returned no output "
-            f"(likely timed out after {effective_timeout}s). "
-            "Try --timeout with a higher value.[/yellow]"
-        )
+        # Step 13: prefer the structured reason from the thread-local
+        # meta over the old "likely timed out" guess. Only available
+        # for AGENT calls — SKILL still falls back to the guess.
+        if agent_meta is not None and not agent_meta.succeeded:
+            if agent_meta.failure_reason == "timeout":
+                ts = agent_meta.timeout_seconds or effective_timeout
+                err_console.print(
+                    f"[yellow]AGENT execution timed out after {ts}s. "
+                    "Try --timeout with a higher value.[/yellow]"
+                )
+            elif agent_meta.failure_reason == "error":
+                err_console.print(
+                    "[yellow]AGENT execution crashed before returning "
+                    "output (see logs for the exception).[/yellow]"
+                )
+            else:
+                err_console.print(
+                    "[yellow]AGENT execution returned empty output.[/yellow]"
+                )
+        else:
+            err_console.print(
+                f"[yellow]SKILL/AGENT execution returned no output "
+                f"(likely timed out after {effective_timeout}s). "
+                "Try --timeout with a higher value.[/yellow]"
+            )
         return {}
 
     if (

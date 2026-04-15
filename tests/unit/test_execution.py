@@ -9,7 +9,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests.evaluation.execution import (
+    AGENT_EXECUTION_TIMEOUT_S,
     TASK_RESULT_MODELS,
+    AgentExecutionMeta,
     GenericResult,
     T11Result,
     T12Result,
@@ -20,8 +22,11 @@ from tests.evaluation.execution import (
     _fixtures_to_workspace_files,
     _format_fixture_message,
     _read_fixture_contents,
+    _record_agent_execution_meta,
+    clear_last_agent_execution_meta,
     execute_agent_artifact,
     execute_skill_artifact,
+    get_last_agent_execution_meta,
 )
 
 
@@ -153,6 +158,151 @@ class TestExecuteAgentArtifact:
         artifact = SimpleNamespace(agent_config={}, skill_content=None, capability_type="agent")
         result = execute_agent_artifact(artifact, task, {})
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Step 13 — sticky agent execution meta
+# ---------------------------------------------------------------------------
+
+
+class TestAgentExecutionMetaThreadLocal:
+    """Round-trip tests for the thread-local meta primitives."""
+
+    def setup_method(self):
+        clear_last_agent_execution_meta()
+
+    def teardown_method(self):
+        clear_last_agent_execution_meta()
+
+    def test_empty_before_first_call(self):
+        assert get_last_agent_execution_meta() is None
+
+    def test_record_and_read_success(self):
+        _record_agent_execution_meta(succeeded=True)
+        meta = get_last_agent_execution_meta()
+        assert isinstance(meta, AgentExecutionMeta)
+        assert meta.succeeded is True
+        assert meta.failure_reason is None
+        assert meta.timeout_seconds is None
+
+    def test_record_and_read_timeout(self):
+        _record_agent_execution_meta(
+            succeeded=False, failure_reason="timeout", timeout_seconds=900,
+        )
+        meta = get_last_agent_execution_meta()
+        assert meta.succeeded is False
+        assert meta.failure_reason == "timeout"
+        assert meta.timeout_seconds == 900
+
+    def test_record_and_read_error(self):
+        _record_agent_execution_meta(succeeded=False, failure_reason="error")
+        meta = get_last_agent_execution_meta()
+        assert meta.succeeded is False
+        assert meta.failure_reason == "error"
+        assert meta.timeout_seconds is None
+
+    def test_clear_resets_meta(self):
+        _record_agent_execution_meta(succeeded=True)
+        assert get_last_agent_execution_meta() is not None
+        clear_last_agent_execution_meta()
+        assert get_last_agent_execution_meta() is None
+
+    def test_meta_is_thread_local(self):
+        import threading
+        _record_agent_execution_meta(succeeded=True)
+        other_thread_meta: list = []
+
+        def _worker():
+            other_thread_meta.append(get_last_agent_execution_meta())
+
+        t = threading.Thread(target=_worker)
+        t.start()
+        t.join()
+        # Main thread still sees its own meta; worker saw nothing.
+        assert get_last_agent_execution_meta() is not None
+        assert other_thread_meta == [None]
+
+
+class TestExecuteAgentArtifactMeta:
+    """Integration tests for execute_agent_artifact → meta side effects."""
+
+    def setup_method(self):
+        clear_last_agent_execution_meta()
+
+    def teardown_method(self):
+        clear_last_agent_execution_meta()
+
+    def _artifact(self):
+        return SimpleNamespace(
+            agent_config={"system_prompt": "You are an agent.", "is_deep_agent": False},
+            skill_content=None,
+            capability_type="agent",
+        )
+
+    def _task(self):
+        return SimpleNamespace(task_id="T13", task_prompt="test", fixture_paths=[])
+
+    @patch("tests.evaluation.execution._execute_agent_inner")
+    def test_success_records_succeeded_true(self, mock_inner):
+        mock_inner.return_value = {"result": "ok"}
+        execute_agent_artifact(self._artifact(), self._task(), {})
+        meta = get_last_agent_execution_meta()
+        assert meta is not None
+        assert meta.succeeded is True
+        assert meta.failure_reason is None
+
+    @patch("tests.evaluation.execution._execute_agent_inner")
+    def test_exception_in_inner_records_error(self, mock_inner):
+        mock_inner.side_effect = RuntimeError("boom")
+        execute_agent_artifact(self._artifact(), self._task(), {})
+        meta = get_last_agent_execution_meta()
+        assert meta is not None
+        assert meta.succeeded is False
+        assert meta.failure_reason == "error"
+
+    def test_inner_sets_timeout_meta_wrapper_preserves(self, monkeypatch):
+        """The inner function sets meta on its own timeout branch; the outer
+        wrapper must NOT overwrite it with a success signal on a clean return."""
+
+        def _fake_inner(*args, **kwargs):
+            _record_agent_execution_meta(
+                succeeded=False,
+                failure_reason="timeout",
+                timeout_seconds=AGENT_EXECUTION_TIMEOUT_S,
+            )
+            return {}
+
+        import tests.evaluation.execution as exec_mod
+        monkeypatch.setattr(exec_mod, "_execute_agent_inner", _fake_inner)
+
+        result = execute_agent_artifact(self._artifact(), self._task(), {})
+        assert result == {}
+        meta = get_last_agent_execution_meta()
+        assert meta is not None
+        assert meta.succeeded is False
+        assert meta.failure_reason == "timeout"
+        assert meta.timeout_seconds == AGENT_EXECUTION_TIMEOUT_S
+
+    @patch("tests.evaluation.execution._execute_agent_inner")
+    def test_meta_cleared_between_calls(self, mock_inner):
+        # First call records error.
+        mock_inner.side_effect = RuntimeError("boom")
+        execute_agent_artifact(self._artifact(), self._task(), {})
+        assert get_last_agent_execution_meta().failure_reason == "error"
+
+        # Second call succeeds — must overwrite, not leak prior error.
+        mock_inner.side_effect = None
+        mock_inner.return_value = {"ok": True}
+        execute_agent_artifact(self._artifact(), self._task(), {})
+        meta = get_last_agent_execution_meta()
+        assert meta.succeeded is True
+        assert meta.failure_reason is None
+
+    def test_timeout_ceiling_is_900s(self):
+        # Regression guard for the 480→900 bump. If this fires, update
+        # the value in tests/evaluation/execution.py and re-read the
+        # langfuse trace that justified it.
+        assert AGENT_EXECUTION_TIMEOUT_S == 900
 
 
 # ---------------------------------------------------------------------------
