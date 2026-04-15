@@ -1,5 +1,7 @@
 # Registry Retrieval Fix Plan — Dual-Query Search + Reusable Descriptions
 
+> ✅ **DONE 2026-04-15** in commit `fd8d118`. Part A (dual-query retrieval in `registry.detect_gaps`) and Part B (decomposer prompt Rule 14 forbidding paths/per-run values in subtask descriptions) shipped as a single bundle. 9 new dual-query tests in `test_registry.py` and 4 subtask→description wiring tests in `test_gap_detection.py`. See `docs/MASTER_PLAN_2026_04_13.md` §6.0 row 2.5 for the short form and §14.5 for the pointer back to this doc. The plan text below is preserved for design rationale and the empirical measurements that motivated the approach.
+
 **Date:** 2026-04-14 (end of day). **Revised later same day** to add Part B (prompt cleanup for reusable descriptions) after the user observed that decomposer descriptions hardcode absolute file paths, which hurts both the retrieval-side embedding quality AND cross-run capability reuse.
 
 **Problem:** Seeded capabilities are silently not matching their intended queries in most runs. Two compounding causes:
