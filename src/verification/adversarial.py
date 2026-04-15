@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+from typing import Annotated
 
 from pydantic import BaseModel, Field
 
@@ -172,7 +173,82 @@ area.
 # ---------------------------------------------------------------------------
 
 
-def _create_adversarial_agent():
+def _make_probe_sandbox_execute(pip_packages: list[str]):
+    """Return a ``sandbox_execute`` variant that auto-unions *pip_packages*
+    into every call's ``extra_packages`` argument.
+
+    **Why this exists.** The prober LLM receives the artifact's source code
+    as text and decides what Python snippets to run inside
+    ``sandbox_execute``. For pandas/numpy/openpyxl-dependent artifacts the
+    prober must pass ``extra_packages=["pandas", ...]`` or the sandbox
+    crashes with ``ModuleNotFoundError`` on the first import. The prober
+    is good at reasoning about behavior but bad at consistently remembering
+    to declare package dependencies — and when the sandbox crashes, the
+    gate fail-opens, which means numerics-heavy artifacts silently skip
+    Tier 3 probing.
+
+    **The fix.** Wrap ``sandbox_execute`` in a closure that always unions
+    the artifact's generator-declared ``pip_packages`` into whatever
+    ``extra_packages`` the LLM supplies. The LLM keeps its usual freedom
+    to add adversarial testing libraries; the artifact's declared
+    dependencies are installed regardless. Deduplicated, order-preserving.
+
+    **Observed failure (2026-04-15 T11 test_mint run, trace
+    ``8ae5cd28a342fb9c8c0e0ea1262b050c``):** probe against
+    ``parse_sales_products_and_targets_3f7485`` called ``sandbox_execute``
+    with the tool source inlined, got back
+    ``ModuleNotFoundError: No module named 'pandas'`` on the first probe
+    turn, and the follow-up model call crashed with an unrelated
+    library-level 400. That 400 is out of scope (langchain_openai serdes
+    bug), but the ``ModuleNotFoundError`` is our bug — the chain executor
+    threads ``pip_packages`` through to the compositional run but the
+    prober never learned how.
+
+    See ``docs/MASTER_PLAN_2026_04_13.md`` §14.9 for the full rationale.
+    """
+    from src.verification.sandbox_tool import (
+        sandbox_execute as _base_sandbox_execute,
+    )
+
+    # Snapshot packages at closure-creation time so subsequent mutations
+    # of the caller's list don't affect in-flight probes.
+    _baseline = list(pip_packages)
+
+    def sandbox_execute(
+        code: Annotated[
+            str, Field(description="Python code snippet to execute in the sandbox")
+        ],
+        timeout: Annotated[
+            int, Field(default=10, description="Timeout in seconds")
+        ] = 10,
+        extra_packages: list[str] | None = None,
+        *,
+        allow_network: bool = False,
+    ) -> dict:
+        """Execute a Python snippet in an isolated Docker container.
+
+        (Probe-scoped wrapper: auto-installs the artifact's declared
+        ``pip_packages`` in addition to any packages the caller specifies.)
+
+        Returns ``{"stdout": str, "stderr": str, "exit_code": int, "success": bool}``.
+        Raises nothing — all failures are captured in the return dict.
+        """
+        combined: list[str] = list(_baseline)
+        if extra_packages:
+            for pkg in extra_packages:
+                if pkg not in combined:
+                    combined.append(pkg)
+        return _base_sandbox_execute(
+            code=code,
+            timeout=timeout,
+            extra_packages=combined if combined else None,
+            allow_network=allow_network,
+        )
+
+    return sandbox_execute
+
+
+def _create_adversarial_agent(pip_packages: list[str] | None = None):
     """Create a fresh adversarial DeepAgent for each invocation.
 
     ``reasoning_effort="low"`` is set on the model: the three attack patterns
@@ -185,17 +261,25 @@ def _create_adversarial_agent():
     tokens per call that were restating the system prompt back at itself.
     Drops typical probe latency ~120-230s → ~40-90s.
     See docs/perf_fixes_2026_04_14.md §2c-1.
+
+    When *pip_packages* is a non-empty list, the sandbox_execute tool is
+    wrapped in a closure that auto-unions those packages into every call's
+    ``extra_packages`` argument (see :func:`_make_probe_sandbox_execute`).
+    Otherwise the unwrapped tool is used — behavior unchanged from pre-fix.
     """
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
 
-    from src.verification.sandbox_tool import sandbox_execute
-
     from src.config import DEFAULT_LLM_MODEL
+
+    if pip_packages:
+        probe_sandbox = _make_probe_sandbox_execute(pip_packages)
+    else:
+        from src.verification.sandbox_tool import sandbox_execute as probe_sandbox
 
     return create_deep_agent(
         model=init_chat_model(DEFAULT_LLM_MODEL, reasoning_effort="low"),
-        tools=[sandbox_execute],
+        tools=[probe_sandbox],
         system_prompt=ADVERSARIAL_SYSTEM_PROMPT,
         response_format=AdversarialFindings,
         name="adversarial-prober",
@@ -389,8 +473,17 @@ def probe(artifact: GeneratedArtifact) -> VerificationReport:
             reason = "No source code to probe."
         return _skip_report(capability_name, reason)
 
+    # Step 14.9: thread the generator's declared ``pip_packages`` into the
+    # sandbox tool so pandas/numpy/openpyxl-dependent artifacts don't crash
+    # their first probe turn with ``ModuleNotFoundError``. Empty list is
+    # treated as None and falls through to the unwrapped sandbox_execute.
+    # See ``_make_probe_sandbox_execute`` for the full rationale.
+    artifact_pip_packages: list[str] = list(
+        getattr(artifact, "pip_packages", None) or []
+    )
+
     try:
-        agent = _create_adversarial_agent()
+        agent = _create_adversarial_agent(pip_packages=artifact_pip_packages)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to create adversarial agent")
         emit_langfuse_event(

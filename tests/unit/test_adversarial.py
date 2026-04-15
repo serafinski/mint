@@ -26,8 +26,10 @@ from src.verification.adversarial import (
     ADVERSARIAL_RECURSION_LIMIT,
     AdversarialFinding,
     AdversarialFindings,
+    _create_adversarial_agent,
     _error_report,
     _findings_to_report,
+    _make_probe_sandbox_execute,
     _timeout_report,
     probe,
 )
@@ -451,6 +453,253 @@ class TestAdversarialModels:
                 severity=sev,
             )
             assert f.severity == sev
+
+
+# ---------------------------------------------------------------------------
+# pip_packages propagation — Step 14.9
+# ---------------------------------------------------------------------------
+
+
+class TestPipPackagesPropagation:
+    """Regression tests for Step 14.9: adversarial sandbox must install the
+    generator's declared pip_packages so numerics-heavy artifacts
+    (pandas / numpy / openpyxl) don't crash their first probe turn with
+    ModuleNotFoundError.
+
+    See docs/MASTER_PLAN_2026_04_13.md §14.9 for the motivating failure
+    (langfuse trace 8ae5cd28a342fb9c8c0e0ea1262b050c).
+    """
+
+    def test_empty_packages_delegates_to_base(self):
+        """With no packages, the wrapper delegates to base sandbox_execute
+        with ``extra_packages=None`` — equivalent to the pre-fix behavior.
+        """
+        calls: list[dict] = []
+
+        def fake_base(code, timeout=10, extra_packages=None, *, allow_network=False):
+            calls.append({
+                "code": code,
+                "timeout": timeout,
+                "extra_packages": extra_packages,
+                "allow_network": allow_network,
+            })
+            return {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
+
+        with patch(
+            "src.verification.sandbox_tool.sandbox_execute",
+            fake_base,
+        ):
+            wrapped = _make_probe_sandbox_execute([])
+            wrapped(code="print('hi')")
+
+        assert len(calls) == 1
+        assert calls[0]["extra_packages"] is None
+
+    def test_single_package_always_passed(self):
+        """With ``pip_packages=['pandas']``, every call to the wrapped tool
+        installs pandas — even when the LLM doesn't pass ``extra_packages``.
+        """
+        calls: list[dict] = []
+
+        def fake_base(code, timeout=10, extra_packages=None, *, allow_network=False):
+            calls.append({"extra_packages": extra_packages})
+            return {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
+
+        with patch(
+            "src.verification.sandbox_tool.sandbox_execute",
+            fake_base,
+        ):
+            wrapped = _make_probe_sandbox_execute(["pandas"])
+            wrapped(code="import pandas as pd")
+
+        assert calls[0]["extra_packages"] == ["pandas"]
+
+    def test_llm_supplied_packages_union_with_artifact_packages(self):
+        """When the LLM-supplied ``extra_packages`` differs from the
+        artifact's ``pip_packages``, both sets are unioned (preserving
+        order: artifact first, LLM additions second, dedup'd).
+        """
+        calls: list[dict] = []
+
+        def fake_base(code, timeout=10, extra_packages=None, *, allow_network=False):
+            calls.append({"extra_packages": extra_packages})
+            return {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
+
+        with patch(
+            "src.verification.sandbox_tool.sandbox_execute",
+            fake_base,
+        ):
+            wrapped = _make_probe_sandbox_execute(["pandas", "numpy"])
+            # LLM adds a fake adversarial testing library
+            wrapped(
+                code="import pandas, numpy, fakelib",
+                extra_packages=["fakelib"],
+            )
+
+        assert calls[0]["extra_packages"] == ["pandas", "numpy", "fakelib"]
+
+    def test_duplicate_packages_are_deduplicated(self):
+        """If the LLM happens to pass a package the artifact already
+        requires, the wrapper dedups to avoid redundant ``uv pip install``
+        arguments.
+        """
+        calls: list[dict] = []
+
+        def fake_base(code, timeout=10, extra_packages=None, *, allow_network=False):
+            calls.append({"extra_packages": extra_packages})
+            return {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
+
+        with patch(
+            "src.verification.sandbox_tool.sandbox_execute",
+            fake_base,
+        ):
+            wrapped = _make_probe_sandbox_execute(["pandas", "numpy"])
+            wrapped(
+                code="import pandas",
+                extra_packages=["pandas", "openpyxl"],
+            )
+
+        # pandas appears once, numpy and openpyxl both present.
+        assert calls[0]["extra_packages"] == ["pandas", "numpy", "openpyxl"]
+
+    def test_baseline_packages_snapshot_protects_against_mutation(self):
+        """The wrapper snapshots ``pip_packages`` at closure-creation time,
+        so mutating the caller's list after the wrapper is created does not
+        affect subsequent calls. Prevents a sneaky class of bugs where the
+        caller's pip_packages list is a shared reference.
+        """
+        calls: list[dict] = []
+
+        def fake_base(code, timeout=10, extra_packages=None, *, allow_network=False):
+            calls.append({"extra_packages": extra_packages})
+            return {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
+
+        caller_list = ["pandas"]
+        with patch(
+            "src.verification.sandbox_tool.sandbox_execute",
+            fake_base,
+        ):
+            wrapped = _make_probe_sandbox_execute(caller_list)
+            # Caller mutates the list after wrapper is created
+            caller_list.append("malicious-package")
+            wrapped(code="import pandas")
+
+        # The wrapper should still only install pandas, not the appended item.
+        assert calls[0]["extra_packages"] == ["pandas"]
+
+    def test_probe_threads_artifact_pip_packages_into_agent(self):
+        """End-to-end: ``probe()`` reads ``artifact.pip_packages`` and
+        passes them to ``_create_adversarial_agent`` so the wrapped
+        sandbox_execute is used.
+        """
+        captured: dict = {}
+
+        def fake_create(pip_packages=None):
+            captured["pip_packages"] = list(pip_packages or [])
+            return _mock_agent_invoke(_clean_findings())
+
+        artifact = GeneratedArtifact(
+            capability_name="pandas-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code="import pandas as pd\ndef run(): return pd.DataFrame()",
+            pip_packages=["pandas", "openpyxl"],
+        )
+
+        with patch(
+            "src.verification.adversarial._create_adversarial_agent",
+            fake_create,
+        ):
+            report = probe(artifact)
+
+        assert captured["pip_packages"] == ["pandas", "openpyxl"]
+        # The probe still completes with clean findings.
+        assert report.overall_passed is True
+        assert report.tier_reached == 3
+
+    def test_probe_handles_missing_pip_packages_field_gracefully(self):
+        """Legacy / partial artifacts without ``pip_packages`` set must not
+        crash. The probe falls back to the empty-list case (unwrapped
+        sandbox_execute).
+        """
+        captured: dict = {}
+
+        def fake_create(pip_packages=None):
+            captured["pip_packages"] = list(pip_packages or [])
+            return _mock_agent_invoke(_clean_findings())
+
+        artifact = GeneratedArtifact(
+            capability_name="no-deps-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code="def run(): return 42",
+            # pip_packages not specified — default is empty list
+        )
+
+        with patch(
+            "src.verification.adversarial._create_adversarial_agent",
+            fake_create,
+        ):
+            probe(artifact)
+
+        assert captured["pip_packages"] == []
+
+    def test_create_adversarial_agent_none_packages_uses_base_tool(self):
+        """Passing ``pip_packages=None`` (or omitting) must use the
+        unwrapped sandbox_execute so pre-fix behavior is preserved for
+        callers that haven't been updated.
+        """
+        # Use a dummy deep agent factory to capture the tools list passed in.
+        captured_tools: dict = {}
+
+        def fake_create_deep_agent(**kwargs):
+            captured_tools["tools"] = kwargs.get("tools")
+            return MagicMock()
+
+        with patch("deepagents.create_deep_agent", fake_create_deep_agent):
+            _create_adversarial_agent(pip_packages=None)
+
+        from src.verification.sandbox_tool import sandbox_execute as base_tool
+
+        assert captured_tools["tools"] == [base_tool]
+
+    def test_create_adversarial_agent_empty_list_uses_base_tool(self):
+        """Empty list is treated as None — unwrapped base tool used.
+        Matches the ``if pip_packages:`` truthiness check in
+        ``_create_adversarial_agent``.
+        """
+        captured_tools: dict = {}
+
+        def fake_create_deep_agent(**kwargs):
+            captured_tools["tools"] = kwargs.get("tools")
+            return MagicMock()
+
+        with patch("deepagents.create_deep_agent", fake_create_deep_agent):
+            _create_adversarial_agent(pip_packages=[])
+
+        from src.verification.sandbox_tool import sandbox_execute as base_tool
+
+        assert captured_tools["tools"] == [base_tool]
+
+    def test_create_adversarial_agent_with_packages_uses_wrapped_tool(self):
+        """Non-empty list routes through ``_make_probe_sandbox_execute``.
+        The wrapped tool is NOT the same object as base sandbox_execute.
+        """
+        captured_tools: dict = {}
+
+        def fake_create_deep_agent(**kwargs):
+            captured_tools["tools"] = kwargs.get("tools")
+            return MagicMock()
+
+        with patch("deepagents.create_deep_agent", fake_create_deep_agent):
+            _create_adversarial_agent(pip_packages=["pandas"])
+
+        from src.verification.sandbox_tool import sandbox_execute as base_tool
+
+        tools = captured_tools["tools"]
+        assert len(tools) == 1
+        assert tools[0] is not base_tool  # it's a wrapped closure
+        # And the closure's name is still sandbox_execute (so langchain's
+        # tool introspection picks up the expected tool name).
+        assert tools[0].__name__ == "sandbox_execute"
 
 
 # ---------------------------------------------------------------------------
