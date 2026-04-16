@@ -50,6 +50,7 @@ from src.orchestrator.tool_loader import ToolLoader
 from src.orchestrator.verification_node import verification_node
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
+from src.schemas.optimizer_config import OptimizerConfig
 from src.schemas.task import TaskState
 from src.verification.gate import verify as gate_verify
 
@@ -61,6 +62,7 @@ def create_pipeline(
     loader: ToolLoader,
     *,
     run_optimizer: bool = False,
+    optimizer_config: OptimizerConfig | None = None,
     metrics_store: MetricsStore | None = None,
     verification_enabled: bool = True,
 ) -> StateGraph:
@@ -71,10 +73,18 @@ def create_pipeline(
     Args:
         registry: Capability registry used for gap detection and MCP tool registration.
         loader: Tool loader used to dynamically load and register generated MCP tools.
-        run_optimizer: When ``True``, append the granularity optimizer loop after the
-            loading node.  Requires *metrics_store* to be provided.
-        metrics_store: DuckDB metrics store required when *run_optimizer* is ``True``.
-            Ignored when *run_optimizer* is ``False``.
+        run_optimizer: Legacy boolean — when ``True``, append the granularity
+            optimizer loop with all three operations forced on (backward-compat
+            alias for callers that haven't adopted ``optimizer_config``).
+            Ignored if ``optimizer_config`` is provided explicitly.
+        optimizer_config: Per-operation optimizer config (§12 finding #8). When
+            provided, supersedes ``run_optimizer``. Any operation resolved to
+            "off" is skipped at apply time; if all three are off for the current
+            ``invocation_count`` the optimizer subgraph is not wired. When
+            ``None`` and ``run_optimizer=True``, falls back to all-on; when
+            ``None`` and ``run_optimizer=False``, falls back to all-off.
+        metrics_store: DuckDB metrics store required when the optimizer is
+            enabled.  Ignored when the optimizer is disabled.
         verification_enabled: When ``False``, the verification gate is bypassed
             (``gate_fn=None`` → stub always passes).  Used for the no_verification
             evaluation baseline.
@@ -82,6 +92,23 @@ def create_pipeline(
     Returns:
         An uncompiled ``StateGraph[TaskState]`` ready to be compiled and invoked.
     """
+    # Normalize to an OptimizerConfig — callers pass either the legacy bool
+    # (eval harness, older tests) or the new config (CLI runner). The new
+    # config takes precedence when both are provided.
+    if optimizer_config is None:
+        optimizer_config = OptimizerConfig.from_run_optimizer_bool(run_optimizer)
+
+    # The pipeline only wires the optimizer subgraph when at least one
+    # operation would fire. We don't know the invocation_count at graph-
+    # build time, so we use a conservative "any non-off" check: if any
+    # operation is "auto" or "on", wire it. The loop itself re-checks
+    # per-operation at apply_operations_node time when it has the real
+    # count from metrics_store.
+    _any_op_enabled = any(
+        getattr(optimizer_config, op) != "off"
+        for op in ("prune", "split", "merge")
+    )
+    run_optimizer = _any_op_enabled
     builder = StateGraph(TaskState)
 
     # --- Nodes without injected dependencies ---
@@ -123,7 +150,9 @@ def create_pipeline(
         # KL divergence is meaningful after the first run.
         from src.optimizer.loop import OptimizerState, create_optimization_loop
 
-        _opt_loop = create_optimization_loop(registry, metrics_store)
+        _opt_loop = create_optimization_loop(
+            registry, metrics_store, optimizer_config=optimizer_config,
+        )
         _prev_optimizer_scores: dict[str, float] = {}
 
         def _optimizer_node(state: TaskState) -> Command:

@@ -471,3 +471,91 @@ class TestDuckDBMigration:
             new_row = next(r for r in recent_all if r.task_id == "task-new")
             assert new_row.input_args == '{"fresh": true}'
             assert new_row.actual_output == '{"ok": 1}'
+
+
+# ---------------------------------------------------------------------------
+# §12 finding #6b — user-judgment wrong-output flagging
+# ---------------------------------------------------------------------------
+
+
+class TestFlagMostRecentInvocationWrong:
+    def test_no_invocations_returns_none(self, store):
+        assert store.flag_most_recent_invocation_wrong("reason") is None
+
+    def test_flags_most_recent_across_all_capabilities(self, store):
+        """With no capability filter, flag the globally-most-recent row."""
+        # Insert three rows in order; the last one should be flagged.
+        store.record_invocation(_make_record(
+            capability_id="tool-a", task_id="t1",
+            actual_output='{"x": 1}',
+        ))
+        store.record_invocation(_make_record(
+            capability_id="tool-b", task_id="t2",
+            actual_output='{"y": 2}',
+        ))
+        store.record_invocation(_make_record(
+            capability_id="tool-c", task_id="t3",
+            actual_output='{"z": 3}',
+        ))
+
+        flagged = store.flag_most_recent_invocation_wrong("got it wrong")
+
+        assert flagged is not None
+        assert flagged.capability_id == "tool-c"
+        assert flagged.task_id == "t3"
+        assert flagged.success is False
+        assert flagged.error_message == "got it wrong"
+        # Original actual_output preserved for Step 8 wrong-output-case
+        # branch to replay against.
+        assert flagged.actual_output == '{"z": 3}'
+
+    def test_capability_filter_flags_most_recent_for_that_cap_only(self, store):
+        store.record_invocation(_make_record(capability_id="tool-a", task_id="a1"))
+        store.record_invocation(_make_record(capability_id="tool-b", task_id="b1"))
+        store.record_invocation(_make_record(capability_id="tool-a", task_id="a2"))
+        store.record_invocation(_make_record(capability_id="tool-b", task_id="b2"))
+
+        flagged = store.flag_most_recent_invocation_wrong(
+            "wrong", capability_id="tool-a",
+        )
+        assert flagged is not None
+        assert flagged.capability_id == "tool-a"
+        assert flagged.task_id == "a2"  # most recent for tool-a, not b2
+
+    def test_capability_filter_no_match_returns_none(self, store):
+        store.record_invocation(_make_record(capability_id="tool-a"))
+        assert store.flag_most_recent_invocation_wrong(
+            "reason", capability_id="nonexistent",
+        ) is None
+
+    def test_flagged_row_visible_to_get_recent_failures(self, store):
+        """Downstream: flagged rows become Step 8 split-candidate failure cases."""
+        store.record_invocation(_make_record(
+            capability_id="parser", task_id="t1",
+            input_args='{"value": 150}', actual_output='{"clamped": 150}',
+        ))
+
+        store.flag_most_recent_invocation_wrong(
+            "expected clamp to 100", capability_id="parser",
+        )
+
+        failures = store.get_recent_failures("parser", limit=5)
+        assert len(failures) == 1
+        assert failures[0].success is False
+        assert failures[0].error_message == "expected clamp to 100"
+        assert failures[0].input_args == '{"value": 150}'
+        assert failures[0].actual_output == '{"clamped": 150}'
+
+    def test_records_user_flagged_wrong_event(self, store):
+        """Chapter 6 analytics signal — count user-feedback events."""
+        store.record_invocation(_make_record(capability_id="tool-a"))
+        store.flag_most_recent_invocation_wrong("bad answer")
+
+        # The event is stored in capability_events; query it directly.
+        rows = store._conn.execute(
+            "SELECT event_type, details, capability_id FROM capability_events "
+            "WHERE event_type = 'user_flagged_wrong'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][1] == "bad answer"
+        assert rows[0][2] == "tool-a"

@@ -160,6 +160,229 @@ def history(
 
 
 # ---------------------------------------------------------------------------
+# mint config — persistent CLI settings (§12 finding #8)
+# ---------------------------------------------------------------------------
+
+config_app = typer.Typer(
+    name="config",
+    help="Manage persistent CLI settings (currently: per-operation optimizer config).",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(config_app, name="config")
+
+_VALID_OPTIMIZER_OPS = ("prune", "split", "merge")
+_VALID_OPTIMIZER_SETTINGS = ("auto", "on", "off")
+
+
+def _settings_path() -> Path:
+    from src.cli.runner import _data_dir
+
+    return _data_dir() / "cli" / "settings.json"
+
+
+@config_app.command("set")
+def config_set(
+    key: Annotated[str, typer.Argument(
+        help="Setting key (e.g., optimizer.prune, optimizer.split, optimizer.merge)"
+    )],
+    value: Annotated[str, typer.Argument(
+        help="Setting value (auto | on | off for optimizer operations)"
+    )],
+) -> None:
+    """Set a persistent CLI setting.
+
+    Currently supported keys:
+
+    - ``optimizer.prune``, ``optimizer.split``, ``optimizer.merge`` —
+      each accepts ``auto`` (threshold-gated), ``on`` (always run), or
+      ``off`` (never run). Per-invocation flags (``--no-optimizer``,
+      ``--enable-optimizer``) still override these per run.
+    """
+    from src.cli.display import console, err_console
+    from src.cli.settings import load_settings, save_settings
+
+    if not key.startswith("optimizer."):
+        err_console.print(
+            f"[red]Unknown setting key '{key}'. Supported: "
+            f"optimizer.prune, optimizer.split, optimizer.merge.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    op = key.split(".", 1)[1]
+    if op not in _VALID_OPTIMIZER_OPS:
+        err_console.print(
+            f"[red]Unknown optimizer operation '{op}'. Valid: "
+            f"{', '.join(_VALID_OPTIMIZER_OPS)}.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    if value not in _VALID_OPTIMIZER_SETTINGS:
+        err_console.print(
+            f"[red]Invalid value '{value}'. Valid: "
+            f"{', '.join(_VALID_OPTIMIZER_SETTINGS)}.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    path = _settings_path()
+    settings = load_settings(path)
+    settings.setdefault("optimizer", {})[op] = value
+    save_settings(path, settings)
+    console.print(f"[green]Set {key} = {value}[/green] ({path})")
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show current persistent CLI settings."""
+    import json
+
+    from src.cli.display import console
+    from src.cli.settings import load_settings
+
+    path = _settings_path()
+    settings = load_settings(path)
+    if not settings:
+        console.print(f"[dim]No settings saved yet ({path}).[/dim]")
+        console.print(
+            "[dim]Defaults: optimizer.{prune,split,merge} = auto (threshold-gated).[/dim]"
+        )
+        return
+    console.print(f"[bold]Settings ({path}):[/bold]")
+    console.print(json.dumps(settings, indent=2, sort_keys=True))
+
+
+@config_app.command("reset")
+def config_reset() -> None:
+    """Reset ALL settings to defaults (all optimizer operations back to 'auto').
+
+    Deletes ``data/cli/settings.json``. Per-invocation flags
+    (``--no-optimizer`` / ``--enable-optimizer``) and the in-memory
+    defaults are unchanged. This does NOT wipe generated capabilities,
+    metrics, or the registry — use ``mint reset`` for that.
+    """
+    from src.cli.display import console
+
+    path = _settings_path()
+    if path.exists():
+        path.unlink()
+        console.print(
+            f"[green]Reset all settings to defaults[/green] ([dim]{path}[/dim] deleted). "
+            "optimizer.{prune,split,merge} = auto."
+        )
+    else:
+        console.print(
+            "[dim]No settings file exists; already at defaults "
+            "(optimizer.{prune,split,merge} = auto).[/dim]"
+        )
+
+
+@config_app.command("unset")
+def config_unset(
+    key: Annotated[str, typer.Argument(
+        help="Setting key to unset (e.g., optimizer.split)"
+    )],
+) -> None:
+    """Unset a persistent CLI setting (revert to default).
+
+    For wiping ALL settings at once, use ``mint config reset``.
+    """
+    from src.cli.display import console, err_console
+    from src.cli.settings import load_settings, save_settings
+
+    if not key.startswith("optimizer."):
+        err_console.print(f"[red]Unknown setting key '{key}'.[/red]")
+        raise typer.Exit(code=1)
+
+    op = key.split(".", 1)[1]
+    if op not in _VALID_OPTIMIZER_OPS:
+        err_console.print(f"[red]Unknown optimizer operation '{op}'.[/red]")
+        raise typer.Exit(code=1)
+
+    path = _settings_path()
+    settings = load_settings(path)
+    optimizer = settings.get("optimizer", {})
+    if op in optimizer:
+        del optimizer[op]
+        if not optimizer:
+            settings.pop("optimizer", None)
+        save_settings(path, settings)
+        console.print(f"[green]Unset {key} (revert to default 'auto')[/green]")
+    else:
+        console.print(f"[dim]{key} was not set (already at default).[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# mint feedback — user-judgment wrong-output flagging (§12 finding #6b)
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def feedback(
+    wrong: Annotated[
+        bool,
+        typer.Option("--wrong", help="Flag the most recent run as producing wrong output."),
+    ] = False,
+    reason: Annotated[
+        str | None,
+        typer.Option("--reason", "-r", help="Why the output was wrong (free text)."),
+    ] = None,
+    capability: Annotated[
+        str | None,
+        typer.Option(
+            "--capability", "-c",
+            help="Flag the most recent invocation of this specific capability.",
+        ),
+    ] = None,
+) -> None:
+    """Flag the most recent run's output as wrong.
+
+    Closes the CLI feedback loop (§12 finding #6b): without this subcommand,
+    non-crashing but semantically-wrong outputs were invisible to the
+    Pillar 3 optimizer's success_rate metric on CLI invocations. Flagging
+    updates the most recent ``InvocationRecord`` to ``success=False`` with
+    the user's reason as ``error_message``, and records a
+    ``user_flagged_wrong`` event for Chapter 6 analytics.
+
+    Usage:
+        mint feedback --wrong
+        mint feedback --wrong --reason "got db_connections wrong"
+        mint feedback --wrong --capability write-markdown-report
+    """
+    from src.cli.display import console, err_console
+    from src.cli.runner import _create_infra, _load_env
+
+    if not wrong:
+        err_console.print(
+            "[red]mint feedback requires --wrong to flag output as incorrect.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    _load_env()
+    _, _, metrics_store = _create_infra(seed=False)
+
+    record = metrics_store.flag_most_recent_invocation_wrong(
+        reason=reason or "user-flagged-wrong",
+        capability_id=capability,
+    )
+    if record is None:
+        target = f"for capability '{capability}'" if capability else ""
+        err_console.print(
+            f"[yellow]No recent invocation found {target}; nothing to flag.[/yellow]"
+        )
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"[green]Flagged invocation of '{record.capability_id}' as wrong[/green] "
+        f"(reason: {record.error_message!r}). Recorded at {record.invoked_at}."
+    )
+    console.print(
+        "[dim]The Pillar 3 optimizer will now see this as success=False on next "
+        "optimizer cycle — split's wrong-output-case branch can fire on this "
+        "capability if it also has high reuse.[/dim]"
+    )
+
+
+# ---------------------------------------------------------------------------
 # mint prune
 # ---------------------------------------------------------------------------
 

@@ -250,7 +250,7 @@ Import from these; avoid modifying unless explicitly required. These are the mod
 - **`src/registry/store.py`** — `SkillRegistry` (CRUD + hierarchical embedding search); `seed_registry()`.
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + granularity metric queries).
 - **`src/config.py`** — `DEFAULT_LLM_MODEL` (env: `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env: `JIT_SANDBOX_IMAGE`), `FILE_SIZE_LIMIT_BYTES`, `BINARY_EXTENSIONS`, `AUTO_OPTIMIZER_THRESHOLD`.
-- **`src/cli/app.py`** — MINT CLI entry point (Typer): `run`, `plan`, `retry`, `list`, `inspect`, `history`, `prune`, `seed`, `reset`, `disable`, `enable`.
+- **`src/cli/app.py`** — MINT CLI entry point (Typer): `run`, `plan`, `retry`, `list`, `inspect`, `history`, `prune`, `seed`, `reset`, `disable`, `enable`, `config set/show/unset` (per-operation optimizer config per §12 finding #8), `feedback --wrong` (CLI wrong-output flagging per §12 finding #6b).
 - **`tests/evaluation/`** — `tasks.py` (`TaskDefinition`, `ALL_TASKS`, `PILOT_TASKS`), `harness.py` (`EvaluationHarness`), `execution.py` (`execute_skill_artifact`, `execute_agent_artifact`), `snapshots.py`.
 
 Other stable interfaces (optimizer loop, verification tiers, tool_loader, sandbox_tool, evaluation_store, schema_extraction) can be discovered by reading the corresponding source files.

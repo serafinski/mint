@@ -14,12 +14,14 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 from scipy.stats import entropy
 
+from src.config import AUTO_OPTIMIZER_THRESHOLD
 from src.optimizer.operations import merge, prune, split
 from src.optimizer.utility import compute_all_utilities
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
 from src.schemas.capability import CapabilityType
 from src.schemas.metrics import GranularityMetrics
+from src.schemas.optimizer_config import OptimizerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -145,11 +147,27 @@ def create_optimization_loop(
     split_success_threshold: float = 0.7,
     merge_reuse_threshold: float = 0.05,
     llm_model: str = "",
+    optimizer_config: OptimizerConfig | None = None,
 ) -> Any:
     """Build the LangGraph optimization loop.
 
+    Args:
+        optimizer_config: Per-operation enable/disable config (§12 finding
+            #8). When ``None``, defaults to all-``"on"`` — preserves the
+            pre-finding-#8 semantic where the loop unconditionally ran
+            all three operations whenever invoked. Threshold gating
+            belongs to the caller (``create_pipeline`` decides whether to
+            invoke the loop at all based on invocation_count vs
+            ``AUTO_OPTIMIZER_THRESHOLD``); once invoked, each operation
+            honors its per-config setting.
+
     Returns a compiled StateGraph.
     """
+    # Default to all-"on" when caller doesn't specify — preserves the
+    # pre-finding-#8 loop semantic (operations always fire when invoked).
+    # The threshold gate is enforced upstream by create_pipeline / the CLI
+    # runner, not by this loop.
+    _config = optimizer_config or OptimizerConfig.all_on()
 
     def compute_metrics_node(state: OptimizerState) -> Command:
         """Compute utility scores for all active capabilities."""
@@ -275,48 +293,83 @@ def create_optimization_loop(
         )
 
     def apply_operations_node(state: OptimizerState) -> Command:
-        """Apply prune, split, and merge operations."""
+        """Apply prune, split, and merge operations.
+
+        Each operation is gated independently against ``optimizer_config``
+        per §12 finding #8. The gate resolves ``"auto"`` against the
+        current ``AUTO_OPTIMIZER_THRESHOLD`` using ``invocation_count`` from
+        the metrics store; ``"on"`` always runs; ``"off"`` always skips.
+        """
         errors = list(state.errors)
         pruned: list[str] = []
         split_results: dict[str, list[str]] = {}
         merge_results: dict[str, str] = {}
 
-        # Prune
+        # Resolve the invocation_count once so all three gates see the
+        # same snapshot. Falling back to 0 on any error means "auto"
+        # effectively becomes "off" — safer than running an unbounded
+        # optimizer when the metrics store is broken.
         try:
-            pruned = prune(registry, metrics_store, window_days=prune_window_days)
+            invocation_count = metrics_store.invocation_count_total()
         except Exception as e:  # noqa: BLE001
-            errors.append(f"prune failed: {e}")
+            logger.warning(
+                "Optimizer: failed to read invocation_count_total (%s); "
+                "treating 'auto' as 'off'",
+                e,
+            )
+            invocation_count = 0
+
+        # Prune
+        if _config.is_enabled(
+            "prune", invocation_count=invocation_count, threshold=AUTO_OPTIMIZER_THRESHOLD,
+        ):
+            try:
+                pruned = prune(registry, metrics_store, window_days=prune_window_days)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"prune failed: {e}")
+        else:
+            logger.debug("Optimizer: prune skipped (config=%s)", _config.prune)
 
         # Filter out pruned capabilities so we don't attempt split/merge on
         # deactivated items (avoids wasted LLM calls and double-deactivation).
         pruned_set = set(pruned)
 
         # Split
-        for cap_id in state.split_candidates:
-            if cap_id in pruned_set:
-                logger.debug("Skipping split of pruned capability '%s'", cap_id)
-                continue
-            try:
-                new_ids = split(
-                    registry, metrics_store, cap_id, llm_model=llm_model
-                )
-                split_results[cap_id] = new_ids
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"split '{cap_id}' failed: {e}")
+        if _config.is_enabled(
+            "split", invocation_count=invocation_count, threshold=AUTO_OPTIMIZER_THRESHOLD,
+        ):
+            for cap_id in state.split_candidates:
+                if cap_id in pruned_set:
+                    logger.debug("Skipping split of pruned capability '%s'", cap_id)
+                    continue
+                try:
+                    new_ids = split(
+                        registry, metrics_store, cap_id, llm_model=llm_model
+                    )
+                    split_results[cap_id] = new_ids
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"split '{cap_id}' failed: {e}")
+        else:
+            logger.debug("Optimizer: split skipped (config=%s)", _config.split)
 
         # Merge
-        for pair in state.merge_candidates:
-            if any(cid in pruned_set for cid in pair):
-                logger.debug("Skipping merge of pair %s (one or both pruned)", pair)
-                continue
-            try:
-                merged_id = merge(
-                    registry, metrics_store, list(pair), llm_model=llm_model
-                )
-                key = "+".join(pair)
-                merge_results[key] = merged_id
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"merge {pair} failed: {e}")
+        if _config.is_enabled(
+            "merge", invocation_count=invocation_count, threshold=AUTO_OPTIMIZER_THRESHOLD,
+        ):
+            for pair in state.merge_candidates:
+                if any(cid in pruned_set for cid in pair):
+                    logger.debug("Skipping merge of pair %s (one or both pruned)", pair)
+                    continue
+                try:
+                    merged_id = merge(
+                        registry, metrics_store, list(pair), llm_model=llm_model
+                    )
+                    key = "+".join(pair)
+                    merge_results[key] = merged_id
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"merge {pair} failed: {e}")
+        else:
+            logger.debug("Optimizer: merge skipped (config=%s)", _config.merge)
 
         # Filter utility_scores to only include capabilities that are still
         # active after prune/split/merge, so pipeline.py carries accurate

@@ -1547,16 +1547,38 @@ def execute_task(
         )
         return 1
 
-    # Determine optimizer state
+    # §12 finding #8: build per-operation optimizer config from (priority
+    # order): per-invocation flags > persistent settings > defaults.
+    # - `--no-optimizer` overrides everything to all-off.
+    # - `--enable-optimizer` overrides everything to all-on.
+    # - Otherwise, read persistent settings from `data/cli/settings.json`
+    #   (via `mint config set optimizer.<op> <value>`); fall through to
+    #   defaults (all-"auto", threshold-gated).
+    from src.cli.settings import get_optimizer_config_from_settings, load_settings
+    from src.schemas.optimizer_config import OptimizerConfig
+
+    count = metrics_store.invocation_count_total()
     if no_optimizer:
-        run_optimizer = False
+        optimizer_config = OptimizerConfig.all_off()
     elif enable_optimizer:
-        run_optimizer = True
+        optimizer_config = OptimizerConfig.all_on()
     else:
-        count = metrics_store.invocation_count_total()
-        run_optimizer = count >= _AUTO_OPTIMIZER_THRESHOLD
-        if run_optimizer:
-            err_console.print(f"[dim]Optimizer auto-enabled ({count} invocations recorded).[/dim]")
+        _settings_path = _data_dir() / "cli" / "settings.json"
+        _settings_opt = get_optimizer_config_from_settings(load_settings(_settings_path))
+        optimizer_config = OptimizerConfig(**_settings_opt) if _settings_opt else OptimizerConfig()
+        if optimizer_config.any_enabled(
+            invocation_count=count, threshold=_AUTO_OPTIMIZER_THRESHOLD,
+        ):
+            _auto_ops = [
+                op for op in ("prune", "split", "merge")
+                if optimizer_config.is_enabled(
+                    op, invocation_count=count, threshold=_AUTO_OPTIMIZER_THRESHOLD,
+                )
+            ]
+            err_console.print(
+                f"[dim]Optimizer enabled: {', '.join(_auto_ops)} "
+                f"({count} invocations recorded).[/dim]"
+            )
 
     from src.orchestrator.output_contract_resolver import resolve_output_contract
     from src.orchestrator.pipeline import create_pipeline
@@ -1565,7 +1587,7 @@ def execute_task(
     pipeline = create_pipeline(
         registry,
         loader,
-        run_optimizer=run_optimizer,
+        optimizer_config=optimizer_config,
         metrics_store=metrics_store,
         verification_enabled=not skip_verification,
     ).compile()
@@ -1588,9 +1610,16 @@ def execute_task(
     _run_id = _uuid.uuid4().hex[:12]
     _file_formats = list({fp.suffix.lower().lstrip(".") for fp in file_paths}) if file_paths else []
     _trace_tags = ["mint-cli", *(f"format:{fmt}" for fmt in sorted(_file_formats))]
+    # §12 finding #8: derive trace tag / metadata from the resolved
+    # OptimizerConfig. "optimizer-on" fires if any operation would run
+    # at the current invocation_count; individual operation states are
+    # recorded in metadata for Chapter 6 analytics.
+    _optimizer_any = optimizer_config.any_enabled(
+        invocation_count=count, threshold=_AUTO_OPTIMIZER_THRESHOLD,
+    )
     if skip_verification:
         _trace_tags.append("no-verification")
-    if run_optimizer:
+    if _optimizer_any:
         _trace_tags.append("optimizer-on")
     if allow_network:
         _trace_tags.append("allow-network")
@@ -1601,7 +1630,8 @@ def execute_task(
             "task": task[:200],
             "files": [fp.name for fp in file_paths],
             "params": parsed_params,
-            "optimizer": run_optimizer,
+            "optimizer": _optimizer_any,
+            "optimizer_config": optimizer_config.model_dump(),
             "verification": not skip_verification,
             "allow_network": allow_network,
         },
@@ -1930,8 +1960,8 @@ def execute_task(
             artifact = proxy
             output = match_output
 
-    # Report optimizer actions (if it ran)
-    if run_optimizer and not json_output:
+    # Report optimizer actions (if any operation ran).
+    if _optimizer_any and not json_output:
         try:
             events = metrics_store._conn.execute(
                 "SELECT event_type, COUNT(*) FROM capability_events "
@@ -2066,6 +2096,16 @@ def execute_task(
     # Success: artifact executed with output, or registry matched (even
     # without source_code — the system found a relevant capability)
     if artifact is not None and output:
+        # §12 finding #6b: nudge the user toward `mint feedback --wrong`
+        # so non-crashing but semantically-wrong outputs can feed back
+        # into the Pillar 3 optimizer. Without this loop CLI runs only
+        # ever produce success=False on crashes, not on user-judgment
+        # wrong answers.
+        console.print(
+            "[dim]Was this output wrong? Run "
+            "[bold]mint feedback --wrong --reason \"...\"[/bold] "
+            "to flag it for the optimizer.[/dim]"
+        )
         return 0
     # Registry matched but couldn't execute (seeded descriptor without
     # source code) — still a valid match, not a pipeline failure

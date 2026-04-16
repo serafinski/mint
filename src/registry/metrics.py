@@ -230,6 +230,84 @@ class MetricsStore:
         row = self._conn.execute("SELECT COUNT(*) FROM invocations").fetchone()
         return row[0] if row else 0
 
+    def flag_most_recent_invocation_wrong(
+        self,
+        reason: str,
+        *,
+        capability_id: str | None = None,
+    ) -> InvocationRecord | None:
+        """Mark the most recent invocation as ``success=False`` with a user reason.
+
+        Implements §12 finding #6b — the CLI feedback loop so Step 8 split's
+        wrong-output-case semantics can fire on subsequent splits. Without
+        this, CLI ``InvocationRecord``s only ever get ``success=False`` from
+        crashes (``error_message`` populated by the executor); user-judgment
+        wrong-output-flagging had no path into the metrics store.
+
+        The flagged row's ``error_message`` is set to ``reason`` (so the
+        coverage verifier's error-case branch can read it) while preserving
+        the row's existing ``actual_output`` (so the wrong-output-case branch
+        can compare against it).
+
+        Args:
+            reason: User-provided reason the output was wrong. Stored as
+                ``error_message`` so downstream queries can distinguish
+                user-flagged-wrong rows from crashes by the reason text.
+            capability_id: When provided, flag the most recent invocation of
+                THIS capability. When ``None``, flag the most recent
+                invocation across all capabilities.
+
+        Returns:
+            The flagged ``InvocationRecord`` (post-update), or ``None`` when
+            no matching invocation exists (nothing to flag).
+
+        Also records a ``user_flagged_wrong`` capability event via
+        :meth:`record_event` so Chapter 6 can count CLI user-feedback signal.
+        """
+        if capability_id is not None:
+            query = (
+                "SELECT id, capability_id, task_id, success, token_cost, "
+                "latency_ms, error_message, input_args, actual_output, "
+                "invoked_at FROM invocations WHERE capability_id = ? "
+                "ORDER BY invoked_at DESC LIMIT 1"
+            )
+            params: list = [capability_id]
+        else:
+            query = (
+                "SELECT id, capability_id, task_id, success, token_cost, "
+                "latency_ms, error_message, input_args, actual_output, "
+                "invoked_at FROM invocations ORDER BY invoked_at DESC LIMIT 1"
+            )
+            params = []
+
+        row = self._conn.execute(query, params).fetchone()
+        if row is None:
+            return None
+
+        row_id = row[0]
+        self._conn.execute(
+            """
+            UPDATE invocations
+            SET success = FALSE, error_message = ?
+            WHERE id = ?
+            """,
+            [reason, row_id],
+        )
+
+        self.record_event(row[1], "user_flagged_wrong", reason)
+
+        return InvocationRecord(
+            capability_id=row[1],
+            task_id=row[2],
+            success=False,
+            token_cost=row[4],
+            latency_ms=row[5],
+            error_message=reason,
+            input_args=row[7],
+            actual_output=row[8],
+            invoked_at=row[9],
+        )
+
     def list_capabilities(self) -> list[str]:
         """All unique capability IDs that have been invoked."""
         rows = self._conn.execute(
