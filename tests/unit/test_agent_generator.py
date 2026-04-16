@@ -1,7 +1,7 @@
 """Unit tests for the agent generator module.
 
 LLM-calling behaviour is covered by ``tests/integration/test_agent_generator.py``
-with real DeepSeek calls.  These tests cover the pure-Python validation logic
+with real OpenAI calls.  These tests cover the pure-Python validation logic
 and the node's routing behaviour without any LLM mocking.
 """
 

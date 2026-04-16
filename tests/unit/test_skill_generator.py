@@ -1,7 +1,7 @@
 """Unit tests for the skill generator node.
 
 LLM-calling behaviour is covered by ``tests/integration/test_skill_generator.py``
-with real DeepSeek calls.  These tests cover pure helper functions, content
+with real OpenAI calls.  These tests cover pure helper functions, content
 validation (via quick_validate.py), and the node's routing logic without any
 LLM mocking.
 """

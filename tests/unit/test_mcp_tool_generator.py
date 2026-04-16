@@ -1,7 +1,7 @@
 """Unit tests for the MCP tool generator.
 
 LLM-calling behaviour is covered by ``tests/integration/test_mcp_tool_generator.py``
-with real DeepSeek calls.  These tests cover schema validation, the
+with real OpenAI calls.  These tests cover schema validation, the
 ``_validate_code`` helper, and the node's routing logic (patching
 ``generate_single_tool``, not the LLM).
 """
