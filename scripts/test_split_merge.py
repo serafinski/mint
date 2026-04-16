@@ -621,6 +621,332 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Split via CLI feedback (wrong-output-case branch + §12 finding #6b)
+# ---------------------------------------------------------------------------
+
+
+def test_split_wrong_output_via_feedback(verbose: bool = False) -> bool:
+    """End-to-end: CLI feedback → split → variants fix the reported issue.
+
+    This is the canonical *"user runs buggy tool, flags wrong output,
+    split fires, new variants fix the problem"* flow. It closes the
+    loop between §12 finding #6b (``mint feedback --wrong``) and Step 8
+    split's **wrong-output-case** branch — the one branch that was
+    never previously verified against a real LLM on real feedback-
+    sourced failures.
+
+    **Why this is different from ``test_split_mcp_tool``.** The existing
+    MCP_TOOL split test seeds crash-shaped failures (error_message set,
+    actual_output null) — it exercises the error-case branch of
+    ``_variant_handles_case`` (*"variant handles iff runs without
+    raising"*). Feedback-flagged rows populate BOTH ``error_message``
+    (the user's reason) AND ``actual_output`` (the original wrong
+    output), so they exercise the wrong-output-case branch (*"variant
+    handles iff runs AND produces output ≠ parent's actual_output"*).
+    That branch has different semantics and had never been end-to-end
+    tested with a real LLM on real feedback-sourced rows.
+
+    **Why this requires a genuinely buggy parent.** Per §12 finding #5d,
+    the wrong-output-case semantic rewards wrongness when the recorded
+    ``actual_output`` is actually correct (variants can't differentiate
+    without becoming incorrect themselves). So we need a parent that IS
+    buggy and user feedback that correctly identifies the bug. Here the
+    parent ``clamp-integer-buggy`` returns ``value`` unclamped for
+    ``value > high`` — deliberately wrong. The LLM-generated variants
+    should produce ``{clamped: 100}`` for ``{value: 150}`` — which
+    differs from the parent's ``{clamped: 150}`` — so the wrong-output-
+    case branch reports "handled".
+
+    **The CLI flow this demonstrates:**
+
+    1. User runs ``mint run ...`` several times. Pipeline records
+       each invocation with ``success=True, actual_output={clamped: X}``
+       (pipeline has no oracle).
+    2. User notices some outputs are wrong and runs ``mint feedback
+       --wrong --capability clamp-integer-buggy --reason "..."`` to
+       flag them. Same code path this test exercises via
+       ``flag_most_recent_invocation_wrong``.
+    3. After enough invocations, optimizer threshold triggers split
+       (not orchestrated here — we call ``split()`` directly to skip
+       threshold orchestration).
+    4. Split's LLM produces specialized variants that actually clamp.
+    5. ``verify_coverage`` replays each flagged wrong-output case
+       against the variants — each variant produces a different (now
+       correct) output, so the wrong-output-case branch reports
+       "handled" and coverage passes.
+    6. Parent deactivated, variants registered, user's complaint fixed.
+
+    Expected happy path: LLM generates correct clamp variants →
+    verify_coverage passes → split commits atomically.
+
+    On rollback (LLM non-determinism): atomic invariant must hold —
+    parent stays active, no variants registered, rollback event
+    recorded. Same dual-path assertion structure as
+    ``test_split_mcp_tool``.
+    """
+    print("\n" + "=" * 70)
+    print("  SPLIT TEST — wrong-output-case branch via CLI feedback (§12 #6b)")
+    print("=" * 70)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        registry = _create_fresh_registry(tmp_dir)
+        metrics = MetricsStore()
+
+        # Deliberately BUGGY parent — does not clamp high bound. This is
+        # load-bearing: the wrong-output-case branch requires the
+        # parent's recorded actual_output to be genuinely wrong relative
+        # to correct behavior, so that a correct variant produces a
+        # different (correct) output. See §12 finding #5d.
+        buggy_source = (
+            '"""Clamp an integer to [low, high] — BUGGY (does not clamp high)."""\n'
+            "from typing import Annotated\n"
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from pydantic import Field\n\n"
+            'mcp = FastMCP("clamp-integer-buggy")\n\n'
+            "@mcp.tool()\n"
+            "async def clamp(\n"
+            "    value: Annotated[int, Field(description='The integer to clamp')],\n"
+            "    low: Annotated[int, Field(description='Lower bound (inclusive)')] = 0,\n"
+            "    high: Annotated[int, Field(description='Upper bound (inclusive)')] = 100,\n"
+            ") -> dict:\n"
+            "    \"\"\"Return {'clamped': clamped_value} — BUG: does not clamp high.\"\"\"\n"
+            "    if value < low:\n"
+            "        return {'clamped': low}\n"
+            "    return {'clamped': value}\n\n"
+            'if __name__ == "__main__":\n'
+            "    mcp.run()\n"
+        )
+
+        parent = CapabilityDescriptor(
+            name="clamp-integer-buggy",
+            description=(
+                "Clamp an integer to a configurable [low, high] range "
+                "(buggy — does not clamp high bound)"
+            ),
+            capability_type=CapabilityType.MCP_TOOL,
+            domain="math",
+            tags=["math", "utility"],
+            metadata={
+                "generated": "true",
+                "source": "integration_test_feedback",
+                "source_code": buggy_source,
+            },
+        )
+        registry.add(parent)
+        print(f"\n  Registered buggy parent: {parent.name}")
+        print("  Parent bug: returns `value` unclamped when value > high.")
+
+        # Simulate the user's CLI flow: invoke → flag wrong → invoke → flag wrong → ...
+        # The flag_most_recent_invocation_wrong API flags the MOST RECENT row.
+        # We sequence: record buggy invocation → immediately flag → repeat.
+        # Then record additional correct invocations to establish high reuse.
+        print("\n  Simulating CLI flow: invoke → mint feedback --wrong → repeat...")
+
+        # --- Flagged wrong-output cases (the user's grievances) ---
+        wrong_case_1 = InvocationRecord(
+            capability_id="clamp-integer-buggy",
+            task_id="user-run-150",
+            success=True,  # pipeline sees no crash
+            token_cost=100,
+            latency_ms=50.0,
+            input_args='{"value": 150, "low": 0, "high": 100}',
+            actual_output='{"clamped": 150}',  # WRONG (should be 100)
+        )
+        metrics.record_invocation(wrong_case_1)
+        flagged = metrics.flag_most_recent_invocation_wrong(
+            reason="value 150 not clamped to high bound 100",
+            capability_id="clamp-integer-buggy",
+        )
+        if flagged is None or flagged.task_id != "user-run-150":
+            print(f"  FAIL: expected to flag user-run-150; got {flagged}")
+            return False
+        print(f"    ✓ Flagged {flagged.task_id}: {flagged.error_message}")
+
+        wrong_case_2 = InvocationRecord(
+            capability_id="clamp-integer-buggy",
+            task_id="user-run-200",
+            success=True,
+            token_cost=100,
+            latency_ms=50.0,
+            input_args='{"value": 200, "low": 0, "high": 100}',
+            actual_output='{"clamped": 200}',  # WRONG
+        )
+        metrics.record_invocation(wrong_case_2)
+        flagged = metrics.flag_most_recent_invocation_wrong(
+            reason="value 200 not clamped to high bound 100",
+            capability_id="clamp-integer-buggy",
+        )
+        if flagged is None or flagged.task_id != "user-run-200":
+            print(f"  FAIL: expected to flag user-run-200; got {flagged}")
+            return False
+        print(f"    ✓ Flagged {flagged.task_id}: {flagged.error_message}")
+
+        # --- High reuse padding (correct invocations for in-range values) ---
+        # These don't get flagged; they establish reuse_rate > 0.6 so the
+        # parent looks like a realistic split candidate. Called directly
+        # via split() below so threshold orchestration is bypassed, but
+        # we seed for post-hoc metric sanity checks.
+        all_task_ids = [f"task-{i:02d}" for i in range(10)]
+        filler = CapabilityDescriptor(
+            name="filler-tool-feedback-split",
+            description="filler",
+            capability_type=CapabilityType.MCP_TOOL,
+        )
+        registry.add(filler)
+        _seed_invocations(
+            metrics, "filler-tool-feedback-split", all_task_ids,
+            success_rate=1.0, n_per_task=1,
+        )
+        # Correct invocations (in-range values, parent's buggy branch
+        # not hit so output is correct) — seeded as success=True.
+        correct_tasks = [f"correct-task-{i:02d}" for i in range(6)]
+        _seed_invocations(
+            metrics, "clamp-integer-buggy", correct_tasks,
+            success_rate=1.0, n_per_task=1,
+        )
+        print(f"\n  Reuse padding: {len(correct_tasks)} additional correct invocations seeded")
+
+        # Confirm the flagged rows are visible to split's failure-case query.
+        recorded_failures = metrics.get_recent_failures("clamp-integer-buggy")
+        print(f"  get_recent_failures returns {len(recorded_failures)} flagged row(s):")
+        for f in recorded_failures:
+            has_output = "yes" if f.actual_output else "no"
+            print(
+                f"    {f.task_id}: actual_output={has_output}, "
+                f"reason={f.error_message!r}"
+            )
+            if not f.actual_output:
+                print(
+                    f"  FAIL: feedback-flagged row missing actual_output — "
+                    "wrong-output-case branch cannot fire"
+                )
+                return False
+
+        # --- Run split with real LLM ---
+        # Split will: (a) prompt LLM for specialized variants, (b) verify
+        # each variant through three-tier gate, (c) run verify_coverage
+        # which replays the flagged wrong-output cases, (d) atomically
+        # register + deactivate parent on pass, or rollback on any fail.
+        # ~4-6 LLM calls, ~$0.10, 60-120s.
+        print("\n  Running split(...) — will take ~60-120s with real LLM...", flush=True)
+        try:
+            new_ids = split(registry, metrics, "clamp-integer-buggy")
+        except Exception as exc:
+            print(f"\n  FAIL: split() raised: {exc}")
+            return False
+
+        if new_ids is None:
+            # Rollback path — atomic invariant must hold. This can happen
+            # on LLM non-determinism (e.g., variant produces same buggy
+            # output as parent, or Tier 3 flags a hallucination). Report
+            # clearly and pass the test IF rollback is clean.
+            print(
+                "\n  NOTE: split() returned None — gate or coverage rejected "
+                "the variants. Verifying atomic rollback invariant."
+            )
+            rollback_ok = True
+            parent_check = registry.get("clamp-integer-buggy")
+            if parent_check is None or not parent_check.is_active:
+                print("  FAIL: parent 'clamp-integer-buggy' should still be active")
+                rollback_ok = False
+            else:
+                print("  OK: parent 'clamp-integer-buggy' still active")
+
+            rollback_events = metrics._conn.execute(
+                "SELECT capability_id, event_type, details FROM capability_events "
+                "WHERE event_type IN ('split_rollback', 'verification_rollback') "
+                "ORDER BY occurred_at"
+            ).fetchall()
+            print(f"\n  Rollback events: {len(rollback_events)}")
+            for cid, etype, details in rollback_events:
+                print(f"    {cid}: {etype} — {details[:100]}")
+            if not rollback_events:
+                print("  FAIL: no rollback event recorded")
+                rollback_ok = False
+
+            if rollback_ok:
+                print(
+                    "\n  PASS: coverage correctly rolled back (LLM variance on "
+                    "wrong-output-case branch) AND atomic invariant held."
+                )
+                return True
+            else:
+                print("\n  FAIL: atomic rollback invariant violated")
+                return False
+
+        # --- HAPPY PATH (expected) ---
+        print("\n  Results:")
+        print(f"  New variants: {new_ids}")
+
+        if len(new_ids) < 1:
+            print(f"  FAIL: expected >= 1 variant; got {len(new_ids)}")
+            return False
+
+        parent_check = registry.get("clamp-integer-buggy")
+        if parent_check is None or parent_check.is_active:
+            print(
+                "  FAIL: parent 'clamp-integer-buggy' should be deactivated "
+                "after successful split"
+            )
+            return False
+        print("  OK: parent 'clamp-integer-buggy' deactivated")
+
+        # Every variant has real executable source_code
+        for vid in new_ids:
+            variant = registry.get(vid)
+            if variant is None:
+                print(f"  FAIL: variant '{vid}' not found in registry")
+                return False
+            variant_source = (variant.metadata or {}).get("source_code", "")
+            if not variant_source:
+                print(
+                    f"  FAIL: variant '{vid}' has no source_code — regression "
+                    "to pre-Step-8 metadata-only stub"
+                )
+                return False
+            if "FastMCP" not in variant_source:
+                print(
+                    f"  FAIL: variant '{vid}' source does not mention FastMCP"
+                )
+                return False
+            print(f"  Variant '{vid}':")
+            print(f"    description: {variant.description[:70]}...")
+            print(
+                f"    type={variant.capability_type.value}, "
+                f"active={variant.is_active}, "
+                f"source_code={len(variant_source)} chars"
+            )
+
+        # Capability events trail
+        events = metrics._conn.execute(
+            "SELECT capability_id, event_type, details FROM capability_events "
+            "ORDER BY occurred_at"
+        ).fetchall()
+        print(f"\n  Events recorded: {len(events)}")
+        for eid, etype, details in events:
+            print(f"    {eid}: {etype} — {details[:80]}")
+
+        # Confirm user_flagged_wrong events — the Chapter 6 analytics signal
+        flagged_events = [e for e in events if e[1] == "user_flagged_wrong"]
+        if len(flagged_events) != 2:
+            print(
+                f"  FAIL: expected 2 user_flagged_wrong events; "
+                f"got {len(flagged_events)}"
+            )
+            return False
+        print(
+            f"  OK: {len(flagged_events)} user_flagged_wrong events recorded "
+            "for Chapter 6 analytics"
+        )
+
+        print(
+            "\n  PASS: CLI feedback → split → variants fix reported issue "
+            "(wrong-output-case branch exercised end-to-end with real LLM)"
+        )
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Merge test
 # ---------------------------------------------------------------------------
 
@@ -1496,6 +1822,14 @@ def main() -> int:
         help="Run only the MCP_TOOL split test (coverage verifier happy-path)",
     )
     parser.add_argument(
+        "--split-feedback-only",
+        action="store_true",
+        help=(
+            "Run only the CLI-feedback → split → wrong-output-case test "
+            "(§12 finding #6b end-to-end)"
+        ),
+    )
+    parser.add_argument(
         "--merge-only",
         action="store_true",
         help="Run both merge tests (CSV rollback-canary + stats happy-path)",
@@ -1525,6 +1859,7 @@ def main() -> int:
         args.split_only
         or args.split_skill_only
         or args.split_mcp_only
+        or args.split_feedback_only
         or args.merge_only
         or args.merge_csv_only
         or args.merge_stats_only
@@ -1535,6 +1870,9 @@ def main() -> int:
     )
     run_split_mcp = (
         args.split_mcp_only or args.split_only or (not only_one)
+    )
+    run_split_feedback = (
+        args.split_feedback_only or args.split_only or (not only_one)
     )
     run_merge_csv = (
         args.merge_csv_only or args.merge_only or (not only_one)
@@ -1551,6 +1889,11 @@ def main() -> int:
 
     if run_split_mcp:
         results["split_mcp"] = test_split_mcp_tool(verbose=args.verbose)
+
+    if run_split_feedback:
+        results["split_feedback"] = test_split_wrong_output_via_feedback(
+            verbose=args.verbose,
+        )
 
     if run_merge_csv:
         results["merge_csv"] = test_merge(verbose=args.verbose)
