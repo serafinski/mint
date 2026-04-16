@@ -585,6 +585,82 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
         3. Fix follows the same two-layer defense shape: prompt-rule/structural-declaration for LLM compliance + structural safety net for when LLM doesn't comply.
       - The methodology itself is the thesis contribution — an audit protocol for self-developing MAS code where prose-driven LLM components silently drift from typed contracts unless each layer has a structural enforcer downstream.
 
+   13. **Multi-file output: chained-writers bug in `_ensure_file_writer_last_step` — ⚠ Drift-via-locked-in-test + ✅ Resolved same-session (2026-04-16, surfaced by user-asked static review during Phase 2 closeout).** Sixth same-shape drift finding of the week and a particularly instructive one because **the unit test asserted the broken behavior verbatim**, locking it in.
+
+      **The bug.** `_ensure_file_writer_last_step` (Step 12 / finding #10's safety-net validator) is supposed to append a deterministic MCP_TOOL writer for each file the task declares in `OutputContract.required_files`. The original implementation **chained writers serially**:
+
+      ```python
+      for filename in required_files:
+          writer = SubTask(
+              depends_on=[predecessor_index],            # initially original last; then prior writer
+              requires_upstream_keys=predecessor_keys,   # initially original keys; then ['output_file']
+              ...
+          )
+          augmented.append(writer)
+          predecessor_index = len(augmented) - 1
+          predecessor_keys = ['output_file']
+      ```
+
+      For a single required file (the only case any test or eval task exercised), this is fine. For `required_files=['output.csv', 'report.md']`:
+
+      - Writer 1 (csv): `depends_on=[orig_last]`, `requires_upstream_keys=[orig_keys]` — gets the actual data, writes CSV ✓
+      - Writer 2 (md): `depends_on=[writer_1]`, `requires_upstream_keys=['output_file']` — only sees the **filepath string** of writer 1's output, **cannot access the original data to serialize the markdown report** ❌
+
+      The unit test `test_multi_file_append_chains_in_order` **asserted exactly this broken behavior**:
+
+      ```python
+      assert result[2].depends_on == [1]                       # second writer chained off first
+      assert result[2].requires_upstream_keys == ['output_file']  # only path, not original data
+      ```
+
+      So the test guarded the bug instead of catching it. Same anti-pattern as the "tests codifying bugs" memory entry.
+
+      **Why nobody noticed.** Every authored eval task + test_mint scenario asks for **at most one file**: T07 (`output.csv`), T11 (`output.xlsx`), T16 test_mint variant (`report.md`). The multi-file path was never exercised end-to-end. Pure latent bug.
+
+      **The fix.** All writers depend on the **original predecessor** in parallel — same upstream data, parallel branches in the topological order, each writer serializes its own format independently. Code:
+
+      ```python
+      original_predecessor_index = len(subtasks) - 1
+      original_predecessor_keys = list(subtasks[-1].output_schema.keys())
+      for filename in required_files:
+          writer = SubTask(
+              depends_on=[original_predecessor_index],          # always original
+              requires_upstream_keys=original_predecessor_keys, # always original keys
+              ...
+          )
+          augmented.append(writer)
+      ```
+
+      Test renamed and rewritten: `test_multi_file_writers_run_in_parallel_off_original` — asserts both writers depend on index 0 (original), both have full original predecessor keys, each targets its own filename + format.
+
+      **What's NOT fixed by this commit (but worth knowing):**
+
+      - **Decomposer Rule 15 prompt** doesn't explicitly cover multi-file. The LLM might produce one writer that handles all files, or multiple writers. Either is acceptable in principle, but the prompt should probably explicitly endorse the multi-writer parallel pattern. Out of scope for this fix; worth a Rule 15 prompt-addition follow-up if §12 audit surfaces it.
+      - **End-to-end integration test for multi-file added but not exercising the parallel path** — see empirical addendum below.
+
+      **Empirical addendum (2026-04-16, T16 multi-file `--agent-only` run after the fix landed):** The validator's parallel-writer code path was NOT exercised by the first end-to-end multi-file test_mint run. Observed behavior:
+
+      - **Test prompt** (T16, `test_agent_yaml_incident`) was modified to request BOTH `report.md` AND `metrics.csv`. `OutputContract.required_files=['report.md', 'metrics.csv']` (extracted by Step 14.6 LLM resolver).
+      - **Decomposer chose a 2-subtask shape**: `incident-case-triage-and-metric-causality-analysis` (AGENT) → `write-markdown-and-csv-files` (single MCP_TOOL writer handling both files).
+      - **Single combined writer** named `write_markdown_and_csv_files_18239d` was generated. The MCP_TOOL generator produced source code that writes both files in one tool invocation. Tier 3 ground-truth probe ran and passed (with a minor info-level finding about CSV trailing-whitespace differences vs reference).
+      - **Both files produced and collected**: `report.md` (555 bytes, correct cascade table) + `metrics.csv` (229 bytes, correct per-metric data) — `_collect_output_files` picked up both. CLI displayed `✓ File (report.md)` AND `✓ File (metrics.csv)`.
+      - **Validator did NOT fire**: Rule 15 compliance was detected because the last subtask's description mentions both filenames (case-insensitive substring match catches both). Parallel-append rescue path was unnecessary.
+
+      **What this means.** The parallel-writer structure that finding #13 fixed is **structurally correct** (unit tests prove it) but **rarely exercised in practice** because the LLM decomposer prefers the more efficient single-combined-writer pattern for multi-file outputs. The validator remains a load-bearing safety net: if the decomposer ever produces zero writers when files are required, the parallel-append branch fires and produces correct multi-file behavior. The fact that current LLM behavior favors the combined-writer path doesn't make the safety net dead code — it's insurance against decomposer regressions or LLM model changes.
+
+      **What this means for §12 / Chapter 4.** The empirical pattern (LLM prefers combined writer over multiple parallel writers for multi-file outputs) is a Pillar 1 data point worth documenting. It's not a drift — both shapes produce correct results. It's a *characterization* of how the LLM decomposer approaches multi-file output. The combined-writer pattern is more cost-efficient (one MCP_TOOL generation vs N) and more atomic (one write step's failure mode is simpler than N parallel writers' joint failure modes). Worth a half-paragraph in Chapter 4 / Chapter 5.3 noting that real LLM behavior under our prompt design tends toward combined writers for multi-file, with the parallel structure as the structural fallback.
+
+      **Optional Rule 15 prompt iteration.** If a future task prefers parallel writers (e.g., for very large files where parallel I/O would help, or for visual progress reporting), Rule 15 could be extended with: *"For multi-file outputs, prefer one writer per file (parallel structure) when files are large or independent; combine writers into one when files share data and the combined cost is lower than per-file generation."* Not blocking; worth flagging for §12 audit.
+
+      **The methodology lesson (sixth same-shape finding):** *"tests that lock in broken behavior"* is a distinct sub-pattern of the broader drift family. The fix protocol for this sub-pattern is: when fixing a bug, ALWAYS check whether existing tests assert the bug's broken state — if so, the fix isn't done until those tests are rewritten to assert correct behavior. This is the pattern the `audit_tests_when_fixing_bugs.md` memory entry already captured for T16 and chain coherence; finding #13 reinforces it.
+
+      **Cross-reference with other findings:**
+      - #10 (file output Option A → Option B pivot) — the same code (`_ensure_file_writer_last_step`) was the artifact of finding #10's fix. The chained-writers bug was introduced as part of that fix and never tested in the multi-file dimension.
+      - #11 (classifier file-writer override) — multi-file correctness depends on the classifier override correctly routing every `write-*` gap to MCP_TOOL, not just the first. Override is per-gap so it scales fine — verified by inspection.
+      - #12 (AGENT output_schema runtime compliance) — Layer 2's runtime check fires per-step; multi-file writer chains would each be checked. No interaction concern.
+
+      **When §12 runs:** add a row noting the locked-in-test sub-pattern of drift detection methodology. Chapter 4 already discusses drift; this adds a specific protocol point about test-asserted-buggy-behavior.
+
    **When to do this.** After Steps 4-11 land (so Pillar 3 is in its final form and doesn't need re-auditing), but before Phase 3 Step 14 (smoke tests and pilot). The audit output informs what gets fixed in Phase 3 and what gets disclosed in Chapter 4 writing post-eval.
 
 13. **AGENT execution timeout + sticky-flag pattern.** (~1.5-2 hours, added 2026-04-14 after the 19:01 test_mint run surfaced this.) Same class of bug as the decomposition timeout that Fix 2b addressed — a hard cutoff on a variance-prone runtime, this time inside `tests/evaluation/execution.py::execute_agent_artifact`. The generated incident-triage agent completed pipeline generation + verification fine, then hit the 480s agent-execution hard timeout during its adaptive investigation (reasoning-mode wall-clock variance on a long-running DeepAgent, same story we already saw on decomposition). The previous 14:44 run passed at 584.4s total because the agent happened to fit under 480s that time; the 19:01 run didn't.

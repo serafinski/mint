@@ -240,10 +240,13 @@ def test_skill_excel() -> bool:
 def test_agent_yaml_incident() -> bool:
     """AGENT: Root cause diagnosis with YAML incident report (new format).
 
-    Phase 3 Step 12 (Option B): also requests a Markdown report file. Exercises
-    the decomposer Rule 15 / ``_ensure_file_writer_last_step`` path — the
-    chain should end in an appended MCP_TOOL writer that produces report.md
-    after the AGENT investigation step.
+    Phase 3 Step 12 (Option B): requests TWO file outputs in different
+    formats (report.md + metrics.csv) — the only test_mint scenario that
+    exercises the multi-file path. Catches §12 finding #13 (chained-
+    writers bug) end-to-end: validator must append two MCP_TOOL writers
+    in PARALLEL off the original predecessor (each reading the AGENT's
+    structured output independently and serializing its own format),
+    NOT serially with writer-2 reading writer-1's filepath.
     """
     return _run_mint(
         task=(
@@ -256,6 +259,8 @@ def test_agent_yaml_incident() -> bool:
             "test them, and revise. "
             "Write a markdown incident summary to report.md (one table with "
             "metric name, onset time, and cascade position). "
+            "Also write the same per-metric data as a CSV to metrics.csv "
+            "(columns: metric_name, onset_time, cascade_position). "
             "Also return a dict with 'root_cause_metric' (str), "
             "'cascade_chain' (list of str), and 'n_metrics_investigated' (int)."
         ),

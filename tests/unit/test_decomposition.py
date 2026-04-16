@@ -1377,8 +1377,22 @@ class TestEnsureFileWriterLastStep:
         assert writer.output_schema == {"output_file": "str — path of the written file"}
         assert set(writer.requires_upstream_keys) == {"region_revenues", "summary_row_count"}
 
-    def test_multi_file_append_chains_in_order(self):
-        """Multiple required files — each writer chains off the previous one."""
+    def test_multi_file_writers_run_in_parallel_off_original(self):
+        """Multiple required files — every writer depends on the ORIGINAL
+        predecessor in parallel (NOT chained writer-after-writer).
+
+        Regression guard for §12 finding #13: an earlier version chained
+        writers so that writer 2's ``depends_on=[writer_1]`` and
+        ``requires_upstream_keys=['output_file']``. That broke multi-file
+        end-to-end — writer 2 only saw the filepath string of writer 1's
+        output, not the original data, and could not serialize its own
+        format. Empirically untested at the time because every authored
+        eval task asks for at most one file.
+
+        Correct shape: writer 1 reads original data → writes file A.
+        Writer 2 reads SAME original data → writes file B (in different
+        format). Topologically parallel.
+        """
         from src.orchestrator.decomposition import _ensure_file_writer_last_step
         from src.schemas.task import SubTask
 
@@ -1387,22 +1401,28 @@ class TestEnsureFileWriterLastStep:
                 description="Summarize the incident report",
                 required_capabilities=["summarize-incident"],
                 depends_on=[],
-                output_schema={"summary": "str"},
+                output_schema={
+                    "summary": "str",
+                    "metrics_table": "list[dict]",
+                },
             ),
         ]
         result = _ensure_file_writer_last_step(
             subtasks, ["output.csv", "report.md"],
         )
         assert len(result) == 3
-        # First writer depends on index 0 (original last step).
+        # Both writers depend on the original last step (index 0), in parallel.
         assert result[1].depends_on == [0]
+        assert result[2].depends_on == [0]  # NOT [1] — that was the bug
+        # Both writers read the SAME original predecessor keys (so each
+        # has access to the actual data, not just a sibling writer's path).
+        assert set(result[1].requires_upstream_keys) == {"summary", "metrics_table"}
+        assert set(result[2].requires_upstream_keys) == {"summary", "metrics_table"}
+        # Each writer targets its own file + format.
         assert "output.csv" in result[1].description
         assert result[1].required_capabilities == ["write-csv-file"]
-        # Second writer chains off the first writer.
-        assert result[2].depends_on == [1]
         assert "report.md" in result[2].description
         assert result[2].required_capabilities == ["write-md-file"]
-        assert result[2].requires_upstream_keys == ["output_file"]
 
     def test_case_insensitive_filename_match(self):
         """Decomposer may produce descriptions with different casing."""

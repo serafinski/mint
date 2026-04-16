@@ -259,17 +259,33 @@ def _ensure_file_writer_last_step(
     - The last subtask's description does NOT mention any of the required
       filenames (case-insensitive substring match)
 
-    **What it appends** (one subtask per missing required file, in order):
+    **What it appends** (one subtask per missing required file):
     - ``description``: ``"Write the upstream result to <filename> as
       <format>."``
     - ``required_capabilities``: ``["write-<ext>-file"]`` — short, reusable,
       and a natural merge candidate under Pillar 3.
-    - ``depends_on``: ``[<index of previous last subtask>]``.
+    - ``depends_on``: ``[<index of the original last subtask>]`` — every
+      writer depends on the SAME original predecessor in parallel
+      (NOT chained writer-after-writer). For multi-file asks each writer
+      reads the same upstream data and serializes its own format
+      independently. CompositionalExecutor's topological sort handles
+      parallel branches fine.
     - ``output_schema``: ``{"output_file": "str — path of the written
       file"}``.
-    - ``requires_upstream_keys``: the TOP-LEVEL keys of the predecessor's
-      ``output_schema`` (satisfies the chain coherence contract from
-      Rule 13 / ``_validate_chain_coherence``).
+    - ``requires_upstream_keys``: the TOP-LEVEL keys of the original
+      predecessor's ``output_schema`` (satisfies the chain coherence
+      contract from Rule 13 / ``_validate_chain_coherence``).
+
+    **Why parallel and not chained.** An earlier version chained writers
+    so that writer N+1's ``depends_on=[writer_N]`` and
+    ``requires_upstream_keys=['output_file']``. That broke multi-file
+    end-to-end: writer 2 only saw the FILEPATH STRING of writer 1's
+    output, not the original data, and could not serialize its own
+    format. Empirically untested at the time because every authored
+    eval task asks for at most one file (T07: output.csv, T11:
+    output.xlsx, T16: report.md). Surfaced 2026-04-16 by a static
+    review during Phase 2 closeout. See §12 finding #13 for the full
+    write-up.
 
     **Why a helper instead of prompt-only.** Per §12 finding #10, relying
     on prompt compliance alone is the Option-A-as-fallback pattern that
@@ -289,9 +305,11 @@ def _ensure_file_writer_last_step(
         return subtasks
 
     # Decomposer non-compliance — synthesize writer step(s).
+    # All writers depend on the ORIGINAL last subtask in parallel — see
+    # docstring for why chained writers were wrong for multi-file.
     augmented = list(subtasks)
-    predecessor_index = len(subtasks) - 1
-    predecessor_keys = list(subtasks[-1].output_schema.keys())
+    original_predecessor_index = len(subtasks) - 1
+    original_predecessor_keys = list(subtasks[-1].output_schema.keys())
 
     _EXT_TO_FORMAT = {
         ".csv": "CSV",
@@ -317,15 +335,11 @@ def _ensure_file_writer_last_step(
                 "file format and returning the output file path."
             ),
             required_capabilities=[f"write-{ext_slug}-file"],
-            depends_on=[predecessor_index],
+            depends_on=[original_predecessor_index],
             output_schema={"output_file": "str — path of the written file"},
-            requires_upstream_keys=predecessor_keys,
+            requires_upstream_keys=original_predecessor_keys,
         )
         augmented.append(writer)
-        # Each appended writer chains off the previous one so multi-file
-        # asks (e.g. output.csv AND report.md) serialize cleanly.
-        predecessor_index = len(augmented) - 1
-        predecessor_keys = ["output_file"]
 
     return augmented
 
