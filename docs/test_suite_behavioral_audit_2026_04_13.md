@@ -3,8 +3,8 @@
 **Date:** 2026-04-13
 **Branch:** `iter/6-execution-backends`, post-Phase-3.5c, pre-B1
 **Scope:** All 44 test files in `tests/unit/` + `tests/integration/` (~16,655 LOC), cross-referenced against `src/`
-**Follow-up to:** `docs/test_suite_audit_2026_04_13.md` (import-level audit, same day)
-**Cluster reports:** `docs/test_audit_cluster_{A,B,C,D}_2026_04_13.md`
+**Follow-up to:** `docs/archive/test_suite_audit_2026_04_13.md` (import-level audit, same day)
+**Cluster reports:** `docs/archive/test_audit_cluster_{A,B,C,D}_2026_04_13.md`
 
 ---
 
@@ -140,7 +140,7 @@ Cluster D, finding #11. `test_search_relevance` asserts `results[0][0].name == "
 
 ## What this audit confirms about the earlier import-level audit
 
-The earlier audit (`docs/test_suite_audit_2026_04_13.md`) concluded:
+The earlier audit (`docs/archive/test_suite_audit_2026_04_13.md`) concluded:
 - No dead imports ✅ confirmed
 - No stale shape assertions at the grep level ✅ confirmed
 - No duplicative unit↔integration pairs ✅ confirmed

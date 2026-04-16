@@ -4,7 +4,7 @@
 **Branch:** `iter/6-execution-backends`
 **Status:** Stages 1-4 complete (Stages 1-2 committed, Stages 3-4 uncommitted as of 2026-04-11); Stage 4.5 and Stages 5-8 pending
 **Supersedes (partially):** `docs/archive/single_artifact_enforcement_plan.md`
-**Cross-reference:** `docs/pre_eval_execution_plan.md` is the sequencing-and-validation layer; this doc is the architectural detail. Stage 1 ↔ Phase 1 Track 1a, Stage 2 ↔ Phase 2, Stages 3-4 ↔ Phase 3, **Stage 4.5 ↔ Phase 3.5b (added 2026-04-09)**, Stages 5-7 are absorbed into Phase 3 / Phase 3.5 verification, Stage 8 ↔ Phases 5-6.
+**Cross-reference:** `docs/archive/pre_eval_execution_plan.md` is the sequencing-and-validation layer; this doc is the architectural detail. Stage 1 ↔ Phase 1 Track 1a, Stage 2 ↔ Phase 2, Stages 3-4 ↔ Phase 3, **Stage 4.5 ↔ Phase 3.5b (added 2026-04-09)**, Stages 5-7 are absorbed into Phase 3 / Phase 3.5 verification, Stage 8 ↔ Phases 5-6.
 
 ---
 
@@ -459,7 +459,7 @@ Each stage is independently testable and reversible. Commit at each stage bounda
 
 ### Stage 4.5: DeepAgents subagents for AGENT-typed compositional execution
 
-**Status**: Added 2026-04-09 after the Phase 2 verification gate exposed a context-engineering gap. See `docs/pre_eval_execution_plan.md` Phase 3.5b for the integrated execution-plan view; the detail below is the architectural design and lives in this plan because it is a Stage 4 follow-up.
+**Status**: Added 2026-04-09 after the Phase 2 verification gate exposed a context-engineering gap. See `docs/archive/pre_eval_execution_plan.md` Phase 3.5b for the integrated execution-plan view; the detail below is the architectural design and lives in this plan because it is a Stage 4 follow-up.
 
 **Goal**: when the compositional executor handles an agent-typed chain (i.e., one or more gaps classified as AGENT, including over-decomposed multi-step agent tasks), wrap the chain in a DeepAgents lead-with-subagents pattern instead of running each agent as an independent standalone DeepAgent process. Directly addresses the proposal's third tension (*"context economy in a MAS where agents pass context to each other"*) at the generated-capability layer.
 

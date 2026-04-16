@@ -25,7 +25,7 @@ Why this matters: the proposal's Pillar 3 Merge clause requires
 Without populated schemas, that conjunct is vacuous and Merge falls back
 to prose-only clustering — which Phase D (2026-04-13) showed cannot
 distinguish structurally-similar capabilities across business verticals.
-See ``docs/b1_enriched_embedding_plan.md`` for the full rationale.
+See ``docs/archive/b1_enriched_embedding_plan.md`` for the full rationale.
 """
 
 from __future__ import annotations

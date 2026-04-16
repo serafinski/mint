@@ -1,5 +1,9 @@
 # Pre-Eval Execution Plan
 
+> **⚠ SUPERSEDED 2026-04-16.** This document is historical. The live pre-eval sequencing is now in `docs/MASTER_PLAN_2026_04_13.md` §6.0 (priority table) and §6.1 (full step detail + ordered script execution schedule). Key divergences from the text below that have NOT been retrofitted here: (a) eval size is now **400 records**, not 360 (20 tasks × 4 conditions × 5 runs); (b) unit-test baseline is **1326 passing** (2026-04-16 end of session), not 887; (c) `proposal_vs_implementation.md` v1 has been replaced by `proposal_vs_implementation_v2.md`; (d) `todo_drift_and_missing.md` is no longer the tracking doc — §12 findings in the master plan are; (e) additional pre-eval analyzer steps (Step 18.5 Gini + classification accuracy; Step 18.7 new `scripts/analyze_longitudinal.py` for KL convergence) have been added and are referenced in the master plan; (f) Pillar 3 Split + Merge have been ✅ resolved across all three types (Steps 5-8). The content below is preserved as the original sequencing-and-validation reasoning, useful for audit-trail and Chapter 4/6 writing context. **Do not add new work items here — add to the master plan.**
+
+---
+
 **Scope:** everything that has to happen between now and the full 360-record eval, in the order it should happen.
 
 **Sibling docs:**
