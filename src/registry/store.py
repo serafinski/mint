@@ -523,7 +523,6 @@ def seed_registry(registry: SkillRegistry) -> None:
             "Compute the nth Fibonacci number",
             CapabilityType.MCP_TOOL,
             domain="mathematics",
-            tags=["math", "computation", "sequence"],
             input_schema={"n": "int"},
             output_schema={"result": "int"},
             source_code=(
@@ -555,7 +554,6 @@ def seed_registry(registry: SkillRegistry) -> None:
             ),
             CapabilityType.MCP_TOOL,
             domain="data-processing",
-            tags=["csv", "parsing", "data-ingestion"],
             input_schema={"file_path": "str"},
             output_schema={"row_count": "int", "column_names": "list[str]"},
             source_code=(
@@ -583,7 +581,6 @@ def seed_registry(registry: SkillRegistry) -> None:
             ),
             CapabilityType.MCP_TOOL,
             domain="data-processing",
-            tags=["date", "formatting", "conversion"],
             input_schema={
                 "date_string": "str",
                 "input_format": "str",
@@ -619,7 +616,6 @@ def seed_registry(registry: SkillRegistry) -> None:
             ),
             CapabilityType.MCP_TOOL,
             domain="data-processing",
-            tags=["json", "validation", "schema"],
             input_schema={"config_path": "str", "schema_path": "str"},
             output_schema={"errors": "list[str]"},
             source_code=(
@@ -651,7 +647,6 @@ def seed_registry(registry: SkillRegistry) -> None:
             ),
             CapabilityType.MCP_TOOL,
             domain="text-analysis",
-            tags=["text", "statistics", "nlp", "readability"],
             input_schema={"file_path": "str"},
             output_schema={"word_count": "int", "readability_score": "float"},
             source_code=(
@@ -686,7 +681,6 @@ def seed_registry(registry: SkillRegistry) -> None:
             ),
             CapabilityType.SKILL,
             domain="data-processing",
-            tags=["data-cleaning", "etl", "workflow", "preprocessing"],
             input_schema={"data": "list[dict]"},
             output_schema={
                 "clean_row_count": "int",
@@ -727,7 +721,6 @@ def seed_registry(registry: SkillRegistry) -> None:
             ),
             CapabilityType.SKILL,
             domain="reporting",
-            tags=["report", "summary", "documentation"],
             input_schema={"data": "list[dict]"},
             output_schema={
                 "summary": "str",
@@ -765,7 +758,6 @@ def seed_registry(registry: SkillRegistry) -> None:
             ),
             CapabilityType.AGENT,
             domain="analytics",
-            tags=["analysis", "eda", "profiling", "insights", "autonomous"],
             input_schema={"dataset_path": "str"},
             output_schema={
                 "profile": "dict",

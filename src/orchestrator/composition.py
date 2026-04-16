@@ -219,22 +219,49 @@ class CompositionalExecutor:
 
     @staticmethod
     def _collect_output_files(workspace: Path) -> dict[str, bytes]:
-        """Scan workspace for ``output.*`` files written by the last step.
+        """Scan workspace for arbitrary files written by the last step.
 
-        Returns a mapping of filename → raw bytes.  Only files matching
-        the ``output.*`` naming convention are collected (the MCP_TOOL
-        generator prompt instructs last-step tools to write here when the
-        task requests a non-JSON output format).
+        Returns a mapping of filename → raw bytes. Collects any file at
+        the workspace root that is NOT a known intermediate (``step_N_output.json``
+        files written by the compositional executor itself) or the
+        ``fixtures/`` directory.
+
+        **Pre-Step-12 behavior** (2026-04-12 to 2026-04-16): this method
+        filtered on ``candidate.stem == "output"``, only picking up files
+        named ``output.*`` (``output.csv``, ``output.xlsx``, ...). That
+        worked for the B3 era where the MCP_TOOL generator prompt told
+        last-step tools to write to ``/workspace/output.<ext>``.
+
+        **Post-Rule-15 behavior** (2026-04-16): the decomposer now appends
+        writer subtasks whose description explicitly names the requested
+        file (e.g., ``report.md``, ``incident_summary.md``). The MCP_TOOL
+        generator produces code that writes to exactly those filenames,
+        not ``output.*``. An empirical T16 run (2026-04-16 15:51) produced
+        a writer that correctly wrote ``/workspace/report.md`` but the
+        stem filter silently dropped it, ``cleanup_workspace`` deleted
+        it, and the user saw an empty mint_output dir despite the dict
+        output being correct. The fix broadens the collector to accept
+        any non-intermediate file — format-agnostic, matches whatever
+        filename the decomposer's ``required_files`` contract declared.
         """
         output_files: dict[str, bytes] = {}
         try:
             for candidate in workspace.iterdir():
-                if candidate.is_file() and candidate.stem == "output":
-                    output_files[candidate.name] = candidate.read_bytes()
-                    logger.info(
-                        "Collected output file: %s (%d bytes)",
-                        candidate.name, len(output_files[candidate.name]),
-                    )
+                if not candidate.is_file():
+                    continue
+                # Skip intermediate step-output JSON files — those are
+                # serialized dict outputs the executor itself wrote for
+                # downstream MCP_TOOL steps to read.
+                if (
+                    candidate.name.startswith("step_")
+                    and candidate.name.endswith("_output.json")
+                ):
+                    continue
+                output_files[candidate.name] = candidate.read_bytes()
+                logger.info(
+                    "Collected output file: %s (%d bytes)",
+                    candidate.name, len(output_files[candidate.name]),
+                )
         except OSError as exc:
             logger.warning("Failed to scan workspace for output files: %s", exc)
         return output_files
@@ -421,12 +448,50 @@ class CompositionalExecutor:
             langfuse_session_id=self.langfuse_session_id,
         )
 
+    def _collect_union_output_schema(
+        self,
+        *,
+        artifact: Any,
+        current_ref: CapabilityReference,
+    ) -> dict[str, str] | None:
+        """Union output_schemas across every subtask that resolves to this artifact.
+
+        §12 finding #12 refinement (2026-04-16 after T16 third-run
+        empirical failure). When a lead+subagents artifact covers N
+        decomposer gaps, the lead executes once and produces an
+        aggregated output covering all N gaps. Using just the currently-
+        executing subtask's schema as ``response_format`` is too narrow —
+        the lead's natural aggregation includes task-level return keys
+        and sibling subtasks' declared keys. This helper produces the
+        union so the dynamic Pydantic model captures every key the
+        downstream consumers might need. Paired with ``extra="allow"``
+        on the dynamic model (see ``_build_dynamic_result_model``) so the
+        lead's composite output isn't rejected for including extras.
+
+        Returns ``None`` when no subtask resolves to this artifact (e.g.
+        match from the registry, not a generated artifact) or when the
+        union is empty.
+        """
+        current_name = getattr(artifact, "capability_name", None) or current_ref.capability_name
+        union: dict[str, str] = {}
+        for other in self.subtasks:
+            other_ref, _ = self._resolve_step(other)
+            if other_ref is None:
+                continue
+            if other_ref.capability_name != current_name:
+                continue
+            for key, desc in (other.output_schema or {}).items():
+                if key not in union:
+                    union[key] = desc
+        return union or None
+
     def _execute_agent_step(
         self,
         artifact_or_match: Any,
         ref: CapabilityReference,
         workspace: Path,
         upstream_outputs: dict[int, dict],
+        subtask: SubTask | None = None,
     ) -> dict:
         from tests.evaluation.execution import (
             execute_agent_artifact,
@@ -440,12 +505,30 @@ class CompositionalExecutor:
             else self._match_to_artifact(artifact_or_match, ref)
         )
 
+        # §12 finding #12: thread the subtask's decomposer-declared
+        # output_schema into the agent executor so it can build a dynamic
+        # Pydantic response_format. This enforces Structured State
+        # Communication on AGENT handoffs (the key that downstream
+        # MCP_TOOL writers use via requires_upstream_keys).
+        #
+        # For lead+subagents artifacts: multiple subtasks can resolve to
+        # the same artifact. The lead executes ONCE and produces an
+        # aggregated output covering ALL collapsed gaps. Using just the
+        # current subtask's narrow schema makes the response_format reject
+        # the lead's natural composite output. Compute the UNION of all
+        # subtasks that resolve to this artifact so the schema captures
+        # every key the downstream consumers might need.
+        output_schema = self._collect_union_output_schema(
+            artifact=artifact, current_ref=ref,
+        ) if subtask else None
+
         output = execute_agent_artifact(
             artifact,
             self.task,
             fixture_contents,
             langfuse_tags=self.langfuse_tags,
             langfuse_session_id=self.langfuse_session_id,
+            output_schema=output_schema,
         )
 
         # Step 13: capture the sticky meta on failure so ``run()`` can
@@ -482,7 +565,8 @@ class CompositionalExecutor:
             )
         elif cap_type == CapabilityType.AGENT:
             output = self._execute_agent_step(
-                artifact_or_match, ref, workspace, upstream_outputs
+                artifact_or_match, ref, workspace, upstream_outputs,
+                subtask=subtask,
             )
         else:
             logger.warning("Unknown capability type: %s", cap_type)
@@ -638,16 +722,47 @@ class CompositionalExecutor:
                 step_results.append(output)
                 executed_outputs[step_idx] = output
 
-                # Diagnostic: check output keys against schema contract
-                if subtask.output_schema and output:
+                # §12 finding #12: runtime output-schema compliance check.
+                # Layer 2 of the two-layer defense (Layer 1 is the dynamic
+                # response_format in execute_agent_artifact). Fails the chain
+                # when an AGENT step's output is missing keys the decomposer
+                # declared in output_schema — same keys that downstream
+                # MCP_TOOL/SKILL steps rely on via requires_upstream_keys.
+                # MCP_TOOL output is deterministic (whatever the function
+                # returns) so only enforce for AGENT/SKILL runtime outputs.
+                if subtask.output_schema and output and ref.capability_type in (
+                    CapabilityType.AGENT, CapabilityType.SKILL,
+                ):
                     expected = set(subtask.output_schema.keys())
                     actual = set(output.keys())
                     missing = expected - actual
                     if missing:
+                        reason = (
+                            f"{ref.capability_type.value} output missing "
+                            f"declared schema keys {sorted(missing)} "
+                            f"(declared: {sorted(expected)}, "
+                            f"got: {sorted(actual)})"
+                        )
                         logger.warning(
-                            "Step %d (%s) output missing expected schema keys: %s "
-                            "(expected: %s, got: %s)",
-                            step_idx, ref.capability_name, missing, expected, actual,
+                            "Step %d (%s): %s — failing chain per §12 "
+                            "finding #12 (AGENT/SKILL output_schema "
+                            "compliance enforcement).",
+                            step_idx, ref.capability_name, reason,
+                        )
+                        self._last_step_failure_reason = reason
+                        self._end_langfuse_chain_trace(
+                            lf, chain_trace, False, step_results,
+                            failed_step=step_idx,
+                            failed_name=subtask.description,
+                        )
+                        return ChainResult(
+                            chain_length=len(execution_order),
+                            chain_success=False,
+                            step_results=step_results,
+                            step_timings=step_timings,
+                            failed_step_index=step_idx,
+                            failed_step_name=subtask.description,
+                            failed_step_reason=reason,
                         )
 
                 # Record real invocation in metrics store

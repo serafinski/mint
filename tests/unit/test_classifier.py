@@ -763,3 +763,210 @@ class TestClassifierNode:
 
         # No-op path: classified_gaps not in update (or unchanged)
         assert "classified_gaps" not in cmd.update
+
+
+# ---------------------------------------------------------------------------
+# File-writer override — §12 finding #11 safety net
+# ---------------------------------------------------------------------------
+
+
+class TestEnforceFileWriterMcpTool:
+    """Direct unit tests for the override helper."""
+
+    def test_no_required_files_noop(self):
+        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
+
+        gaps = [
+            ClassifiedGap(
+                query="write-xlsx-file",
+                description="write-xlsx-file",
+                classified_type=CapabilityType.AGENT,
+                confidence=0.9,
+                rationale="AGENT bias",
+            ),
+        ]
+        out, warnings = _enforce_file_writer_mcp_tool(gaps, [])
+        assert out == gaps  # identity — no mutation
+        assert warnings == []
+
+    def test_empty_gaps_noop(self):
+        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
+
+        out, warnings = _enforce_file_writer_mcp_tool([], ["output.csv"])
+        assert out == []
+        assert warnings == []
+
+    def test_writer_classified_agent_gets_overridden(self):
+        """The T16 drift case — parent-task bias folded writer into AGENT."""
+        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
+
+        gaps = [
+            ClassifiedGap(
+                query="incident-triage-agent",
+                description="incident-triage-agent",
+                classified_type=CapabilityType.AGENT,
+                confidence=0.95,
+                rationale="Parent is agent-task",
+            ),
+            ClassifiedGap(
+                query="write-markdown-report",
+                description="write-markdown-report",
+                classified_type=CapabilityType.AGENT,
+                confidence=0.9,
+                rationale="Parent is agent-task",
+            ),
+        ]
+        out, warnings = _enforce_file_writer_mcp_tool(gaps, ["report.md"])
+        assert len(warnings) == 1
+        assert "write-markdown-report" in warnings[0]
+        assert "mcp_tool" in warnings[0]
+        # Investigator stays AGENT.
+        assert out[0].classified_type == CapabilityType.AGENT
+        # Writer overridden to MCP_TOOL.
+        assert out[1].classified_type == CapabilityType.MCP_TOOL
+        # Rationale carries the override audit trail.
+        assert "Step 12 finding #11 override" in out[1].rationale
+        assert "Parent is agent-task" in out[1].rationale  # original preserved
+
+    def test_writer_classified_skill_gets_overridden(self):
+        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
+
+        gaps = [
+            ClassifiedGap(
+                query="write-csv-file",
+                description="write-csv-file",
+                classified_type=CapabilityType.SKILL,
+                confidence=0.8,
+                rationale="Parent is skill-task",
+            ),
+        ]
+        out, warnings = _enforce_file_writer_mcp_tool(gaps, ["output.csv"])
+        assert len(warnings) == 1
+        assert out[0].classified_type == CapabilityType.MCP_TOOL
+
+    def test_writer_already_mcp_tool_noop(self):
+        """The T11 happy path — writer correctly classified; don't touch."""
+        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
+
+        gaps = [
+            ClassifiedGap(
+                query="write-xlsx-file",
+                description="write-xlsx-file",
+                classified_type=CapabilityType.MCP_TOOL,
+                confidence=0.95,
+                rationale="Deterministic file I/O",
+            ),
+        ]
+        out, warnings = _enforce_file_writer_mcp_tool(gaps, ["output.xlsx"])
+        assert warnings == []
+        assert out[0].classified_type == CapabilityType.MCP_TOOL
+        # Rationale unchanged — no override note added.
+        assert "override" not in out[0].rationale.lower()
+
+    def test_non_writer_gap_not_touched(self):
+        """Non-writer gaps (any classification) are left alone."""
+        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
+
+        gaps = [
+            ClassifiedGap(
+                query="parse-sales-csv",
+                description="parse-sales-csv",
+                classified_type=CapabilityType.MCP_TOOL,
+                confidence=0.95,
+                rationale="Deterministic parsing",
+            ),
+            ClassifiedGap(
+                query="summarize-findings",
+                description="summarize-findings",
+                classified_type=CapabilityType.SKILL,
+                confidence=0.8,
+                rationale="Domain expertise",
+            ),
+        ]
+        out, warnings = _enforce_file_writer_mcp_tool(gaps, ["output.csv"])
+        assert warnings == []
+        assert out[0].classified_type == CapabilityType.MCP_TOOL
+        assert out[1].classified_type == CapabilityType.SKILL
+
+    def test_case_insensitive_write_prefix(self):
+        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
+
+        gaps = [
+            ClassifiedGap(
+                query="WRITE-XLSX-FILE",  # uppercase
+                description="WRITE-XLSX-FILE",
+                classified_type=CapabilityType.AGENT,
+                confidence=0.9,
+                rationale="AGENT bias",
+            ),
+        ]
+        out, warnings = _enforce_file_writer_mcp_tool(gaps, ["output.xlsx"])
+        assert len(warnings) == 1
+        assert out[0].classified_type == CapabilityType.MCP_TOOL
+
+
+class TestClassifierNodeWritererOverride:
+    """Integration-style — classifier_node wires the override correctly."""
+
+    @patch("src.orchestrator.classifier.classify_gap")
+    def test_override_fires_when_contract_declares_files(self, mock_classify):
+        """End-to-end: classifier LLM routes writer to AGENT, override fixes it."""
+        from src.schemas.task import OutputContract
+
+        mock_classify.side_effect = [
+            ClassifiedGap(
+                query="incident-triage-agent",
+                description="incident-triage-agent",
+                classified_type=CapabilityType.AGENT,
+                confidence=0.95,
+                rationale="Parent is agent-task",
+            ),
+            ClassifiedGap(
+                query="write-markdown-report",
+                description="write-markdown-report",
+                classified_type=CapabilityType.AGENT,
+                confidence=0.9,
+                rationale="Parent is agent-task",
+            ),
+        ]
+        state = TaskState(
+            task_description="Investigate and write report.md",
+            required_capabilities=["incident-triage-agent", "write-markdown-report"],
+            gaps=[
+                GapItem(query="incident-triage-agent", description="incident-triage-agent"),
+                GapItem(query="write-markdown-report", description="write-markdown-report"),
+            ],
+            classified_gaps=[],
+            output_contract=OutputContract(required_files=["report.md"]),
+        )
+
+        cmd = classifier_node(state)
+        out = cmd.update["classified_gaps"]
+        assert len(out) == 2
+        assert out[0].classified_type == CapabilityType.AGENT  # investigator
+        assert out[1].classified_type == CapabilityType.MCP_TOOL  # writer overridden
+        # Warning surfaced in errors.
+        errors = cmd.update.get("errors", [])
+        assert any("write-markdown-report" in e for e in errors)
+
+    @patch("src.orchestrator.classifier.classify_gap")
+    def test_no_override_when_contract_has_no_files(self, mock_classify):
+        """Without required_files, the override is inert."""
+        mock_classify.return_value = ClassifiedGap(
+            query="write-csv-file",
+            description="write-csv-file",
+            classified_type=CapabilityType.AGENT,
+            confidence=0.9,
+            rationale="AGENT bias",
+        )
+        state = TaskState(
+            task_description="Some task without file output",
+            required_capabilities=["write-csv-file"],
+            gaps=[GapItem(query="write-csv-file", description="write-csv-file")],
+            classified_gaps=[],
+            # No output_contract — override can't fire.
+        )
+
+        cmd = classifier_node(state)
+        out = cmd.update["classified_gaps"]
+        assert out[0].classified_type == CapabilityType.AGENT  # not overridden

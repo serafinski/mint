@@ -652,10 +652,19 @@ def show_capability_detail(
     ct = str(cap.capability_type).split(".")[-1].upper()
     active = "[green]active[/green]" if cap.is_active else "[red]inactive[/red]"
 
-    # Metadata panel
+    # Metadata panel. Domain + is_generic come from the evolutionary
+    # taxonomy (B1 Step 3.5f) and are load-bearing for gap-detection
+    # retrieval — a generic capability bypasses the domain filter at
+    # search time via the ``$or`` ChromaDB where clause.
+    generic_label = (
+        "[green]yes[/green] (bypasses domain filter in gap detection)"
+        if cap.is_generic
+        else "[dim]no[/dim] (domain-scoped)"
+    )
     meta_lines = [
         f"[bold]Type:[/bold] {ct}",
         f"[bold]Domain:[/bold] {cap.domain}",
+        f"[bold]Generic:[/bold] {generic_label}",
         f"[bold]Status:[/bold] {active}",
         f"[bold]Tags:[/bold] {', '.join(cap.tags) if cap.tags else '(none)'}",
         f"[bold]Created:[/bold] {cap.created_at:%Y-%m-%d %H:%M}",

@@ -17,6 +17,7 @@ app = typer.Typer(
     "Generate, verify, and execute capabilities on demand.",
     no_args_is_help=True,
     rich_markup_mode="rich",
+    add_completion=False,
 )
 
 
@@ -170,7 +171,7 @@ def prune(
         typer.Option("--window", "-w", help="Days of inactivity before pruning"),
     ] = 30,
 ) -> None:
-    """Remove capabilities with no recent invocations."""
+    """Deactivate capabilities with no recent invocations (archived, not deleted; re-enable with `mint enable`)."""
     from src.cli.display import console
     from src.cli.runner import _create_infra, _load_env
 
@@ -181,7 +182,10 @@ def prune(
 
     pruned = do_prune(registry, metrics_store, window_days=window_days)
     if pruned:
-        console.print(f"[yellow]Pruned {len(pruned)} capability(ies):[/yellow]")
+        console.print(
+            f"[yellow]Deactivated {len(pruned)} capability(ies) "
+            f"(still in registry, re-enable with `mint enable <name>`):[/yellow]"
+        )
         for name in pruned:
             console.print(f"  - {name}")
     else:

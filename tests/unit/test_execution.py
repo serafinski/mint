@@ -770,3 +770,103 @@ class TestAgentInvokeInput:
         files = captured_invoke_input["files"]
         # The pre-existing skill must win — the fixture is filtered out.
         assert files["/SKILL.md"]["content"] == ["# Skill from skills dir"]
+
+
+# ---------------------------------------------------------------------------
+# §12 finding #12 — dynamic response_format from decomposer output_schema
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDynamicResultModel:
+    def test_empty_schema_returns_none(self):
+        from tests.evaluation.execution import _build_dynamic_result_model
+
+        assert _build_dynamic_result_model(None) is None
+        assert _build_dynamic_result_model({}) is None
+
+    def test_builds_model_with_declared_keys(self):
+        from tests.evaluation.execution import _build_dynamic_result_model
+
+        schema = {
+            "metrics_table": "list[dict]",
+            "root_cause_metric": "str",
+            "cascade_chain": "list[str]",
+        }
+        model = _build_dynamic_result_model(schema)
+        assert model is not None
+        # All declared keys must be present as required fields.
+        assert set(model.model_fields.keys()) == {
+            "metrics_table", "root_cause_metric", "cascade_chain",
+        }
+        for name, field in model.model_fields.items():
+            assert field.is_required(), f"Field '{name}' should be required"
+
+    def test_model_allows_extra_keys(self):
+        """extra='allow' tolerates additional keys beyond the declared ones.
+
+        Important for lead+subagents AGENTs where the lead produces
+        aggregated output covering multiple collapsed gaps plus task-level
+        return keys. An earlier extra='forbid' design empirically failed
+        on the T16 third-run (2026-04-16): the lead produced task-level
+        keys as "extras", Pydantic rejected them, whole chain failed.
+        """
+        from tests.evaluation.execution import _build_dynamic_result_model
+
+        model = _build_dynamic_result_model({"a": "int"})
+        # Declared key must be present.
+        instance = model(a=1, b=2, c="extra")
+        assert instance.a == 1
+        # Extra keys are tolerated (stored via model_extra on Pydantic v2
+        # with extra='allow').
+        assert getattr(instance, "b", None) == 2
+
+    def test_model_still_requires_declared_keys(self):
+        """extra='allow' doesn't weaken required-key enforcement."""
+        import pytest
+        from pydantic import ValidationError
+
+        from tests.evaluation.execution import _build_dynamic_result_model
+
+        model = _build_dynamic_result_model({"a": "int"})
+        # Missing declared key must be rejected even with extra='allow'.
+        with pytest.raises(ValidationError):
+            model(b=2)  # no "a"
+
+
+class TestExecuteAgentArtifactDynamicResponseFormat:
+    @patch("tests.evaluation.execution._execute_agent_inner")
+    def test_output_schema_threaded_through(self, mock_inner):
+        """execute_agent_artifact forwards output_schema to _execute_agent_inner."""
+        from tests.evaluation.execution import execute_agent_artifact
+
+        mock_inner.return_value = {"metrics_table": [], "root_cause_metric": "x"}
+
+        artifact = SimpleNamespace(agent_config={"system_prompt": "you are"})
+        task = SimpleNamespace(task_id="", task_prompt="test")
+
+        output_schema = {
+            "metrics_table": "list[dict]",
+            "root_cause_metric": "str",
+        }
+        execute_agent_artifact(
+            artifact, task, {},
+            output_schema=output_schema,
+        )
+
+        # _execute_agent_inner received output_schema as a keyword arg.
+        _, kwargs = mock_inner.call_args
+        assert kwargs["output_schema"] == output_schema
+
+    @patch("tests.evaluation.execution._execute_agent_inner")
+    def test_default_no_output_schema(self, mock_inner):
+        """Existing callers without output_schema still work — param defaults to None."""
+        from tests.evaluation.execution import execute_agent_artifact
+
+        mock_inner.return_value = {}
+        artifact = SimpleNamespace(agent_config={"system_prompt": "you are"})
+        task = SimpleNamespace(task_id="", task_prompt="test")
+
+        execute_agent_artifact(artifact, task, {})
+
+        _, kwargs = mock_inner.call_args
+        assert kwargs["output_schema"] is None

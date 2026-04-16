@@ -289,6 +289,73 @@ def classify_task(
 # ---------------------------------------------------------------------------
 
 
+def _enforce_file_writer_mcp_tool(
+    classified_gaps: list,
+    required_files: list[str],
+) -> tuple[list, list[str]]:
+    """Force file-writer gaps to be MCP_TOOL regardless of classifier drift.
+
+    **Why this exists (Phase 3 Step 12, §12 finding #11, 2026-04-16).**
+    The proposal's Pillar 1.3 says file I/O is *"deterministic + stateless
+    → MCP tool"*. Empirically, the classifier's parent-task-first decision
+    rule biases AGENT-parent tasks (e.g. incident investigations with a
+    file-writer tail) to route ALL subtasks as AGENT, collapsing them into
+    one lead+subagents agent. A writer folded into a lead+subagents
+    agent runs on DeepAgent's ``StateBackend`` — not the Docker workspace
+    ``_collect_output_files`` reads from. Net effect: the file silently
+    fails to materialize even when the agent's dict output is correct
+    (the T16 reproducer).
+
+    The classifier prompt was also hardened with a file-writer exception
+    + Example G. This helper is the **structural safety net** for the
+    cases where LLM compliance on the new exception is unreliable. Same
+    two-layer-defense pattern as Step 12's decomposer Rule 15 +
+    ``_ensure_file_writer_last_step`` validator.
+
+    **How it identifies writer gaps.** Writer gaps follow a strong naming
+    convention (Rule 15 + ``_ensure_file_writer_last_step``): their query
+    starts with ``"write-"``. We override any such gap whose classified
+    type is not ``MCP_TOOL`` when ``required_files`` is non-empty.
+
+    **What it returns.** The (possibly mutated) classified_gaps list and
+    a list of warning strings to append to ``state.errors``. Never
+    raises.
+    """
+    from src.schemas.task import CapabilityType
+
+    if not required_files or not classified_gaps:
+        return classified_gaps, []
+
+    warnings: list[str] = []
+    updated: list = []
+    for cg in classified_gaps:
+        query = (cg.query or "").lower()
+        looks_like_writer = query.startswith("write-")
+        if looks_like_writer and cg.classified_type != CapabilityType.MCP_TOOL:
+            warnings.append(
+                f"Classifier override: gap '{cg.query}' was classified as "
+                f"{cg.classified_type.value} but looks like a file-writer; "
+                f"forcing to mcp_tool per Pillar 1.3 (deterministic file I/O) "
+                f"and Step 12 finding #11 (parent-task bias drift)."
+            )
+            # Pydantic models are frozen by default — rebuild with the new
+            # type. Preserve confidence and extend the rationale so the
+            # override is visible in run.json.
+            cg = cg.model_copy(update={
+                "classified_type": CapabilityType.MCP_TOOL,
+                "rationale": (
+                    f"[Step 12 finding #11 override] Original classifier "
+                    f"rationale: {cg.rationale} — OVERRIDDEN to mcp_tool "
+                    f"because query starts with 'write-' and the task "
+                    f"declares required_files. File I/O is deterministic "
+                    f"per Pillar 1.3; SKILL/AGENT backends cannot write "
+                    f"to the Docker workspace."
+                ),
+            })
+        updated.append(cg)
+    return updated, warnings
+
+
 def classifier_node(
     state: TaskState,
 ) -> Command[Literal["generate_mcp_tool"]]:
@@ -390,6 +457,19 @@ def classifier_node(
             n_fallbacks,
             len(state.gaps),
         )
+
+    # §12 finding #11: safety net for the classifier's parent-task bias.
+    # If the task declares file outputs, any gap whose name starts with
+    # "write-" must be mcp_tool regardless of what the LLM classifier
+    # returned. Writer gaps classified as SKILL/AGENT cannot write to the
+    # Docker workspace and silently fail file production.
+    if state.output_contract is not None and state.output_contract.required_files:
+        classified_gaps, override_warnings = _enforce_file_writer_mcp_tool(
+            classified_gaps, state.output_contract.required_files,
+        )
+        for w in override_warnings:
+            logger.warning("Classifier: %s", w)
+            errors.append(w)
 
     return Command(
         update={

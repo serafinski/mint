@@ -209,7 +209,12 @@ def test_mcp_tsv() -> bool:
 
 
 def test_skill_excel() -> bool:
-    """SKILL: Multi-source integration with Excel product catalog (new format)."""
+    """SKILL: Multi-source integration with Excel product catalog (new format).
+
+    Phase 3 Step 12 (Option B): also requests an Excel file output. Exercises
+    the decomposer Rule 15 / ``_ensure_file_writer_last_step`` path — the
+    chain should end in an appended MCP_TOOL writer that produces output.xlsx.
+    """
     return _run_mint(
         task=(
             "Build a data integration pipeline using these three data sources: "
@@ -218,7 +223,9 @@ def test_skill_excel() -> bool:
             "(2) Compute per-region revenue totals (quantity * unit_price). "
             "(3) Compare each region's revenue against its target. "
             "This requires a multi-step workflow integrating separate data sources "
-            "with intermediate outputs. Return a dict with 'summary_row_count' (int), "
+            "with intermediate outputs. "
+            "Write the per-region revenue vs. target summary to output.xlsx as Excel. "
+            "Also return a dict with 'summary_row_count' (int), "
             "'region_revenues' (dict), and 'regions_meeting_target' (int)."
         ),
         files=[
@@ -231,7 +238,13 @@ def test_skill_excel() -> bool:
 
 
 def test_agent_yaml_incident() -> bool:
-    """AGENT: Root cause diagnosis with YAML incident report (new format)."""
+    """AGENT: Root cause diagnosis with YAML incident report (new format).
+
+    Phase 3 Step 12 (Option B): also requests a Markdown report file. Exercises
+    the decomposer Rule 15 / ``_ensure_file_writer_last_step`` path — the
+    chain should end in an appended MCP_TOOL writer that produces report.md
+    after the AGENT investigation step.
+    """
     return _run_mint(
         task=(
             "You are investigating a service degradation incident. "
@@ -240,7 +253,10 @@ def test_agent_yaml_incident() -> bool:
             "Identify which metric changed FIRST (the root cause) by comparing "
             "onset times across metrics. Determine the cascade chain. "
             "This requires adaptive investigation: examine data, form hypotheses, "
-            "test them, and revise. Return a dict with 'root_cause_metric' (str), "
+            "test them, and revise. "
+            "Write a markdown incident summary to report.md (one table with "
+            "metric name, onset time, and cascade position). "
+            "Also return a dict with 'root_cause_metric' (str), "
             "'cascade_chain' (list of str), and 'n_metrics_investigated' (int)."
         ),
         files=[

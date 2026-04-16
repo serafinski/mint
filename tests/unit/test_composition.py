@@ -901,19 +901,29 @@ class TestLeadDedup:
 
 
 class TestCollectOutputFiles:
-    """Tests for _collect_output_files — detecting output.* files in workspace."""
+    """Tests for _collect_output_files — collecting non-intermediate files from workspace.
+
+    Post-2026-04-16 refinement: the collector is format-agnostic and picks up
+    any file at the workspace root that isn't a known intermediate
+    (``step_N_output.json``). Previously it only matched stem ``"output"``,
+    which silently dropped ``report.md`` / ``summary.txt`` / any non-``output.*``
+    filename that the decomposer's Rule 15 writer produced.
+    """
 
     def test_collects_output_csv(self, tmp_path):
         ws = tmp_path / "workspace"
         ws.mkdir()
         csv_content = b"a,b,c\n1,2,3\n"
         (ws / "output.csv").write_bytes(csv_content)
-        # Non-output files should be ignored
+        # step_N_output.json intermediates are NOT collected.
         (ws / "step_0_output.json").write_text("{}")
+        # Other files ARE now collected (post-2026-04-16 fix).
         (ws / "data.txt").write_text("hello")
 
         result = CompositionalExecutor._collect_output_files(ws)
-        assert result == {"output.csv": csv_content}
+        assert result["output.csv"] == csv_content
+        assert "data.txt" in result  # no longer filtered out
+        assert "step_0_output.json" not in result  # still skipped
 
     def test_collects_multiple_output_files(self, tmp_path):
         ws = tmp_path / "workspace"
@@ -926,20 +936,40 @@ class TestCollectOutputFiles:
         assert "output.csv" in result
         assert "output.xlsx" in result
 
+    def test_collects_report_md(self, tmp_path):
+        """Regression guard for T16 rerun (2026-04-16 15:51).
+
+        The writer MCP_TOOL wrote ``/workspace/report.md`` correctly but the
+        previous stem-only filter silently dropped it. Rule 15 writers can
+        produce any filename; the collector must honor that.
+        """
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        md_content = b"# Incident Summary\n\n| metric | onset |\n|---|---|\n"
+        (ws / "report.md").write_bytes(md_content)
+
+        result = CompositionalExecutor._collect_output_files(ws)
+        assert "report.md" in result
+        assert result["report.md"] == md_content
+
     def test_empty_workspace(self, tmp_path):
         ws = tmp_path / "workspace"
         ws.mkdir()
         result = CompositionalExecutor._collect_output_files(ws)
         assert result == {}
 
-    def test_no_output_stem_files(self, tmp_path):
+    def test_step_intermediates_skipped(self, tmp_path):
+        """step_N_output.json files are executor intermediates — don't collect."""
         ws = tmp_path / "workspace"
         ws.mkdir()
         (ws / "step_0_output.json").write_text("{}")
+        (ws / "step_1_output.json").write_text("{}")
+        (ws / "step_10_output.json").write_text("{}")
         (ws / "result.csv").write_bytes(b"a,b\n")
 
         result = CompositionalExecutor._collect_output_files(ws)
-        assert result == {}
+        # Only the legitimate output file is collected.
+        assert result == {"result.csv": b"a,b\n"}
 
     def test_nonexistent_workspace(self, tmp_path):
         ws = tmp_path / "nonexistent"
@@ -1168,3 +1198,281 @@ class TestBuildSchemaContext:
         ctx = build_schema_context(gap, subtasks)
         assert '"data"' in ctx
         assert "receives" not in ctx.lower()  # no input contract for first step
+
+
+# ---------------------------------------------------------------------------
+# §12 finding #12 — AGENT/SKILL output_schema runtime compliance check
+# ---------------------------------------------------------------------------
+
+
+class TestAgentOutputSchemaRuntimeCheck:
+    """Runtime validator — Layer 2 of the finding #12 defense.
+
+    Layer 1 (dynamic response_format in execute_agent_artifact) is
+    tested in tests/unit/test_execution.py::TestBuildDynamicResultModel
+    and TestExecuteAgentArtifactDynamicResponseFormat.
+    """
+
+    @patch("tests.evaluation.execution.execute_agent_artifact")
+    def test_agent_missing_schema_keys_fails_chain(self, mock_agent):
+        """When AGENT output omits declared output_schema keys, chain fails."""
+        # AGENT returns task-level keys only — missing `metrics_table`
+        # that the decomposer declared. Reproduces the T16 2nd-run failure.
+        mock_agent.return_value = {
+            "root_cause_metric": "db_connections",
+            "cascade_chain": ["a", "b"],
+        }
+
+        subtask = SubTask(
+            description="Investigate incident and produce metrics_table",
+            required_capabilities=["incident-triage"],
+            depends_on=[],
+            output_schema={
+                "metrics_table": "list[dict] — each with metric, onset",
+                "root_cause_metric": "str",
+                "cascade_chain": "list[str]",
+            },
+        )
+        art = _make_artifact(
+            "incident-triage-agent", CapabilityType.AGENT,
+            gap_query="incident-triage",
+            agent_config={"system_prompt": "investigate"},
+        )
+        ex = CompositionalExecutor(
+            subtasks=[subtask],
+            resolution={"incident-triage": CapabilityReference(
+                source="generated", capability_name="incident-triage-agent",
+                capability_type=CapabilityType.AGENT,
+            )},
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+
+        result = ex.run()
+        assert result.chain_success is False
+        assert result.failed_step_index == 0
+        assert "metrics_table" in (result.failed_step_reason or "")
+
+    @patch("tests.evaluation.execution.execute_agent_artifact")
+    def test_agent_full_compliance_passes(self, mock_agent):
+        """When AGENT produces all declared keys, chain continues normally."""
+        mock_agent.return_value = {
+            "metrics_table": [{"metric": "db_connections", "onset": "05:00"}],
+            "root_cause_metric": "db_connections",
+            "cascade_chain": ["a"],
+        }
+
+        subtask = SubTask(
+            description="Investigate",
+            required_capabilities=["investigate"],
+            depends_on=[],
+            output_schema={
+                "metrics_table": "list[dict]",
+                "root_cause_metric": "str",
+                "cascade_chain": "list[str]",
+            },
+        )
+        art = _make_artifact(
+            "investigator", CapabilityType.AGENT,
+            gap_query="investigate",
+            agent_config={"system_prompt": "investigate"},
+        )
+        ex = CompositionalExecutor(
+            subtasks=[subtask],
+            resolution={"investigate": CapabilityReference(
+                source="generated", capability_name="investigator",
+                capability_type=CapabilityType.AGENT,
+            )},
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+
+        result = ex.run()
+        assert result.chain_success is True
+        assert result.failed_step_reason is None
+
+    @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
+    def test_mcp_tool_bypasses_runtime_check(self, mock_mcp):
+        """MCP_TOOL output is deterministic — runtime check only fires for AGENT/SKILL.
+
+        If an MCP_TOOL returns fewer keys than output_schema declared, that's
+        a bug in the generated code and shows up as a KeyError downstream,
+        not something the runtime validator should enforce (the generator
+        and Tier 2 behavioral test are the right layers for that).
+        """
+        mock_mcp.return_value = {"only_one_key": 42}
+
+        subtask = SubTask(
+            description="Parse CSV",
+            required_capabilities=["parse"],
+            depends_on=[],
+            output_schema={"row_count": "int", "column_names": "list[str]"},
+        )
+        art = _make_artifact(
+            "parser", CapabilityType.MCP_TOOL,
+            gap_query="parse",
+            source_code="async def parser(): return {'only_one_key': 42}",
+        )
+        ex = CompositionalExecutor(
+            subtasks=[subtask],
+            resolution={"parse": CapabilityReference(
+                source="generated", capability_name="parser",
+                capability_type=CapabilityType.MCP_TOOL,
+            )},
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+
+        result = ex.run()
+        # MCP_TOOL output missing declared keys still lets the chain succeed
+        # at this step — the runtime validator skips MCP_TOOL.
+        assert result.chain_success is True
+
+    def test_union_output_schema_lead_with_subagents(self):
+        """Union spans every subtask resolving to the same artifact.
+
+        T16 third-run failure: decomposer produced 5 subtasks, 4 AGENT
+        gaps collapsed into lead+subagents. Using the first subtask's
+        narrow schema as response_format forced the lead to produce only
+        parse-YAML keys, rejecting its natural aggregated output.
+
+        The union fix: combine all 4 collapsed subtasks' schemas so the
+        response_format captures every key the lead naturally produces.
+        """
+        subtasks = [
+            SubTask(
+                description="parse yaml",
+                required_capabilities=["parse-yaml"],
+                depends_on=[],
+                output_schema={"parsed_yaml": "dict"},
+            ),
+            SubTask(
+                description="analyze onsets",
+                required_capabilities=["analyze-onsets"],
+                depends_on=[0],
+                output_schema={"per_metric_onsets": "dict"},
+            ),
+            SubTask(
+                description="final summary",
+                required_capabilities=["summarize"],
+                depends_on=[1],
+                output_schema={
+                    "root_cause_metric": "str",
+                    "cascade_chain": "list[str]",
+                    "n_metrics_investigated": "int",
+                },
+            ),
+        ]
+        # All three subtasks resolve to the same lead+subagents artifact.
+        lead_ref = CapabilityReference(
+            source="generated", capability_name="incident-triage-lead",
+            capability_type=CapabilityType.AGENT,
+        )
+        art = _make_artifact(
+            "incident-triage-lead", CapabilityType.AGENT,
+            gap_query="parse-yaml",  # primary query
+            agent_config={"system_prompt": "lead"},
+        )
+        executor = CompositionalExecutor(
+            subtasks=subtasks,
+            resolution={
+                "parse-yaml": lead_ref,
+                "analyze-onsets": lead_ref,
+                "summarize": lead_ref,
+            },
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+
+        union = executor._collect_union_output_schema(
+            artifact=art, current_ref=lead_ref,
+        )
+        assert union is not None
+        # Union covers keys from all three collapsed subtasks.
+        assert set(union.keys()) == {
+            "parsed_yaml",
+            "per_metric_onsets",
+            "root_cause_metric",
+            "cascade_chain",
+            "n_metrics_investigated",
+        }
+
+    def test_union_output_schema_solo_agent_equals_subtask_schema(self):
+        """When only one subtask resolves to the artifact, union = that schema."""
+        subtasks = [
+            SubTask(
+                description="solo investigation",
+                required_capabilities=["investigate"],
+                depends_on=[],
+                output_schema={
+                    "root_cause_metric": "str",
+                    "cascade_chain": "list[str]",
+                },
+            ),
+        ]
+        ref = CapabilityReference(
+            source="generated", capability_name="investigator",
+            capability_type=CapabilityType.AGENT,
+        )
+        art = _make_artifact(
+            "investigator", CapabilityType.AGENT,
+            gap_query="investigate",
+            agent_config={"system_prompt": "go"},
+        )
+        executor = CompositionalExecutor(
+            subtasks=subtasks,
+            resolution={"investigate": ref},
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+
+        union = executor._collect_union_output_schema(
+            artifact=art, current_ref=ref,
+        )
+        assert union == {
+            "root_cause_metric": "str",
+            "cascade_chain": "list[str]",
+        }
+
+    @patch("tests.evaluation.execution.execute_skill_artifact")
+    def test_skill_missing_schema_keys_also_fails(self, mock_skill):
+        """The runtime validator applies to SKILL too, not just AGENT."""
+        mock_skill.return_value = {"partial": "output"}
+
+        subtask = SubTask(
+            description="Apply domain workflow",
+            required_capabilities=["apply"],
+            depends_on=[],
+            output_schema={"summary": "str", "counts": "dict"},
+        )
+        art = _make_artifact(
+            "applier", CapabilityType.SKILL,
+            gap_query="apply",
+            skill_content="# applier SKILL",
+        )
+        ex = CompositionalExecutor(
+            subtasks=[subtask],
+            resolution={"apply": CapabilityReference(
+                source="generated", capability_name="applier",
+                capability_type=CapabilityType.SKILL,
+            )},
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+
+        result = ex.run()
+        assert result.chain_success is False
+        assert "summary" in (result.failed_step_reason or "")
+        assert "counts" in (result.failed_step_reason or "")

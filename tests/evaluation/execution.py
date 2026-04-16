@@ -22,7 +22,7 @@ import threading
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, create_model
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +184,64 @@ class GenericResult(BaseModel):
     """Fallback for tasks without a dedicated response model."""
     model_config = {"extra": "allow"}
     result: dict = {}
+
+
+def _build_dynamic_result_model(
+    output_schema: dict[str, str] | None,
+) -> type[BaseModel] | None:
+    """Build a per-invocation Pydantic response model from a decomposer output_schema.
+
+    **Why (§12 finding #12, 2026-04-16).** The proposal's §3.4 Structured
+    State Communication requires *"strictly typed JSON schemas representing
+    the world state at each handoff point"*. The CLI path for AGENT
+    execution falls back to :class:`GenericResult` (``extra="allow"``),
+    which lets the LLM pick any keys it wants. The T16 second-run failure
+    (`Missing required upstream_data key: metrics_table`) was the
+    empirical consequence: AGENT produced task-level return keys only,
+    the decomposer's declared ``metrics_table`` key never reached the
+    downstream MCP_TOOL writer, writer crashed.
+
+    This helper closes the gap. When a decomposer subtask carries a
+    non-empty ``output_schema``, we build a per-invocation Pydantic
+    model with each key as a required ``object``-typed field and
+    ``extra="forbid"`` — forcing the LLM's structured-output call to
+    produce exactly those keys. The field type is ``object`` (not
+    more specific) because the decomposer's ``output_schema`` values are
+    free-form prose descriptions (``"list[dict] — each dict has ..."``)
+    that we don't parse into concrete types; ``object`` is the widest
+    JSON-schema-compatible type that will accept any LLM-produced value.
+
+    Returns ``None`` when the schema is empty (fall back to the existing
+    ``TASK_RESULT_MODELS.get(..., GenericResult)`` behavior).
+
+    Layer 1 of the two-layer defense for finding #12. Layer 2 is the
+    runtime output-key validator in
+    :func:`src.orchestrator.composition.CompositionalExecutor._execute_agent_step`
+    which fails the chain when output keys still don't match the
+    declared schema (e.g. if the LLM's structured-output call itself
+    failed and the DeepAgent fell back to an empty dict).
+    """
+    if not output_schema:
+        return None
+    # ``object`` is JSON-schema's permissive "any value" type; paired with
+    # ``...`` (Ellipsis default) the field is required. ``extra="allow"``
+    # tolerates additional keys beyond the declared ones — necessary for
+    # lead+subagents AGENT artifacts where the lead produces an aggregated
+    # output that covers all collapsed subtasks' schemas + the task-level
+    # return keys. An initial ``extra="forbid"`` design was empirically
+    # too strict (T16 third run 2026-04-16: lead produced task-level keys
+    # as "extras", pydantic rejected them, whole chain failed). The
+    # required-keys enforcement alone gives downstream MCP_TOOL writers
+    # what they need via ``requires_upstream_keys``; the extras are harmless.
+    class _DynamicAgentResultBase(BaseModel):
+        model_config = {"extra": "allow"}
+
+    fields: dict = {key: (object, ...) for key in output_schema}
+    return create_model(
+        "DynamicAgentResult",
+        __base__=_DynamicAgentResultBase,
+        **fields,
+    )
 
 
 TASK_RESULT_MODELS: dict[str, type[BaseModel]] = {
@@ -897,12 +955,22 @@ def execute_agent_artifact(
     *,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    output_schema: dict[str, str] | None = None,
 ) -> dict:
     """Execute an AGENT artifact via DeepAgent with progressive skill disclosure.
 
     Uses ``create_deep_agent()`` with ``skills=`` parameter so the agent
     discovers available skills via progressive disclosure (metadata first,
     full content on activation).
+
+    The optional ``output_schema`` parameter (§12 finding #12) carries the
+    decomposer's declared per-subtask output schema. When provided and
+    non-empty, a dynamic Pydantic response model is built from its keys
+    and used as ``response_format`` — forcing the LLM's structured-output
+    call to produce exactly those keys and satisfy the downstream MCP_TOOL
+    writer's ``requires_upstream_keys`` contract. Falls back to
+    ``TASK_RESULT_MODELS.get(task_id, GenericResult)`` when the schema is
+    empty (CLI free-form tasks without a matching authored task).
 
     Never raises — returns ``{}`` on any failure. The sticky outcome
     (success / timeout / error) is recorded via
@@ -915,6 +983,7 @@ def execute_agent_artifact(
             artifact, task, fixture_contents,
             langfuse_tags=langfuse_tags,
             langfuse_session_id=langfuse_session_id,
+            output_schema=output_schema,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent execution failed for %s: %s", getattr(task, "task_id", "?"), exc)
@@ -937,6 +1006,7 @@ def _execute_agent_inner(
     *,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    output_schema: dict[str, str] | None = None,
 ) -> dict:
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
@@ -976,6 +1046,25 @@ def _execute_agent_inner(
     skills_param = [skills_prefix] if skill_files else None
 
     result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
+
+    # §12 finding #12 (2026-04-16): when the decomposer carries a per-gap
+    # output_schema, use it to build a dynamic Pydantic model that forces
+    # the LLM's structured-output call to produce exactly the declared
+    # keys. Prevents the T16 second-run failure mode where the AGENT
+    # returned task-level keys only and downstream MCP_TOOL writers
+    # crashed on missing upstream keys. The authored-task models in
+    # TASK_RESULT_MODELS still win for named eval tasks (T04, T11, T16,
+    # etc.) — this only activates on CLI free-form tasks that fall
+    # through to GenericResult.
+    if result_model is GenericResult:
+        dynamic_model = _build_dynamic_result_model(output_schema)
+        if dynamic_model is not None:
+            result_model = dynamic_model
+            logger.info(
+                "Agent executor: using dynamic response_format from decomposer "
+                "output_schema with keys %s",
+                sorted(output_schema.keys()),
+            )
 
     # Build subagents list if this is a lead-with-subagents artifact.
     # Each subagent config is a dict with name, description, system_prompt, tools.

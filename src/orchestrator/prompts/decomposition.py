@@ -226,6 +226,37 @@ the upstream transactions list", not "aggregate the 80 transactions \
 from ..."). The generator uses the task-level file paths for step 0 and \
 the upstream data contract for steps 1+.
 
+15. **File outputs require a dedicated deterministic writer step as the \
+LAST subtask.** When the task prompt asks the pipeline to produce a file \
+(e.g., "write output.csv", "produce an Excel file", "save the results to \
+report.md", "output.xlsx", "write a markdown summary to report.md"), the \
+**final subtask MUST be a deterministic file-writing step** whose \
+description explicitly mentions the filename and format. This step will be \
+classified as MCP_TOOL (deterministic + stateless per capability \
+classification) and can write to the Docker workspace; SKILL and AGENT \
+steps cannot write files. The writer step:
+
+- Depends on the upstream analysis/aggregation step.
+- Takes the upstream result dict via ``requires_upstream_keys`` and \
+serializes it as the requested format.
+- Has a description in the form ``"Write the <result description> to \
+<filename> as <format>."``.
+- Has ``required_capabilities`` like ``["write-xlsx-file"]``, \
+``["write-csv-file"]``, ``["write-markdown-report"]`` — short and \
+searchable for registry reuse.
+- Has ``output_schema`` like ``{"output_file": "str — path of the \
+written file"}``.
+
+If the task asks for BOTH a dict return value AND a file output, use the \
+writer as the FINAL step and have it emit both the file and a \
+confirmation dict — the chain's final dict still flows back to the caller \
+as ``step_results[-1]`` and the workspace still carries the file.
+
+This rule aligns with the proposal's Pillar 1 classification (file \
+writing is deterministic + stateless → MCP_TOOL) and makes file \
+production a first-class capability eligible for registry reuse and \
+Pillar 3 evolutionary operations. See Example 8 below.
+
 ## Output
 
 Return your decomposition via the structured output format. Every subtask must
@@ -456,6 +487,47 @@ items below the rules' min_days_of_stock threshold. Return counts."
     }
   ],
   "reasoning": "Step 2 reads upstream_data['rules']['min_days_of_stock'] at runtime, but the coherence contract tracks TOP-LEVEL keys only — so requires_upstream_keys lists 'rules', not 'min_days_of_stock'. The predecessor produces 'rules' as a dict; nested fields inside it are an internal detail of that producer."
+}
+```
+
+### Example 8 (file output — last step is a deterministic writer):
+Task: "Join the sales CSV with the products Excel catalog on product_id, \
+compute per-region revenue totals (quantity * unit_price), and write the \
+per-region summary to output.xlsx. Also return a dict with \
+'summary_row_count' (int) and 'region_revenues' (dict)."
+
+```json
+{
+  "subtasks": [
+    {
+      "description": "Parse the sales CSV and the products Excel file, returning both as in-memory tables keyed by name.",
+      "required_capabilities": ["parse-sales-csv-and-products-xlsx"],
+      "depends_on": [],
+      "output_schema": {
+        "sales": "list[dict] — each dict has product_id, region, quantity",
+        "products": "list[dict] — each dict has product_id, unit_price"
+      },
+      "requires_upstream_keys": []
+    },
+    {
+      "description": "Join sales with products on product_id and aggregate revenue per region (sum of quantity * unit_price).",
+      "required_capabilities": ["join-sales-with-products-and-aggregate-revenue-per-region"],
+      "depends_on": [0],
+      "output_schema": {
+        "region_revenues": "dict — region name → total revenue (float)",
+        "summary_row_count": "int"
+      },
+      "requires_upstream_keys": ["sales", "products"]
+    },
+    {
+      "description": "Write the per-region revenue summary to output.xlsx as Excel, using region as the row key and total revenue as the value column.",
+      "required_capabilities": ["write-xlsx-file"],
+      "depends_on": [1],
+      "output_schema": {"output_file": "str — path of the written file"},
+      "requires_upstream_keys": ["region_revenues", "summary_row_count"]
+    }
+  ],
+  "reasoning": "The task asks for both a dict return value and an Excel file output. Per Rule 15, the file output requires a deterministic writer step as the LAST subtask — classified as MCP_TOOL, capable of writing to the Docker workspace. Steps 0 and 1 do the parsing and aggregation; step 2 is the writer. The writer's required_capabilities name is short and reusable: 'write-xlsx-file' will match any existing xlsx writer in the registry and is a natural merge candidate with 'write-csv-file' under Pillar 3."
 }
 ```
 """

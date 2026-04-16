@@ -1298,3 +1298,157 @@ class TestDecompositionNodeCoherenceIntegration:
         # The warning message must cite last-write-wins so a reader
         # understands the runtime consequence.
         assert "last-write-wins" in warning_entries[0]
+
+
+# ---------------------------------------------------------------------------
+# File output writer step (Phase 3 Step 12 — Option B)
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureFileWriterLastStep:
+    """Unit tests for ``_ensure_file_writer_last_step`` per §12 finding #10."""
+
+    def test_empty_required_files_noop(self):
+        from src.orchestrator.decomposition import _ensure_file_writer_last_step
+        from src.schemas.task import SubTask
+
+        subtasks = [
+            SubTask(
+                description="Parse CSV and return row count",
+                required_capabilities=["parse-csv"],
+                depends_on=[],
+                output_schema={"row_count": "int"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, [])
+        assert result == subtasks
+
+    def test_empty_subtasks_noop(self):
+        from src.orchestrator.decomposition import _ensure_file_writer_last_step
+
+        result = _ensure_file_writer_last_step([], ["output.csv"])
+        assert result == []
+
+    def test_decomposer_compliance_is_noop(self):
+        """When the last subtask already mentions the filename, no-op."""
+        from src.orchestrator.decomposition import _ensure_file_writer_last_step
+        from src.schemas.task import SubTask
+
+        subtasks = [
+            SubTask(
+                description="Aggregate revenue per region",
+                required_capabilities=["aggregate-revenue"],
+                depends_on=[],
+                output_schema={"region_revenues": "dict"},
+            ),
+            SubTask(
+                description="Write the per-region summary to output.xlsx as Excel",
+                required_capabilities=["write-xlsx-file"],
+                depends_on=[0],
+                output_schema={"output_file": "str"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, ["output.xlsx"])
+        assert result == subtasks  # no append
+
+    def test_decomposer_non_compliance_appends_writer(self):
+        """When the last subtask doesn't mention the file, append a writer."""
+        from src.orchestrator.decomposition import _ensure_file_writer_last_step
+        from src.schemas.task import SubTask
+
+        subtasks = [
+            SubTask(
+                description="Aggregate revenue per region and return a dict",
+                required_capabilities=["aggregate-revenue"],
+                depends_on=[],
+                output_schema={
+                    "region_revenues": "dict — region → total revenue",
+                    "summary_row_count": "int",
+                },
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, ["output.xlsx"])
+        assert len(result) == 2
+        writer = result[-1]
+        assert "output.xlsx" in writer.description
+        assert "excel" in writer.description.lower()
+        assert writer.required_capabilities == ["write-xlsx-file"]
+        assert writer.depends_on == [0]
+        assert writer.output_schema == {"output_file": "str — path of the written file"}
+        assert set(writer.requires_upstream_keys) == {"region_revenues", "summary_row_count"}
+
+    def test_multi_file_append_chains_in_order(self):
+        """Multiple required files — each writer chains off the previous one."""
+        from src.orchestrator.decomposition import _ensure_file_writer_last_step
+        from src.schemas.task import SubTask
+
+        subtasks = [
+            SubTask(
+                description="Summarize the incident report",
+                required_capabilities=["summarize-incident"],
+                depends_on=[],
+                output_schema={"summary": "str"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(
+            subtasks, ["output.csv", "report.md"],
+        )
+        assert len(result) == 3
+        # First writer depends on index 0 (original last step).
+        assert result[1].depends_on == [0]
+        assert "output.csv" in result[1].description
+        assert result[1].required_capabilities == ["write-csv-file"]
+        # Second writer chains off the first writer.
+        assert result[2].depends_on == [1]
+        assert "report.md" in result[2].description
+        assert result[2].required_capabilities == ["write-md-file"]
+        assert result[2].requires_upstream_keys == ["output_file"]
+
+    def test_case_insensitive_filename_match(self):
+        """Decomposer may produce descriptions with different casing."""
+        from src.orchestrator.decomposition import _ensure_file_writer_last_step
+        from src.schemas.task import SubTask
+
+        subtasks = [
+            SubTask(
+                description="Write the SUMMARY to OUTPUT.XLSX as an Excel workbook",
+                required_capabilities=["write-xlsx-file"],
+                depends_on=[],
+                output_schema={"output_file": "str"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, ["output.xlsx"])
+        assert result == subtasks  # case-insensitive match succeeds → no-op
+
+    def test_markdown_extension_maps_to_format_label(self):
+        from src.orchestrator.decomposition import _ensure_file_writer_last_step
+        from src.schemas.task import SubTask
+
+        subtasks = [
+            SubTask(
+                description="Summarize",
+                required_capabilities=["summarize"],
+                depends_on=[],
+                output_schema={"summary": "str"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, ["report.md"])
+        assert "Markdown" in result[-1].description
+
+    def test_unknown_extension_uppercase_fallback(self):
+        from src.orchestrator.decomposition import _ensure_file_writer_last_step
+        from src.schemas.task import SubTask
+
+        subtasks = [
+            SubTask(
+                description="Summarize",
+                required_capabilities=["summarize"],
+                depends_on=[],
+                output_schema={"summary": "str"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, ["report.xyz"])
+        # Unknown extension → required_capabilities uses ext slug; description
+        # uses uppercased slug for the format label. No crash.
+        assert result[-1].required_capabilities == ["write-xyz-file"]
+        assert "XYZ" in result[-1].description

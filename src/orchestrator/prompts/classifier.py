@@ -205,6 +205,32 @@ test is too permissive — it fires for almost any narrow gap, including \
 gaps that exist precisely to apply a skill-task's specialized expertise. \
 Lead with the parent-task assessment instead.
 
+**File-writer exception (Phase 3 Step 12, 2026-04-16).** One carve-out \
+to the parent-task-first rule: **a subtask whose job is to serialize \
+upstream data to a file is ALWAYS `mcp_tool`, regardless of the parent \
+task's type.** Signals that identify a file-writer subtask:
+
+- Description explicitly names a filename and a file format (e.g., \
+"Write the summary to output.xlsx as Excel", "Save report.md", \
+"Emit output.csv")
+- `required_capabilities` contains a `write-<ext>-file` / \
+`write-<format>-report` / `save-<format>` capability name
+- `output_schema` has an `output_file` key
+
+For such a subtask, the Pillar 1.3 rule applies literally: writing a \
+serialized dict to a file on disk is deterministic + stateless. It also \
+has a **structural** reason to be `mcp_tool` — the SKILL and AGENT \
+execution backends cannot write to the Docker workspace where \
+`_collect_output_files` picks files up. A misclassified writer will \
+silently fail to produce the file even when the rest of the chain \
+succeeds. See Example G below for the canonical case.
+
+This exception OVERRIDES the "agent-task with N gaps → classify all \
+as agent" collapsing rule. An investigation-style agent-task that \
+ends in a file writer produces TWO capabilities: one AGENT for the \
+adaptive investigation, one MCP_TOOL for the file write — NOT one \
+lead+subagents agent with a writer subagent.
+
 ## Important Distinctions
 
 - **Multi-step ≠ skill.** A tool-task with multiple compute stages is still \
@@ -222,7 +248,11 @@ classify something as a skill.
 as workflows but carry no specialized expertise — a three-stage \
 compute pipeline with no domain knowledge is still a tool-task.
 - **Agent-task with N gaps ≠ N agents.** Agent-tasks should ideally be \
-one gap; if you see multiple, classify all as agent so they collapse.
+one gap; if you see multiple, classify the adaptive-reasoning gaps as \
+agent so they collapse via downstream deduplication. **Exception:** a \
+file-writer gap at the end of the chain is `mcp_tool`, not \
+agent — see the "File-writer exception" in the Decision Process \
+section above and Example G below.
 - Classify EACH GAP INDIVIDUALLY within the parent's context. Two gaps \
 in the same skill-task CAN be different types (typically a mix of \
 mcp_tool plumbing and skill expertise-carrying steps).
@@ -439,6 +469,48 @@ into the triage capability.", capability_name="triage-intake-reader"
 Answer for F2: classified_type=**agent**, confidence=0.95, rationale="Parent \
 is an agent-task; this is the core triage step.", \
 capability_name="patient-case-triager"
+
+### Example G — agent-task with a file-writer tail (File-writer exception)
+
+Full task: "You are investigating a service degradation incident. Read \
+the incident YAML and system metrics CSV, identify which metric changed \
+first (the root cause), determine the cascade chain. Write a markdown \
+incident summary to report.md. Also return a dict with \
+'root_cause_metric', 'cascade_chain', 'n_metrics_investigated'."
+
+The decomposer produced two gaps (Rule 15 compliance — the writer is a \
+dedicated last step):
+Gap G1: "incident-triage-agent"
+Gap G2: "write-markdown-report"
+
+The parent is an agent-task (adaptive investigation). **But the \
+collapsing rule does NOT apply to G2** — G2 is the file-writer tail. \
+Per the File-writer exception in Step 2 above, G2 is classified as \
+mcp_tool even though the parent is an agent-task. G1 stays agent.
+
+Answer for G1: classified_type=**agent**, confidence=0.95, \
+rationale="Parent is an agent-task (adaptive incident investigation \
+with hypothesis/revise loops). This gap is the investigation itself — \
+classify as agent.", capability_name="incident-triage-agent"
+
+Answer for G2: classified_type=**mcp_tool**, confidence=0.95, \
+rationale="Parent is an agent-task, but this gap is the file-writer \
+tail — it serializes upstream data to report.md. Per the File-writer \
+exception, writers are always mcp_tool regardless of the parent's \
+type (Pillar 1.3: file I/O is deterministic + stateless; also SKILL \
+and AGENT backends cannot write to the Docker workspace). Classifying \
+as mcp_tool so the chain ends in a deterministic writer that \
+`_collect_output_files` can pick up.", \
+capability_name="write-markdown-report"
+
+**Result: a 2-step chain (AGENT investigator → MCP_TOOL writer), NOT \
+a lead+subagents agent.** The writer runs in the Docker sandbox, \
+writes `/workspace/report.md`, and the file is produced.
+
+Contrast with Example F: F had no file-writer tail — both gaps were \
+part of the investigation, so collapse was correct. Here G2 is \
+structurally different: it's the post-investigation artifact \
+serialization, not adaptive reasoning. Do NOT collapse.
 
 ## Respond With
 
