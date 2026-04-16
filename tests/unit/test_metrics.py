@@ -331,11 +331,40 @@ class TestGetRecentFailures:
         )
         assert store.get_recent_failures("fibonacci") == []
 
-    def test_skips_rows_without_actual_output(self, store: MetricsStore):
+    def test_includes_error_cases_without_actual_output(self, store: MetricsStore):
+        """Error-cases (parent raised, no actual_output) MUST be returned.
+
+        2026-04-16 fix: an earlier version of get_recent_failures also
+        required ``actual_output IS NOT NULL`` in the SQL filter, which
+        silently dropped every error-case. That made Step 8's
+        error-case coverage branch CLI-dead-code because crash-path
+        InvocationRecords never reached verify_coverage. The bug was
+        empirically caught by scripts/test_split_merge.py --split-mcp-only
+        when "Seeded 1 failure case(s) for replay" didn't match the
+        expected 2. This test is the regression guard.
+        """
         store.record_invocation(
             _make_record(
                 success=False,
-                error_message="had no output captured",
+                error_message="ValueError: something broke",
+                input_args='{"x": 1}',
+                actual_output=None,
+            )
+        )
+        failures = store.get_recent_failures("fibonacci")
+        assert len(failures) == 1
+        assert failures[0].error_message == "ValueError: something broke"
+        assert failures[0].actual_output is None
+        assert failures[0].input_args == '{"x": 1}'
+
+    def test_skips_rows_missing_both_error_and_output(self, store: MetricsStore):
+        """A row with success=False but NEITHER error_message NOR
+        actual_output tells us nothing about what the failure looked
+        like — no failure mode to replay. Skip."""
+        store.record_invocation(
+            _make_record(
+                success=False,
+                error_message=None,
                 input_args='{"x": 1}',
                 actual_output=None,
             )

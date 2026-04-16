@@ -12,12 +12,21 @@ from src.optimizer.operations import (
     MergeAgentsSubagent,
     MergeSkillsResult,
     MergeToolsResult,
-    SplitResult,
-    SplitVariant,
+    SplitAgentsResult,
+    SplitAgentVariant,
+    SplitAgentVariantSubagent,
+    SplitSkillsResult,
+    SplitSkillVariant,
+    SplitToolsResult,
+    SplitToolVariant,
     _MAX_AGENT_SUBAGENT_BUDGET,
     _merge_agents,
     _merge_skills,
     _merge_tools,
+    _register_artifact_directly,
+    _split_agents,
+    _split_skills,
+    _split_tools,
     merge,
     prune,
     split,
@@ -152,226 +161,9 @@ class TestPrune:
         registry.deactivate.assert_called_once_with("idle-cap")
 
 
-class TestSplit:
-    def test_rejects_mcp_tool(self):
-        registry = MagicMock()
-        registry.get.return_value = _make_cap("tool-a", cap_type=CapabilityType.MCP_TOOL)
-        store = MagicMock()
-
-        with pytest.raises(ValueError, match="Split is not supported for MCP_TOOL"):
-            split(registry, store, "tool-a")
-
-    def test_raises_key_error_for_missing_capability(self):
-        registry = MagicMock()
-        registry.get.return_value = None
-        store = MagicMock()
-
-        with pytest.raises(KeyError, match="not found"):
-            split(registry, store, "nonexistent")
-
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_split_skill(self, mock_init):
-        cap = _make_cap("data-workflow", cap_type=CapabilityType.SKILL, domain="data", tags=["etl"])
-
-        registry = MagicMock()
-        # Return parent for its own ID; None for variant names (no collision).
-        registry.get.side_effect = lambda n: cap if n == "data-workflow" else None
-
-        store = MagicMock()
-
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = SplitResult(
-            analysis="The skill fails for large datasets",
-            variants=[
-                SplitVariant(name="data-workflow-small", description="For small datasets"),
-                SplitVariant(name="data-workflow-large", description="For large datasets"),
-            ],
-        )
-
-        result = split(registry, store, "data-workflow")
-
-        assert result == ["data-workflow-small", "data-workflow-large"]
-        # Parent deactivated
-        registry.deactivate.assert_called_once_with("data-workflow")
-        # Two new capabilities registered
-        assert registry.add.call_count == 2
-        # New caps inherit type and domain
-        for call in registry.add.call_args_list:
-            new_cap = call[0][0]
-            assert new_cap.capability_type == CapabilityType.SKILL
-            assert new_cap.domain == "data"
-
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_split_inherits_tags_from_parent(self, mock_init):
-        cap = _make_cap(
-            "data-workflow", cap_type=CapabilityType.SKILL, domain="data", tags=["etl", "csv"]
-        )
-        registry = MagicMock()
-        registry.get.side_effect = lambda n: cap if n == "data-workflow" else None
-        store = MagicMock()
-
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = SplitResult(
-            analysis="Split by format",
-            variants=[
-                SplitVariant(name="variant-a", description="CSV variant"),
-                SplitVariant(name="variant-b", description="JSON variant"),
-            ],
-        )
-
-        split(registry, store, "data-workflow")
-
-        for call in registry.add.call_args_list:
-            new_cap = call[0][0]
-            assert new_cap.tags == ["etl", "csv"]
-
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_split_agent(self, mock_init):
-        cap = _make_cap("analysis-agent", cap_type=CapabilityType.AGENT)
-
-        registry = MagicMock()
-        registry.get.side_effect = lambda n: cap if n == "analysis-agent" else None
-        store = MagicMock()
-
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = SplitResult(
-            analysis="Agent scope too broad",
-            variants=[
-                SplitVariant(name="profiling-agent", description="Data profiling"),
-                SplitVariant(name="correlation-agent", description="Correlation analysis"),
-            ],
-        )
-
-        result = split(registry, store, "analysis-agent")
-
-        assert len(result) == 2
-        for call in registry.add.call_args_list:
-            new_cap = call[0][0]
-            assert new_cap.capability_type == CapabilityType.AGENT
-
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_split_repair_pass_on_first_failure(self, mock_init):
-        """split() retries once when LLM output fails validation."""
-        cap = _make_cap("data-workflow", cap_type=CapabilityType.SKILL)
-        registry = MagicMock()
-        registry.get.side_effect = lambda n: cap if n == "data-workflow" else None
-        store = MagicMock()
-
-        good_result = SplitResult(
-            analysis="Second attempt was correct",
-            variants=[
-                SplitVariant(name="variant-a", description="Handles A"),
-                SplitVariant(name="variant-b", description="Handles B"),
-            ],
-        )
-
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        # First call fails, second (repair) succeeds
-        mock_structured.invoke.side_effect = [RuntimeError("bad JSON"), good_result]
-
-        result = split(registry, store, "data-workflow")
-        assert result == ["variant-a", "variant-b"]
-        assert mock_structured.invoke.call_count == 2
-
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_split_raises_if_repair_also_fails(self, mock_init):
-        """split() raises if both initial call and repair pass fail."""
-        cap = _make_cap("data-workflow", cap_type=CapabilityType.SKILL)
-        registry = MagicMock()
-        registry.get.return_value = cap
-        store = MagicMock()
-
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.side_effect = RuntimeError("always fails")
-
-        with pytest.raises(RuntimeError, match="always fails"):
-            split(registry, store, "data-workflow")
-        assert mock_structured.invoke.call_count == 2
-
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_split_aborts_if_any_variant_name_collides(self, mock_init):
-        """split(): if any variant name already exists, abort entirely (all-or-nothing)."""
-        cap = _make_cap("data-workflow", cap_type=CapabilityType.SKILL, domain="data", tags=["etl"])
-
-        existing = _make_cap("data-workflow-small", cap_type=CapabilityType.SKILL)
-
-        def _get(name):
-            if name == "data-workflow":
-                return cap
-            if name == "data-workflow-small":
-                return existing  # collision
-            return None
-
-        registry = MagicMock()
-        registry.get.side_effect = _get
-        store = MagicMock()
-
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = SplitResult(
-            analysis="Split by dataset size",
-            variants=[
-                SplitVariant(name="data-workflow-small", description="Small datasets"),
-                SplitVariant(name="data-workflow-large", description="Large datasets"),
-            ],
-        )
-
-        with pytest.raises(ValueError, match="already exists in registry"):
-            split(registry, store, "data-workflow")
-
-        # All-or-nothing: no variants registered, parent not deactivated
-        assert registry.add.call_count == 0
-        registry.deactivate.assert_not_called()
-
-    @patch("src.optimizer.operations.init_chat_model")
-    def test_split_does_not_deactivate_parent_when_all_variants_collide(self, mock_init):
-        """split(): parent is kept active if every variant name already exists."""
-        cap = _make_cap("data-workflow", cap_type=CapabilityType.SKILL)
-
-        def _get(name):
-            if name == "data-workflow":
-                return cap
-            # Every variant name collides
-            return _make_cap(name, cap_type=CapabilityType.SKILL)
-
-        registry = MagicMock()
-        registry.get.side_effect = _get
-        store = MagicMock()
-
-        mock_llm = MagicMock()
-        mock_init.return_value = mock_llm
-        mock_structured = MagicMock()
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = SplitResult(
-            analysis="Split",
-            variants=[
-                SplitVariant(name="variant-a", description="A"),
-                SplitVariant(name="variant-b", description="B"),
-            ],
-        )
-
-        with pytest.raises(ValueError, match="already exists in registry"):
-            split(registry, store, "data-workflow")
-
-        registry.add.assert_not_called()
-        registry.deactivate.assert_not_called()
+# TestSplit tests live below the helper functions (_passing_report /
+# _failing_report / _cap_with_source) — see TestSplitDispatch and the
+# per-type TestSplit{Tools,Skills,Agents} classes after TestMergeAgents.
 
 
 # ---------------------------------------------------------------------------
@@ -1034,3 +826,579 @@ class TestMergeAgents:
         result = merge(registry, store, ["agent-a", "agent-b"])
         assert result is None
         registry.deactivate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Step 8 — per-type split dispatch + helpers
+# ---------------------------------------------------------------------------
+
+
+def _vacuous_coverage_report():
+    """Mock return for verify_coverage — vacuously passing (empty failure cases)."""
+    from src.verification.coverage import CoverageReport
+    return CoverageReport(all_covered=True, status="vacuous")
+
+
+def _verified_coverage_report():
+    """Mock return for verify_coverage — all cases covered."""
+    from src.verification.coverage import CoverageReport
+    return CoverageReport(
+        all_covered=True,
+        status="verified",
+        coverage_map={"t1": ["variant-a"]},
+    )
+
+
+def _uncovered_coverage_report():
+    """Mock return for verify_coverage — one case uncovered."""
+    from src.verification.coverage import CoverageReport
+    return CoverageReport(
+        all_covered=False,
+        status="verified",
+        coverage_map={},
+        uncovered_cases=["t1"],
+    )
+
+
+def _unverifiable_type_coverage_report():
+    """Mock return for verify_coverage on SKILL/AGENT — vacuously passing."""
+    from src.verification.coverage import CoverageReport
+    return CoverageReport(all_covered=True, status="unverifiable_type")
+
+
+class TestSplitDispatch:
+    """split() routes by capability type and rejects unsupported paths."""
+
+    def test_missing_capability_raises_key_error(self):
+        registry = MagicMock()
+        registry.get.return_value = None
+        store = MagicMock()
+        with pytest.raises(KeyError, match="not found"):
+            split(registry, store, "nonexistent")
+
+    @patch("src.optimizer.operations._split_tools")
+    def test_mcp_tool_routes_to_split_tools(self, mock_split_tools):
+        mock_split_tools.return_value = ["var-a", "var-b"]
+        registry = MagicMock()
+        registry.get.return_value = _cap_with_source(
+            "tool-a", CapabilityType.MCP_TOOL, source_code="async def f(): pass",
+        )
+        store = MagicMock()
+
+        result = split(registry, store, "tool-a")
+        assert result == ["var-a", "var-b"]
+        mock_split_tools.assert_called_once()
+
+    @patch("src.optimizer.operations._split_skills")
+    def test_skill_routes_to_split_skills(self, mock_split_skills):
+        mock_split_skills.return_value = ["var-a", "var-b"]
+        registry = MagicMock()
+        registry.get.return_value = _cap_with_source(
+            "skill-a", CapabilityType.SKILL,
+            skill_content="---\nname: skill-a\n---\n",
+        )
+        store = MagicMock()
+
+        result = split(registry, store, "skill-a")
+        assert result == ["var-a", "var-b"]
+        mock_split_skills.assert_called_once()
+
+    @patch("src.optimizer.operations._split_agents")
+    def test_agent_routes_to_split_agents(self, mock_split_agents):
+        mock_split_agents.return_value = ["var-a", "var-b"]
+        registry = MagicMock()
+        registry.get.return_value = _cap_with_source(
+            "agent-a", CapabilityType.AGENT,
+            agent_config={"system_prompt": "You are an agent"},
+        )
+        store = MagicMock()
+
+        result = split(registry, store, "agent-a")
+        assert result == ["var-a", "var-b"]
+        mock_split_agents.assert_called_once()
+
+
+class TestSplitTools:
+    """_split_tools: MCP_TOOL parent → per-type coverage verification active."""
+
+    def _mcp_parent(self, name: str = "tool-parent") -> CapabilityDescriptor:
+        return _cap_with_source(
+            name,
+            cap_type=CapabilityType.MCP_TOOL,
+            source_code=(
+                '"""Parent tool."""\n'
+                "from typing import Annotated\n"
+                "from mcp.server.fastmcp import FastMCP\n"
+                "from pydantic import Field\n"
+                f'mcp = FastMCP("{name}")\n'
+                "@mcp.tool()\n"
+                "async def run(x: Annotated[int, Field(description='x')]) -> dict:\n"
+                "    return {'y': x * 2}\n"
+            ),
+            tags=["parser"],
+            domain="data",
+        )
+
+    def _variant(self, name: str) -> SplitToolVariant:
+        return SplitToolVariant(
+            name=name,
+            description=f"Specialized variant {name}",
+            subspace=f"subspace for {name}",
+            source_code=(
+                '"""Variant."""\n'
+                "from typing import Annotated\n"
+                "from mcp.server.fastmcp import FastMCP\n"
+                "from pydantic import Field\n"
+                f'mcp = FastMCP("{name}")\n'
+                "@mcp.tool()\n"
+                "async def run(x: Annotated[int, Field(description='x')]) -> dict:\n"
+                "    return {'y': x * 3}\n"
+                'if __name__ == "__main__":\n'
+                "    mcp.run()\n"
+            ),
+            pip_packages=[],
+        )
+
+    @patch("src.verification.coverage.verify_coverage")
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_happy_path_registers_variants_and_deactivates_parent(
+        self, mock_init, mock_gate, mock_coverage,
+    ):
+        parent = self._mcp_parent()
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "tool-parent": parent,
+            "var-a": None,
+            "var-b": None,
+        }.get(n)
+        store = MagicMock()
+        store.get_recent_failures.return_value = []
+
+        mock_gate.return_value = _passing_report("any")
+        mock_coverage.return_value = _vacuous_coverage_report()
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SplitToolsResult(
+            analysis="fails on large inputs vs small",
+            variants=[self._variant("var-a"), self._variant("var-b")],
+        )
+
+        result = split(registry, store, "tool-parent")
+
+        assert result == ["var-a", "var-b"]
+        # Gate was called per variant
+        assert mock_gate.call_count == 2
+        # Coverage was called collectively
+        assert mock_coverage.call_count == 1
+        # Both variants registered
+        assert registry.add.call_count == 2
+        # Parent deactivated
+        registry.deactivate.assert_called_once_with("tool-parent")
+
+    @patch("src.verification.coverage.verify_coverage")
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_phase_b_gate_rejection_aborts_without_registering(
+        self, mock_init, mock_gate, mock_coverage,
+    ):
+        parent = self._mcp_parent()
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "tool-parent": parent, "var-a": None, "var-b": None,
+        }.get(n)
+        store = MagicMock()
+        store.get_recent_failures.return_value = []
+
+        # First variant passes gate, second fails
+        mock_gate.side_effect = [
+            _passing_report("var-a"),
+            _failing_report("var-b", severity=Severity.HIGH),
+        ]
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SplitToolsResult(
+            analysis="analysis",
+            variants=[self._variant("var-a"), self._variant("var-b")],
+        )
+
+        result = split(registry, store, "tool-parent")
+
+        assert result is None
+        # No registration — phase B aborted before phase D
+        registry.add.assert_not_called()
+        # Parent NOT deactivated — atomic rollback
+        registry.deactivate.assert_not_called()
+        # Coverage was NOT called — phase B aborts before phase C
+        mock_coverage.assert_not_called()
+
+    @patch("src.verification.coverage.verify_coverage")
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_phase_c_coverage_rejection_aborts(
+        self, mock_init, mock_gate, mock_coverage,
+    ):
+        parent = self._mcp_parent()
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "tool-parent": parent, "var-a": None, "var-b": None,
+        }.get(n)
+        store = MagicMock()
+        store.get_recent_failures.return_value = []
+
+        mock_gate.return_value = _passing_report("any")
+        mock_coverage.return_value = _uncovered_coverage_report()
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SplitToolsResult(
+            analysis="analysis",
+            variants=[self._variant("var-a"), self._variant("var-b")],
+        )
+
+        result = split(registry, store, "tool-parent")
+
+        assert result is None
+        # No registration — phase C aborted before phase D
+        registry.add.assert_not_called()
+        registry.deactivate.assert_not_called()
+
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_name_collision_aborts_before_gate(self, mock_init):
+        parent = self._mcp_parent()
+        existing = _cap_with_source("already-exists", CapabilityType.MCP_TOOL)
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "tool-parent": parent, "already-exists": existing,
+        }.get(n)
+        store = MagicMock()
+        store.get_recent_failures.return_value = []
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SplitToolsResult(
+            analysis="analysis",
+            variants=[
+                self._variant("already-exists"),  # collides
+                self._variant("var-b"),
+            ],
+        )
+
+        result = split(registry, store, "tool-parent")
+        assert result is None
+        registry.add.assert_not_called()
+        registry.deactivate.assert_not_called()
+
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_parent_without_source_aborts(self, mock_init):
+        # Parent has no source_code in metadata
+        parent = CapabilityDescriptor(
+            name="tool-parent",
+            description="desc",
+            capability_type=CapabilityType.MCP_TOOL,
+            domain="data",
+            tags=[],
+            metadata={"generated": "true"},  # no source_code
+        )
+        registry = MagicMock()
+        registry.get.return_value = parent
+        store = MagicMock()
+
+        result = split(registry, store, "tool-parent")
+        assert result is None
+        mock_init.assert_not_called()  # never even called the LLM
+
+
+class TestSplitSkills:
+    """_split_skills: SKILL parent → coverage is vacuous per MCP_TOOL-only scope."""
+
+    def _skill_parent(self, name: str = "skill-parent") -> CapabilityDescriptor:
+        return _cap_with_source(
+            name,
+            cap_type=CapabilityType.SKILL,
+            skill_content=(
+                f"---\nname: {name}\ndescription: parent skill\n---\n\n"
+                "Do the thing.\n"
+            ),
+            tags=["workflow"],
+            domain="analytics",
+        )
+
+    def _variant(self, name: str) -> SplitSkillVariant:
+        return SplitSkillVariant(
+            name=name,
+            description=f"Specialized skill {name}",
+            subspace=f"subspace for {name}",
+            skill_content=(
+                f"---\nname: {name}\ndescription: specialized\n---\n\n"
+                "Do the specialized thing.\n"
+            ),
+        )
+
+    @patch("src.verification.coverage.verify_coverage")
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_happy_path(self, mock_init, mock_gate, mock_coverage):
+        parent = self._skill_parent()
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "skill-parent": parent, "var-a": None, "var-b": None,
+        }.get(n)
+        store = MagicMock()
+        store.get_recent_failures.return_value = []
+
+        mock_gate.return_value = _passing_report("any")
+        # SKILL coverage dispatches to unverifiable_type in the real helper,
+        # but we patch verify_coverage directly so we return the same shape.
+        mock_coverage.return_value = _unverifiable_type_coverage_report()
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SplitSkillsResult(
+            analysis="parent was too broad",
+            variants=[self._variant("var-a"), self._variant("var-b")],
+        )
+
+        result = split(registry, store, "skill-parent")
+
+        assert result == ["var-a", "var-b"]
+        assert mock_gate.call_count == 2
+        assert registry.add.call_count == 2
+        registry.deactivate.assert_called_once_with("skill-parent")
+
+    @patch("src.verification.coverage.verify_coverage")
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_gate_rejection_aborts(self, mock_init, mock_gate, mock_coverage):
+        parent = self._skill_parent()
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "skill-parent": parent, "var-a": None, "var-b": None,
+        }.get(n)
+        store = MagicMock()
+        store.get_recent_failures.return_value = []
+
+        mock_gate.return_value = _failing_report("any")
+        mock_coverage.return_value = _unverifiable_type_coverage_report()
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SplitSkillsResult(
+            analysis="x",
+            variants=[self._variant("var-a"), self._variant("var-b")],
+        )
+
+        result = split(registry, store, "skill-parent")
+        assert result is None
+        registry.add.assert_not_called()
+        registry.deactivate.assert_not_called()
+
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_parent_without_skill_content_aborts(self, mock_init):
+        parent = CapabilityDescriptor(
+            name="skill-parent",
+            description="desc",
+            capability_type=CapabilityType.SKILL,
+            domain="x",
+            tags=[],
+            metadata={"generated": "true"},
+        )
+        registry = MagicMock()
+        registry.get.return_value = parent
+        store = MagicMock()
+
+        result = split(registry, store, "skill-parent")
+        assert result is None
+        mock_init.assert_not_called()
+
+
+class TestSplitAgents:
+    """_split_agents: AGENT parent → coverage vacuous, global subagent budget enforced."""
+
+    def _agent_parent(self, name: str = "agent-parent") -> CapabilityDescriptor:
+        return _cap_with_source(
+            name,
+            cap_type=CapabilityType.AGENT,
+            agent_config={"system_prompt": f"You are {name}."},
+            domain="research",
+        )
+
+    def _variant(self, name: str, n_subagents: int = 0) -> SplitAgentVariant:
+        subagents = [
+            SplitAgentVariantSubagent(
+                name=f"{name}-sub-{i}",
+                description=f"subagent {i}",
+                system_prompt=f"you are sub {i}",
+                tools=["sandbox_execute"],
+            )
+            for i in range(n_subagents)
+        ]
+        return SplitAgentVariant(
+            name=name,
+            description=f"Specialized agent {name}",
+            subspace=f"subspace for {name}",
+            system_prompt=f"You investigate {name}'s subspace.",
+            subagents=subagents,
+        )
+
+    @patch("src.verification.coverage.verify_coverage")
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_happy_path_solo_variants(self, mock_init, mock_gate, mock_coverage):
+        parent = self._agent_parent()
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "agent-parent": parent, "var-a": None, "var-b": None,
+        }.get(n)
+        store = MagicMock()
+        store.get_recent_failures.return_value = []
+
+        mock_gate.return_value = _passing_report("any")
+        mock_coverage.return_value = _unverifiable_type_coverage_report()
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SplitAgentsResult(
+            analysis="agent too broad",
+            variants=[
+                self._variant("var-a", n_subagents=0),
+                self._variant("var-b", n_subagents=0),
+            ],
+        )
+
+        result = split(registry, store, "agent-parent")
+        assert result == ["var-a", "var-b"]
+        assert registry.add.call_count == 2
+        registry.deactivate.assert_called_once_with("agent-parent")
+
+    @patch("src.verification.coverage.verify_coverage")
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_global_subagent_budget_ceiling_aborts_before_gate(
+        self, mock_init, mock_gate, mock_coverage,
+    ):
+        """Total subagent count across all variants > _MAX_AGENT_SUBAGENT_BUDGET
+        aborts the split without calling the gate (cheaper than running Tier 3
+        on over-complex variants)."""
+        parent = self._agent_parent()
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {"agent-parent": parent}.get(n)
+        store = MagicMock()
+        store.get_recent_failures.return_value = []
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        # Each variant has 5 subagents → 2 variants × 5 = 10 > _MAX_AGENT_SUBAGENT_BUDGET (8)
+        mock_structured.invoke.return_value = SplitAgentsResult(
+            analysis="too complex",
+            variants=[
+                self._variant("var-a", n_subagents=5),
+                self._variant("var-b", n_subagents=5),
+            ],
+        )
+
+        result = split(registry, store, "agent-parent")
+        assert result is None
+        mock_gate.assert_not_called()  # budget rejection happens before gate
+        mock_coverage.assert_not_called()
+        registry.add.assert_not_called()
+        registry.deactivate.assert_not_called()
+
+    @patch("src.verification.coverage.verify_coverage")
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_subagent_budget_under_ceiling_proceeds(
+        self, mock_init, mock_gate, mock_coverage,
+    ):
+        """Total subagent count == 4 (2 + 2) is under 8 — split should proceed."""
+        parent = self._agent_parent()
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "agent-parent": parent, "var-a": None, "var-b": None,
+        }.get(n)
+        store = MagicMock()
+        store.get_recent_failures.return_value = []
+
+        mock_gate.return_value = _passing_report("any")
+        mock_coverage.return_value = _unverifiable_type_coverage_report()
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SplitAgentsResult(
+            analysis="under budget",
+            variants=[
+                self._variant("var-a", n_subagents=2),
+                self._variant("var-b", n_subagents=2),
+            ],
+        )
+
+        result = split(registry, store, "agent-parent")
+        assert result == ["var-a", "var-b"]
+
+    @patch("src.verification.coverage.verify_coverage")
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_gate_rejection_aborts(self, mock_init, mock_gate, mock_coverage):
+        parent = self._agent_parent()
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "agent-parent": parent, "var-a": None, "var-b": None,
+        }.get(n)
+        store = MagicMock()
+        store.get_recent_failures.return_value = []
+
+        mock_gate.return_value = _failing_report("any")
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = SplitAgentsResult(
+            analysis="x",
+            variants=[
+                self._variant("var-a", n_subagents=0),
+                self._variant("var-b", n_subagents=0),
+            ],
+        )
+
+        result = split(registry, store, "agent-parent")
+        assert result is None
+        registry.deactivate.assert_not_called()
+
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_parent_without_system_prompt_aborts(self, mock_init):
+        parent = CapabilityDescriptor(
+            name="agent-parent",
+            description="desc",
+            capability_type=CapabilityType.AGENT,
+            domain="x",
+            tags=[],
+            metadata={"generated": "true"},  # no agent_config
+        )
+        registry = MagicMock()
+        registry.get.return_value = parent
+        store = MagicMock()
+
+        result = split(registry, store, "agent-parent")
+        assert result is None
+        mock_init.assert_not_called()

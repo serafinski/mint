@@ -302,18 +302,44 @@ class MetricsStore:
         """Most recent FAILED invocations for a capability, newest first.
 
         Used by Step 8's split operation to pull recorded failure cases
-        for a high-reuse / low-success capability, which the Tier 4
-        coverage verifier then replays against newly-generated split
-        variants. A failure case is an invocation with ``success=False``;
-        ``error_message``, ``input_args``, and ``actual_output`` are all
-        available on the returned records for downstream use.
+        for a high-reuse / low-success capability, which the
+        ``verify_coverage`` helper then replays against newly-generated
+        split variants. A failure case is an invocation with
+        ``success=False``; ``error_message``, ``input_args``, and
+        ``actual_output`` are all available on the returned records for
+        downstream use.
 
-        Only returns records where both ``input_args`` and
-        ``actual_output`` are populated — a failure case without a
-        captured input is useless as a replay probe, and a failure case
-        without a captured output tells us nothing about what the
-        capability got wrong. Rows missing either field are silently
-        skipped (counts may be less than ``limit``).
+        Returns records where ``input_args`` is populated AND at least
+        one of ``actual_output`` or ``error_message`` is populated:
+
+        - **Error-case** (parent raised): ``error_message`` is set,
+          ``actual_output`` is typically None because the parent raised
+          before producing output. The coverage verifier's error-case
+          branch (:func:`~src.verification.coverage._variant_handles_case`)
+          checks whether the variant runs on ``input_args`` without
+          raising.
+        - **Wrong-output-case** (parent didn't raise but was classified
+          as failed): ``actual_output`` is populated with the wrong
+          output, ``error_message`` is typically None. The coverage
+          verifier's wrong-output branch checks whether the variant
+          produces a different output.
+
+        Rows missing ``input_args`` entirely are silently skipped — a
+        failure case without a captured input is useless as a replay
+        probe. Rows missing BOTH ``actual_output`` AND ``error_message``
+        are also skipped — we can't verify a failure we have no record
+        of. Pre-Step-4 rows (all three fields NULL) are skipped for
+        the same reason.
+
+        **2026-04-16 fix:** an earlier version of this query also
+        required ``actual_output IS NOT NULL``, which silently excluded
+        every error-case (where parent raised before producing output).
+        That made Step 8's error-case coverage branch CLI-dead-code. The
+        bug was empirically caught by ``scripts/test_split_merge.py
+        --split-mcp-only``'s "Seeded N failure case(s) for replay" log
+        line not matching the expected count. See §12 pre-registered
+        finding #5 (coverage verifier semantics) for why error-cases
+        are the stronger signal anyway.
         """
         rows = self._conn.execute(
             """
@@ -324,7 +350,7 @@ class MetricsStore:
             WHERE capability_id = ?
               AND success = FALSE
               AND input_args IS NOT NULL
-              AND actual_output IS NOT NULL
+              AND (actual_output IS NOT NULL OR error_message IS NOT NULL)
             ORDER BY invoked_at DESC
             LIMIT ?
             """,

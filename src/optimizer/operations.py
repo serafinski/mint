@@ -160,6 +160,62 @@ def verify_and_register_or_rollback(
         return False, reason
 
     # --- Register ---
+    return _register_artifact_directly(
+        artifact,
+        registry,
+        metrics_store,
+        event_type=event_type,
+        event_details=event_details,
+        tags=tags,
+        domain=domain,
+    )
+
+
+def _register_artifact_directly(
+    artifact: GeneratedArtifact,
+    registry: SkillRegistry,
+    metrics_store: MetricsStore,
+    *,
+    event_type: str,
+    event_details: str,
+    tags: list[str] | None = None,
+    domain: str | None = None,
+) -> tuple[bool, str | None]:
+    """Register an artifact without re-running the verification gate.
+
+    Factored out from :func:`verify_and_register_or_rollback` for reuse
+    by Step 8's per-type split helpers, which verify every variant in
+    a batch BEFORE registering any. The split flow is:
+
+    1. Build N variants from the LLM output.
+    2. For each variant, call ``gate.verify()`` — if any fails, abort
+       without touching the registry (parent stays active).
+    3. Run ``verify_coverage`` collectively — if coverage fails, abort.
+    4. Register each variant via this helper (NO re-verification).
+    5. Deactivate the parent.
+
+    Phase 4 must not re-run the gate because Tier 3's adversarial probe
+    is LLM-nondeterministic — a variant that passed phase 2 could fail
+    phase 4 on stochastic variance, which would break atomicity without
+    an obvious rollback path. Instead, the split trusts phase 2's
+    verdict and only registers the artifact here.
+
+    For merge, ``verify_and_register_or_rollback`` calls this helper
+    directly after its own gate check, so there is no behavior change
+    for merge callers — the logic is identical, just refactored.
+
+    MCP_TOOL: delegates to ``ToolLoader.register_tool`` to inherit
+    Step 2's AST schema extraction + source_code persistence.
+    SKILL / AGENT: builds the descriptor directly from artifact fields.
+
+    Never raises. Returns ``(True, None)`` on successful registration,
+    ``(False, reason)`` on any exception (unexpected registry failure,
+    descriptor validation failure, metrics event recording failure).
+    On failure, records a ``verification_rollback`` event the same way
+    the gate-rejection path does — the calling split helper should
+    treat any failure here as terminal and abort the split.
+    """
+    name = artifact.capability_name
     try:
         effective_domain = domain or artifact.domain or "generated"
         if artifact.capability_type == CapabilityType.MCP_TOOL:
@@ -208,7 +264,7 @@ def verify_and_register_or_rollback(
 
         metrics_store.record_event(name, event_type, event_details)
         logger.info(
-            "verify_and_register_or_rollback(%s): registered as %s (%s)",
+            "_register_artifact_directly(%s): registered as %s (%s)",
             name, event_type, event_details,
         )
         return True, None
@@ -216,7 +272,7 @@ def verify_and_register_or_rollback(
     except Exception as exc:  # noqa: BLE001
         reason = f"registration failed for {name}: {exc}"
         logger.warning(
-            "verify_and_register_or_rollback(%s): %s", name, reason
+            "_register_artifact_directly(%s): %s", name, reason
         )
         metrics_store.record_event(name, "verification_rollback", reason)
         return False, reason
@@ -225,21 +281,172 @@ def verify_and_register_or_rollback(
 # --- Structured output schemas for LLM calls ---
 
 
-class SplitVariant(BaseModel):
-    """A specialized variant produced by splitting a capability."""
+class _SplitVariantCommon(BaseModel):
+    """Shared fields across all three per-type split variant schemas."""
 
     name: str = Field(..., description="Name for the specialized variant (hyphen-case)")
-    description: str = Field(..., description="What this variant does")
+    description: str = Field(
+        ..., description="What this variant does in one sentence"
+    )
+    subspace: str = Field(
+        ...,
+        description=(
+            "The input subspace this variant targets — the specific "
+            "kind of input where the parent capability was breaking and "
+            "this variant is specialized to handle. Pillar 3 Split "
+            "language: 'input subspaces where the capability breaks'."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 
 
-class SplitResult(BaseModel):
-    """LLM output for a split operation."""
+class SplitToolVariant(_SplitVariantCommon):
+    """One MCP_TOOL variant produced by splitting."""
 
-    analysis: str = Field(..., description="Why the capability fails and how to split it")
-    variants: list[SplitVariant] = Field(
-        ..., min_length=2, max_length=4, description="Specialized variants"
+    source_code: str = Field(
+        ...,
+        description=(
+            "Complete Python source file for this specialized variant. "
+            "Must follow the FastMCP pattern (imports, mcp = FastMCP(...), "
+            "@mcp.tool()-decorated async def, Annotated[type, Field(...)] "
+            "parameters, if __name__ == '__main__': mcp.run()). The "
+            "function body should handle the variant's declared subspace "
+            "robustly — it is NOT a narrowing of the parent; it is a "
+            "reimplementation specialized to one subspace."
+        ),
+    )
+    pip_packages: list[str] = Field(
+        default_factory=list,
+        description=(
+            "PyPI package names required by this variant's source. Use "
+            "pip install names (pyyaml not yaml). Omit stdlib and the "
+            "base image packages (mcp, pydantic)."
+        ),
+    )
+
+
+class SplitSkillVariant(_SplitVariantCommon):
+    """One SKILL variant produced by splitting."""
+
+    skill_content: str = Field(
+        ...,
+        description=(
+            "Complete SKILL.md body including YAML frontmatter (name, "
+            "description, allowed-tools, etc.) and the instruction prose "
+            "that teaches an agent how to handle this variant's declared "
+            "subspace. Each variant is a coherent specialized skill — "
+            "not a narrowing of the parent, but a focused reimplementation."
+        ),
+    )
+
+
+class SplitAgentVariantSubagent(BaseModel):
+    """One subagent of one AGENT variant in a split."""
+
+    name: str = Field(..., description="Subagent name (hyphen-case)")
+    description: str = Field(..., description="One-sentence subagent role")
+    system_prompt: str = Field(
+        ..., description="Full system prompt for the subagent's isolated context"
+    )
+    tools: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names of tools the subagent can call. Generator agents "
+            "currently support only ``sandbox_execute``."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class SplitAgentVariant(_SplitVariantCommon):
+    """One AGENT variant produced by splitting."""
+
+    system_prompt: str = Field(
+        ...,
+        description=(
+            "Full system prompt for the variant's lead agent. Describes "
+            "the adaptive reasoning the agent should perform on its "
+            "declared input subspace."
+        ),
+    )
+    subagents: list[SplitAgentVariantSubagent] = Field(
+        default_factory=list,
+        description=(
+            "Optional subagents for this variant. The per-variant "
+            "subagent count is limited by the global budget ceiling "
+            "enforced by ``_split_agents`` across ALL variants combined."
+        ),
+    )
+
+
+class _SplitResultCommon(BaseModel):
+    """Shared fields across all three per-type split LLM output schemas."""
+
+    analysis: str = Field(
+        ...,
+        description=(
+            "Why the parent capability has high-reuse-low-success metrics "
+            "and how the failure cases partition into input subspaces. "
+            "The proposal's Pillar 3 Split clause calls this 'the input "
+            "subspaces where the capability breaks'. This field is the "
+            "LLM's articulation of that partition and is used for "
+            "Chapter 6 analysis — humans can read it to understand what "
+            "the optimizer saw in the failure data."
+        ),
+    )
+
+
+class SplitToolsResult(_SplitResultCommon):
+    """LLM output for splitting an MCP_TOOL capability into specialized variants."""
+
+    variants: list[SplitToolVariant] = Field(
+        ...,
+        min_length=2,
+        max_length=4,
+        description=(
+            "Two to four specialized MCP_TOOL variants. Each variant "
+            "carries complete executable source and targets a declared "
+            "input subspace of the parent's failure data."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class SplitSkillsResult(_SplitResultCommon):
+    """LLM output for splitting a SKILL capability into specialized variants."""
+
+    variants: list[SplitSkillVariant] = Field(
+        ...,
+        min_length=2,
+        max_length=4,
+        description=(
+            "Two to four specialized SKILL variants. Each variant "
+            "carries complete SKILL.md content and targets a declared "
+            "input subspace of the parent's failure data."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class SplitAgentsResult(_SplitResultCommon):
+    """LLM output for splitting an AGENT capability into specialized variants."""
+
+    variants: list[SplitAgentVariant] = Field(
+        ...,
+        min_length=2,
+        max_length=4,
+        description=(
+            "Two to four specialized AGENT variants. Each variant "
+            "carries a lead system prompt plus optional subagents, and "
+            "targets a declared input subspace of the parent's failure "
+            "data. The per-variant subagent count is constrained by the "
+            "global budget ceiling enforced by the caller across all "
+            "variants combined."
+        ),
     )
 
     model_config = {"extra": "forbid"}
@@ -404,106 +611,73 @@ def split(
     capability_id: str,
     *,
     llm_model: str = "",
-) -> list[str]:
-    """Split a capability into specialized variants.
+) -> list[str] | None:
+    """Split a capability into specialized variants for its input subspaces.
 
-    Type constraint: Only SKILL and AGENT types can be split.
+    Dispatches by capability type to one of the per-type split helpers:
 
-    Candidates should have reuse_rate > 0.6 AND success_rate < 0.7.
+    - ``MCP_TOOL`` → :func:`_split_tools` (gate per variant + collective
+      coverage verification via :func:`verify_coverage`)
+    - ``SKILL`` → :func:`_split_skills` (gate per variant only;
+      coverage returns vacuously passing per MCP_TOOL-only scope)
+    - ``AGENT`` → :func:`_split_agents` (gate per variant only;
+      global subagent budget ceiling enforced across variants)
+
+    Each per-type helper produces a list of specialized variants as
+    ``GeneratedArtifact`` objects carrying real executable content
+    (source_code / skill_content / agent_config). The split flow is
+    five-phase atomic:
+
+    1. **Build** variants from the LLM output.
+    2. **Verify** each variant through the three-tier gate via
+       ``gate.verify()`` only — no registration. If ANY variant fails
+       the gate, abort without touching the registry.
+    3. **Coverage** check via :func:`verify_coverage` — MCP_TOOL runs
+       the replay loop against the parent's recorded failures from
+       :func:`MetricsStore.get_recent_failures`, SKILL/AGENT return a
+       vacuously-passing report. If coverage fails, abort.
+    4. **Register** each verified variant via
+       :func:`_register_artifact_directly` — this path does NOT
+       re-run the gate (Tier 3 is LLM-nondeterministic and re-running
+       risks breaking atomicity on stochastic variance).
+    5. **Deactivate** the parent only after all variants are
+       successfully registered.
+
+    If any of phases 2-4 fail, the function returns ``None`` and
+    neither the new variants nor the parent are touched. This is the
+    atomic rollback guarantee that couples Pillar 3 Split to Pillar 2's
+    *"must pass all three tiers"* contract the same way merge already
+    does in Step 6.
 
     Args:
         registry: Skill registry.
-        metrics_store: Metrics store for pulling metrics.
+        metrics_store: Metrics store for pulling metrics + recording events.
         capability_id: ID of the capability to split.
-        llm_model: Model identifier for init_chat_model.
+        llm_model: Model identifier for init_chat_model. Empty string
+            uses DEFAULT_LLM_MODEL.
 
     Returns:
-        List of new capability IDs.
+        List of new variant capability names on successful split,
+        ``None`` on gate rejection, coverage failure, name collision,
+        LLM failure, or any other non-fatal failure.
 
     Raises:
-        ValueError: If capability is MCP_TOOL type.
-        KeyError: If capability not found.
+        KeyError: If ``capability_id`` is not found in the registry.
     """
     cap = registry.get(capability_id)
     if cap is None:
         raise KeyError(f"Capability '{capability_id}' not found in registry")
 
     if cap.capability_type == CapabilityType.MCP_TOOL:
-        raise ValueError(
-            "Split is not supported for MCP_TOOL capabilities. "
-            "Only SKILL and AGENT types can be split."
-        )
+        return _split_tools(cap, registry, metrics_store, llm_model=llm_model)
+    if cap.capability_type == CapabilityType.SKILL:
+        return _split_skills(cap, registry, metrics_store, llm_model=llm_model)
+    if cap.capability_type == CapabilityType.AGENT:
+        return _split_agents(cap, registry, metrics_store, llm_model=llm_model)
 
-    llm = init_chat_model(llm_model or DEFAULT_LLM_MODEL)
-    structured_llm = llm.with_structured_output(SplitResult)
-    lf_config = _langfuse_config()
-
-    prompt = (
-        f"A capability named '{cap.name}' with description '{cap.description}' "
-        f"(type: {cap.capability_type.value}) has high reuse but mediocre success rate. "
-        f"Analyze why it might fail for some use cases and propose 2 specialized variants "
-        f"that each handle a narrower subset of tasks more reliably.\n\n"
-        f"Return a JSON object with 'analysis' (string), and 'variants' (list of objects "
-        f"with 'name' and 'description'). Example:\n"
-        f'{{"analysis": "The capability handles both CSV and JSON but fails for malformed JSON.", '
-        f'"variants": ['
-        f'{{"name": "csv-data-cleaner", "description": "Cleans and validates CSV data files"}}, '
-        f'{{"name": "json-data-cleaner", "description": "Cleans and validates JSON data files"}}'
-        f"]}}"
+    raise ValueError(
+        f"split() does not support capability_type={cap.capability_type.value}"
     )
-
-    # Initial attempt
-    try:
-        result: SplitResult = structured_llm.invoke(prompt, config=lf_config)
-    except Exception as first_err:
-        logger.warning(
-            "split() LLM output invalid for '%s', triggering repair pass: %s",
-            capability_id, first_err,
-        )
-        repair_prompt = (
-            f"{prompt}\n\nPrevious attempt failed with: {first_err}\n"
-            f"Return only valid JSON matching the schema above."
-        )
-        try:
-            result = structured_llm.invoke(repair_prompt, config=lf_config)
-        except Exception as repair_err:
-            logger.error("split() repair pass failed for '%s': %s", capability_id, repair_err)
-            raise
-
-    # Note: variant CapabilityDescriptors are metadata-only (name + description).
-    # They contain no generated code and therefore do not go through the
-    # three-tier verification gate.  Verification applies only to code artifacts
-    # (MCP tools, SKILL.md files, agent configs) produced by the pipeline generators.
-    # Validate all variant names first (all-or-nothing: if any name collides,
-    # abort the entire split so the parent is not left deactivated with missing variants).
-    for variant in result.variants:
-        if registry.get(variant.name) is not None:
-            raise ValueError(
-                f"split(): variant name '{variant.name}' already exists in registry — "
-                f"aborting split of '{capability_id}'"
-            )
-
-    new_ids: list[str] = []
-    for variant in result.variants:
-        new_cap = CapabilityDescriptor(
-            name=variant.name,
-            description=variant.description,
-            capability_type=cap.capability_type,
-            domain=cap.domain,
-            tags=cap.tags,
-        )
-        registry.add(new_cap)
-        metrics_store.record_event(
-            variant.name, "created", f"split from {capability_id}"
-        )
-        new_ids.append(variant.name)
-
-    # Deactivate parent only after all variants are successfully added
-    registry.deactivate(capability_id)
-    metrics_store.record_event(capability_id, "split", f"into {new_ids}")
-    logger.info("Split '%s' into %s", capability_id, new_ids)
-
-    return new_ids
 
 
 _MAX_AGENT_SUBAGENT_BUDGET = 8
@@ -1094,3 +1268,705 @@ def merge(
         return _merge_agents(caps, registry, metrics_store, llm_model=llm_model)
 
     raise ValueError(f"merge() does not support capability_type={cap_type.value}")
+
+
+# ---------------------------------------------------------------------------
+# Step 8 + finding #4/#5 — per-type split helpers
+# ---------------------------------------------------------------------------
+#
+# The split operation produces a ``GeneratedArtifact`` per variant with
+# real executable content (not metadata-only stubs like the pre-2026-04-16
+# code) and routes each through a five-phase atomic flow:
+#
+#   Phase A. Build N variants from the LLM output.
+#   Phase B. ``gate.verify()`` each variant (no registration). If any
+#            variant fails, abort without touching the registry.
+#   Phase C. ``verify_coverage`` on all variants collectively. MCP_TOOL
+#            runs the replay loop; SKILL/AGENT return vacuously passing
+#            per the MCP_TOOL-only coverage scope (see §12 finding #5
+#            in docs/MASTER_PLAN_2026_04_13.md — Pillar 1 × Pillar 3
+#            tension analysis).
+#   Phase D. Register each variant via ``_register_artifact_directly``
+#            (no re-verification — Tier 3 is LLM-nondeterministic and
+#            re-running risks breaking atomicity on stochastic variance).
+#   Phase E. Deactivate the parent only after all variants registered.
+#
+# If any phase fails, the function returns ``None`` — parent stays
+# active, no variants registered. This mirrors Step 6's merge atomicity
+# guarantee at the multi-variant level.
+#
+# The robustness hint below is the split-side counterpart to Step 6's
+# ``_MERGE_ROBUSTNESS_HINT`` — same four general principles (prefer
+# library defaults, handle edge cases, explicit error handling, don't
+# swallow exceptions), framed for split's specialize-to-subspace
+# direction rather than merge's union-across-parents direction. It is
+# deliberately domain-general for the same generalization-concern
+# reasons documented in finding #4.
+
+
+_SPLIT_ROBUSTNESS_HINT = """\
+## Robustness requirements (Pillar 3 "strongest behavioral patterns")
+
+The proposal's Pillar 3 Split clause asks for *"specialized variants
+that target input subspaces where the parent capability breaks"*.
+Each variant you produce is a **focused specialist** for one such
+subspace — not a narrowing of the parent, but a reimplementation
+optimized for the specific kind of input the parent was breaking on.
+The criteria below apply to each variant independently and are
+intentionally domain-general — they should guide every variant
+regardless of whether the subspace involves data parsing, math, text
+analysis, agentic reasoning, or any other task shape.
+
+- **Prefer well-known, battle-tested library defaults over hand-rolled
+  logic.** If a mature standard-library or widely-used third-party
+  library already solves the task the variant is specialized for, use
+  it with its documented defaults rather than reimplementing the same
+  logic by hand. Hand-rolled reimplementations frequently miss edge
+  cases the library has already handled — exactly the kind of failure
+  that put the parent capability into the split candidate pool.
+
+- **Handle the variant's subspace fully.** The parent was breaking on
+  this subspace; your variant exists to fix it. Identify the edge
+  cases real user input for this subspace will contain and handle
+  them by construction. The variant should be measurably more robust
+  on its declared subspace than the parent was.
+
+- **Explicit error handling at boundaries.** Validate inputs before
+  processing them. On failure, raise a clear error with enough
+  context for the caller to understand what went wrong — do NOT
+  silently return a plausible-looking default, a zero count, or an
+  empty collection. The verification gate's Tier 3 adversarial
+  prober will run the variant against realistic reference inputs and
+  flag any deterministic mismatch; silent failures will trip that
+  check.
+
+- **Never swallow exceptions to return a plausible-looking dict.**
+  If the variant can't complete its work, let the exception propagate
+  so the calling pipeline sees a real error, not a synthesized "empty
+  result" that masks the failure.
+
+Each variant should be a **stronger, narrower reimplementation** of
+the capability for its declared subspace — not a wrapper around the
+parent, not a subset of the parent's logic, and not a concatenation
+of parent code with extra guards. Write each variant as if it were
+being authored from scratch to handle one specific kind of input
+really well.
+
+"""
+
+
+def _summarize_failures_for_prompt(
+    failures: list[InvocationRecord], max_cases: int = 5,
+) -> str:
+    """Build a human-readable failure-case summary for the split prompt.
+
+    The LLM needs to see the parent's failure data to identify input
+    subspaces. This helper formats the most recent failures (up to
+    ``max_cases``) as a compact multi-line summary showing each
+    failure's task_id, input_args, and either the error_message or
+    the wrong actual_output — whichever is recorded.
+
+    Returns "No recorded failure cases." if the list is empty, which
+    signals to the LLM that it should rely on the parent's description
+    alone to identify subspaces (degraded mode — split will still run
+    but coverage verification will be vacuous since there's nothing
+    to replay).
+    """
+    if not failures:
+        return "No recorded failure cases. Identify subspaces from the parent's description alone."
+
+    lines: list[str] = []
+    for i, f in enumerate(failures[:max_cases], start=1):
+        args_preview = (f.input_args or "")[:200]
+        if f.error_message:
+            mode = f"ERROR — {f.error_message[:200]}"
+        elif f.actual_output:
+            mode = f"WRONG OUTPUT — {f.actual_output[:200]}"
+        else:
+            mode = "UNKNOWN FAILURE MODE"
+        lines.append(
+            f"{i}. task_id={f.task_id}\n"
+            f"   input_args: {args_preview}\n"
+            f"   failure: {mode}"
+        )
+    if len(failures) > max_cases:
+        lines.append(f"... plus {len(failures) - max_cases} more failure case(s) not shown.")
+    return "\n".join(lines)
+
+
+def _split_phase_b_verify_all(
+    artifacts: list[GeneratedArtifact], context: str,
+) -> tuple[bool, str | None]:
+    """Phase B of the split flow: verify each variant via gate.verify() only.
+
+    Returns ``(True, None)`` if all variants pass the three-tier gate,
+    ``(False, reason)`` on the first failure. No registration happens
+    here — callers that receive a True result proceed to phase C
+    (coverage) and then phase D (``_register_artifact_directly``).
+
+    ``context`` is the parent capability name for logging.
+    """
+    from src.verification.gate import verify as _gate_verify
+
+    for artifact in artifacts:
+        try:
+            report = _gate_verify(artifact)
+        except Exception as exc:  # noqa: BLE001
+            reason = f"gate.verify raised on variant '{artifact.capability_name}': {exc}"
+            logger.warning("split phase B (%s): %s", context, reason)
+            return False, reason
+        if not report.overall_passed:
+            blocking = [
+                f"tier{f.tier}/{f.severity.value}:{f.category}"
+                for f in report.findings
+                if f.severity in (Severity.CRITICAL, Severity.HIGH)
+            ]
+            reason = (
+                f"variant '{artifact.capability_name}' failed gate: "
+                f"{', '.join(blocking) if blocking else 'overall_passed=False with no blocking findings'}"
+            )
+            logger.warning("split phase B (%s): %s", context, reason)
+            return False, reason
+    return True, None
+
+
+def _split_finalize(
+    parent: CapabilityDescriptor,
+    artifacts: list[GeneratedArtifact],
+    registry: SkillRegistry,
+    metrics_store: MetricsStore,
+) -> list[str] | None:
+    """Phases D + E: register each verified variant and deactivate parent.
+
+    Called after phase B (gate) and phase C (coverage) have both
+    returned clean. Registers each variant via
+    :func:`_register_artifact_directly` (no re-verification), then
+    deactivates the parent. Returns the list of new variant names.
+
+    On any registration failure, attempts to roll back already-
+    registered variants via ``registry.deactivate``. This should
+    rarely happen because phase B already verified every artifact,
+    but the fallback preserves the atomicity guarantee.
+    """
+    registered: list[str] = []
+    for artifact in artifacts:
+        ok, reason = _register_artifact_directly(
+            artifact,
+            registry,
+            metrics_store,
+            event_type="split_variant",
+            event_details=f"split from {parent.name}",
+            tags=list(parent.tags),
+            domain=parent.domain,
+        )
+        if not ok:
+            # Shouldn't happen because phase B already verified — but
+            # if it does, roll back any variants we've already registered
+            # in this phase so the parent can stay active cleanly.
+            logger.error(
+                "split phase D (%s): registration unexpectedly failed for "
+                "'%s' after phase B verified it — %s. Rolling back %d "
+                "already-registered variants.",
+                parent.name, artifact.capability_name, reason, len(registered),
+            )
+            for prev_name in registered:
+                try:
+                    registry.deactivate(prev_name)
+                    metrics_store.record_event(
+                        prev_name,
+                        "split_rollback",
+                        f"phase D registration failed on sibling '{artifact.capability_name}'",
+                    )
+                except Exception as rollback_exc:  # noqa: BLE001
+                    logger.error(
+                        "split phase D (%s): rollback of '%s' also failed: %s",
+                        parent.name, prev_name, rollback_exc,
+                    )
+            return None
+        registered.append(artifact.capability_name)
+
+    registry.deactivate(parent.name)
+    metrics_store.record_event(
+        parent.name, "split", f"into {registered}",
+    )
+    logger.info("Split %s %s → %s", parent.capability_type.value, parent.name, registered)
+    return registered
+
+
+def _split_tools(
+    parent: CapabilityDescriptor,
+    registry: SkillRegistry,
+    metrics_store: MetricsStore,
+    *,
+    llm_model: str,
+) -> list[str] | None:
+    """Per-type split for MCP_TOOL parents.
+
+    Pulls recent failures from the metrics store, prompts the LLM with
+    the parent's source + failure summary + robustness hint, packages
+    each returned variant as a ``GeneratedArtifact``, and routes them
+    through the five-phase atomic flow.
+
+    Coverage verification is ACTIVE for MCP_TOOL splits — the collective
+    :func:`verify_coverage` call replays each recorded failure case
+    against each variant and asserts at least one variant fixes each
+    failure mode. If coverage fails, the split is rejected and the
+    parent stays active.
+
+    Returns the list of new variant names on success, ``None`` on any
+    gate/coverage/registration failure.
+    """
+    from src.verification.coverage import verify_coverage
+
+    parent_source = (parent.metadata or {}).get("source_code", "").strip()
+    if not parent_source:
+        logger.warning(
+            "_split_tools: parent '%s' has no source_code in metadata — "
+            "cannot split without a reference implementation",
+            parent.name,
+        )
+        return None
+
+    failure_cases = metrics_store.get_recent_failures(parent.name, limit=10)
+    failure_summary = _summarize_failures_for_prompt(failure_cases)
+
+    llm = init_chat_model(llm_model or DEFAULT_LLM_MODEL)
+    structured_llm = llm.with_structured_output(SplitToolsResult)
+    lf_config = _langfuse_config()
+
+    prompt = (
+        "Split the following MCP_TOOL capability into 2-4 specialized "
+        "variants, each targeting an input subspace where the parent "
+        "has been breaking. Each variant must be a complete FastMCP "
+        "source file: `from mcp.server.fastmcp import FastMCP` + `mcp "
+        "= FastMCP(...)` + an `@mcp.tool()`-decorated `async def` with "
+        "`Annotated[type, Field(...)]` parameters + `if __name__ == "
+        "'__main__': mcp.run()` at the end.\n\n"
+        "Each variant is a FOCUSED SPECIALIST for its declared subspace "
+        "— not a narrowing of the parent and not a wrapper around it. "
+        "Write each variant as if you were authoring it from scratch "
+        "to handle one kind of input really well.\n\n"
+        "## Parent capability\n\n"
+        f"### {parent.name}\n"
+        f"Description: {parent.description}\n"
+        f"```python\n{parent_source}\n```\n\n"
+        "## Recent failure cases\n\n"
+        f"{failure_summary}\n\n"
+        f"{_SPLIT_ROBUSTNESS_HINT}"
+        "Return a JSON object with fields: `analysis` (string — your "
+        "interpretation of what input subspaces the parent is breaking "
+        "on, grounded in the failure cases above), and `variants` "
+        "(list of 2-4 objects each with `name` (hyphen-case), "
+        "`description`, `subspace` (what kind of input this variant "
+        "handles), `source_code` (complete Python file), and "
+        "`pip_packages` (list of pip install names, omit stdlib and "
+        "mcp/pydantic))."
+    )
+
+    try:
+        result: SplitToolsResult = _invoke_structured_with_repair(
+            structured_llm, prompt, lf_config,
+            op="split(MCP_TOOL)", context=parent.name,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_split_tools: LLM repair failed for %s: %s", parent.name, exc)
+        return None
+
+    # Name collision check — all-or-nothing.
+    for v in result.variants:
+        if registry.get(v.name) is not None:
+            logger.warning(
+                "_split_tools: variant name '%s' already exists — aborting split of '%s'",
+                v.name, parent.name,
+            )
+            return None
+
+    # Phase A — build GeneratedArtifacts for each variant.
+    artifacts: list[GeneratedArtifact] = []
+    for v in result.variants:
+        artifacts.append(
+            GeneratedArtifact(
+                capability_name=v.name,
+                capability_type=CapabilityType.MCP_TOOL,
+                description=v.description,
+                source_code=v.source_code,
+                pip_packages=list(v.pip_packages or []),
+                gap_query=None,
+                domain=parent.domain,
+            )
+        )
+
+    # Phase B — verify each variant through the gate.
+    ok, reason = _split_phase_b_verify_all(artifacts, parent.name)
+    if not ok:
+        logger.warning(
+            "_split_tools: phase B rejected split of %s — %s. Parent stays active.",
+            parent.name, reason,
+        )
+        metrics_store.record_event(
+            parent.name, "split_rollback", f"phase B: {reason}",
+        )
+        return None
+
+    # Phase C — collective coverage verification (MCP_TOOL replay).
+    try:
+        coverage = verify_coverage(artifacts, failure_cases)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "_split_tools: verify_coverage raised on %s: %s. Parent stays active.",
+            parent.name, exc,
+        )
+        metrics_store.record_event(
+            parent.name, "split_rollback", f"phase C exception: {exc}",
+        )
+        return None
+
+    if not coverage.all_covered:
+        logger.warning(
+            "_split_tools: coverage rejected split of %s — status=%s, "
+            "uncovered_cases=%s, execution_errors=%d. Parent stays active.",
+            parent.name, coverage.status,
+            coverage.uncovered_cases, len(coverage.execution_errors),
+        )
+        metrics_store.record_event(
+            parent.name,
+            "split_rollback",
+            (
+                f"phase C coverage: status={coverage.status}, "
+                f"uncovered={len(coverage.uncovered_cases)}"
+            ),
+        )
+        return None
+
+    # Phases D + E — register variants and deactivate parent.
+    return _split_finalize(parent, artifacts, registry, metrics_store)
+
+
+def _split_skills(
+    parent: CapabilityDescriptor,
+    registry: SkillRegistry,
+    metrics_store: MetricsStore,
+    *,
+    llm_model: str,
+) -> list[str] | None:
+    """Per-type split for SKILL parents.
+
+    Same five-phase flow as :func:`_split_tools` but for SKILL parents.
+    Coverage verification in phase C dispatches to
+    ``CoverageReport(all_covered=True, status="unverifiable_type")``
+    per the MCP_TOOL-only scope documented in §12 finding #5 — SKILL
+    splits rely on the three-tier gate's per-variant safety check
+    alone, the same way SKILL merge already does in Step 6. The
+    coverage call is still made for consistency (and so any future
+    Chapter 7 work that adds SKILL coverage drops in cleanly) but
+    currently it's vacuous.
+    """
+    from src.verification.coverage import verify_coverage
+
+    parent_content = (parent.metadata or {}).get("skill_content", "").strip()
+    if not parent_content:
+        logger.warning(
+            "_split_skills: parent '%s' has no skill_content in metadata — "
+            "cannot split without a reference implementation",
+            parent.name,
+        )
+        return None
+
+    failure_cases = metrics_store.get_recent_failures(parent.name, limit=10)
+    failure_summary = _summarize_failures_for_prompt(failure_cases)
+
+    llm = init_chat_model(llm_model or DEFAULT_LLM_MODEL)
+    structured_llm = llm.with_structured_output(SplitSkillsResult)
+    lf_config = _langfuse_config()
+
+    prompt = (
+        "Split the following SKILL capability into 2-4 specialized "
+        "variants, each targeting an input subspace where the parent "
+        "has been breaking. Each variant must be a complete SKILL.md "
+        "body with valid YAML frontmatter (`name`, `description`, and "
+        "optionally `allowed-tools`) followed by instruction prose and "
+        "optional fenced Python code blocks.\n\n"
+        "Each variant is a FOCUSED SPECIALIST for its declared subspace "
+        "— not a narrowing of the parent, but a coherent specialized "
+        "skill. Write each variant as if it were being authored from "
+        "scratch for one kind of input.\n\n"
+        "## Parent capability\n\n"
+        f"### {parent.name}\n"
+        f"Description: {parent.description}\n"
+        f"```markdown\n{parent_content}\n```\n\n"
+        "## Recent failure cases\n\n"
+        f"{failure_summary}\n\n"
+        f"{_SPLIT_ROBUSTNESS_HINT}"
+        "**Note on SKILL content shape.** Fenced Python code blocks in "
+        "a SKILL.md are treated as executable surface by the "
+        "verification gate — extracted by the layered code-fence "
+        "scanner (Tier 1) and run through the adversarial prober "
+        "(Tier 3). Any Python you embed in a variant is subject to "
+        "the same robustness criteria above and will be tested against "
+        "realistic reference inputs. Choose the content shape that "
+        "best fits the variant's subspace: embed Python only when the "
+        "workflow is inherently code-shaped, otherwise prefer prose "
+        "instructions the executing agent can follow with its own "
+        "tool-calling loop.\n\n"
+        "Return a JSON object with fields: `analysis` (string — your "
+        "interpretation of the input subspaces the parent is breaking "
+        "on, grounded in the failure cases above), and `variants` "
+        "(list of 2-4 objects each with `name` (hyphen-case), "
+        "`description`, `subspace`, and `skill_content` (full SKILL.md "
+        "body including YAML frontmatter))."
+    )
+
+    try:
+        result: SplitSkillsResult = _invoke_structured_with_repair(
+            structured_llm, prompt, lf_config,
+            op="split(SKILL)", context=parent.name,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_split_skills: LLM repair failed for %s: %s", parent.name, exc)
+        return None
+
+    for v in result.variants:
+        if registry.get(v.name) is not None:
+            logger.warning(
+                "_split_skills: variant name '%s' already exists — aborting split of '%s'",
+                v.name, parent.name,
+            )
+            return None
+
+    # Phase A — build GeneratedArtifacts. SKILL input/output schemas
+    # are inherited from the parent's declaration (the LLM doesn't
+    # need to re-derive them — they're stable across variants because
+    # the input/output contract is a parent-level property).
+    artifacts: list[GeneratedArtifact] = []
+    for v in result.variants:
+        artifacts.append(
+            GeneratedArtifact(
+                capability_name=v.name,
+                capability_type=CapabilityType.SKILL,
+                description=v.description,
+                skill_content=v.skill_content,
+                gap_query=None,
+                input_schema=dict(parent.input_schema or {}),
+                output_schema=dict(parent.output_schema or {}),
+                domain=parent.domain,
+            )
+        )
+
+    # Phase B — gate per variant.
+    ok, reason = _split_phase_b_verify_all(artifacts, parent.name)
+    if not ok:
+        logger.warning(
+            "_split_skills: phase B rejected split of %s — %s. Parent stays active.",
+            parent.name, reason,
+        )
+        metrics_store.record_event(
+            parent.name, "split_rollback", f"phase B: {reason}",
+        )
+        return None
+
+    # Phase C — coverage dispatches to unverifiable_type (vacuous pass)
+    # per MCP_TOOL-only scope. Still called for consistency with the
+    # MCP_TOOL path and to make future Chapter 7 extensions drop in.
+    coverage = verify_coverage(artifacts, failure_cases)
+    if not coverage.all_covered:
+        # Should be impossible for SKILL (coverage is vacuous) but
+        # guarded for robustness — if verify_coverage ever tightens
+        # for SKILL, this branch catches it cleanly.
+        logger.warning(
+            "_split_skills: coverage unexpectedly rejected SKILL split of %s — "
+            "status=%s. Parent stays active.",
+            parent.name, coverage.status,
+        )
+        metrics_store.record_event(
+            parent.name, "split_rollback", f"phase C (SKILL): {coverage.status}",
+        )
+        return None
+
+    return _split_finalize(parent, artifacts, registry, metrics_store)
+
+
+def _split_agents(
+    parent: CapabilityDescriptor,
+    registry: SkillRegistry,
+    metrics_store: MetricsStore,
+    *,
+    llm_model: str,
+) -> list[str] | None:
+    """Per-type split for AGENT parents.
+
+    Same five-phase flow as :func:`_split_tools` / :func:`_split_skills`
+    but for AGENT parents. Coverage is vacuous for the same reason
+    (MCP_TOOL-only scope). Enforces a **global** subagent budget
+    ceiling: the sum of subagent counts across ALL variants must not
+    exceed ``_MAX_AGENT_SUBAGENT_BUDGET`` (=8), matching the
+    per-operation ceiling that ``_merge_agents`` enforces on merge.
+    Splitting a single AGENT into 4 variants each with 3 subagents
+    would blow up to 12 total subagents, which would be more context-
+    management complexity than the original — defeating the point of
+    splitting.
+    """
+    from src.verification.coverage import verify_coverage
+
+    parent_cfg_raw = (parent.metadata or {}).get("agent_config", "")
+    try:
+        parent_cfg = (
+            json.loads(parent_cfg_raw)
+            if isinstance(parent_cfg_raw, str) and parent_cfg_raw
+            else (parent_cfg_raw if isinstance(parent_cfg_raw, dict) else {})
+        )
+    except Exception:  # noqa: BLE001
+        parent_cfg = {}
+
+    parent_system_prompt = (parent_cfg.get("system_prompt") or "").strip()
+    parent_subagents = parent_cfg.get("subagents") or []
+    if not parent_system_prompt:
+        logger.warning(
+            "_split_agents: parent '%s' has no system_prompt in agent_config — "
+            "cannot split without a reference implementation",
+            parent.name,
+        )
+        return None
+
+    parent_sub_summary = (
+        ", ".join(s.get("name", "?") for s in parent_subagents)
+        if parent_subagents
+        else "(solo agent, no subagents)"
+    )
+
+    failure_cases = metrics_store.get_recent_failures(parent.name, limit=10)
+    failure_summary = _summarize_failures_for_prompt(failure_cases)
+
+    llm = init_chat_model(llm_model or DEFAULT_LLM_MODEL)
+    structured_llm = llm.with_structured_output(SplitAgentsResult)
+    lf_config = _langfuse_config()
+
+    prompt = (
+        "Split the following AGENT capability into 2-4 specialized "
+        "variants, each targeting an input subspace where the parent "
+        "has been breaking. Each variant is a complete agent config: "
+        "a lead `system_prompt` plus optional `subagents`.\n\n"
+        "Each variant is a FOCUSED SPECIALIST for its declared subspace "
+        "— not a narrowing of the parent, but a coherent specialized "
+        "agent. The lead system prompts and subagent prompts should "
+        "describe the adaptive reasoning the agent should perform on "
+        "its one specific subspace.\n\n"
+        "**CRITICAL budget constraint.** The total subagent count "
+        "across ALL variants combined MUST NOT exceed "
+        f"{_MAX_AGENT_SUBAGENT_BUDGET}. If you propose 4 variants, you "
+        f"have at most {_MAX_AGENT_SUBAGENT_BUDGET} total subagent "
+        "slots to distribute across them (on average 2 subagents per "
+        "variant, though uneven distribution is fine). Splitting an "
+        "AGENT is supposed to REDUCE per-variant reasoning complexity, "
+        "not multiply it — variants that each have 3+ subagents would "
+        "make the resulting registry more complex than the parent was, "
+        "defeating the point.\n\n"
+        "## Parent capability\n\n"
+        f"### {parent.name}\n"
+        f"Description: {parent.description}\n"
+        f"System prompt:\n```\n{parent_system_prompt}\n```\n"
+        f"Subagents: {parent_sub_summary}\n\n"
+        "## Recent failure cases\n\n"
+        f"{failure_summary}\n\n"
+        f"{_SPLIT_ROBUSTNESS_HINT}"
+        "**Note on AGENT content shape.** Each variant's `system_prompt` "
+        "and each subagent's `system_prompt` are prose-only — no "
+        "executable Python. The robustness criteria above apply to the "
+        "**instructions** you give the agent: tell it to prefer "
+        "well-known library patterns and robust error handling in "
+        "whatever code it generates at runtime, not to hand-roll logic "
+        "that matches the parent's implementation detail. An agent "
+        "following robust instructions will produce robust outputs at "
+        "runtime; an agent following hand-rolled-pattern instructions "
+        "will inherit the parent's edge-case failures.\n\n"
+        "Return a JSON object with fields: `analysis` (string — your "
+        "interpretation of the input subspaces the parent is breaking "
+        "on, grounded in the failure cases above), and `variants` "
+        "(list of 2-4 objects each with `name` (hyphen-case), "
+        "`description`, `subspace`, `system_prompt`, and `subagents` "
+        "(list of objects with `name`, `description`, `system_prompt`, "
+        "`tools`))."
+    )
+
+    try:
+        result: SplitAgentsResult = _invoke_structured_with_repair(
+            structured_llm, prompt, lf_config,
+            op="split(AGENT)", context=parent.name,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_split_agents: LLM repair failed for %s: %s", parent.name, exc)
+        return None
+
+    # Global budget ceiling check — BEFORE the gate, before any
+    # registration. Cheaper to reject an over-budget plan than run
+    # Tier 3 on every over-complex variant.
+    total_subagents = sum(len(v.subagents) for v in result.variants)
+    if total_subagents > _MAX_AGENT_SUBAGENT_BUDGET:
+        logger.warning(
+            "_split_agents: LLM returned %d total subagents across %d variants "
+            "(> %d global budget) — aborting split of %s, parent stays active",
+            total_subagents,
+            len(result.variants),
+            _MAX_AGENT_SUBAGENT_BUDGET,
+            parent.name,
+        )
+        metrics_store.record_event(
+            parent.name,
+            "split_rollback",
+            f"subagent budget exceeded: {total_subagents} > {_MAX_AGENT_SUBAGENT_BUDGET}",
+        )
+        return None
+
+    for v in result.variants:
+        if registry.get(v.name) is not None:
+            logger.warning(
+                "_split_agents: variant name '%s' already exists — aborting split of '%s'",
+                v.name, parent.name,
+            )
+            return None
+
+    # Phase A — build GeneratedArtifacts with agent_config dict.
+    artifacts: list[GeneratedArtifact] = []
+    for v in result.variants:
+        agent_config: dict = {
+            "system_prompt": v.system_prompt,
+            "is_deep_agent": True,
+        }
+        if v.subagents:
+            agent_config["subagents"] = [sa.model_dump() for sa in v.subagents]
+        artifacts.append(
+            GeneratedArtifact(
+                capability_name=v.name,
+                capability_type=CapabilityType.AGENT,
+                description=v.description,
+                agent_config=agent_config,
+                gap_query=None,
+                domain=parent.domain,
+            )
+        )
+
+    # Phase B — gate per variant.
+    ok, reason = _split_phase_b_verify_all(artifacts, parent.name)
+    if not ok:
+        logger.warning(
+            "_split_agents: phase B rejected split of %s — %s. Parent stays active.",
+            parent.name, reason,
+        )
+        metrics_store.record_event(
+            parent.name, "split_rollback", f"phase B: {reason}",
+        )
+        return None
+
+    # Phase C — vacuous for AGENT per MCP_TOOL-only scope.
+    coverage = verify_coverage(artifacts, failure_cases)
+    if not coverage.all_covered:
+        logger.warning(
+            "_split_agents: coverage unexpectedly rejected AGENT split of %s — "
+            "status=%s. Parent stays active.",
+            parent.name, coverage.status,
+        )
+        metrics_store.record_event(
+            parent.name, "split_rollback", f"phase C (AGENT): {coverage.status}",
+        )
+        return None
+
+    return _split_finalize(parent, artifacts, registry, metrics_store)

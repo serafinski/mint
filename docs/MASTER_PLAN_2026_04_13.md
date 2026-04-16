@@ -300,6 +300,124 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
 
          **What is NOT this finding:** an earlier version of this scoping decision framed it as "SKILL/AGENT coverage is infrastructure-complexity-hard to build" (task synthesis, fixture handling, etc.). That framing is **wrong** and should not appear in any doc. The correct framing is the Pillar 1 × Pillar 3 tension above — coverage verification for nondeterministic executors is **ill-defined**, not just harder to build.
 
+      **5d. ⚠ Empirical limitation surfaced 2026-04-16 — the wrong-output-case semantic rewards wrongness when the recorded `actual_output` is actually correct.** The first post-Step-4-fix run of `scripts/test_split_merge.py --split-mcp-only` empirically demonstrated a subtle limitation of the wrong-output-case branch in `_variant_handles_case`. Reproduction:
+
+      1. The test seeded a `clamp-integer` parent (correct implementation, no bugs) and a recorded `InvocationRecord` with `input_args='{"value": 150}'` and `actual_output='{"clamped": 100}'` (no `error_message`). I labeled this as a "wrong output" case but — crucially — the parent's output of `{clamped: 100}` on `{value: 150}` with default `high=100` is **actually correct**. I seeded a correct answer as wrong.
+      2. Split produced two correct specialized variants via the LLM.
+      3. Phase B (three-tier gate per variant) passed cleanly.
+      4. Phase C (`verify_coverage`) replayed the case against each variant. Both variants correctly returned `{clamped: 100}` — the same correct answer the parent produced. Under the sub-finding 5b semantic (*"variant handles iff runs without raising AND produces output ≠ parent's recorded actual_output"*), matching the parent counts as "not handled".
+      5. Coverage returned `all_covered=False` with `uncovered=['failure-2-unexpected-default']`. Split rolled back. Parent stayed active. The atomic rollback was empirically validated, but not in the way the test intended.
+
+      **The underlying issue:** the wrong-output-case semantic only has meaning when the recorded `actual_output` is *genuinely* wrong relative to some oracle. Without an oracle, "variant handles iff output differs" collapses into "variant is rewarded for being different from the parent" — which rewards *incorrectness* if the parent was actually correct, because the only way to differentiate is to produce a different (and therefore wrong) answer.
+
+      **Where "wrong output" labels are trustworthy:**
+
+      - **Eval harness (`tests/evaluation/`):** `task.validator` closures provide external ground truth. A row only gets `success=False` if the validator affirmatively rejected the output, so the "wrong" label is trustworthy. Phase 5 wrong-output-case splits would be semantically meaningful under this oracle.
+      - **Post-`mint feedback --wrong` CLI flow (Chapter 7 feature per finding #6b):** the user is the oracle. Trustworthy iff the user's judgment is correct.
+      - **Synthetic test seeding:** only meaningful when the test author carefully constructs a case where the parent's `actual_output` is genuinely wrong relative to a deliberately-introduced parent bug (e.g. an off-by-one clamp). Easy to get wrong, as this 2026-04-16 run demonstrated.
+
+      **Where "wrong output" labels are NOT trustworthy:**
+
+      - **Current CLI flow:** no oracle exists — `success=False` never fires in CLI invocation recording post-Step-6-commit (see finding #6b). Zero wrong-output-case records in CLI today.
+      - **Naive test seeding:** labeling any random input/output pair as "wrong" without verifying it against a reference implementation.
+
+      **Implication for Chapter 4 / Chapter 6:**
+
+      Chapter 4 should disclose that the coverage verifier's wrong-output-case branch has meaningful semantics only when paired with a trustworthy oracle. The Phase 5 eval provides such an oracle (task validators), so Chapter 6 numbers measured on MCP_TOOL splits in the `full` condition ARE meaningful — but only because the eval harness injects the oracle. A thesis that claimed "coverage verification works in CLI flow" would be overclaiming given finding #6b (no CLI oracle exists). Stick to the eval-harness scope.
+
+      **Implication for `scripts/test_split_merge.py::test_split_mcp_tool`:**
+
+      The original test design (one error-case + one wrong-output-case) can't produce a clean happy-path PASS without a deliberately-buggy parent. The 2026-04-16 fix replaces the synthetic wrong-output-case with a second error-case (`{value: 150, low: 0, high: null}` → parent raises `TypeError` on the `>` comparison with `None`). Both cases now have clean error-case semantics — correct variants handle both by not raising, happy path fires cleanly. The wrong-output-case branch of `_variant_handles_case` remains covered by unit tests in `TestVariantHandlesCase_WrongOutputCase` (mocked sandbox, synthetic but controlled inputs).
+
+      **Add a ⚠ row to `proposal_vs_implementation_v2.md`** when §12 runs, cross-referenced with 5b, noting: *"The coverage verifier's wrong-output-case semantic is only meaningful when the recorded `actual_output` is genuinely wrong relative to an oracle. Trustworthy oracles: eval-harness task validators (Phase 5 scope). Non-trustworthy: CLI feedback without `mint feedback --wrong` (see finding #6b). Synthetic test seeding must use a deliberately-buggy parent to produce valid wrong-output-case scenarios — a correct parent paired with a mislabeled wrong-output will always roll back, which is what happened in the 2026-04-16 `test_split_mcp_tool` run before the test was rewritten to use two error-cases."*
+
+   6. **Feedback mechanism for wrong outputs — ⚠ Known limitation + 🟡 Refined + Chapter 7 feature gap (added 2026-04-16 during Step 8 review).** This has two layered concerns the audit should pick up together.
+
+      **6a. ⚠ Fundamental limitation — semantic correctness cannot be verified without external ground truth.** MINT has four layers of failure detection:
+
+      - **Crash-level** (LLM error, compile error, sandbox timeout, registration failure) — pipeline raises, CLI exits non-zero, user sees a traceback. Unambiguous.
+      - **Gate-level** (Tier 1/2/3 rejection, retry loop exhausted) — pipeline classifies as `GENERATION_FAILED`, CLI exits non-zero, user sees verification report.
+      - **Contract-level** (Step 14.6 — output has wrong shape: missing keys/files per `OutputContract`) — terminal-state check via `output_contract.check()`, CLI exit code 3.
+      - **Semantic-level** — output exists, has correct shape, has plausible content, but is semantically wrong. Example: user asks *"which metric is the root cause of this cascade"*, AGENT returns `{root_cause_metric: "error_rate", ...}` when the correct answer is `db_connections`. **The CLI cannot detect this** because the user asked the question precisely because they don't know the answer — there is no oracle.
+
+      This is a **fundamental limitation of LLM-as-computation without external ground truth**, not a MINT-specific bug. The proposal never claimed semantic verification without an oracle. The Phase 5 evaluation harness uses per-task `validator` closures defined in `tests/evaluation/tasks.py` that provide external ground truth for each T01-T20 task — that's how `output_in_range` is measured and how Chapter 6 reports correctness — **but a CLI user has no such validator**. Chapter 4 / Chapter 6 must explicitly distinguish testbed-level correctness measurement (with validators) from CLI-level correctness measurement (no validator, user judgment only). When §12 runs, add a ⚠ row to Pillar 2 and/or a Chapter 4 limitations subsection with the draft text: *"Semantic correctness verification is out of scope for the CLI pipeline. The verification gate catches artifact-level issues (hardcoded data, mocks, silent fallbacks, wrong shape). Tier 2 behavioral testing catches parameter-ignorance and trivial-output shortcuts. Tier 3 adversarial probing catches some semantic shortcuts on MCP_TOOL capabilities via ground-truth comparison to prober-generated reference inputs. Beyond these, semantic correctness of the capability's output against the user's actual question is not verifiable without an external oracle. CLI users must apply their own judgment or cross-check against known-good data. Phase 5 / Chapter 6 correctness metrics use per-task validators from `tests/evaluation/tasks.py` which step outside what a CLI user can do."*
+
+      **6b. 🟡 Feature gap — CLI flow never produces wrong-output `InvocationRecord`s, so Step 8's split wrong-output-case semantics are CLI-dead-code.** Structural consequence of 6a: since no oracle tells the CLI an output was wrong, the invocation recording path in `src/orchestrator/composition.py` never marks a non-crashing invocation with `success=False`. `MetricsStore.get_recent_failures` queries `WHERE success = FALSE`, so in CLI flow the only records it ever returns are crashes (`error_message IS NOT NULL`). Step 8's `_variant_handles_case` wrong-output-case branch (variant runs without raising AND produces output ≠ parent's recorded `actual_output`) is structurally reachable only via the eval harness (where `task.validator` marks records as failed) or via the synthetic seeding path in `scripts/test_split_merge.py::test_split_mcp_tool`. **In real CLI use, split can only specialize on crashes.** Minimal fix (~1-1.5h, Chapter 7 or Phase 3 scope): add a `mint feedback [run_id] --wrong [--reason TEXT]` CLI subcommand that:
+      (a) reads the `last_run.json` sidecar the runner already writes,
+      (b) updates the relevant `InvocationRecord` to `success=False` with the user's reason as `error_message` + the original output captured as `actual_output` (so Step 8's wrong-output-case branch can actually fire on subsequent splits),
+      (c) records a `user_flagged_wrong` metrics event for Chapter 6 counting.
+      Optional UX nudge: after every `mint run`, print *"Was this correct? Re-run `mint feedback --wrong` to flag the last run."* as a one-liner. Not blocking for Phase 5 (the eval harness doesn't use it anyway) but a legitimate Chapter 7 feature that would close the CLI-side feedback loop.
+
+   7. **Inconsistent reasoning-effort configuration across LLM-calling components — 🟡 Refined (added 2026-04-16 during Step 8 review, after verifying the Tier 3 setting).** MINT uses `gpt-5-mini` as the default model (`src/config.py:DEFAULT_LLM_MODEL`), which is a reasoning-capable model. Different components explicitly configure `reasoning_effort` differently, and some don't configure it at all:
+
+      | Component | Setting | Source | Rationale |
+      |---|---|---|---|
+      | Tier 3 adversarial | `reasoning_effort="low"` | `src/verification/adversarial.py:303` | 2026-04-14 perf fix — fixed attack-pattern enum means LLM can't invent new attacks, default reasoning was burning ~2k tokens/call on planning ceremony. Drops latency ~120-230s → ~40-90s. See `docs/perf_fixes_2026_04_14.md §2c-1`. |
+      | Gap-detection taxonomy classification | `reasoning_effort="minimal"` | `src/orchestrator/gap_detection.py:85` | Pattern-matching task, not reasoning. Drops ~8s → ~1s. |
+      | Decomposition, classifier, generators (MCP_TOOL/SKILL/AGENT), merge/split LLM calls, output contract extractor | **default** (inherits gpt-5-mini default) | Various | No explicit setting. |
+
+      **Two concerns.** (1) **The Tier 3 "low" choice was not measured against a quality baseline.** The 2026-04-14 optimization was made on observed latency reduction, with the rationale that the reasoning was being wasted on "restating the system prompt back at itself". But it was never compared against default or "medium" on a "does it catch less stuff" axis. From a thesis-rigor standpoint there's a legitimate question: does `"low"` catch the same failure modes as `"medium"` or `"high"` would on the same artifacts? We don't know. A tighter Tier 3 system prompt (removing the ceremony the LLM was restating) could probably support `"medium"` without the latency blowup and would strengthen the verification rigor claim in Chapter 4. (2) **Split / merge LLM calls in Step 6 + Step 8 don't configure reasoning at all** — they use `init_chat_model(DEFAULT_LLM_MODEL)` without a `reasoning_effort` argument. Their structured-output schemas are complex enough that reasoning budget probably helps, but no one has tuned this. Same for decomposition, classifier, generators, and the Step 14.6 output contract extractor. **None of MINT's LLM calls have been systematically tuned for reasoning-model decoding patterns.** Current implementation works because `gpt-5-mini` does reasonable things with long prompts at default effort, but the thesis can't claim "optimized for reasoning models" — only "works with a reasoning model". When §12 runs, add a 🟡 row with a Chapter 4 disclosure: *"MINT's LLM calls use a mix of reasoning effort levels: Tier 3 adversarial probing is explicitly tuned to `'low'` for latency (2026-04-14), gap-detection taxonomy classification uses `'minimal'` for the same reason, and all other LLM-calling components (decomposition, classifier, generators, merge, split, output contract extractor) use gpt-5-mini's default (`'medium'`). No systematic tuning has been done for reasoning-model decoding patterns. The Tier 3 `'low'` choice was made on observed latency without a measured quality baseline. Chapter 7 future work: targeted reasoning-level tuning on a per-component basis with quality measurement."*
+
+   8. **Per-operation optimizer granularity + persistent settings — 🟢 Kept deviation + UX follow-up (added 2026-04-16 during Step 8 review; refined same-session to per-operation granularity after user feedback).** The CLI currently auto-enables the entire optimizer loop (prune + split + merge together) when `MetricsStore.invocation_count_total() >= AUTO_OPTIMIZER_THRESHOLD` (=20 per `src/config.py:80`), and users can override per-invocation via `--no-optimizer` / `--enable-optimizer` flags (`src/cli/runner.py:1550-1559`). Two problems: **(i)** the flags have to be remembered on every run; **(ii)** the single on/off switch is the wrong granularity because each operation has a very different cost/benefit profile, especially after Step 7 + Step 8 landed:
+
+      | Operation | Cost per firing | Benefit | User default likely |
+      |---|---|---|---|
+      | **Prune** | ~0 (no LLM, metadata-only `registry.deactivate` on zero-invocation caps) | Registry hygiene; prevents unbounded growth | Always on |
+      | **Merge** | ~1 LLM call + 3-tier gate when candidates exist; often 0 candidates per run | Consolidates low-reuse near-duplicates; small wins | Usually on |
+      | **Split** | ~60-120 s + ~$0.10-0.15 per firing post-Step-8 (multi-variant gate + coverage replay on MCP_TOOL); zero cost when no candidates | Specializes high-reuse / low-success capabilities into subspace variants; big structural wins | Situational (users experimenting may turn off to avoid wall-clock jumps) |
+
+      A user running short interactive CLI sessions likely wants `prune=on, split=off, merge=auto` (cheap cleanup without the big split rewrites). A user doing long longitudinal sessions expecting full evolutionary optimization wants all three `auto`. A user debugging the optimizer wants `on` for one operation and `off` for the others to isolate the behavior. The current single-switch design can't express any of these.
+
+      **Proposed fix (Phase 3 CLI UX pass, ~1.5-2 h).** Replace the per-invocation-only `--no-optimizer` / `--enable-optimizer` flags with a per-operation granular design:
+
+      ```json
+      # data/cli/settings.json
+      {
+        "optimizer": {
+          "prune": "auto",
+          "split": "auto",
+          "merge": "auto"
+        }
+      }
+      ```
+
+      Each operation independently `auto` / `on` / `off`:
+      - **`auto`** (default) — honors `AUTO_OPTIMIZER_THRESHOLD=20` for the loop + per-candidate threshold checks. Reproduces current behavior exactly.
+      - **`on`** — forces the operation to run on every `mint run`, regardless of `AUTO_OPTIMIZER_THRESHOLD`.
+      - **`off`** — disables that operation entirely, regardless of thresholds.
+
+      New CLI surface:
+
+      ```bash
+      mint config set optimizer.prune on     # always run prune
+      mint config set optimizer.split off    # never run split
+      mint config set optimizer.merge auto   # default
+      mint config show                       # dump current settings
+      mint config unset optimizer.split      # revert to auto
+
+      # Per-invocation flag overrides (take priority over persistent settings)
+      mint run --no-split --no-merge "task..."
+      mint run --no-optimizer "task..."       # backward-compat alias for all three off
+      ```
+
+      **Implementation sketch:**
+      1. **`src/schemas/optimizer_config.py`** (new, small) — `OptimizerConfig` Pydantic schema with `prune` / `split` / `merge` as `Literal["auto", "on", "off"]`. Include an `any_enabled: bool` property.
+      2. **`src/cli/settings.py`** (new) — atomic JSON read/write with `fcntl.flock` + write-to-temp + rename, same pattern as `src/orchestrator/taxonomy.py`. `load_settings() -> dict | None` and `save_settings(settings: dict)`.
+      3. **`src/cli/app.py`** — new `config` Typer subcommand with `set` / `show` / `unset` verbs.
+      4. **`src/cli/runner.py`** — read persistent settings at task entry, merge with per-invocation flag overrides (flags > persistent > defaults), build an `OptimizerConfig`, thread it into `create_pipeline` as `optimizer_config: OptimizerConfig | None` replacing the current bare `run_optimizer: bool`.
+      5. **`src/orchestrator/pipeline.py::create_pipeline`** — accept `optimizer_config: OptimizerConfig | None = None`. When `None`, no optimizer node wired. When set and `any_enabled`, wire the optimizer node and pass the config into the sub-graph.
+      6. **`src/optimizer/loop.py::create_optimization_loop`** — accept `config: OptimizerConfig` parameter. Gate each operation in `apply_operations_node` on the corresponding `config.prune` / `config.split` / `config.merge` field. Default parameter reproduces the all-`auto` behavior (backward compatible).
+      7. **Backward compatibility for the eval harness:** `run_pilot.py` / `run_longitudinal.py` / `tests/evaluation/harness.py` currently pass `run_optimizer=True` via `create_pipeline`. Keep the `run_optimizer: bool` parameter as a deprecated alias that constructs `OptimizerConfig(prune="on", split="on", merge="on")` when `True` and `None` when `False`. No eval-harness changes needed for Phase 5.
+      8. **Unit tests:** settings atomicity (write + read round trip, `fcntl.flock` under concurrent writers), config merging (persistent + flags + defaults), loop conditional application (each operation independently gated), CLI subcommand plumbing (`mint config set` writes expected JSON, `mint config show` dumps it, `mint config unset` reverts).
+
+      **Backward compatibility for existing CLI users** (pre-settings file): `load_settings()` returns `None` on missing file → `OptimizerConfig()` with all-`auto` defaults → exact current behavior. Users who never touch `mint config` see no difference.
+
+      **🟢 Audit-doc row for `proposal_vs_implementation_v2.md` when §12 runs:** *"`AUTO_OPTIMIZER_THRESHOLD=20` is a tuning parameter not derived from the proposal's formal framework. Chosen to balance optimizer feedback frequency against per-run latency. With Step 7/8 the optimizer's wall-clock cost grew significantly (multi-variant gate + MCP_TOOL coverage replay), making the threshold choice more consequential per-firing. The Phase 3 CLI UX pass adds per-operation granular controls (`mint config set optimizer.{prune,split,merge} auto|on|off`) so users can opt each operation in or out independently — addressing the observation that prune is ~free and usually wanted, merge is cheap and usually wanted, and split is expensive and situationally wanted. Phase 5 eval bypasses both the threshold and the persistent settings (passes `OptimizerConfig(prune='on', split='on', merge='on')` explicitly)."* Chapter 6 should report measured per-run latency distributions broken out by which operations actually fired during each run.
+
+      **Companion feature:** bundle this with finding #6b (`mint feedback --wrong` for CLI wrong-output flagging) in a single "Phase 3 CLI UX pass" commit since both need the `src/cli/settings.py` infrastructure and both are user-visible CLI changes. ~3 h combined for both features.
+
+      **Action:** straightforward Phase 3 scope, no thesis-alignment concerns, worth doing before Phase 5 so longitudinal wall-clock numbers are interpretable and so a user running `mint run` doesn't get unexpectedly hit with a 120-second split on invocation 20 without having opted in.
+
    **When to do this.** After Steps 4-11 land (so Pillar 3 is in its final form and doesn't need re-auditing), but before Phase 3 Step 14 (smoke tests and pilot). The audit output informs what gets fixed in Phase 3 and what gets disclosed in Chapter 4 writing post-eval.
 
 13. **AGENT execution timeout + sticky-flag pattern.** (~1.5-2 hours, added 2026-04-14 after the 19:01 test_mint run surfaced this.) Same class of bug as the decomposition timeout that Fix 2b addressed — a hard cutoff on a variance-prone runtime, this time inside `tests/evaluation/execution.py::execute_agent_artifact`. The generated incident-triage agent completed pipeline generation + verification fine, then hit the 480s agent-execution hard timeout during its adaptive investigation (reasoning-mode wall-clock variance on a long-running DeepAgent, same story we already saw on decomposition). The previous 14:44 run passed at 584.4s total because the agent happened to fit under 480s that time; the 19:01 run didn't.
