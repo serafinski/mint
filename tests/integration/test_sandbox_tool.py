@@ -1,6 +1,6 @@
 """Integration tests for sandbox_execute — require Docker + built jit-sandbox image.
 
-Build the image first: make build-sandbox
+Build the image first: docker build -t jit-sandbox sandbox/
 
 These tests are skipped in CI unless Docker is available.
 """

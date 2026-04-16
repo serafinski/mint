@@ -1,7 +1,7 @@
 """Integration tests for CompositionalExecutor — require Docker + built jit-sandbox image.
 
 Tests the full chain execution with real workspace I/O and Docker sandbox.
-Build the image first: make build-sandbox
+Build the image first: docker build -t jit-sandbox sandbox/
 """
 
 import json
