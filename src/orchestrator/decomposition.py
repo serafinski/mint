@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 # pays. See docs/perf_fixes_2026_04_14.md §2b.
 DECOMPOSITION_TIMEOUT_S = 240
 DECOMPOSITION_RECURSION_LIMIT = 50
+# §12 finding #15 (2026-04-16): retry the decomposer up to 3 times on
+# timeout / exception / empty result before failing closed. Matches the
+# 3-strike pattern used by verification_node (finding #14). Previously
+# a single failure fell through to a single-sentence fallback path;
+# that was drift from the proposal's "orchestrator agent breaks the
+# input task into subtasks" contract.
+MAX_DECOMPOSITION_ATTEMPTS = 3
 
 # Two-stage circuit breaker for capability count.
 # WARN: emit visibility signal but proceed intact — genuine 6-7 step tasks survive.
@@ -482,74 +489,113 @@ def decomposition_node(
     required_caps: list[str] = []
     errors: list[str] = list(state.errors)
 
-    # Use manual executor management so we can call shutdown(wait=False) on
-    # timeout — the context-manager form calls shutdown(wait=True) from __exit__,
-    # which blocks until the thread finishes even after TimeoutError is raised.
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
-        future = pool.submit(
-            agent.invoke,
-            {"messages": [{"role": "user", "content": state.task_description}]},
-            config,
-        )
-        result = future.result(timeout=DECOMPOSITION_TIMEOUT_S)
-        pool.shutdown(wait=False)
+    # §12 finding #15: retry the decomposer up to MAX_DECOMPOSITION_ATTEMPTS
+    # times on timeout / exception / empty structured response before giving
+    # up. Same 3-strike pattern as verification_node (finding #14). Each
+    # attempt uses a fresh ThreadPoolExecutor and the full
+    # DECOMPOSITION_TIMEOUT_S budget. The pool is manually managed so we can
+    # shutdown(wait=False) on timeout — the context-manager form calls
+    # shutdown(wait=True) from __exit__, which blocks until the thread
+    # finishes even after TimeoutError is raised.
+    for attempt in range(1, MAX_DECOMPOSITION_ATTEMPTS + 1):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = pool.submit(
+                agent.invoke,
+                {"messages": [{"role": "user", "content": state.task_description}]},
+                config,
+            )
+            result = future.result(timeout=DECOMPOSITION_TIMEOUT_S)
+            pool.shutdown(wait=False)
 
-        structured: DecompositionResult | None = result.get("structured_response")
+            structured: DecompositionResult | None = result.get("structured_response")
 
-        if structured is not None:
-            for item in structured.subtasks:
-                subtasks.append(
-                    SubTask(
-                        description=item.description,
-                        required_capabilities=item.required_capabilities,
-                        depends_on=item.depends_on,
-                        output_schema=item.output_schema,
-                        requires_upstream_keys=item.requires_upstream_keys,
+            if structured is not None and structured.subtasks:
+                for item in structured.subtasks:
+                    subtasks.append(
+                        SubTask(
+                            description=item.description,
+                            required_capabilities=item.required_capabilities,
+                            depends_on=item.depends_on,
+                            output_schema=item.output_schema,
+                            requires_upstream_keys=item.requires_upstream_keys,
+                        )
                     )
+                    required_caps.extend(item.required_capabilities)
+                # Success — break out of retry loop.
+                break
+
+            # Successful invocation but no structured_response or empty
+            # subtasks — treat as retryable.
+            if structured is None:
+                logger.warning(
+                    "DecompositionAgent attempt %d/%d: no structured_response",
+                    attempt, MAX_DECOMPOSITION_ATTEMPTS,
                 )
-                required_caps.extend(item.required_capabilities)
-            if not subtasks:
                 errors.append(
-                    "Decomposition agent returned 0 subtasks; treating whole task as one capability"
+                    f"Decomposition attempt {attempt}/{MAX_DECOMPOSITION_ATTEMPTS}: "
+                    "no structured response"
                 )
-                logger.warning("DecompositionAgent: structured response contained 0 subtasks")
+                emit_langfuse_event(
+                    langfuse_handler,
+                    "decomposition.no_structured_response",
+                    "WARNING",
+                    {
+                        "attempt": attempt,
+                        "task_description": state.task_description[:200],
+                    },
+                )
+            else:
+                logger.warning(
+                    "DecompositionAgent attempt %d/%d: 0 subtasks",
+                    attempt, MAX_DECOMPOSITION_ATTEMPTS,
+                )
+                errors.append(
+                    f"Decomposition attempt {attempt}/{MAX_DECOMPOSITION_ATTEMPTS}: "
+                    "empty subtask list"
+                )
                 emit_langfuse_event(
                     langfuse_handler,
                     "decomposition.empty_subtasks",
                     "WARNING",
-                    {"task_description": state.task_description[:200]},
+                    {
+                        "attempt": attempt,
+                        "task_description": state.task_description[:200],
+                    },
                 )
-        else:
-            errors.append("Decomposition agent returned no structured response")
-            logger.warning("DecompositionAgent: no structured_response in result")
+
+        except concurrent.futures.TimeoutError:
+            pool.shutdown(wait=False)
+            errors.append(
+                f"Decomposition attempt {attempt}/{MAX_DECOMPOSITION_ATTEMPTS}: "
+                f"timed out after {DECOMPOSITION_TIMEOUT_S}s"
+            )
+            logger.error(
+                "DecompositionAgent attempt %d/%d: timed out after %ds",
+                attempt, MAX_DECOMPOSITION_ATTEMPTS, DECOMPOSITION_TIMEOUT_S,
+            )
             emit_langfuse_event(
                 langfuse_handler,
-                "decomposition.no_structured_response",
-                "WARNING",
-                {"task_description": state.task_description[:200]},
+                "decomposition.timeout",
+                "ERROR",
+                {"attempt": attempt, "timeout_s": DECOMPOSITION_TIMEOUT_S},
             )
-
-    except concurrent.futures.TimeoutError:
-        pool.shutdown(wait=False)
-        errors.append(f"Decomposition agent timed out after {DECOMPOSITION_TIMEOUT_S}s")
-        logger.error("DecompositionAgent: timed out after %ds", DECOMPOSITION_TIMEOUT_S)
-        emit_langfuse_event(
-            langfuse_handler,
-            "decomposition.timeout",
-            "ERROR",
-            {"timeout_s": DECOMPOSITION_TIMEOUT_S},
-        )
-    except Exception as exc:  # noqa: BLE001
-        pool.shutdown(wait=False)
-        errors.append(f"Decomposition agent error: {exc}")
-        logger.exception("DecompositionAgent: unexpected error")
-        emit_langfuse_event(
-            langfuse_handler,
-            "decomposition.error",
-            "ERROR",
-            {"error": str(exc)},
-        )
+        except Exception as exc:  # noqa: BLE001
+            pool.shutdown(wait=False)
+            errors.append(
+                f"Decomposition attempt {attempt}/{MAX_DECOMPOSITION_ATTEMPTS}: "
+                f"error: {exc}"
+            )
+            logger.exception(
+                "DecompositionAgent attempt %d/%d: unexpected error",
+                attempt, MAX_DECOMPOSITION_ATTEMPTS,
+            )
+            emit_langfuse_event(
+                langfuse_handler,
+                "decomposition.error",
+                "ERROR",
+                {"attempt": attempt, "error": str(exc)},
+            )
 
     # Deduplicate required_caps while preserving insertion order.
     # Multiple subtasks may reference the same capability; searching/classifying
@@ -588,21 +634,21 @@ def decomposition_node(
         )
         required_caps = required_caps[:MAX_CAPS_HARD]
 
-    # Fallback: if no subtasks were produced, use the first sentence of the task
-    # description as a capability query (the full description is too long for
-    # effective semantic search in the registry).
-    #
-    # Sticky-failure flag: if we reach this branch, decomposition effectively
-    # failed — the pipeline will continue running through the fallback path so
-    # the user sees whatever partial output is achievable, but the terminal CLI
-    # display and the evaluation harness's success classifier MUST classify the
-    # run as failed. We carry this as a dedicated boolean on TaskState because
-    # `status` is transitioned forward by every downstream node and cannot
-    # carry a sticky signal. See docs/perf_fixes_2026_04_14.md §2b.
+    # §12 finding #15 (2026-04-16): if no subtasks were produced after
+    # MAX_DECOMPOSITION_ATTEMPTS retries, FAIL CLOSED per the proposal's
+    # Pillar 1.1 contract ("An orchestrator agent breaks the input task
+    # into subtasks"). Previously this branch ran a single-sentence
+    # fallback ("first sentence as capability query") that degraded
+    # silently into a Pillar-1-incompatible single-gap pipeline. The
+    # fallback was engineering-pragma UX, not proposal-aligned. Under the
+    # new contract: empty subtasks + empty required_caps means the
+    # downstream pipeline sees no work to do, reaches a terminal state
+    # cleanly via the never-raises contract, and the sticky
+    # decomposition_succeeded=False flag surfaces the failure at the
+    # CLI (exit 2) or the evaluation harness (failure_reason=
+    # generation_failed with decomposition-fail distinction). No silent
+    # degraded output.
     decomposition_succeeded = bool(subtasks)
-    if not subtasks:
-        first_sentence = state.task_description.split(".")[0].strip()
-        required_caps = [first_sentence[:200] if first_sentence else state.task_description[:200]]
 
     # Chain coherence validation (Phase 2 Step 14). Only meaningful when we
     # have a real multi-subtask decomposition to validate. Walks the DAG and

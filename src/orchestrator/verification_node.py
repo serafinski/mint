@@ -10,12 +10,26 @@ On each call the node:
 
 1. Runs ``gate_fn`` against every artifact in ``state.generated_artifacts``.
 2. Increments ``attempt_count``.
-3. If all pass (or attempts are exhausted): routes to ``loading_node``.
-   Exhausted retries fail open — the pipeline always reaches a terminal state.
-4. If some fail and retries remain: removes the failed artifacts from state
-   and routes back to ``generate_mcp_tool``.  The generators re-run all
-   classified gaps; the replace-by-name logic in each generator ensures that
-   re-generated artifacts overwrite the old versions rather than accumulating.
+3. If all pass: routes to ``loading_node`` with every artifact kept.
+4. If some fail and retries remain (``attempt_count < MAX_ATTEMPTS``):
+   removes the failed artifacts from state and routes back to
+   ``generate_mcp_tool``.  The generators re-run all classified gaps; the
+   replace-by-name logic in each generator ensures that re-generated
+   artifacts overwrite the old versions rather than accumulating.
+5. If attempts are exhausted AND some artifacts still fail (**§12 finding
+   #14, 2026-04-16**): the node FAILS CLOSED per the proposal's Pillar 2
+   contract (*"Only verified capabilities enter production"*).
+   Concretely: failed artifacts are DROPPED from ``generated_artifacts``
+   so they never register; the sticky flag
+   ``state.verification_succeeded`` is set to ``False``; routing still
+   proceeds to ``loading_node`` (which registers only the remaining
+   passed artifacts) and then through the rest of the pipeline, but the
+   CLI runner and evaluation harness both detect the sticky flag at
+   terminal state and classify the run as VERIFICATION_FAILED with a
+   clear error. This replaces the pre-2026-04-16 fail-open behavior
+   (unverified artifacts kept + executed with warnings), which was a
+   latent drift from the proposal — see master plan §12 finding #14 for
+   the full audit trail.
 
 **No-verification baseline:** ``gate_fn=None`` uses ``_stub_gate``, which
 always returns a passing ``VerificationReport``.  The real ``gate.verify``
@@ -179,37 +193,52 @@ def verification_node(
                         )
 
     all_passed = len(failed_artifacts) == 0
+    verification_succeeded = state.verification_succeeded
 
-    if all_passed or new_attempt_count >= MAX_ATTEMPTS:
+    if all_passed:
+        # Happy path — every artifact passed. Route to loading_node with
+        # all artifacts preserved.
         goto: str = "loading_node"
-        # Fail open: keep all artifacts including failures when out of retries.
         artifacts_to_keep = list(state.generated_artifacts)
-        if not all_passed:
-            logger.warning(
-                "Verification failed for %d artifact(s) after %d attempt(s) — failing open: %s",
-                len(failed_artifacts),
-                new_attempt_count,
-                [a.capability_name for a in failed_artifacts],
-            )
-            emit_langfuse_event(
-                state.trace_id,
-                "verification.fail_open",
-                "WARNING",
-                {
-                    "attempt_count": new_attempt_count,
-                    "failed": [a.capability_name for a in failed_artifacts],
-                },
-            )
-            errors.append(
-                f"Verification failed after {new_attempt_count} attempt(s), failing open: "
-                + ", ".join(a.capability_name for a in failed_artifacts)
-            )
-        else:
-            logger.info(
-                "All %d artifact(s) passed verification (attempt %d)",
-                len(passed_artifacts),
-                new_attempt_count,
-            )
+        logger.info(
+            "All %d artifact(s) passed verification (attempt %d)",
+            len(passed_artifacts),
+            new_attempt_count,
+        )
+    elif new_attempt_count >= MAX_ATTEMPTS:
+        # §12 finding #14 (2026-04-16): FAIL CLOSED per the proposal's
+        # Pillar 2 contract. Drop the failed artifacts (they never
+        # register) and set the sticky verification_succeeded=False flag
+        # so the CLI runner / evaluation harness classify the run as
+        # verification_failed. Still route to loading_node so any
+        # passed-sibling artifacts register normally, and so the pipeline
+        # reaches a terminal state (never-raises contract preserved).
+        goto = "loading_node"
+        artifacts_to_keep = passed_artifacts
+        verification_succeeded = False
+        logger.warning(
+            "Verification failed for %d artifact(s) after %d attempt(s) — "
+            "failing CLOSED per proposal Pillar 2 (§12 finding #14). "
+            "Dropping failed artifacts: %s",
+            len(failed_artifacts),
+            new_attempt_count,
+            [a.capability_name for a in failed_artifacts],
+        )
+        emit_langfuse_event(
+            state.trace_id,
+            "verification.fail_closed",
+            "ERROR",
+            {
+                "attempt_count": new_attempt_count,
+                "failed": [a.capability_name for a in failed_artifacts],
+            },
+        )
+        errors.append(
+            f"Verification failed after {new_attempt_count} attempt(s); "
+            "task classified as VERIFICATION_FAILED per Pillar 2 contract. "
+            "Failed artifacts dropped from registry: "
+            + ", ".join(a.capability_name for a in failed_artifacts)
+        )
     else:
         # Some artifacts failed; retry with only the passing ones.
         # Generators re-run all classified_gaps but replace by capability_name,
@@ -230,6 +259,7 @@ def verification_node(
             "verification_results": list(state.verification_results) + new_reports,
             "attempt_count": new_attempt_count,
             "status": TaskStatus.VERIFYING,
+            "verification_succeeded": verification_succeeded,
             "errors": errors,
         },
         goto=goto,

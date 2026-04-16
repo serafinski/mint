@@ -163,6 +163,10 @@ def test_failed_artifacts_removed_on_retry():
 
 
 def test_max_attempts_routes_to_loading_node():
+    """Terminal state on exhaustion: still routes to loading_node (never-raises contract),
+    but the sticky verification_succeeded flag flips to False so downstream layers
+    classify the run as VERIFICATION_FAILED (§12 finding #14).
+    """
     state = TaskState(
         task_description="t",
         generated_artifacts=[_artifact("bad")],
@@ -173,8 +177,11 @@ def test_max_attempts_routes_to_loading_node():
     assert cmd.goto == "loading_node"
 
 
-def test_max_attempts_keeps_all_artifacts():
-    """Fail open: failed artifacts are kept so loading_node can still attempt to load them."""
+def test_max_attempts_drops_failed_artifacts():
+    """§12 finding #14: fail-closed — failed artifacts MUST be dropped so they
+    never register in production, per the proposal's Pillar 2 contract
+    ('Only verified capabilities enter production'). Passed siblings stay.
+    """
     state = TaskState(
         task_description="t",
         generated_artifacts=[_artifact("good"), _artifact("bad")],
@@ -184,10 +191,13 @@ def test_max_attempts_keeps_all_artifacts():
 
     names = [a.capability_name for a in cmd.update["generated_artifacts"]]
     assert "good" in names
-    assert "bad" in names
+    assert "bad" not in names  # dropped on fail-closed
 
 
-def test_max_attempts_records_fail_open_error():
+def test_max_attempts_sets_sticky_fail_flag():
+    """§12 finding #14: sticky verification_succeeded flag flips to False
+    so CLI runner + harness classify the task as VERIFICATION_FAILED.
+    """
     state = TaskState(
         task_description="t",
         generated_artifacts=[_artifact("bad")],
@@ -195,7 +205,66 @@ def test_max_attempts_records_fail_open_error():
     )
     cmd = verification_node(state, gate_fn=_gate_failing_for("bad"))
 
-    assert any("failing open" in e.lower() or "fail open" in e.lower() for e in cmd.update["errors"])
+    assert cmd.update["verification_succeeded"] is False
+
+
+def test_max_attempts_all_pass_keeps_sticky_flag_true():
+    """Happy path at MAX_ATTEMPTS: all passed, verification_succeeded stays True,
+    failed artifacts list is empty, all artifacts kept.
+    """
+    state = TaskState(
+        task_description="t",
+        generated_artifacts=[_artifact("good1"), _artifact("good2")],
+        attempt_count=MAX_ATTEMPTS - 1,
+    )
+
+    def _pass_all(artifact):
+        from src.schemas.verification import VerificationReport
+
+        return VerificationReport(
+            capability_name=artifact.capability_name,
+            findings=[],
+            overall_passed=True,
+            tier_reached=3,
+        )
+
+    cmd = verification_node(state, gate_fn=_pass_all)
+
+    assert cmd.goto == "loading_node"
+    names = [a.capability_name for a in cmd.update["generated_artifacts"]]
+    assert set(names) == {"good1", "good2"}
+    assert cmd.update["verification_succeeded"] is True
+
+
+def test_max_attempts_records_fail_closed_error():
+    """Errors list should carry a VERIFICATION_FAILED marker that the CLI
+    runner and eval harness can surface.
+    """
+    state = TaskState(
+        task_description="t",
+        generated_artifacts=[_artifact("bad")],
+        attempt_count=MAX_ATTEMPTS - 1,
+    )
+    cmd = verification_node(state, gate_fn=_gate_failing_for("bad"))
+
+    assert any(
+        "VERIFICATION_FAILED" in e or "Pillar 2 contract" in e
+        for e in cmd.update["errors"]
+    )
+
+
+def test_retry_below_max_does_not_flip_sticky_flag():
+    """Below MAX_ATTEMPTS: retry path, sticky flag stays True until exhaustion."""
+    state = TaskState(
+        task_description="t",
+        generated_artifacts=[_artifact("bad")],
+        attempt_count=0,  # first failure, retries remain
+    )
+    cmd = verification_node(state, gate_fn=_gate_failing_for("bad"))
+
+    assert cmd.goto == "generate_mcp_tool"
+    # verification_succeeded is NOT flipped mid-retry; only on exhaustion.
+    assert cmd.update["verification_succeeded"] is True
 
 
 # ---------------------------------------------------------------------------

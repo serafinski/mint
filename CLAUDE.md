@@ -206,6 +206,16 @@ The gate uses fail-fast tiering to avoid wasting tokens:
 
 **Tier 1 scans Python source wherever it appears.** `static_scanner.scan()` runs AST + regex only on MCP_TOOL Python (prose-based SKILL/AGENT content false-flagged on words like "mock" and "placeholder" — T04 reproducer, 2026-04-08). However, `gate.py _static_scan()` wraps the scanner with a **layered code-fence extractor** (`_extract_python_fences`): for SKILL and AGENT artifacts, every ```python ... ``` block inside `skill_content` / `system_prompt` / embedded `skill_content` is extracted and fed back through the full MCP_TOOL AST + regex scan. Only the prose around code is skipped. Full methodology note in `docs/proposal_vs_implementation_v2.md`.
 
+**Three-layer strict-gate pattern (§12 findings #14, #15, #16, 2026-04-16).** Every proposal-critical LLM-dependent stage follows a uniform retry + sticky-flag + dedicated exit code pattern. No silent fallback paths anywhere in the pipeline:
+
+| Layer | Code | Sticky flag | Max attempts | CLI exit |
+|---|---|---|---|---|
+| Pillar 1.1 decomposition | `src/orchestrator/decomposition.py` | `decomposition_succeeded` | `MAX_DECOMPOSITION_ATTEMPTS=3` | 2 |
+| Pillar 1.3 classification | `src/orchestrator/classifier.py::classify_gap` | `classification_succeeded` | `MAX_CLASSIFICATION_ATTEMPTS=3` | 5 |
+| Pillar 2 verification | `src/orchestrator/verification_node.py` | `verification_succeeded` | `MAX_ATTEMPTS=3` | 4 |
+
+Each stage retries the LLM call up to N times. On exhaustion: flip the sticky flag, emit an ERROR-level LangFuse event, drop any partially-produced artifacts from state, allow the pipeline to continue to terminal state via the never-raises contract. The CLI runner detects the sticky flag and exits with a dedicated code so failure reasons are layer-specific. Pre-fix behaviour (single-attempt + silent fallback at decomposition; single-attempt + MCP_TOOL default at classification; 3x retry + fail-open at verification) let unverified / mis-classified / degraded artifacts through production — all three corrected to proposal-strict semantics. See master plan §12 findings #14/#15/#16 for full audit trails.
+
 ### Pillar 3: Type-Scoped Operations
 
 | Operation | MCP Tools | Skills | Agents |

@@ -143,8 +143,15 @@ class TestDecompositionNode:
 
         assert set(cmd.update["required_capabilities"]) == {"cap-a", "cap-b", "cap-c"}
 
-    def test_no_structured_response_falls_back_to_task_description(self, state):
-        """If structured_response is None, falls back to whole task as one capability."""
+    def test_no_structured_response_fails_closed_after_retries(self, state):
+        """§12 finding #15: 3x retries with None structured_response → fail-closed.
+
+        No single-sentence fallback; decomposition_succeeded=False flips so
+        the CLI exits with code 2 and the eval harness classifies this as
+        a generation_failed run.
+        """
+        from src.orchestrator.decomposition import MAX_DECOMPOSITION_ATTEMPTS
+
         mock_tpe, _ = _make_mock_pool({"structured_response": None})
 
         with patch("src.orchestrator.decomposition._get_agent"):
@@ -152,12 +159,24 @@ class TestDecompositionNode:
                 cmd = decomposition_node(state)
 
         assert cmd.update["subtasks"] == []
-        assert cmd.update["required_capabilities"] == [state.task_description]
+        assert cmd.update["required_capabilities"] == []  # no fallback
+        assert cmd.update["decomposition_succeeded"] is False
         errors = cmd.update["errors"]
-        assert any("no structured response" in e.lower() for e in errors)
+        # One "no structured response" error per attempt.
+        no_resp_errs = [e for e in errors if "no structured response" in e.lower()]
+        assert len(no_resp_errs) == MAX_DECOMPOSITION_ATTEMPTS
 
-    def test_timeout_falls_back_and_records_error(self, state):
-        """TimeoutError from the agent is caught and recorded in errors."""
+    def test_timeout_fails_closed_after_retries(self, state):
+        """§12 finding #15: TimeoutError on all attempts → fail-closed.
+
+        Under the new retry + fail-closed contract (MAX_DECOMPOSITION_ATTEMPTS=3):
+        - Every attempt times out → errors list has 3 timeout entries
+        - No single-sentence fallback (required_capabilities stays empty)
+        - decomposition_succeeded=False sticky flag flips
+        - CLI detects the flag and exits with code 2
+        """
+        from src.orchestrator.decomposition import MAX_DECOMPOSITION_ATTEMPTS
+
         mock_tpe, _ = _make_mock_pool(
             future_raises=concurrent.futures.TimeoutError()
         )
@@ -167,12 +186,19 @@ class TestDecompositionNode:
                 cmd = decomposition_node(state)
 
         assert cmd.update["subtasks"] == []
-        assert cmd.update["required_capabilities"] == [state.task_description]
+        # No fallback — required_capabilities stays empty instead of
+        # degrading to the single-sentence path.
+        assert cmd.update["required_capabilities"] == []
+        assert cmd.update["decomposition_succeeded"] is False
         errors = cmd.update["errors"]
-        assert any("timed out" in e.lower() for e in errors)
+        # One "timed out" error per attempt.
+        timeout_errs = [e for e in errors if "timed out" in e.lower()]
+        assert len(timeout_errs) == MAX_DECOMPOSITION_ATTEMPTS
 
-    def test_arbitrary_exception_falls_back_and_records_error(self, state):
-        """Any unexpected exception is caught and recorded in errors."""
+    def test_arbitrary_exception_fails_closed_after_retries(self, state):
+        """§12 finding #15: Exception on all attempts → fail-closed."""
+        from src.orchestrator.decomposition import MAX_DECOMPOSITION_ATTEMPTS
+
         mock_tpe, _ = _make_mock_pool(
             future_raises=RuntimeError("Connection refused")
         )
@@ -182,9 +208,12 @@ class TestDecompositionNode:
                 cmd = decomposition_node(state)
 
         assert cmd.update["subtasks"] == []
-        assert cmd.update["required_capabilities"] == [state.task_description]
+        assert cmd.update["required_capabilities"] == []  # no fallback
+        assert cmd.update["decomposition_succeeded"] is False
         errors = cmd.update["errors"]
-        assert any("Connection refused" in e for e in errors)
+        # One "Connection refused" per attempt.
+        match_errs = [e for e in errors if "Connection refused" in e]
+        assert len(match_errs) == MAX_DECOMPOSITION_ATTEMPTS
 
     def test_status_always_decomposing(self, state):
         """Status is DECOMPOSING regardless of success or failure."""
@@ -226,14 +255,16 @@ class TestDecompositionNode:
         assert "pre-existing error" in errors
         assert any("new error" in e for e in errors)
 
-    def test_empty_subtasks_list_falls_back_and_records_error(self, state):
-        """Agent returns DecompositionResult with 0 subtasks → fallback + error recorded.
+    def test_empty_subtasks_list_fails_closed_after_retries(self, state):
+        """§12 finding #15: 0 subtasks on every attempt → fail-closed.
 
-        Unlike structured_response=None (no response at all), a valid response with
-        an empty subtasks list is a distinct failure mode — the agent succeeded
-        structurally but produced no useful output.  An error must be recorded so
-        operators can observe this in state.errors and in LangFuse.
+        A valid structured response with an empty subtasks list is treated
+        as a retryable failure. After MAX_DECOMPOSITION_ATTEMPTS consecutive
+        empty responses, the node fails closed with no single-sentence
+        fallback.
         """
+        from src.orchestrator.decomposition import MAX_DECOMPOSITION_ATTEMPTS
+
         structured = DecompositionResult(subtasks=[], reasoning="Task seems trivial")
         mock_tpe, _ = _make_mock_pool({"structured_response": structured})
 
@@ -242,9 +273,12 @@ class TestDecompositionNode:
                 cmd = decomposition_node(state)
 
         assert cmd.update["subtasks"] == []
-        assert cmd.update["required_capabilities"] == [state.task_description]
+        assert cmd.update["required_capabilities"] == []  # no fallback
+        assert cmd.update["decomposition_succeeded"] is False
         errors = cmd.update["errors"]
-        assert any("0 subtasks" in e for e in errors)
+        # One "empty subtask list" error per attempt.
+        empty_errs = [e for e in errors if "empty subtask list" in e]
+        assert len(empty_errs) == MAX_DECOMPOSITION_ATTEMPTS
 
     # ------------------------------------------------------------------
     # Sticky decomposition_succeeded flag (Fix 2b)

@@ -567,55 +567,66 @@ class TestClassifierNode:
         for item in cmd.update["classified_gaps"]:
             assert isinstance(item, ClassifiedGap)
 
-    def test_fallback_classification_added_to_errors(self):
-        """When classify_gap returns a fallback result, node records it in state.errors."""
+    def test_classification_failure_sets_sticky_flag(self):
+        """§12 finding #16: classify_gap returns None on exhaustion →
+        classifier_node flips classification_succeeded=False and records a
+        CLASSIFICATION_FAILED error marker. No silent MCP_TOOL default.
+        """
         state = TaskState(
             task_description="Parse CSV",
             required_capabilities=["parse-csv"],
             gaps=[GapItem(description="parse-csv", query="parse-csv")],
         )
 
-        fallback = ClassifiedGap(
-            description="parse-csv",
-            query="parse-csv-abcdef",
-            classified_type=CapabilityType.MCP_TOOL,
-            confidence=0.3,
-            rationale="LLM classification failed (API error); defaulting to MCP_TOOL",
-        )
-
         with patch(
             "src.orchestrator.classifier.classify_gap",
-            return_value=fallback,
+            return_value=None,  # None = all retries exhausted per finding #16
         ):
             cmd = classifier_node(state)
 
-        assert len(cmd.update.get("errors", [])) == 1
-        assert "Classification fallback" in cmd.update["errors"][0]
+        # No silent MCP_TOOL classification inserted.
+        assert cmd.update["classified_gaps"] == []
+        # Sticky flag flipped.
+        assert cmd.update["classification_succeeded"] is False
+        # Error marker present.
+        errors = cmd.update.get("errors", [])
+        assert any(
+            "CLASSIFICATION_FAILED" in e or "Classification failed for gap" in e
+            for e in errors
+        )
 
-    def test_fallback_classification_still_produces_classified_gap(self):
-        """A fallback classification is still included in classified_gaps."""
+    def test_partial_classification_failure_flips_sticky_flag(self):
+        """Mixed outcome: one gap classifies successfully, one fails retries.
+        Sticky flag still flips — any classification failure fails the task.
+        """
         state = TaskState(
-            task_description="Parse CSV",
-            required_capabilities=["parse-csv"],
-            gaps=[GapItem(description="parse-csv", query="parse-csv")],
+            task_description="Parse CSV and summarize",
+            required_capabilities=["parse-csv", "summarize"],
+            gaps=[
+                GapItem(description="parse-csv", query="parse-csv"),
+                GapItem(description="summarize", query="summarize"),
+            ],
         )
 
-        fallback = ClassifiedGap(
+        success = ClassifiedGap(
             description="parse-csv",
             query="parse-csv-abcdef",
             classified_type=CapabilityType.MCP_TOOL,
-            confidence=0.3,
-            rationale="LLM classification failed (API error); defaulting to MCP_TOOL",
+            confidence=0.95,
+            rationale="Deterministic CSV parsing",
         )
 
         with patch(
             "src.orchestrator.classifier.classify_gap",
-            return_value=fallback,
+            side_effect=[success, None],  # first ok, second fails all retries
         ):
             cmd = classifier_node(state)
 
+        # The successful one is still registered.
         assert len(cmd.update["classified_gaps"]) == 1
-        assert cmd.update["classified_gaps"][0].classified_type == CapabilityType.MCP_TOOL
+        assert cmd.update["classified_gaps"][0].query == "parse-csv-abcdef"
+        # Sticky flag flipped because ONE gap failed.
+        assert cmd.update["classification_succeeded"] is False
 
     def test_preserves_existing_errors(self):
         """classifier_node propagates pre-existing errors from state."""

@@ -95,7 +95,7 @@ if requested_format and not collected_files:
 
 > *"Option A (executor-level conversion) is the right fix. It's deterministic, fast, and doesn't depend on any LLM. The final JSON dict has all the data — converting `{"region_revenues": {"North": 19031.32, ...}}` to an Excel sheet with a 'Region' and 'Revenue' column is mechanical."*
 
-The concern with Option A that the original plan weighted too low: **it short-circuits Pillars 1-3 of the thesis proposal**. Executor-level synthesis is not a generated capability — it's not classified (Pillar 1.3), not generated (Pillar 1.4), not verified (Pillar 2), not registered (can't reuse), not eligible for Pillar 3 (split/merge/prune). Installing a parallel hardcoded-format codepath in the executor is the same drift pattern as the Tier 3 white-box/black-box drift in `perf_fixes_2026_04_14.md` §3e.
+The concern with Option A that the original plan weighted too low: **it short-circuits Pillars 1-3 of the thesis proposal**. Executor-level synthesis is not a generated capability — it's not classified (Pillar 1.3), not generated (Pillar 1.4), not verified (Pillar 2), not registered (can't reuse), not eligible for Pillar 3 (split/merge/prune). Installing a parallel hardcoded-format codepath in the executor is the same drift pattern as the Tier 3 capability-type coverage-gap drift in `perf_fixes_2026_04_14.md` §3e.
 
 **Option A was implemented first, then reverted in the same session.** The revert commit is part of the Option B landing commit. Option A's shipped code (synthesis helpers `_find_tabular`, `_synthesize_csv`, `_synthesize_xlsx`, `_synthesize_markdown`, `_synthesize_file_from_dict` + 18 unit tests + executor plumbing) was deleted; `output_contract` was dropped from `CompositionalExecutor.__init__`.
 

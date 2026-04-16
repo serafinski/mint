@@ -460,6 +460,40 @@ class TaskState(BaseModel):
             "behavior in that case."
         ),
     )
+    verification_succeeded: bool = Field(
+        default=True,
+        description=(
+            "Sticky flag set to False by verification_node when MAX_ATTEMPTS "
+            "retries are exhausted and at least one generated artifact still "
+            "fails the three-tier gate. Restores proposal-strict Pillar 2 "
+            "semantics (§12 finding #14): 'Only verified capabilities enter "
+            "production'. When False, failed artifacts are dropped from "
+            "generated_artifacts (so they never register) and the CLI "
+            "runner / evaluation harness classify the run as "
+            "VERIFICATION_FAILED rather than fall-through success. Same "
+            "sticky-flag pattern as decomposition_succeeded — carried "
+            "dedicated because the status enum transitions forward through "
+            "every downstream node and cannot preserve a rejection signal."
+        ),
+    )
+    classification_succeeded: bool = Field(
+        default=True,
+        description=(
+            "Sticky flag set to False by classifier_node when any gap fails "
+            "classification after MAX_CLASSIFICATION_ATTEMPTS retries (§12 "
+            "finding #16, 2026-04-16). Restores proposal-strict Pillar 1.3 "
+            "semantics: 'An MCP tool that should have been a skill will be "
+            "too rigid; a skill that should have been an agent will lack the "
+            "autonomy to handle state.' Previously a classification LLM "
+            "failure silently defaulted to MCP_TOOL with confidence=0.3, "
+            "which is exactly the type-mismatch failure mode the proposal "
+            "warns against. Under the new contract: 3x retry on exception; "
+            "final failure flips this sticky flag, surfaces a distinct CLI "
+            "exit code, and fails the task cleanly rather than shipping a "
+            "mis-classified artifact. Same sticky-flag pattern as "
+            "decomposition_succeeded and verification_succeeded."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 

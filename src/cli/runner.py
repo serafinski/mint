@@ -2079,6 +2079,64 @@ def execute_task(
             err_console.print(f"[dim]Errors: {'; '.join(_errs[:3])}[/dim]")
         return 2  # distinct from 1 (hard failure) and 0 (success)
 
+    # §12 finding #16 — proposal-strict Pillar 1.3 fail-closed.
+    # classifier_node sets this sticky flag to False when any gap fails
+    # classification after MAX_CLASSIFICATION_ATTEMPTS retries. No
+    # silent MCP_TOOL default.
+    classification_ok = _get_final("classification_succeeded", True)
+    if not classification_ok:
+        err_console.print(
+            "\n[bold red]✗ CLASSIFICATION FAILED — gap could not be typed[/bold red]"
+        )
+        err_console.print(
+            "[red]One or more capability gaps could not be classified as "
+            "MCP_TOOL / SKILL / AGENT after 3 attempts. Per Pillar 1.3 of the "
+            "thesis proposal, a mis-classified capability produces the wrong "
+            "artifact shape (e.g., 'an MCP tool that should have been a "
+            "skill will be too rigid'). The task is classified as "
+            "CLASSIFICATION_FAILED rather than defaulting to MCP_TOOL.[/red]"
+        )
+        _errs = _get_final("errors", []) or []
+        _class_errs = [
+            e for e in _errs if "Classification failed" in e or "CLASSIFICATION_FAILED" in e
+        ]
+        if _class_errs:
+            err_console.print(f"[dim]Last error: {_class_errs[-1]}[/dim]")
+        err_console.print(
+            "[dim]Run `mint retry --hint \"...\"` with guidance. Common "
+            "causes: rate limiting, model provider transient errors.[/dim]"
+        )
+        return 5  # distinct from 0/1/2/3/4
+
+    # §12 finding #14 — proposal-strict Pillar 2 fail-closed. The
+    # verification_node sets this sticky flag to False when MAX_ATTEMPTS
+    # retries exhaust with at least one artifact still failing the gate.
+    # The failed artifact is already dropped from generated_artifacts, so
+    # the chain likely either produced no output or skipped the failing
+    # step. Surface the failure explicitly rather than treating the
+    # fallthrough as success.
+    verification_ok = _get_final("verification_succeeded", True)
+    if not verification_ok:
+        err_console.print(
+            "\n[bold red]✗ VERIFICATION FAILED — no usable capability produced[/bold red]"
+        )
+        err_console.print(
+            "[red]The three-tier verification gate rejected the generated "
+            "capability on 3 consecutive attempts. Per Pillar 2 of the thesis "
+            "proposal ('Only verified capabilities enter production'), the "
+            "failed artifact was dropped from the registry and the task is "
+            "classified as VERIFICATION_FAILED.[/red]"
+        )
+        _errs = _get_final("errors", []) or []
+        _verify_errs = [e for e in _errs if "Verification failed" in e or "VERIFICATION_FAILED" in e]
+        if _verify_errs:
+            err_console.print(f"[dim]Last error: {_verify_errs[-1]}[/dim]")
+        err_console.print(
+            "[dim]Run `mint retry --hint \"...\"` with guidance on what "
+            "the generator keeps getting wrong.[/dim]"
+        )
+        return 4  # distinct from 0 / 1 / 2 / 3 — new exit code for verification-exhaustion
+
     # Step 14.6 — output contract check. Delegated to a small testable
     # helper so the exit-3 wiring can be exercised end-to-end without
     # standing up a live pipeline. Returns 3 if the check fires, None

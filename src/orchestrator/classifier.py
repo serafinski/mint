@@ -137,24 +137,34 @@ def _normalize_capability_name(name: str, task_description: str) -> str:
     return f"{cleaned}-{hash_suffix}"
 
 
+MAX_CLASSIFICATION_ATTEMPTS = 3
+
+
 def classify_gap(
     gap: GapItem,
     task_description: str,
     required_capabilities: list[str],
-) -> ClassifiedGap:
+) -> ClassifiedGap | None:
     """Classify a single gap within the context of the whole task.
 
     Uses a single LLM call at ``temperature=0`` with structured output.
-    Returns a ``ClassifiedGap`` whose ``description`` carries the gap's own
-    description and whose ``query`` is the LLM-chosen semantic name with a
-    collision-safe hash suffix.
+    Retries up to ``MAX_CLASSIFICATION_ATTEMPTS`` times on exception per
+    §12 finding #16 (2026-04-16). Returns a ``ClassifiedGap`` on success,
+    or **``None``** when all attempts fail.
 
-    On LLM failure, returns a fallback classification: ``MCP_TOOL`` with
-    confidence ``0.3`` and the marker ``"LLM classification failed"`` in the
-    rationale (so ``classifier_node`` can detect the fallback and surface it
-    on ``state.errors``). The fallback's ``query`` is a deterministic slug
-    derived from the gap query (not the task description) so multiple
-    failing gaps in the same task don't collide.
+    **Why None instead of a silent MCP_TOOL default.** Previous behavior
+    defaulted to ``classified_type=MCP_TOOL`` with ``confidence=0.3`` and
+    a ``"LLM classification failed"`` rationale marker. Per the thesis
+    proposal's Pillar 1.3 (*"An MCP tool that should have been a skill
+    will be too rigid; a skill that should have been an agent will lack
+    the autonomy to handle state"*), a silent default to any type
+    directly produces the type-mismatch failure mode the proposal warns
+    against. Classifier failure must propagate as failure, not mask as
+    a best-guess classification.
+
+    Callers (``classifier_node``) handle ``None`` by flipping the sticky
+    ``TaskState.classification_succeeded`` flag to ``False`` so CLI /
+    harness classify the task as CLASSIFICATION_FAILED.
 
     Args:
         gap: The single ``GapItem`` to classify (one step of the workflow).
@@ -189,41 +199,46 @@ def classify_gap(
     # retry gets the same suffix (idempotent re-generation).
     name_seed = f"{task_description}||{gap.query}"
 
-    try:
-        result: ClassificationResult = structured_llm.invoke(prompt)
-        capability_name = _normalize_capability_name(
-            result.capability_name, name_seed
-        )
-        return ClassifiedGap(
-            description=gap.description[:500] or gap.query,
-            query=gap.query,
-            classified_type=result.classified_type,
-            confidence=result.confidence,
-            rationale=result.rationale,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Gap classification LLM call failed for %r: %s", gap.query, exc
-        )
-        emit_langfuse_event(
-            None,
-            "classifier.llm_failure",
-            "ERROR",
-            {
-                "gap_query": gap.query,
-                "task_description": task_description[:200],
-                "error": str(exc),
-            },
-        )
-        # Fallback slug derived from the gap query (not the task), so that
-        # multiple failing gaps in the same task produce distinct slugs.
-        return ClassifiedGap(
-            description=gap.description[:500] or gap.query,
-            query=gap.query,
-            classified_type=CapabilityType.MCP_TOOL,
-            confidence=0.3,
-            rationale=f"LLM classification failed ({exc}); defaulting to MCP_TOOL",
-        )
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_CLASSIFICATION_ATTEMPTS + 1):
+        try:
+            result: ClassificationResult = structured_llm.invoke(prompt)
+            capability_name = _normalize_capability_name(
+                result.capability_name, name_seed
+            )
+            return ClassifiedGap(
+                description=gap.description[:500] or gap.query,
+                query=gap.query,
+                classified_type=result.classified_type,
+                confidence=result.confidence,
+                rationale=result.rationale,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.warning(
+                "Gap classification attempt %d/%d failed for %r: %s",
+                attempt, MAX_CLASSIFICATION_ATTEMPTS, gap.query, exc,
+            )
+            emit_langfuse_event(
+                None,
+                "classifier.llm_failure",
+                "WARNING" if attempt < MAX_CLASSIFICATION_ATTEMPTS else "ERROR",
+                {
+                    "attempt": attempt,
+                    "gap_query": gap.query,
+                    "task_description": task_description[:200],
+                    "error": str(exc),
+                },
+            )
+
+    # All retries exhausted — return None so classifier_node can set the
+    # sticky classification_succeeded=False flag. NO silent MCP_TOOL
+    # default (§12 finding #16).
+    logger.error(
+        "Gap classification failed after %d attempts for %r: last error: %s",
+        MAX_CLASSIFICATION_ATTEMPTS, gap.query, last_exc,
+    )
+    return None
 
 
 def classify_task(
@@ -410,7 +425,11 @@ def classifier_node(
     already_classified_descriptions = {cg.description for cg in classified_gaps}
 
     errors: list[str] = list(state.errors)
-    n_fallbacks = 0
+    # §12 finding #16: tracks whether any gap's classification failed all
+    # retries. Starts from prior state so retry invocations don't lose
+    # the signal set by an earlier pass.
+    classification_succeeded = state.classification_succeeded
+    failed_gaps: list[str] = []
 
     for gap in state.gaps:
         gap_desc_key = (gap.description[:500] or gap.query)
@@ -423,6 +442,28 @@ def classifier_node(
             task_description=state.task_description,
             required_capabilities=state.required_capabilities,
         )
+
+        if classified is None:
+            # §12 finding #16: classify_gap returns None when all
+            # MAX_CLASSIFICATION_ATTEMPTS retries failed. Do NOT default
+            # to MCP_TOOL — that was the pre-fix drift the finding
+            # addresses. Flip sticky flag; the failed gap is simply not
+            # added to classified_gaps, which starves its generator and
+            # produces a clean no-artifact-for-this-gap state.
+            classification_succeeded = False
+            failed_gaps.append(gap.query)
+            errors.append(
+                f"Classification failed for gap '{gap.query}' after "
+                f"{MAX_CLASSIFICATION_ATTEMPTS} attempts; task classified as "
+                "CLASSIFICATION_FAILED per Pillar 1.3 contract (no silent "
+                "MCP_TOOL default)."
+            )
+            logger.error(
+                "Classifier: gap '%s' failed after %d attempts — task will "
+                "be marked CLASSIFICATION_FAILED",
+                gap.query, MAX_CLASSIFICATION_ATTEMPTS,
+            )
+            continue
 
         logger.info(
             "  classified %s → %s (confidence=%.2f, name=%s)",
@@ -445,17 +486,22 @@ def classifier_node(
 
         classified_gaps.append(classified)
 
-        # Match the existing convention: "LLM classification failed" marker
-        # in rationale signals an LLM fallback — record as a warning error.
-        if "LLM classification failed" in classified.rationale:
-            errors.append(f"Classification fallback: {classified.rationale}")
-            n_fallbacks += 1
-
-    if n_fallbacks:
+    if failed_gaps:
         logger.warning(
-            "Classifier: %d/%d gap(s) fell back to MCP_TOOL due to LLM failure",
-            n_fallbacks,
+            "Classifier: %d/%d gap(s) failed classification after %d "
+            "attempts each — flipping classification_succeeded=False",
+            len(failed_gaps),
             len(state.gaps),
+            MAX_CLASSIFICATION_ATTEMPTS,
+        )
+        emit_langfuse_event(
+            None,
+            "classifier.fail_closed",
+            "ERROR",
+            {
+                "failed_gaps": failed_gaps,
+                "total_gaps": len(state.gaps),
+            },
         )
 
     # §12 finding #11: safety net for the classifier's parent-task bias.
@@ -475,6 +521,7 @@ def classifier_node(
         update={
             "classified_gaps": classified_gaps,
             "status": TaskStatus.CLASSIFYING,
+            "classification_succeeded": classification_succeeded,
             "errors": errors,
         },
         goto="generate_mcp_tool",
