@@ -182,3 +182,112 @@ class TestFailureBreakdown:
 
     def test_empty_returns_empty_dict(self, store):
         assert store.failure_breakdown("full") == {}
+
+
+class TestRecordInvocationEvents:
+    """Step 18.5: persistent per-capability invocation log for Gini analysis."""
+
+    def test_empty_events_is_zero_rows(self, store):
+        n = store.record_invocation_events(
+            run_id="r0", condition="full", task_id="T01", events=[],
+        )
+        assert n == 0
+        rows = store._conn.execute(
+            "SELECT COUNT(*) FROM invocation_events"
+        ).fetchone()
+        assert rows[0] == 0
+
+    def test_record_single_event(self, store):
+        n = store.record_invocation_events(
+            run_id="r1",
+            condition="full",
+            task_id="T01",
+            events=[{"capability_id": "csv-parser", "success": True}],
+        )
+        assert n == 1
+        rows = store._conn.execute(
+            "SELECT run_id, condition, task_id, capability_id, success, "
+            "token_cost, latency_ms FROM invocation_events"
+        ).fetchall()
+        assert len(rows) == 1
+        run_id, cond, task_id, cap_id, success, token_cost, latency_ms = rows[0]
+        assert run_id == "r1"
+        assert cond == "full"
+        assert task_id == "T01"
+        assert cap_id == "csv-parser"
+        assert success is True
+        assert token_cost == 0
+        assert latency_ms == 0
+
+    def test_record_multiple_events_with_fields(self, store):
+        events = [
+            {
+                "capability_id": "cap-a",
+                "capability_type": "mcp_tool",
+                "success": True,
+                "token_cost": 100,
+                "latency_ms": 50,
+            },
+            {
+                "capability_id": "cap-b",
+                "capability_type": "skill",
+                "success": False,
+                "token_cost": 250,
+                "latency_ms": 1200,
+            },
+        ]
+        n = store.record_invocation_events(
+            run_id="r2", condition="full", task_id="T04", events=events,
+        )
+        assert n == 2
+        rows = store._conn.execute(
+            "SELECT capability_id, capability_type, success, token_cost, latency_ms "
+            "FROM invocation_events ORDER BY capability_id"
+        ).fetchall()
+        assert rows[0] == ("cap-a", "mcp_tool", True, 100, 50)
+        assert rows[1] == ("cap-b", "skill", False, 250, 1200)
+
+    def test_events_keyed_by_run_condition_task(self, store):
+        # Same capability invoked across two conditions — rows distinguishable.
+        for cond in ("full", "no_verification"):
+            store.record_invocation_events(
+                run_id="r3",
+                condition=cond,
+                task_id="T01",
+                events=[{"capability_id": "csv-parser", "success": True}],
+            )
+        counts = store._conn.execute(
+            "SELECT condition, COUNT(*) FROM invocation_events GROUP BY condition ORDER BY condition"
+        ).fetchall()
+        assert counts == [("full", 1), ("no_verification", 1)]
+
+    def test_id_is_unique_per_row(self, store):
+        events = [
+            {"capability_id": "cap-a", "success": True},
+            {"capability_id": "cap-a", "success": True},  # same cap twice
+        ]
+        store.record_invocation_events(
+            run_id="r4", condition="full", task_id="T01", events=events,
+        )
+        ids = store._conn.execute(
+            "SELECT id FROM invocation_events"
+        ).fetchall()
+        assert len(ids) == 2
+        assert len({row[0] for row in ids}) == 2
+
+    def test_persists_across_reopen(self, tmp_path):
+        """Events written on one connection are readable on the next — proves
+        the on-disk persistence the harness relies on."""
+        db_path = str(tmp_path / "test.duckdb")
+        with EvaluationStore(db_path=db_path) as s1:
+            s1.record_invocation_events(
+                run_id="r5",
+                condition="full",
+                task_id="T01",
+                events=[{"capability_id": "csv-parser", "success": True}],
+            )
+        with EvaluationStore(db_path=db_path) as s2:
+            rows = s2._conn.execute(
+                "SELECT capability_id FROM invocation_events"
+            ).fetchall()
+            assert rows == [("csv-parser",)]

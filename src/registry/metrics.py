@@ -225,6 +225,36 @@ class MetricsStore:
         ).fetchone()
         return row[0] if row else 0
 
+    def fetch_invocations_for_task(self, task_id: str) -> list[dict]:
+        """Return all invocations recorded against a given task_id.
+
+        Used by the evaluation harness to flush per-task invocations to
+        the persistent EvaluationStore's ``invocation_events`` table
+        after each task's chain execution completes (Step 18.5 Gini
+        analysis pipeline). Each returned dict matches the shape
+        ``EvaluationStore.record_invocation_events`` expects.
+
+        Returns an empty list if no invocations exist for the task.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT capability_id, success, token_cost, latency_ms
+            FROM invocations
+            WHERE task_id = ?
+            ORDER BY invoked_at
+            """,
+            [task_id],
+        ).fetchall()
+        return [
+            {
+                "capability_id": row[0],
+                "success": bool(row[1]),
+                "token_cost": int(row[2] or 0),
+                "latency_ms": int(row[3] or 0),
+            }
+            for row in rows
+        ]
+
     def invocation_count_total(self) -> int:
         """Total invocations across all capabilities."""
         row = self._conn.execute("SELECT COUNT(*) FROM invocations").fetchone()

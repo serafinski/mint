@@ -69,6 +69,17 @@ class TaskDefinition:
     # copies this directly into TaskState.output_contract at task entry, and
     # the runner's terminal-state check set-compares against the actual output.
     output_contract: OutputContract = field(default_factory=OutputContract)
+    # Step 18.5 (2026-04-17): author-assigned ground-truth primary capability
+    # type for Pillar 1 RQ #1 classification-accuracy analysis. Must be one of
+    # "mcp_tool" / "skill" / "agent" OR None. None means "no ground-truth
+    # assignment" (registry-retrieval tasks like T01-T03 where the expected
+    # behavior is a registry match, not a fresh classification). The
+    # `print_classification_accuracy()` analyzer in scripts/analyze_results.py
+    # cross-tabs this against evaluation_runs.capability_type to produce a
+    # confusion matrix + per-type row/column accuracy. Assignments are
+    # judgment calls made by reading the task_prompt and identifying the
+    # "core work" type — see assignments per task definition below.
+    expected_type: Literal["mcp_tool", "skill", "agent"] | None = None
     is_pilot: bool = False
 
 
@@ -1184,6 +1195,57 @@ T20 = TaskDefinition(
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+
+# Step 18.5 (2026-04-17): author-assigned ground-truth primary capability type
+# per task for Pillar 1 RQ #1 classification-accuracy analysis. Assignments are
+# judgment calls based on each task's task_prompt and core-work shape:
+#
+# - MCP_TOOL: deterministic, stateless operation with a fixed input/output
+#   contract (parse, validate, compute, transform, deduplicate).
+# - SKILL: packaged procedural expertise driven by an external policy /
+#   rules / templates (reorder policy from YAML, budget policy from JSON,
+#   monitoring config, eligibility rules, multi-source workflow).
+# - AGENT: adaptive reasoning where the investigation path depends on
+#   intermediate findings (root-cause cascade diagnosis, fraud triage,
+#   iterative anomaly investigation, exploratory profiling).
+#
+# None of these assignments are secret — the classifier in
+# src/orchestrator/classifier.py sees the same task_prompt text and makes
+# its own decision at pipeline time. The analyzer just compares.
+_EXPECTED_TYPES: dict[str, str] = {
+    "T01": "mcp_tool",   # Parse CSV → row count + column names (deterministic)
+    "T02": "mcp_tool",   # Validate JSON against schema (deterministic)
+    "T03": "mcp_tool",   # Word count + Flesch readability (deterministic)
+    "T04": "skill",      # Inventory reorder policy from YAML rules (policy-driven)
+    "T05": "mcp_tool",   # Clean CSV nulls + duplicates (deterministic)
+    "T06": "mcp_tool",   # KNN imputation (algorithmic, deterministic)
+    "T07": "mcp_tool",   # Fuzzy join + CSV output (algorithmic)
+    "T08": "agent",      # Iterative data quality investigation (adaptive)
+    "T09": "mcp_tool",   # Structured report generation (deterministic)
+    "T10": "agent",      # Adaptive trend analysis: try, compare, select (adaptive)
+    "T11": "skill",      # Multi-source data integration workflow (packaged)
+    "T12": "skill",      # Data quality policy in JSON rules (policy-driven)
+    "T13": "agent",      # Iterative anomaly investigation (adaptive)
+    "T14": "skill",      # Budget allocation policy in JSON (policy-driven)
+    "T15": "skill",      # Config-driven monitoring policy (policy-driven)
+    "T16": "agent",      # Root cause diagnosis cascade (adaptive)
+    "T17": "agent",      # Fraud investigation cross-referencing (adaptive)
+    "T18": "mcp_tool",   # Deduplicate by hashing (deterministic)
+    "T19": "agent",      # Exploratory data analysis (adaptive)
+    "T20": "skill",      # Eligibility policy in JSON rules (policy-driven)
+}
+
+# Populate expected_type on each TaskDefinition. TaskDefinition is frozen
+# (immutability is a long-standing invariant for the testbed — we don't
+# want tasks mutating mid-eval), so this retrofit at import time uses
+# object.__setattr__ to bypass the __setattr__ guard. Equivalent to
+# inlining `expected_type=...` into each of the 20 T-task constructors,
+# but centralizes the ground-truth mapping in _EXPECTED_TYPES above.
+for _task in [
+    T01, T02, T03, T04, T05, T06, T07, T08, T09, T10,
+    T11, T12, T13, T14, T15, T16, T17, T18, T19, T20,
+]:
+    object.__setattr__(_task, "expected_type", _EXPECTED_TYPES[_task.task_id])
 
 ALL_TASKS: list[TaskDefinition] = [
     T01, T02, T03, T04, T05, T06, T07, T08, T09, T10,

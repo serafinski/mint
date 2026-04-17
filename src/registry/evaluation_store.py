@@ -53,6 +53,30 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     output_shape_missing_files VARCHAR NOT NULL DEFAULT '[]',
     timestamp                 TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Step 18.5 (2026-04-17): persistent per-capability invocation log keyed
+-- by (run_id, condition, task_id) for Chapter 6 Gini-coefficient analysis
+-- on capability reuse distribution (proposal §Metrics). MetricsStore is
+-- in-memory per _execute_run call (for optimizer accumulation within a
+-- single run); this table persists the flushed invocations to disk so
+-- analyze_results.py can compute per-(condition, run) and aggregate
+-- Gini over the full 400-record eval.
+CREATE TABLE IF NOT EXISTS invocation_events (
+    id                        VARCHAR PRIMARY KEY,
+    run_id                    VARCHAR NOT NULL,
+    condition                 VARCHAR NOT NULL,
+    task_id                   VARCHAR NOT NULL,
+    capability_id             VARCHAR NOT NULL,
+    capability_type           VARCHAR,
+    success                   BOOLEAN NOT NULL,
+    token_cost                INTEGER NOT NULL DEFAULT 0,
+    latency_ms                INTEGER NOT NULL DEFAULT 0,
+    occurred_at               TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_invocation_events_condition
+    ON invocation_events(condition);
+CREATE INDEX IF NOT EXISTS idx_invocation_events_cap
+    ON invocation_events(capability_id);
 """
 
 # Idempotent migrations for upgrading existing DBs to the Stage 1
@@ -159,6 +183,60 @@ class EvaluationStore:
             ],
         )
         return row_id
+
+    def record_invocation_events(
+        self,
+        *,
+        run_id: str,
+        condition: str,
+        task_id: str,
+        events: list[dict],
+    ) -> int:
+        """Persist a batch of capability invocation events for one task-run.
+
+        Each event is a dict with keys: ``capability_id`` (required, str),
+        ``capability_type`` (optional str), ``success`` (required bool),
+        ``token_cost`` (optional int), ``latency_ms`` (optional int).
+        All rows share the same ``run_id`` / ``condition`` / ``task_id``
+        context — that's the unit the harness flushes after each task's
+        chain execution completes.
+
+        Returns the number of rows inserted. Zero on empty ``events``.
+
+        This is the persistence layer for Step 18.5's Gini-coefficient
+        analysis (proposal §Metrics capability reuse distribution). The
+        in-memory MetricsStore the optimizer shares across tasks within
+        one ``_execute_run`` call is flushed here to disk so post-eval
+        analysis can compute per-(condition, run) and aggregate Gini
+        over the full 400-record eval.
+        """
+        if not events:
+            return 0
+        rows = []
+        now = datetime.now(UTC)
+        for ev in events:
+            rows.append([
+                uuid.uuid4().hex,
+                run_id,
+                condition,
+                task_id,
+                ev["capability_id"],
+                ev.get("capability_type"),
+                bool(ev["success"]),
+                int(ev.get("token_cost", 0) or 0),
+                int(ev.get("latency_ms", 0) or 0),
+                now,
+            ])
+        self._conn.executemany(
+            """
+            INSERT INTO invocation_events (
+                id, run_id, condition, task_id, capability_id,
+                capability_type, success, token_cost, latency_ms, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        return len(rows)
 
     # -- reading -------------------------------------------------------------
 

@@ -288,6 +288,27 @@ class EvaluationHarness:
             self._store.record_run(record)
             records.append(record)
 
+            # Step 18.5 (2026-04-17): persist per-task invocation events
+            # to the EvaluationStore's invocation_events table for Chapter
+            # 6 Gini analysis. MetricsStore is in-memory (shared across
+            # tasks within a run for optimizer accumulation); this flush
+            # copies only the invocations tagged with this task's task_id
+            # to disk, keyed by (run_id, condition, task_id). Never-raises
+            # — failure here must not break the eval loop.
+            try:
+                task_invocations = metrics_store.fetch_invocations_for_task(task.task_id)
+                self._store.record_invocation_events(
+                    run_id=run_id,
+                    condition=condition,
+                    task_id=task.task_id,
+                    events=task_invocations,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to flush invocation_events for task %s: %s",
+                    task.task_id, exc,
+                )
+
         return records
 
     def _run_one_task(

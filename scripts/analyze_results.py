@@ -475,6 +475,289 @@ def print_token_cost_summary(conn: duckdb.DuckDBPyConnection) -> None:
         print(line)
 
 
+def _gini_coefficient(counts: list[int]) -> float:
+    """Compute the Gini coefficient for a list of non-negative counts.
+
+    Gini is a measure of inequality in [0, 1]:
+    - 0 = perfect equality (every capability invoked the same number of times)
+    - 1 = maximum inequality (one capability gets all invocations)
+
+    Proposal §Metrics: *"Capability reuse distribution | Gini coefficient of
+    invocation counts across the registry. Healthy registries have moderate
+    inequality; unhealthy ones have extreme skew."*
+
+    Uses the standard formula: Gini = sum(|x_i - x_j|) / (2 * n^2 * mean).
+    Returns 0.0 for empty lists or all-zeros (degenerate cases).
+    """
+    if not counts:
+        return 0.0
+    total = sum(counts)
+    n = len(counts)
+    if total == 0 or n == 0:
+        return 0.0
+    sorted_counts = sorted(counts)
+    # Efficient O(n log n) form: 2 * sum((i+1) * x_i) / (n * sum(x)) - (n+1)/n
+    cumulative = sum((i + 1) * x for i, x in enumerate(sorted_counts))
+    return (2.0 * cumulative) / (n * total) - (n + 1.0) / n
+
+
+def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
+    """Gini coefficient of capability invocation counts per condition.
+
+    Addresses proposal §Metrics item 3: *"Capability reuse distribution —
+    Gini coefficient of invocation counts across the registry. Healthy
+    registries have moderate inequality; unhealthy ones have extreme skew."*
+
+    Reads from the persistent ``invocation_events`` table (Step 18.5
+    harness wiring). Groups invocations by (condition, run_id) and
+    computes one Gini per run; reports mean + spread across the N runs
+    per condition. Also reports a condition-level aggregate Gini (all
+    invocations pooled).
+
+    Degenerate cases (empty counts, all zeros) → Gini 0.0. Conditions
+    with no invocation data skipped (happens if an old eval DB predates
+    Step 18.5 wiring).
+    """
+    # Check the table exists — old eval DBs won't have it.
+    try:
+        conn.execute("SELECT 1 FROM invocation_events LIMIT 1")
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n{'='*80}")
+        print("  Gini Coefficient of Capability Invocation Counts")
+        print(f"{'='*80}")
+        print(
+            f"  (skipped: invocation_events table not available — {exc.__class__.__name__}. "
+            "Re-run the eval with Step 18.5 wiring to populate this.)"
+        )
+        return
+
+    # Per-condition, per-run Gini
+    per_run_rows = conn.execute(
+        """
+        SELECT condition, run_id, capability_id, COUNT(*) AS invocations
+        FROM invocation_events
+        GROUP BY condition, run_id, capability_id
+        ORDER BY condition, run_id, capability_id
+        """
+    ).fetchall()
+
+    if not per_run_rows:
+        print(f"\n{'='*80}")
+        print("  Gini Coefficient of Capability Invocation Counts")
+        print(f"{'='*80}")
+        print("  (skipped: invocation_events table is empty)")
+        return
+
+    # Group by (condition, run_id) → list of counts
+    from collections import defaultdict
+    by_run: dict[tuple[str, str], list[int]] = defaultdict(list)
+    by_condition: dict[str, list[int]] = defaultdict(list)
+    for cond, run_id, _cap_id, inv_count in per_run_rows:
+        by_run[(cond, run_id)].append(int(inv_count))
+        by_condition[cond].append(int(inv_count))
+
+    # Compute per-run Ginis
+    condition_ginis: dict[str, list[float]] = defaultdict(list)
+    for (cond, _run_id), counts in by_run.items():
+        condition_ginis[cond].append(_gini_coefficient(counts))
+
+    print(f"\n{'='*80}")
+    print("  Gini Coefficient of Capability Invocation Counts (proposal §Metrics)")
+    print(f"{'='*80}")
+    print(
+        "  Per-condition summary: mean Gini across N independent runs,"
+        " plus the pooled aggregate"
+    )
+    print("  (all invocations across runs in that condition treated as one distribution).")
+    header = (
+        f"  {'Condition':<22} {'N runs':>8} {'Mean Gini':>10} "
+        f"{'Min':>7} {'Max':>7} {'Aggregate':>10}"
+    )
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for cond in CONDITIONS:
+        run_ginis = condition_ginis.get(cond, [])
+        if not run_ginis:
+            print(f"  {CONDITION_LABELS.get(cond, cond):<22} {'—':>8} {'—':>10} {'—':>7} {'—':>7} {'—':>10}")
+            continue
+        mean = sum(run_ginis) / len(run_ginis)
+        aggregate = _gini_coefficient(by_condition[cond])
+        label = CONDITION_LABELS.get(cond, cond)
+        print(
+            f"  {label:<22} {len(run_ginis):>8d} {mean:>10.3f} "
+            f"{min(run_ginis):>7.3f} {max(run_ginis):>7.3f} {aggregate:>10.3f}"
+        )
+
+    print(
+        "\n  Interpretation per proposal: mean Gini near 0 = every capability "
+        "invoked equally (\n  likely signals over-generation of narrow caps "
+        "that get used once); mean Gini\n  near 1 = extreme skew (a few caps "
+        "carry all traffic, others are dead weight). The\n  proposal's "
+        "\"healthy registry\" prediction is moderate values (~0.3-0.6)."
+    )
+
+
+def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> None:
+    """Core-Work Classification Accuracy — task-level primary-type match.
+
+    Operational proxy for proposal Pillar 1 RQ #1:
+        *"How accurately can an LLM classify capability gaps into the
+        three artifact types (MCP tool vs. Skill vs. Agent)?"*
+
+    **What we actually measure.** For each task, the pipeline's chain
+    can contain multiple gaps of potentially different types (e.g., T11
+    produces ``[mcp_tool, skill, mcp_tool]`` — a parse + a policy-driven
+    aggregation + a file-writer). ``evaluation_runs.capability_type`` is
+    the most-capable type in the chain (priority AGENT > SKILL > MCP_TOOL,
+    see ``harness.py:585``). We compare that primary type to the author-
+    assigned ``TaskDefinition.expected_type`` and compute:
+
+    - Per-condition hit rate (correct / total)
+    - 3×3 confusion matrix (expected row × primary-classified column)
+    - Per-expected-type row accuracy
+
+    **Why task-level primary-match, not literal per-gap accuracy.**
+
+    1. **Proposal's PURPOSE is correct routing.** §Pillar 1 claims the
+       classification prevents *"the common mistake of treating all
+       generated capabilities as the same kind of artifact. An MCP tool
+       that should have been a skill will be too rigid; a skill that
+       should have been an agent will lack the autonomy to handle
+       state."* The outcome that matters is: does the core-work land on
+       the right backend? Primary-match answers this directly.
+
+    2. **Per-gap ground truth isn't well-defined.** Gaps are decomposed
+       dynamically by the LLM — T11 might produce 3 or 4 gaps across
+       different runs. Authoring per-gap expected types would either
+       require a canonical decomposition (contradicts adaptive
+       decomposition) or rule-based expectations (which measures rule
+       compliance, not classifier judgment).
+
+    3. **Structural overrides would contaminate per-gap measurement.**
+       Per ``_enforce_file_writer_mcp_tool`` in ``classifier.py``, gaps
+       starting with ``write-`` are forced to MCP_TOOL when the task
+       has required_files. A per-gap metric would count these forced
+       decisions as "classifier correct", systematically inflating
+       accuracy. Primary-match sidesteps this: file-writer MCP_TOOLs
+       are less-capable than any SKILL/AGENT, so ``min(priority)``
+       ignores them.
+
+    4. **Proposal's natural granularity is per-task.** The four
+       baseline conditions × 5 runs × 20 tasks = 400 records; the
+       cross-baseline comparison that Chapter 6 hinges on is per-task.
+
+    **What we lose by not going per-gap:** classifier mistakes on
+    secondary/glue gaps (e.g., if the classifier mis-routed the join
+    step in T11 but got the primary SKILL right, primary-match sees
+    only the hit). Granularity concerns (one SKILL vs many SKILLs for
+    the same core work) are Pillar 3's domain — handled by Gini
+    coefficient, Split, and Merge operations. Not the classification
+    metric's job.
+
+    **Baseline scope.** Static baseline EXCLUDED — bypasses the
+    classifier entirely (direct registry lookup to the pre-written
+    implementation). The three JIT conditions (no_verification /
+    no_optimization / full) all exercise the classifier; their
+    aggregate is the Chapter 6 headline number.
+    """
+    # Import here to avoid circular-import friction at module load time.
+    try:
+        from tests.evaluation.tasks import ALL_TASKS
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n{'='*80}")
+        print("  Core-Work Classification Accuracy — task-level primary-type match")
+        print("  (operational proxy for Pillar 1 RQ #1; see docstring for framing)")
+        print(f"{'='*80}")
+        print(f"  (skipped: couldn't import ALL_TASKS — {exc.__class__.__name__})")
+        return
+
+    expected_map: dict[str, str | None] = {t.task_id: t.expected_type for t in ALL_TASKS}
+    scorable = {tid for tid, et in expected_map.items() if et is not None}
+    if not scorable:
+        print(f"\n{'='*80}")
+        print("  Core-Work Classification Accuracy — task-level primary-type match")
+        print("  (operational proxy for Pillar 1 RQ #1; see docstring for framing)")
+        print(f"{'='*80}")
+        print("  (skipped: no tasks have expected_type assigned)")
+        return
+
+    rows = conn.execute(
+        """
+        SELECT task_id, condition, capability_type
+        FROM evaluation_runs
+        WHERE is_pilot = FALSE AND condition != 'static'
+        """
+    ).fetchall()
+
+    if not rows:
+        print(f"\n{'='*80}")
+        print("  Core-Work Classification Accuracy — task-level primary-type match")
+        print("  (operational proxy for Pillar 1 RQ #1; see docstring for framing)")
+        print(f"{'='*80}")
+        print("  (skipped: no non-pilot JIT-condition rows in evaluation_runs)")
+        return
+
+    # Per-condition accuracy
+    from collections import defaultdict
+    per_condition = defaultdict(lambda: {"hit": 0, "total": 0})
+    confusion: dict[tuple[str, str], int] = defaultdict(int)
+    for task_id, cond, classified in rows:
+        if task_id not in scorable:
+            continue
+        expected = expected_map[task_id]
+        # Normalize classified_type — can be None if the pipeline didn't
+        # reach classification (e.g., decomposition failure).
+        classified_norm = (classified or "unclassified").lower()
+        per_condition[cond]["total"] += 1
+        if classified_norm == expected:
+            per_condition[cond]["hit"] += 1
+        confusion[(expected, classified_norm)] += 1
+
+    print(f"\n{'='*80}")
+    print("  Core-Work Classification Accuracy — task-level primary-type match")
+    print("  (operational proxy for Pillar 1 RQ #1; see docstring for framing)")
+    print(f"{'='*80}")
+    print(
+        f"  Scorable tasks: {len(scorable)}/{len(expected_map)} "
+        f"(excludes tasks with expected_type=None). Classifier bypassed for"
+        " static baseline."
+    )
+    header = f"  {'Condition':<22} {'Hit / Total':>14} {'Accuracy':>10}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for cond in ["no_verification", "no_optimization", "full"]:
+        stats = per_condition.get(cond, {"hit": 0, "total": 0})
+        if stats["total"] == 0:
+            print(f"  {CONDITION_LABELS.get(cond, cond):<22} {'—':>14} {'—':>10}")
+            continue
+        acc = stats["hit"] / stats["total"]
+        print(
+            f"  {CONDITION_LABELS.get(cond, cond):<22} "
+            f"{stats['hit']:>5}/{stats['total']:<8} {acc*100:>9.1f}%"
+        )
+
+    # Confusion matrix (expected row × classified column)
+    types = ["mcp_tool", "skill", "agent"]
+    all_classified = set()
+    for (_exp, cls), _n in confusion.items():
+        all_classified.add(cls)
+    # Display columns: canonical three types, then any extras (e.g. "unclassified")
+    columns = types + sorted(c for c in all_classified if c not in types)
+
+    print(f"\n  Confusion matrix (rows = expected, columns = classified, aggregated over JIT conditions):")
+    col_header = "  " + " " * 11 + " | " + " | ".join(f"{c:>12}" for c in columns) + " |  Row total   Accuracy"
+    print(col_header)
+    print("  " + "-" * (len(col_header) - 2))
+    for exp in types:
+        row = [confusion.get((exp, cls), 0) for cls in columns]
+        row_total = sum(row)
+        row_acc = (confusion.get((exp, exp), 0) / row_total * 100) if row_total else 0.0
+        cells = " | ".join(f"{n:>12d}" for n in row)
+        print(
+            f"  {exp:<11} | {cells} | {row_total:>9}   {row_acc:>7.1f}%"
+        )
+
+
 def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> None:
     """Average latency per condition for JIT runs (excludes static)."""
     rows = conn.execute(
@@ -557,6 +840,14 @@ def main() -> None:
 
     # ── Latency summary ──────────────────────────────────────────────────
     print_latency_summary(conn)
+
+    # ── Core-work classification accuracy (Step 18.5) ────────────────────
+    # Task-level primary-type match as operational proxy for Pillar 1 RQ #1.
+    # See print_classification_accuracy docstring for framing rationale.
+    print_classification_accuracy(conn)
+
+    # ── Gini coefficient of capability invocation counts (§Metrics) ──────
+    print_gini_summary(conn)
 
     conn.close()
 

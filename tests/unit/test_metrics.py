@@ -559,3 +559,45 @@ class TestFlagMostRecentInvocationWrong:
         assert len(rows) == 1
         assert rows[0][1] == "bad answer"
         assert rows[0][2] == "tool-a"
+
+
+# -- fetch_invocations_for_task (Step 18.5) -------------------------------
+
+
+def test_fetch_empty_store_returns_empty_list(store: MetricsStore):
+    assert store.fetch_invocations_for_task("T01") == []
+
+
+def test_fetch_returns_only_matching_task_id(store: MetricsStore):
+    store.record_invocation(_make_record(capability_id="cap-a", task_id="T01"))
+    store.record_invocation(_make_record(capability_id="cap-b", task_id="T02"))
+    store.record_invocation(_make_record(capability_id="cap-c", task_id="T01"))
+
+    rows = store.fetch_invocations_for_task("T01")
+    assert len(rows) == 2
+    assert {r["capability_id"] for r in rows} == {"cap-a", "cap-c"}
+
+
+def test_fetch_row_shape_matches_eval_store_expected(store: MetricsStore):
+    store.record_invocation(_make_record(
+        capability_id="cap-a", task_id="T01", success=True,
+        token_cost=150, latency_ms=200,
+    ))
+    rows = store.fetch_invocations_for_task("T01")
+    assert len(rows) == 1
+    row = rows[0]
+    # EvaluationStore.record_invocation_events expects these keys.
+    assert set(row.keys()) >= {"capability_id", "success", "token_cost", "latency_ms"}
+    assert row["capability_id"] == "cap-a"
+    assert row["success"] is True
+    assert row["token_cost"] == 150
+    assert row["latency_ms"] == 200
+
+
+def test_fetch_preserves_invocation_order(store: MetricsStore):
+    # Earlier invocations should come first (order by invoked_at).
+    for name in ("first", "second", "third"):
+        store.record_invocation(_make_record(capability_id=name, task_id="T01"))
+
+    rows = store.fetch_invocations_for_task("T01")
+    assert [r["capability_id"] for r in rows] == ["first", "second", "third"]
