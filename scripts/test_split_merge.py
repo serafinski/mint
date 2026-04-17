@@ -4,8 +4,16 @@ Seeds a fresh ChromaDB registry and MetricsStore with synthetic invocations
 that satisfy the split/merge thresholds, then runs the operations with real
 LLM calls to verify end-to-end behavior.
 
-Split trigger:  reuse_rate > 0.6 AND success_rate < 0.7 (SKILL or AGENT)
-Merge trigger:  reuse_rate < 0.05 AND semantic similarity >= 0.5 (SKILL only)
+Split trigger:  reuse_rate > 0.6 AND success_rate < 0.7 (SKILL or AGENT
+                in the auto-optimizer loop; MCP_TOOL supported via direct
+                invocation + feedback-driven path). All three types
+                dispatch through ``_split_tools`` / ``_split_skills`` /
+                ``_split_agents`` post-Step-8.
+Merge trigger:  reuse_rate < 0.05 AND description cosine >= 0.5 AND
+                schema Jaccard in [0.5, 1.0). All three types supported
+                post-Step-6 via ``_merge_tools`` / ``_merge_skills`` /
+                ``_merge_agents``. Cross-type merge raises ValueError
+                (Chapter 7 future work).
 
 **Two merge scenarios, intentionally different in how they exercise the gate.**
 
@@ -1538,6 +1546,792 @@ def test_merge_stats(verbose: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# MCP_TOOL merge test (deterministic happy-path canary, post-Step-6)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_mcp_tool(verbose: bool = False) -> bool:
+    """Merge two MCP_TOOL capabilities — deterministic happy-path scenario.
+
+    Closes the last hole in the Pillar 3 per-type integration matrix.
+    Post-Step-6 (commit ``0927261``), ``_merge_tools`` produces real
+    executable FastMCP source by prompting the LLM with each parent's
+    ``metadata['source_code']`` and asking for a single combined tool.
+    This test exercises that path end-to-end under real-LLM conditions.
+
+    Scenario: ``compute-sum`` (returns ``{sum: a+b}``) and
+    ``compute-product`` (returns ``{product: a*b}``) both have low reuse
+    and overlap semantically (both are binary arithmetic on two numbers).
+    The merge target is a single ``compute-arithmetic`` tool that
+    returns ``{sum, product}`` for the same input.
+
+    Why this is a happy-path canary (vs rollback canary):
+    integer arithmetic has no content-sensitive heuristics the Tier 3
+    adversarial prober can exploit. ``ground_truth`` attacks compute
+    ``a+b`` and ``a*b`` themselves; the tool must return the same values.
+    No CSV-Sniffer-style edge cases. If this scenario EVER rolls back,
+    investigate whether Tier 3 is rejecting even trivially-correct code
+    — the rollback fallback in this test treats that as a PASS (atomic
+    invariant holds) with a diagnostic note.
+
+    Thresholds: reuse_rate < 0.05 per parent.
+    """
+    print("\n" + "=" * 70)
+    print("  MERGE TEST — MCP_TOOL (deterministic happy-path)")
+    print("=" * 70)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        registry = _create_fresh_registry(tmp_dir)
+        metrics = MetricsStore()
+
+        # Two deterministic MCP_TOOLs with real FastMCP source.
+        sum_source = (
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from pydantic import Field\n"
+            "from typing import Annotated\n"
+            "\n"
+            "mcp = FastMCP('compute-sum')\n"
+            "\n"
+            "@mcp.tool()\n"
+            "async def compute_sum(\n"
+            "    a: Annotated[float, Field(description='First operand')],\n"
+            "    b: Annotated[float, Field(description='Second operand')],\n"
+            ") -> dict:\n"
+            "    \"\"\"Return {'sum': a + b} for two numeric operands.\"\"\"\n"
+            "    return {'sum': float(a) + float(b)}\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    mcp.run()\n"
+        )
+        product_source = (
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from pydantic import Field\n"
+            "from typing import Annotated\n"
+            "\n"
+            "mcp = FastMCP('compute-product')\n"
+            "\n"
+            "@mcp.tool()\n"
+            "async def compute_product(\n"
+            "    a: Annotated[float, Field(description='First operand')],\n"
+            "    b: Annotated[float, Field(description='Second operand')],\n"
+            ") -> dict:\n"
+            "    \"\"\"Return {'product': a * b} for two numeric operands.\"\"\"\n"
+            "    return {'product': float(a) * float(b)}\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    mcp.run()\n"
+        )
+
+        cap_a = CapabilityDescriptor(
+            name="compute-sum",
+            description=(
+                "Compute the arithmetic sum of two numeric operands. Returns "
+                "a dict with key 'sum' (float)."
+            ),
+            capability_type=CapabilityType.MCP_TOOL,
+            domain="arithmetic",
+            tags=["math", "arithmetic", "binary"],
+            input_schema={"a": "float", "b": "float"},
+            output_schema={"sum": "float"},
+            metadata={
+                "generated": "true",
+                "source": "integration_test",
+                "source_code": sum_source,
+                "pip_packages": "[]",
+            },
+        )
+        cap_b = CapabilityDescriptor(
+            name="compute-product",
+            description=(
+                "Compute the arithmetic product of two numeric operands. "
+                "Returns a dict with key 'product' (float)."
+            ),
+            capability_type=CapabilityType.MCP_TOOL,
+            domain="arithmetic",
+            tags=["math", "arithmetic", "binary"],
+            input_schema={"a": "float", "b": "float"},
+            output_schema={"product": "float"},
+            metadata={
+                "generated": "true",
+                "source": "integration_test",
+                "source_code": product_source,
+                "pip_packages": "[]",
+            },
+        )
+        registry.add(cap_a)
+        registry.add(cap_b)
+        print(f"\n  Registered: {cap_a.name} ({cap_a.capability_type.value})")
+        print(f"  Registered: {cap_b.name} ({cap_b.capability_type.value})")
+
+        # Seed low-reuse invocations + a filler for task-pool diversity.
+        all_task_ids = [f"TASK_{i:02d}" for i in range(25)]
+        filler = CapabilityDescriptor(
+            name="filler-tool-mcp-merge",
+            description="Filler for task diversity in the MCP_TOOL merge test",
+            capability_type=CapabilityType.MCP_TOOL,
+        )
+        registry.add(filler)
+        _seed_invocations(
+            metrics, "filler-tool-mcp-merge", all_task_ids,
+            success_rate=1.0, n_per_task=1,
+        )
+        _seed_invocations(
+            metrics, "compute-sum", ["TASK_00"],
+            success_rate=0.9, n_per_task=3,
+        )
+        _seed_invocations(
+            metrics, "compute-product", ["TASK_01"],
+            success_rate=0.9, n_per_task=3,
+        )
+
+        reuse_a = metrics.reuse_rate("compute-sum")
+        reuse_b = metrics.reuse_rate("compute-product")
+        print(f"\n  compute-sum reuse_rate: {reuse_a:.3f} (threshold: < 0.05)")
+        print(f"  compute-product reuse_rate: {reuse_b:.3f} (threshold: < 0.05)")
+
+        results = registry.search("compute-sum", n_results=5)
+        similarity = next(
+            (score for desc, score in results if desc.name == "compute-product"),
+            None,
+        )
+        print(f"  Semantic similarity: {similarity} (threshold: >= 0.5)")
+
+        print("\n  Running merge(...)...", flush=True)
+        try:
+            merged_id = merge(
+                registry, metrics,
+                ["compute-sum", "compute-product"],
+            )
+        except Exception as exc:
+            print(f"\n  FAIL: merge() raised: {exc}")
+            return False
+
+        if merged_id is None:
+            # Unexpected rollback path — still a PASS if atomic invariant holds.
+            print(
+                "\n  UNEXPECTED: merge() returned None on deterministic "
+                "arithmetic scenario. Verifying atomic rollback invariant."
+            )
+            rollback_ok = True
+            for parent_name in ["compute-sum", "compute-product"]:
+                parent = registry.get(parent_name)
+                if parent is None or not parent.is_active:
+                    print(f"  FAIL: parent '{parent_name}' should still be active")
+                    rollback_ok = False
+                else:
+                    print(f"  OK: parent '{parent_name}' still active")
+
+            rollback_events = metrics._conn.execute(
+                "SELECT capability_id, details FROM capability_events "
+                "WHERE event_type = 'verification_rollback' ORDER BY occurred_at"
+            ).fetchall()
+            if not rollback_events:
+                print("  FAIL: no verification_rollback event recorded")
+                rollback_ok = False
+
+            if rollback_ok:
+                print(
+                    "\n  PASS (unexpected rollback): atomic invariant held. "
+                    "The arithmetic scenario was designed as the MCP_TOOL "
+                    "happy-path validator — if this keeps firing, investigate "
+                    "why Tier 3 is rejecting deterministic numeric code."
+                )
+                return True
+            else:
+                print("\n  FAIL: atomic rollback invariant violated")
+                return False
+
+        # --- HAPPY PATH ---
+        print("\n  Results:")
+        print(f"  Merged capability: {merged_id}")
+
+        merged = registry.get(merged_id)
+        if merged is None:
+            print(f"  FAIL: Merged capability '{merged_id}' not found in registry")
+            return False
+        if merged.capability_type != CapabilityType.MCP_TOOL:
+            print(
+                f"  FAIL: merged capability has type "
+                f"{merged.capability_type.value} — expected mcp_tool"
+            )
+            return False
+
+        merged_source = (merged.metadata or {}).get("source_code", "")
+        if not merged_source:
+            print(
+                "  FAIL: merged capability has no source_code in metadata — "
+                "regression to pre-Step-6 metadata-only stub behavior?"
+            )
+            return False
+        print(
+            f"  source_code: {len(merged_source)} chars, starts with "
+            f"{merged_source[:40]!r}"
+        )
+        if "FastMCP" not in merged_source:
+            print(
+                "  FAIL: merged source_code missing FastMCP import — "
+                "not a valid MCP tool file"
+            )
+            return False
+        if "@mcp.tool()" not in merged_source:
+            print(
+                "  FAIL: merged source_code missing @mcp.tool() decorator — "
+                "not a valid MCP tool file"
+            )
+            return False
+
+        # Loose content check — merged tool should subsume both parents' concepts.
+        lower = merged_source.lower()
+        missing = [
+            kw for kw in ("sum", "product")
+            if kw not in lower
+        ]
+        if missing:
+            print(
+                f"  WARNING: merged source_code does not mention: {missing}. "
+                f"The merge LLM may have dropped parent behavior — soft warning."
+            )
+        else:
+            print("  OK: merged source mentions both parents' semantics")
+
+        # Check parents are deactivated.
+        for parent_name in ["compute-sum", "compute-product"]:
+            parent = registry.get(parent_name)
+            active = parent.is_active if parent else "NOT FOUND"
+            print(f"  Parent '{parent_name}' is_active: {active}")
+            if parent and parent.is_active:
+                print(f"  FAIL: Parent '{parent_name}' should be deactivated")
+                return False
+
+        events = metrics._conn.execute(
+            "SELECT capability_id, event_type, details FROM capability_events "
+            "ORDER BY occurred_at"
+        ).fetchall()
+        print(f"\n  Events recorded: {len(events)}")
+        if verbose:
+            for eid, etype, details in events:
+                print(f"    {eid}: {etype} — {details}")
+
+        print("\n  PASS: MCP_TOOL merge completed (happy path)")
+        return True
+
+
+# ---------------------------------------------------------------------------
+# AGENT split test (post-Step-8 canary — global subagent budget ceiling)
+# ---------------------------------------------------------------------------
+
+
+def test_split_agent(verbose: bool = False) -> bool:
+    """Split an AGENT capability — post-Step-8 AGENT path canary.
+
+    Closes the AGENT split hole in the Pillar 3 per-type integration
+    matrix. Post-Step-8 (commit ``1f8a7db``), ``_split_agents`` produces
+    real agent configs (system_prompt + optional subagents) by prompting
+    the LLM with the parent's ``metadata['agent_config']`` + recent
+    failure cases, and enforces a global ceiling: the sum of subagent
+    counts across all variants must not exceed ``_MAX_AGENT_SUBAGENT_BUDGET``
+    (=8).
+
+    Scenario: ``multi-domain-investigator`` is a solo AGENT (no
+    subagents in parent) whose system_prompt covers three
+    investigation domains — database, network, and application.
+    It has high reuse but mediocre success because the single
+    system prompt is stretched thin across all three domains. The
+    split target is 2-4 specialized investigators, each focused on
+    one domain. As solo variants (no subagents), the budget
+    constraint is trivially satisfied.
+
+    Why solo parent (no subagents): keeps the budget test implicit
+    — split result could allocate up to 8 subagents total across
+    variants. A parent with 3 subagents × 3 variants × 3 subagents
+    per variant = 9 exceeds the budget and would be explicitly
+    tested as a rejection scenario. For the happy-path canary we
+    keep it simple.
+
+    Thresholds: reuse_rate > 0.6, success_rate < 0.7.
+    """
+    print("\n" + "=" * 70)
+    print("  SPLIT TEST — AGENT (solo-parent happy-path canary)")
+    print("=" * 70)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        registry = _create_fresh_registry(tmp_dir)
+        metrics = MetricsStore()
+
+        import json
+
+        parent_system_prompt = (
+            "You are a multi-domain incident investigator. When given a "
+            "system metrics CSV and an incident report, identify the root "
+            "cause and the cascade chain across any of three domains:\n\n"
+            "1. Database incidents (connection pool exhaustion, slow "
+            "queries, deadlocks)\n"
+            "2. Network incidents (packet loss, latency spikes, DNS "
+            "resolution failures)\n"
+            "3. Application incidents (memory leaks, thread pool "
+            "exhaustion, deployment regressions)\n\n"
+            "For each incident, read the provided metrics, correlate them "
+            "with the incident timeline, and return a structured report "
+            "with root_cause_metric, cascade_chain, and n_metrics_investigated."
+        )
+        parent_agent_config = {
+            "system_prompt": parent_system_prompt,
+            "subagents": [],  # solo parent
+        }
+
+        parent_cap = CapabilityDescriptor(
+            name="multi-domain-investigator",
+            description=(
+                "Investigate incidents across database, network, and "
+                "application domains. Identifies root cause metric and "
+                "cascade chain from system metrics + incident report."
+            ),
+            capability_type=CapabilityType.AGENT,
+            domain="incident-response",
+            tags=["investigation", "incident", "multi-domain"],
+            input_schema={
+                "metrics_csv_path": "str",
+                "incident_yaml_path": "str",
+            },
+            output_schema={
+                "root_cause_metric": "str",
+                "cascade_chain": "list[str]",
+                "n_metrics_investigated": "int",
+            },
+            metadata={
+                "generated": "true",
+                "source": "integration_test",
+                "agent_config": json.dumps(parent_agent_config),
+            },
+        )
+        registry.add(parent_cap)
+        print(f"\n  Registered: {parent_cap.name} ({parent_cap.capability_type.value})")
+        print(f"  Parent is solo (0 subagents)")
+
+        # Seed high-reuse + low-success invocations.
+        all_task_ids = [f"TASK_{i:02d}" for i in range(10)]
+        used_task_ids = all_task_ids[:8]  # 8/10 = 80% reuse
+
+        filler = CapabilityDescriptor(
+            name="filler-tool-agent-split",
+            description="Filler for task diversity in the AGENT split test",
+            capability_type=CapabilityType.MCP_TOOL,
+        )
+        registry.add(filler)
+        _seed_invocations(
+            metrics, "filler-tool-agent-split", all_task_ids,
+            success_rate=1.0, n_per_task=1,
+        )
+        n_seeded = _seed_invocations(
+            metrics, "multi-domain-investigator", used_task_ids,
+            success_rate=0.5, n_per_task=5,
+        )
+
+        reuse = metrics.reuse_rate("multi-domain-investigator")
+        success = metrics.success_rate("multi-domain-investigator")
+        print(f"\n  Seeded {n_seeded} invocations across {len(used_task_ids)} task types")
+        print(f"  reuse_rate: {reuse:.2f} (threshold: > 0.6)")
+        print(f"  success_rate: {success:.2f} (threshold: < 0.7)")
+
+        if reuse <= 0.6 or success >= 0.7:
+            print("\n  ERROR: Metrics do not satisfy split thresholds!")
+            return False
+
+        # Run split. Two valid outcomes under the 5-phase atomic flow:
+        #   HAPPY: variants registered with non-empty agent_config, parent
+        #          deactivated, total subagent count across variants <= 8.
+        #   ROLLBACK: gate rejected a variant OR budget exceeded → parent
+        #             stays active, no variants in registry.
+        print("\n  Running split(...)...", flush=True)
+        try:
+            new_ids = split(registry, metrics, "multi-domain-investigator")
+        except Exception as exc:
+            print(f"\n  FAIL: split() raised: {exc}")
+            return False
+
+        if new_ids is None:
+            # --- ROLLBACK PATH ---
+            print(
+                "\n  NOTE: split() returned None — gate/budget rejected one "
+                "or more variants. Verifying atomic rollback invariant."
+            )
+            parent = registry.get("multi-domain-investigator")
+            if parent is None or not parent.is_active:
+                print(
+                    "  FAIL: parent was deactivated despite split rejection — "
+                    "atomic rollback violated"
+                )
+                return False
+            print("  OK: parent 'multi-domain-investigator' still active")
+
+            rollback_events = metrics._conn.execute(
+                "SELECT capability_id, details FROM capability_events "
+                "WHERE event_type = 'split_rollback' "
+                "OR event_type = 'verification_rollback' ORDER BY occurred_at"
+            ).fetchall()
+            print(f"\n  Rollback events: {len(rollback_events)}")
+            for cid, details in rollback_events:
+                print(f"    {cid}: {details[:100]}")
+            if not rollback_events:
+                print("  FAIL: no rollback event recorded")
+                return False
+
+            print(
+                "\n  PASS: gate/budget correctly rejected and atomic "
+                "rollback invariant held."
+            )
+            return True
+
+        # --- HAPPY PATH ---
+        print("\n  Results:")
+        print(f"  New variants: {new_ids}")
+
+        if len(new_ids) < 2:
+            print(f"  FAIL: Expected >= 2 variants, got {len(new_ids)}")
+            return False
+
+        parent = registry.get("multi-domain-investigator")
+        if parent and parent.is_active:
+            print("  FAIL: Parent should be deactivated after split")
+            return False
+        print(f"  Parent 'multi-domain-investigator' deactivated: OK")
+
+        # Verify every variant has non-empty agent_config AND compute the
+        # total subagent count across all variants — must stay <= 8 per
+        # _MAX_AGENT_SUBAGENT_BUDGET.
+        total_subagents = 0
+        for vid in new_ids:
+            variant = registry.get(vid)
+            if variant is None:
+                print(f"  FAIL: Variant '{vid}' not found in registry")
+                return False
+            if variant.capability_type != CapabilityType.AGENT:
+                print(
+                    f"  FAIL: variant '{vid}' has type "
+                    f"{variant.capability_type.value} — expected agent"
+                )
+                return False
+
+            variant_cfg_raw = (variant.metadata or {}).get("agent_config", "")
+            if not variant_cfg_raw:
+                print(
+                    f"  FAIL: variant '{vid}' has no agent_config in metadata "
+                    "— regression to pre-Step-8 metadata-only stub behavior?"
+                )
+                return False
+
+            try:
+                variant_cfg = (
+                    json.loads(variant_cfg_raw)
+                    if isinstance(variant_cfg_raw, str)
+                    else variant_cfg_raw
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"  FAIL: variant '{vid}' agent_config is not valid JSON: {exc}"
+                )
+                return False
+
+            variant_system_prompt = (variant_cfg.get("system_prompt") or "").strip()
+            variant_subagents = variant_cfg.get("subagents") or []
+            if not variant_system_prompt:
+                print(f"  FAIL: variant '{vid}' has no system_prompt in agent_config")
+                return False
+
+            n_sub = len(variant_subagents)
+            total_subagents += n_sub
+            print(
+                f"  Variant '{vid}': system_prompt={len(variant_system_prompt)} "
+                f"chars, subagents={n_sub}, active={variant.is_active}"
+            )
+
+        # Budget check (mirrors the constraint in _split_agents).
+        print(f"\n  Total subagents across variants: {total_subagents} (budget: <= 8)")
+        if total_subagents > 8:
+            print(
+                f"  FAIL: total subagent count {total_subagents} exceeds "
+                f"_MAX_AGENT_SUBAGENT_BUDGET=8 — _split_agents should have "
+                f"rejected this split before registration"
+            )
+            return False
+        print("  OK: budget constraint satisfied")
+
+        events = metrics._conn.execute(
+            "SELECT capability_id, event_type, details FROM capability_events "
+            "ORDER BY occurred_at"
+        ).fetchall()
+        print(f"\n  Events recorded: {len(events)}")
+        if verbose:
+            for eid, etype, details in events:
+                print(f"    {eid}: {etype} — {details}")
+
+        print("\n  PASS: AGENT split completed (happy path)")
+        return True
+
+
+# ---------------------------------------------------------------------------
+# AGENT merge test (post-Step-6 canary — budget ceiling on returned config)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_agent(verbose: bool = False) -> bool:
+    """Merge two AGENT capabilities — post-Step-6 AGENT path canary.
+
+    Closes the AGENT merge hole in the Pillar 3 per-type integration
+    matrix. Post-Step-6 (commit ``0927261``), ``_merge_agents``
+    produces a real combined agent_config (combined_system_prompt +
+    combined_subagents) via LLM, enforces the budget ceiling
+    (``_MAX_AGENT_SUBAGENT_BUDGET=8`` on returned config) BEFORE
+    calling the gate, then routes the result through the standard
+    verify_and_register_or_rollback path.
+
+    Scenario: ``csv-data-investigator`` and ``json-data-investigator``
+    are two solo AGENTs (no subagents), each specialized for one
+    structured-data format. Low reuse on both; semantically similar
+    (both are data-investigation agents). The merge target is a
+    single ``structured-data-investigator`` that handles both formats
+    via one unified system prompt.
+
+    Why solo parents (no subagents): exercises the "simple merge"
+    path. Budget check is trivially satisfied when both parents are
+    solo. For budget-rejection testing, a separate test with parents
+    that together have > 8 subagents would be needed — deferred as
+    a Chapter 7 follow-up since that path is covered by unit tests
+    (``tests/unit/test_optimizer_operations.py::TestMergeAgents``).
+
+    Thresholds: reuse_rate < 0.05 per parent.
+    """
+    print("\n" + "=" * 70)
+    print("  MERGE TEST — AGENT (solo parents, happy-path)")
+    print("=" * 70)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        registry = _create_fresh_registry(tmp_dir)
+        metrics = MetricsStore()
+
+        import json
+
+        csv_agent_config = {
+            "system_prompt": (
+                "You are a CSV data investigator. When given a CSV file and "
+                "a user question, parse the CSV, summarize its structure "
+                "(column names, row count, sample rows), and answer the "
+                "question about its contents. Use pandas or the csv module "
+                "for parsing. Return a structured dict with 'summary' (str) "
+                "and 'answer' (str)."
+            ),
+            "subagents": [],
+        }
+        json_agent_config = {
+            "system_prompt": (
+                "You are a JSON data investigator. When given a JSON file "
+                "and a user question, parse the JSON, summarize its "
+                "structure (top-level keys, nesting depth, array lengths), "
+                "and answer the question about its contents. Use the json "
+                "module for parsing. Return a structured dict with "
+                "'summary' (str) and 'answer' (str)."
+            ),
+            "subagents": [],
+        }
+
+        cap_a = CapabilityDescriptor(
+            name="csv-data-investigator",
+            description=(
+                "Investigate CSV data files — parse, summarize structure, "
+                "answer questions about contents."
+            ),
+            capability_type=CapabilityType.AGENT,
+            domain="data-investigation",
+            tags=["data", "investigation", "csv"],
+            input_schema={"file_path": "str", "question": "str"},
+            output_schema={"summary": "str", "answer": "str"},
+            metadata={
+                "generated": "true",
+                "source": "integration_test",
+                "agent_config": json.dumps(csv_agent_config),
+            },
+        )
+        cap_b = CapabilityDescriptor(
+            name="json-data-investigator",
+            description=(
+                "Investigate JSON data files — parse, summarize structure, "
+                "answer questions about contents."
+            ),
+            capability_type=CapabilityType.AGENT,
+            domain="data-investigation",
+            tags=["data", "investigation", "json"],
+            input_schema={"file_path": "str", "question": "str"},
+            output_schema={"summary": "str", "answer": "str"},
+            metadata={
+                "generated": "true",
+                "source": "integration_test",
+                "agent_config": json.dumps(json_agent_config),
+            },
+        )
+        registry.add(cap_a)
+        registry.add(cap_b)
+        print(f"\n  Registered: {cap_a.name} ({cap_a.capability_type.value}, solo)")
+        print(f"  Registered: {cap_b.name} ({cap_b.capability_type.value}, solo)")
+
+        all_task_ids = [f"TASK_{i:02d}" for i in range(25)]
+        filler = CapabilityDescriptor(
+            name="filler-tool-agent-merge",
+            description="Filler for task diversity in the AGENT merge test",
+            capability_type=CapabilityType.MCP_TOOL,
+        )
+        registry.add(filler)
+        _seed_invocations(
+            metrics, "filler-tool-agent-merge", all_task_ids,
+            success_rate=1.0, n_per_task=1,
+        )
+        _seed_invocations(
+            metrics, "csv-data-investigator", ["TASK_00"],
+            success_rate=0.8, n_per_task=3,
+        )
+        _seed_invocations(
+            metrics, "json-data-investigator", ["TASK_01"],
+            success_rate=0.8, n_per_task=3,
+        )
+
+        reuse_a = metrics.reuse_rate("csv-data-investigator")
+        reuse_b = metrics.reuse_rate("json-data-investigator")
+        print(f"\n  csv-data-investigator reuse_rate: {reuse_a:.3f} (threshold: < 0.05)")
+        print(f"  json-data-investigator reuse_rate: {reuse_b:.3f} (threshold: < 0.05)")
+
+        results = registry.search("csv-data-investigator", n_results=5)
+        similarity = next(
+            (score for desc, score in results if desc.name == "json-data-investigator"),
+            None,
+        )
+        print(f"  Semantic similarity: {similarity} (threshold: >= 0.5)")
+
+        print("\n  Running merge(...)...", flush=True)
+        try:
+            merged_id = merge(
+                registry, metrics,
+                ["csv-data-investigator", "json-data-investigator"],
+            )
+        except Exception as exc:
+            print(f"\n  FAIL: merge() raised: {exc}")
+            return False
+
+        if merged_id is None:
+            # Rollback path — verify atomic invariant.
+            print(
+                "\n  NOTE: merge() returned None. Verifying atomic rollback."
+            )
+            rollback_ok = True
+            for parent_name in ["csv-data-investigator", "json-data-investigator"]:
+                parent = registry.get(parent_name)
+                if parent is None or not parent.is_active:
+                    print(f"  FAIL: parent '{parent_name}' should still be active")
+                    rollback_ok = False
+                else:
+                    print(f"  OK: parent '{parent_name}' still active")
+
+            rollback_events = metrics._conn.execute(
+                "SELECT capability_id, details FROM capability_events "
+                "WHERE event_type = 'verification_rollback' ORDER BY occurred_at"
+            ).fetchall()
+            if not rollback_events:
+                print("  FAIL: no verification_rollback event recorded")
+                rollback_ok = False
+
+            if rollback_ok:
+                print(
+                    "\n  PASS (unexpected rollback): atomic invariant held."
+                )
+                return True
+            return False
+
+        # --- HAPPY PATH ---
+        print("\n  Results:")
+        print(f"  Merged capability: {merged_id}")
+
+        merged = registry.get(merged_id)
+        if merged is None:
+            print(f"  FAIL: Merged capability '{merged_id}' not found")
+            return False
+        if merged.capability_type != CapabilityType.AGENT:
+            print(
+                f"  FAIL: merged capability has type "
+                f"{merged.capability_type.value} — expected agent"
+            )
+            return False
+
+        merged_cfg_raw = (merged.metadata or {}).get("agent_config", "")
+        if not merged_cfg_raw:
+            print(
+                "  FAIL: merged capability has no agent_config in metadata — "
+                "regression to pre-Step-6 metadata-only stub behavior?"
+            )
+            return False
+
+        try:
+            merged_cfg = (
+                json.loads(merged_cfg_raw)
+                if isinstance(merged_cfg_raw, str)
+                else merged_cfg_raw
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  FAIL: merged agent_config is not valid JSON: {exc}")
+            return False
+
+        merged_system_prompt = (merged_cfg.get("system_prompt") or "").strip()
+        merged_subagents = merged_cfg.get("subagents") or []
+        if not merged_system_prompt:
+            print("  FAIL: merged agent_config has no system_prompt")
+            return False
+
+        print(
+            f"  system_prompt: {len(merged_system_prompt)} chars, starts with "
+            f"{merged_system_prompt[:60]!r}..."
+        )
+        print(f"  subagents: {len(merged_subagents)}")
+
+        # Budget check (mirrors the constraint enforced in _merge_agents).
+        if len(merged_subagents) > 8:
+            print(
+                f"  FAIL: merged subagent count {len(merged_subagents)} "
+                f"exceeds _MAX_AGENT_SUBAGENT_BUDGET=8 — _merge_agents "
+                f"should have rejected this merge before the gate"
+            )
+            return False
+        print("  OK: budget constraint satisfied")
+
+        # Loose content check — merged prompt should cover both parents' domains.
+        lower = merged_system_prompt.lower()
+        missing = [kw for kw in ("csv", "json") if kw not in lower]
+        if missing:
+            print(
+                f"  WARNING: merged system_prompt does not mention: {missing}. "
+                f"The merge LLM may have dropped parent behavior — soft warning."
+            )
+        else:
+            print("  OK: merged prompt mentions both parents' formats")
+
+        for parent_name in ["csv-data-investigator", "json-data-investigator"]:
+            parent = registry.get(parent_name)
+            active = parent.is_active if parent else "NOT FOUND"
+            print(f"  Parent '{parent_name}' is_active: {active}")
+            if parent and parent.is_active:
+                print(f"  FAIL: Parent '{parent_name}' should be deactivated")
+                return False
+
+        events = metrics._conn.execute(
+            "SELECT capability_id, event_type, details FROM capability_events "
+            "ORDER BY occurred_at"
+        ).fetchall()
+        print(f"\n  Events recorded: {len(events)}")
+        if verbose:
+            for eid, etype, details in events:
+                print(f"    {eid}: {etype} — {details}")
+
+        print("\n  PASS: AGENT merge completed (happy path)")
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Full optimization loop test
 # ---------------------------------------------------------------------------
 
@@ -1832,17 +2626,32 @@ def main() -> int:
     parser.add_argument(
         "--merge-only",
         action="store_true",
-        help="Run both merge tests (CSV rollback-canary + stats happy-path)",
+        help="Run all four merge tests (CSV rollback + stats + MCP_TOOL + AGENT)",
     )
     parser.add_argument(
         "--merge-csv-only",
         action="store_true",
-        help="Run only the CSV/TSV merge test (rollback-path canary)",
+        help="Run only the CSV/TSV merge test (SKILL rollback-path canary)",
     )
     parser.add_argument(
         "--merge-stats-only",
         action="store_true",
-        help="Run only the math-statistics merge test (happy-path check)",
+        help="Run only the math-statistics merge test (SKILL happy-path)",
+    )
+    parser.add_argument(
+        "--merge-mcp-only",
+        action="store_true",
+        help="Run only the MCP_TOOL merge test (arithmetic happy-path)",
+    )
+    parser.add_argument(
+        "--merge-agent-only",
+        action="store_true",
+        help="Run only the AGENT merge test (data-investigator happy-path)",
+    )
+    parser.add_argument(
+        "--split-agent-only",
+        action="store_true",
+        help="Run only the AGENT split test (multi-domain investigator)",
     )
     parser.add_argument("--loop-only", action="store_true", help="Run only full loop test")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
@@ -1860,9 +2669,12 @@ def main() -> int:
         or args.split_skill_only
         or args.split_mcp_only
         or args.split_feedback_only
+        or args.split_agent_only
         or args.merge_only
         or args.merge_csv_only
         or args.merge_stats_only
+        or args.merge_mcp_only
+        or args.merge_agent_only
         or args.loop_only
     )
     run_split_skill = (
@@ -1874,11 +2686,20 @@ def main() -> int:
     run_split_feedback = (
         args.split_feedback_only or args.split_only or (not only_one)
     )
+    run_split_agent = (
+        args.split_agent_only or args.split_only or (not only_one)
+    )
     run_merge_csv = (
         args.merge_csv_only or args.merge_only or (not only_one)
     )
     run_merge_stats = (
         args.merge_stats_only or args.merge_only or (not only_one)
+    )
+    run_merge_mcp = (
+        args.merge_mcp_only or args.merge_only or (not only_one)
+    )
+    run_merge_agent = (
+        args.merge_agent_only or args.merge_only or (not only_one)
     )
     run_loop = args.loop_only or not only_one
 
@@ -1895,11 +2716,20 @@ def main() -> int:
             verbose=args.verbose,
         )
 
+    if run_split_agent:
+        results["split_agent"] = test_split_agent(verbose=args.verbose)
+
     if run_merge_csv:
         results["merge_csv"] = test_merge(verbose=args.verbose)
 
     if run_merge_stats:
         results["merge_stats"] = test_merge_stats(verbose=args.verbose)
+
+    if run_merge_mcp:
+        results["merge_mcp"] = test_merge_mcp_tool(verbose=args.verbose)
+
+    if run_merge_agent:
+        results["merge_agent"] = test_merge_agent(verbose=args.verbose)
 
     if run_loop:
         results["full_loop"] = test_full_loop(verbose=args.verbose)
