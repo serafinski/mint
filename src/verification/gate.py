@@ -2,17 +2,20 @@
 
 Tier structure (cheapest first, fail-fast):
 
-  0  Skills only : ``quick_validate.py`` structural check            (~0 cost)
-  1  MCP_TOOL    : AST + regex static scan                           (~0 cost)
-     SKILL/AGENT : regex-only scan (not Python — AST does not apply)
-  2  MCP_TOOL    : Behavioural testing in Docker sandbox    (moderate cost)
-     SKILL/AGENT : delegated to behavioral.run() which returns INFO (no source_code)
-  3  All          : Adversarial DeepAgent probing              (high cost)
+  0    Skills only : ``quick_validate.py`` structural check          (~0 cost)
+  1    MCP_TOOL    : AST + regex static scan                         (~0 cost)
+       SKILL/AGENT : regex-only scan (not Python — AST does not apply)
+  1.5  MCP_TOOL    : Docker dry-run import with pip_packages         (~5-10s)
+       SKILL/AGENT : in-process compile() of embedded python fences  (~0 cost)
+  2    MCP_TOOL    : Behavioural testing in Docker sandbox   (moderate cost)
+       SKILL/AGENT : delegated to behavioral.run() which returns INFO
+  3    All          : Adversarial DeepAgent probing              (high cost)
 
 Gate rules:
 
-* Tier 0 CRITICAL (invalid SKILL.md) → reject immediately; skip Tier 1/2/3.
-* Tier 1 CRITICAL (mock artefact, hardcoded data, syntax error) → reject; skip Tier 2/3.
+* Tier 0 CRITICAL (invalid SKILL.md) → reject immediately; skip Tier 1/1.5/2/3.
+* Tier 1 CRITICAL (mock artefact, hardcoded data, syntax error) → reject; skip Tier 1.5/2/3.
+* Tier 1.5 CRITICAL (wrong pip package, import error, fence compile error) → reject; skip Tier 2/3.
 * Tier 2 CRITICAL or HIGH finding → reject; skip Tier 3.
 * After Tier 3: any CRITICAL or HIGH finding across all tiers → reject.
 
@@ -30,7 +33,7 @@ import re
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import Severity, VerificationFinding, VerificationReport
-from src.verification import adversarial, behavioral, static_scanner
+from src.verification import adversarial, behavioral, import_check, static_scanner
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +193,7 @@ def _verify_inner(
 
     if not static_scanner.should_proceed_to_tier2(t1_report):
         logger.info(
-            "Tier 1 rejected %s — CRITICAL finding(s) present, skipping Tier 2/3",
+            "Tier 1 rejected %s — CRITICAL finding(s) present, skipping Tier 1.5/2/3",
             name,
         )
         return VerificationReport(
@@ -198,6 +201,29 @@ def _verify_inner(
             findings=all_findings,
             overall_passed=False,
             tier_reached=t1_report.tier_reached,
+        )
+
+    # ------------------------------------------------------------------
+    # Tier 1.5: Sandbox import probe (fast fail on wrong pip packages,
+    # runtime import errors, or embedded python fence compile errors).
+    # Cheaper than Tier 2 (~5-10s Docker for MCP_TOOL, ~0 for SKILL/AGENT)
+    # so failing here saves the Tier 2/3 token budget on broken artifacts.
+    # ------------------------------------------------------------------
+    current_tier[0] = 1  # Tier 1.5 reports stay at tier=1 per schema constraint
+    logger.debug("Running Tier 1.5 import probe on %s", name)
+    t15_report = import_check.run_import_check(artifact)
+    all_findings.extend(t15_report.findings)
+
+    if not import_check.should_proceed_to_tier2(t15_report):
+        logger.info(
+            "Tier 1.5 rejected %s — CRITICAL import-probe finding(s), skipping Tier 2/3",
+            name,
+        )
+        return VerificationReport(
+            capability_name=name,
+            findings=all_findings,
+            overall_passed=False,
+            tier_reached=1,
         )
 
     # ------------------------------------------------------------------

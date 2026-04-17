@@ -1,17 +1,37 @@
 """Unit tests for src/verification/gate.py.
 
-All external calls (behavioral.run, adversarial.probe) are mocked so these
-tests run without Docker or API keys.
+All external calls (behavioral.run, adversarial.probe, import_check.run_import_check)
+are mocked so these tests run without Docker or API keys.
 """
 
 from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import Severity, VerificationFinding, VerificationReport
 from src.verification.gate import verify
+
+
+@pytest.fixture(autouse=True)
+def _mock_import_check():
+    """Stub Tier 1.5 to a passing report by default — keeps these tests
+    Docker-independent. Tier-1.5-specific behavior is covered in
+    ``tests/unit/test_import_check.py``.
+    """
+    with patch(
+        "src.verification.gate.import_check.run_import_check",
+        return_value=VerificationReport(
+            capability_name="stub",
+            findings=[],
+            overall_passed=True,
+            tier_reached=1,
+        ),
+    ):
+        yield
 
 # ---------------------------------------------------------------------------
 # Helpers
