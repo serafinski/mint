@@ -160,8 +160,10 @@ This is the work that was queued before today started. It's unchanged by the Pil
 | **3.7** | **Step 14.11 — Tier 3 fail-closed on timeout + ceiling bump 300s → 480s** | §14.11 (below) | **~1.5-2 h** | **Added 2026-04-15 end of session** after a thesis-alignment check triggered by the T09 `adversarial_timeout` note in the post-Step-13 test_mint run. The current Tier 3 implementation fails **open** on `concurrent.futures.TimeoutError`: the adversarial probe returns `overall_passed=True` with an `adversarial_timeout` note, and the artifact enters the registry. `docs/thesis_proposal.md` §Pillar 2 says *"Every generated capability must pass all three tiers"* — fail-open is structurally *"couldn't reach a verdict, assumed pass"*, the opposite of *"must pass"*. This is the **second** Tier 3 drift on Pillar 2 (the first being the capability-type coverage gap — prose-only SKILL/AGENT un-probed because the sandbox-payload construction requires inlined source, `docs/perf_fixes_2026_04_14.md §3e`); together they soften the *"systematic verification layer"* claim the proposal makes against EvoMAC / STELLA / ACE. **Fix (Option 1, fail-closed):** flip `overall_passed=False` on the timeout branch and upgrade the `adversarial_timeout` finding to HIGH severity so the existing verification_node retry loop (MAX_ATTEMPTS=3) fires and regenerates the artifact with fresh code. **Secondary fix:** bump the 300s ceiling to 480s (same pattern as Step 13 but scaled 1.6x instead of 1.875x — conservative, no concrete "would have finished at 400s" trace to justify more). **Deferred:** the capability-type coverage gap — that's a bigger architectural change (per-runtime behavioral prober for prose-only capabilities) tracked for post-eval / Chapter 7. Step 14.11 is explicitly the smaller half of the Tier 3 cluster: closes the easier drift in ~1.5-2h without re-architecting the prober. **Eval wall-clock risk:** worst case ~14h added on the 400-record eval if timeout rate stays at 1/7 (the 2026-04-15 test_mint rate). The 480s bump should reduce the fire rate; if it doesn't, fall back to Option 2 (disclose + track) and revert to fail-open for Phase 5, then fix post-eval. Document fallback trigger in the commit body. **§12 coupling:** precommit one of the findings the §12 audit was going to surface — update the §12 checklist to skip this finding and focus on new drifts. |
 | 4 | **Steps 4–11 — B1 / Pillar 3 main block** | Phase 2 Steps 4-11 (below) | ~20 h | The big pre-eval work item. Extend `InvocationRecord`, write `verify_and_register_or_rollback`, implement per-type merge/split/Tier 4 coverage verifier, rewrite optimizer tests to assert on real content. Ordered internally by dependency. |
 | 5 | **Step 12 — Proposal-vs-implementation audit** | Phase 2 Step 12 (below) | ~3-5 h | **After Step 11, not before.** Waits for Pillar 3 to be in final form so the audit doesn't have to re-check merge/split/prune across all three types mid-flux. Expected output: 2-5 drift findings beyond Tier 3 and the known Pillar 3 ones. Each gets classified and routed (fix pre-eval / fix post-eval / disclose in Chapter 4 or 7). |
-| 6 | **Phase 3 Steps 12, 12.5, 13, 13.5, 14 — Pre-eval validation** | Phase 3 (below) | ~6.5-8.5 h | File output fix for SKILL/AGENT + sandbox import probe (Tier 1.5, pulled from memory 2026-04-16) + test augmentations from the behavioral audit + **test suite hygiene pass (TODO scan + necessity audit, ~2-3 h, added 2026-04-16 end of session)** + full smoke tests including a 20-task pilot at one run per task. |
+| 6 | **Phase 3 Steps 12, 12.5, 13, 13.5, 13.7, 13.8, 14 — Pre-eval validation** | Phase 3 (below) | ~10-13.5 h | File output fix for SKILL/AGENT + sandbox import probe (Tier 1.5, pulled from memory 2026-04-16) + test augmentations from the behavioral audit + **test suite hygiene pass (TODO scan + necessity audit, ~2-3 h, added 2026-04-16 end of session)** + **LangFuse tracing audit (Step 13.7, ~2-3 h, added 2026-04-17 end of session — verifies every test-run surface is captured with enough detail to verify Chapter 6 claims)** + **compression-loss analyzer (Step 13.8, ~1.5-2 h, added 2026-04-17 end of session — closes the T3 measurement gap surfaced in the Bootstrapping-Problem audit: the proposal's §Context Economy names *two* failure modes but the repo measured only the verbose-side; this adds the compression-side reader over existing `failed_step_reason` signal)** + full smoke tests including a 20-task pilot at one run per task. |
 | **6.5** | ✅ **DONE 2026-04-17** (commit `ad4908e`). **Step 18.5 — Gini + Core-Work Classification Accuracy + persistent invocation log**. Full proposal-aligned version delivered (not a proxy): Gini reads from new `invocation_events` table populated per-task via the harness flush hook; Core-Work Classification Accuracy uses `TaskDefinition.expected_type` (8 mcp_tool / 6 skill / 6 agent) cross-tabbed against `evaluation_runs.capability_type` (primary = min-priority type in chain per `harness.py:585`). Renamed from "Classification Accuracy" in-flight after user caught that the proposal's literal per-gap framing doesn't match task-level primary-match; four-reason framing preserved in docstring + output header. 586 LOC added across 7 files (schema + analyzer + harness wiring + 10 unit tests). 1336/1336 baseline. |
+| **6.6** | **Step 13.7 — LangFuse tracing audit (verify everything is tracked for every test we're going to run)** | Phase 3 Step 13.7 (below) | **~2-3 h** | **Added 2026-04-17 end of session.** Before Phase 4 Step 18 (400-record eval), Step 19 (longitudinal), and Step 18.8 execution (distribution shift), systematically verify that LangFuse captures enough to verify every claim we'll make in Chapter 6 — per-task token cost (full pipeline, not just LLM calls), per-tier verification events, per-pillar-3 operation events, run/condition/task/capability_id tags propagated to every sub-trace. If something isn't traced, Chapter 6 has to report a weaker result than we could have proven. Inventory expected events → run 1 task × 4 conditions → diff observed vs expected → close gaps with `langfuse_handler` callback threading or explicit `langfuse.span()` wraps. Blocker for Phase 4 (Step 18). |
+| **6.8** | **Step 13.8 — Context-economy compression-loss analyzer (T3 second failure mode)** | Phase 3 Step 13.8 (below) | **~1.5-2 h** | **Added 2026-04-17 end of session** after the `docs/verification/01_bootstrapping_problem.md` audit surfaced a measurement gap: proposal §T3 names *two* failure modes (naive-verbose AND aggressive-compression), but `scripts/analyze_context_utilization.py` only measures the first (peak input-token % of window). Nothing in the repo quantifies "downstream agent needed a key that got dropped at the handoff" — exactly the half of T3 the typed `output_schema` contracts were designed to resist. The signal already exists in `evaluation_records.failed_step_reason` + `output_shape_mismatch` + `output_shape_missing_keys` (populated by `composition.py` runtime validation per §12 finding #12); what's missing is the reader. New `scripts/analyze_compression_loss.py` classifies chain failures into missing-key (compression loss) vs wrong-value vs exception vs timeout vs gate-rejection, reports per-type + per-condition rates + per-key "most frequently dropped" table. Answers the Chapter 6 question "how often does over-compression at an inter-agent handoff produce silently wrong output?" — closing the one acknowledged gap against proposal §Bootstrapping. Pre-eval deliverable (like 18.5 / 18.7 / 18.8); consumes Step 18 eval output. |
 | 7 | **Phase 4 Step 18 — The 400-record eval** | Phase 4 (below) | ~18 h unattended | `run_pilot --all-tasks --all-conditions --n-runs 5`. Starts the thesis's Chapter 6 data. |
 | **7.5** | ✅ **DONE 2026-04-17** (two-commit). **Step 18.7 — Longitudinal KL convergence analyzer + persistent utility/event logging**. Original scope (~1-1.5h) expanded to full proposal-aligned delivery (~3-4h) after user caught that the initial "invocation-count KL" + "active-cap-delta ops" were proxies, not proposal-literal. Final scope: new `scripts/analyze_longitudinal.py` + `cycle_utility_scores` + `cycle_events` tables + harness flush hooks + `MetricsStore.fetch_events_since()` + `BaselineCondition.LONGITUDINAL` enum fix (latent bug). Uses utility-score KL (proposal-literal, mirrors `_compute_kl_divergence`) as primary metric with invocation-count KL as sensitivity series. Reports true per-type op counts + seeded-vs-evolved Gini answering Pillar 3 RQ #1. 26 new unit tests; 1363/1363 baseline. Answers §Metrics item 6 + Pillar 3 RQ #1 + RQ #2. RQ #3 (distribution-shift stability) addressed by Step 18.8 below (pulled out of Chapter 7 future work into pre-eval scope). |
 | **7.7** | ✅ **Step 18.8 — Distribution-shift experiment scripts — DONE 2026-04-17 end of session**. Scripts shipped; execution is Phase 4 wall-clock time. Delivers: (a) `scripts/run_longitudinal_shift.py` (new, 365 LOC) — phased runner with CLI `--phase-a-tasks` / `--phase-b-tasks` / `--shift-at` / `--total`, writes a `distribution_shift` event to cycle_events at the boundary; (b) `scripts/analyze_longitudinal.py` extended with `_detect_shift_point` + `_classify_adaptation` helpers and a full "Distribution-Shift Analysis" output block reporting Phase A cycles-to-converge, KL spike magnitude at shift, Phase B cycles-to-re-converge, and three-tier adaptation verdict ("graceful" ≤2x / "sluggish" 2x-5x / "collapse" >5x or never); (c) `tests/evaluation/cycle_flush.py` — new helper module factoring the Step 18.5 + 18.7 per-task flush logic out of `EvaluationHarness._execute_run` so both longitudinal scripts call the same code path (fixes a latent gap where `run_longitudinal.py` bypassed the harness and didn't populate cycle_utility_scores / cycle_events). 10 new unit tests (shift detection + three-tier classifier). 1373/1373 baseline. Synthetic sanity: 20-cycle shifted DB → correctly detects shift at cycle 10, Phase A converges at cycle 6, KL spike 5.75, Phase B re-converges 6 cycles post-shift, verdict "graceful adaptation (1.0x)". Ready to execute during Phase 5. |
@@ -1333,7 +1335,7 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
 
     **Priority:** ship between Step 13 and Steps 4–11 (the B1 Pillar 3 main block). Same tier as Step 14.7 and Step 13 — a small-scope, pre-eval correctness fix. Do NOT ship after the B1 block starts — B1 is ~20h of deep Pillar 3 work and interleaving a Pillar 2 change in the middle adds merge-conflict risk for no benefit.
 
-**Phase 3 — Remaining pre-eval and validation (~4.5–5.5 hours).**
+**Phase 3 — Remaining pre-eval and validation (~8-10.5 hours, revised 2026-04-17 end of session +2-3 h for Step 13.7 LangFuse tracing audit, then +1.5-2 h for Step 13.8 compression-loss analyzer).**
 
 12. ✅ **DONE 2026-04-16 — File output fix for SKILL/AGENT last steps (Option B, not Option A).** Decomposer prompt Rule 15 + `_ensure_file_writer_last_step` validator append a deterministic MCP_TOOL writer as the last subtask when `state.output_contract.required_files` is non-empty. The writer becomes a regular gap — classified as MCP_TOOL, generated, three-tier-verified, registered, eligible for Pillar 3 operations. An initial Option A implementation (executor-level synthesis with hardcoded format list) was implemented then reverted in the same session after a proposal-alignment review surfaced a five-pillar drift — see §12 finding #10 for the methodology nugget. 8 new tests (`TestEnsureFileWriterLastStep`). Affects T07 (CSV) and T11 (Excel) in the eval testbed.
 
@@ -1395,6 +1397,127 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
        **Out of scope:** writing NEW tests — that's Step 13. This is about deleting or fixing EXISTING ones. If a test is assertion-rotten, rewrite it; if it's redundant, document + remove; if it codifies a fixed bug, rewrite to assert the new contract. Each change runs through `pytest tests/unit/ -q` to confirm the 1326 baseline holds (or drops to a new documented floor).
 
        **Expected outcome:** maintained or slightly reduced test count with a higher confidence interval. Documented follow-ups in `docs/test_suite_hygiene_2026_04_16.md` for anything deferrable to post-eval. Must land BEFORE Step 14 smoke tests so the smoke-test baseline is the post-hygiene number, not contaminated by tests that the hygiene pass would have deleted.
+
+13.7. **LangFuse tracing audit — verify every test-run surface is captured with enough detail to verify Chapter 6 claims** (~2-3 h). **Added 2026-04-17 end of session.**
+
+       **Why this step exists.** Phase 4 Step 18 (400-record eval), Step 19 (longitudinal), and the Step 18.8 distribution-shift run together generate ~450+ end-to-end pipeline invocations. Chapter 6 claims (per-condition success rate, per-task token cost, per-tier rejection rate, Pillar 3 operation frequencies, KL convergence, adaptation verdict) are verifiable only if LangFuse + the DuckDB evaluation store between them captured the evidence the moment it was produced. If an event was never emitted, it cannot be recovered from a re-read of the DB — it has to be regenerated by re-running the (expensive) eval. The §12 finding #17 trace `aec201273d7aef62c675ce5b4cb9a2ef` was the canonical save: we could reconstruct the 5-subagent AGENT reasoning chain post-hoc *because* every LLM call was captured with inputs, outputs, and token counts. If that trace had been lossy, the Step 13 timeout fix would have been blind guesswork. We need the same confidence across all pre-eval surfaces before Phase 4 commits 18+ unattended hours and ~$6 of API spend.
+
+       **What to verify (inventory of expected events).**
+       - **Per pipeline invocation** — a parent trace / session tagged with `run_id`, `condition` (`full` / `no_verification` / `no_optimization` / `static` / `longitudinal`), `task_id` (`T01`-`T20`), `capability_id` at execution time. Verify via LangFuse UI: "filter by task_id=T04, condition=full" returns exactly the expected number of traces (e.g. 5 runs × 1 task = 5).
+       - **Per pipeline stage** — each of the 9 LangGraph nodes (decomposition, gap_detection, classification, generation × 3 types, verification, loading, composition, optimizer) emits either a LangChain auto-trace (via the `langfuse_handler` callback) or an explicit `langfuse.span()`. No node should be silent.
+       - **Per generated artifact** — generation events include token_cost, latency, and the artifact name. This is what `scripts/backfill_token_costs.py` reads; if a generation is un-traced, its token cost backfills to 0 and T3 (token cost per task) metric lies.
+       - **Per verification tier** — Tier 0 (quick_validate structural), Tier 1 (static scanner), Tier 1.5 (import probe), Tier 2 (behavioral), Tier 3 (adversarial) each emit an event with findings + severity + tier_reached. `tier_reached` is the distribution we'll plot in Chapter 4.5. Especially confirm Tier 1.5 events exist post-Step-12.5 (freshly wired 2026-04-17).
+       - **Per retry / sticky-flag fire** — `decomposition_succeeded=False` (exit 2), `classification_succeeded=False` (exit 5), `verification_succeeded=False` (exit 4) should emit ERROR-level LangFuse events per §12 findings #14/#15/#16. These feed the Chapter 4 fail-closed-vs-fail-open comparison.
+       - **Per Pillar 3 operation** — prune / split_variant / merged / verification_rollback events land in both `cycle_events` DuckDB and LangFuse (so the cross-reference works). Distribution-shift runs additionally emit `distribution_shift` at the Phase A/B boundary (Step 18.8).
+       - **Per invocation of a generated capability at runtime** — MCP_TOOL `sandbox_execute` call, SKILL constrained-LLM (≤3 tool calls), AGENT DeepAgent (5-15+ calls) — each should appear as a child span under its parent pipeline trace. This is what `scripts/analyze_context_utilization.py` reads to compute peak input-token % per agent/task; if any backend is silent, T3 (context economy) measurement silently under-reports.
+       - **Per user-feedback event** (§12 finding #6b) — `mint feedback --wrong` writes an `InvocationRecord` with `success=False` + `actual_output` set; the associated LangFuse span should carry a `user_judgment=wrong` tag so we can trace which feedback rows triggered which Pillar 3 splits.
+
+       **Method.** Three-step audit, each ~1 h.
+
+       1. **Write the expected-event inventory.** Produce a table (scratch note: `docs/langfuse_audit_2026_04_17.md`) mapping each of the above event categories to: (a) the module that should emit it, (b) the exact tag / metadata key it carries, (c) the downstream reader that consumes it (`analyze_results.py` / `backfill_token_costs.py` / `analyze_context_utilization.py` / `analyze_longitudinal.py` / manual Chapter 6 UI filter). This gives us the oracle to diff against.
+       2. **Run a minimal end-to-end probe.** `uv run scripts/run_pilot.py --tasks T04 T11 T16 --conditions full no_verification --n-runs 1` — three tasks × two conditions × one run = 6 traces, ~15 min wall clock, ~$0.20. Covers MCP_TOOL (T11), SKILL (T04), AGENT (T16), plus the ablation condition that removes the verification layer. Plus a single longitudinal probe: `uv run scripts/run_longitudinal.py --total 3` to cover cycle_events / cycle_utility_scores LangFuse pairing.
+       3. **Diff observed vs expected.** Pull traces via LangFuse UI + MCP (`mcp__langfuse__fetch_traces` with `run_id` filter). For each inventory row, assert the event is present with the expected shape. Record gaps in the audit note. Fix with one of: (a) thread `config={"callbacks": [langfuse_handler]}` on the missing node, (b) add explicit `langfuse.span(name=..., metadata=...)` wrap, (c) add a tag to an existing span. Re-run probe, re-diff.
+
+       **Known-or-suspected gaps to check first** (quick wins before deep audit):
+       - `src/verification/coverage.py::verify_coverage` — does Step 7's post-split coverage replay emit a LangFuse event, or only a `cycle_events` DuckDB row? (If the latter, Chapter 5.3's coverage-verification narrative is un-traceable.)
+       - `src/orchestrator/loading_node.py::register_tool` — is registration traced with capability_id + domain + is_generic? Gap detection search quality (§3.5f evolutionary taxonomy) depends on this being visible.
+       - `src/optimizer/loop.py::_compute_kl_divergence` — is the per-cycle KL value emitted as a LangFuse score / metric, or only written to `cycle_utility_scores`? Chapter 5.4 convergence analysis wants both.
+       - `tests/evaluation/cycle_flush.py::flush_task_cycle_state` — does the flush hook add a tag linking LangFuse span to the DuckDB cycle_events row? Without this, per-task cross-reference is by-hand.
+       - `scripts/run_longitudinal_shift.py` Phase A/B boundary `distribution_shift` event — does it fire in BOTH stores, or only DuckDB?
+       - Adversarial DeepAgent timeout path (Step 14.11 fail-closed) — is the timeout span captured with enough detail to reconstruct how many sub-probes completed before the cap hit?
+
+       **Out of scope.** Fixing any cost-center prompt-caching inefficiencies surfaced during the audit (that's post-eval). Adding new metrics that aren't already in Chapter 6's plan (scope creep). Retroactively backfilling the existing `data/eval/` snapshots — everything pre-audit is stale and will be overwritten by Phase 4's full re-run.
+
+       **Deliverables.**
+       - `docs/langfuse_audit_2026_04_17.md` with the expected-event inventory, the observed-event diff, and the gap list.
+       - Code patches (one per gap found) adding callbacks / spans / tags as needed.
+       - A re-run of the minimal probe asserting zero observed gaps post-fix.
+       - If any gap is deferred to post-eval because fixing it would require a redesign (unlikely but possible), the audit note records the exact Chapter 6 claim that becomes weakened, so the thesis write-up doesn't accidentally over-claim.
+
+       **Priority.** After Step 13.5 test hygiene (so the audit runs against the same code the smoke tests will verify). Before Step 14 smoke tests (so any instrumentation patches pass through the smoke run). Blocker for Phase 4 Step 18 — do not start the 400-record eval until this audit is green. Rationale: Phase 4 is 18h unattended + ~$6 in API cost; discovering post-hoc that Tier 1.5 events didn't emit would cost a full re-run. A 2-3h audit now is a 5-10x cost-risk ratio.
+
+       **§12 coupling.** When Step 12 (proposal-vs-implementation audit) runs, record LangFuse instrumentation coverage as an observability-layer check — the thesis's "grounded in empirically observed contamination patterns" claim (proposal §Pillar 2, verification-as-a-research-contribution) is only defensible if the empirical observations were actually captured. Any gap surfaced here should be cross-referenced in the §12 audit doc as a methodology disclosure item (not a drift — observability is not a proposal claim per se — but a defensibility note).
+
+13.8. **Context-economy compression-loss analyzer — `scripts/analyze_compression_loss.py`** (~1.5-2 h). **Added 2026-04-17 end of session** after the `docs/verification/01_bootstrapping_problem.md` Bootstrapping-Problem audit surfaced a one-sided measurement of the T3 tension.
+
+       **Why this step exists — the measurement gap.** The proposal's §Bootstrapping §T3 (Context economy, lines 17–19) names **two** failure modes pulling in opposite directions:
+
+       > *"Naive approaches (full conversation history) hit token limits and introduce noise. But aggressive compression loses critical details."*
+
+       The repo has:
+       - **Mechanism to resist both:** typed `output_schema` contracts on `SubTask` + runtime validation in `CompositionalExecutor` (`src/orchestrator/composition.py` lines 733–765, §12 finding #12 Layer 2) + task-boundary `OutputContract.check()` (Step 14.6).
+       - **Metric for the first failure mode:** `scripts/analyze_context_utilization.py` computes peak `input_tokens / 128_000` per agent/task from LangFuse traces → quantifies how close to the ceiling we are.
+       - **No metric for the second failure mode.** Nothing reports "fraction of chain failures where an upstream step dropped a key that the downstream step declared as needed" — that's compression loss at a handoff boundary.
+
+       **Concrete failure shape.** Decomposer produces `SubTask_A.output_schema = {"parsed_rows", "schema_sha"}`. Step A's generated artifact returns only `{"parsed_rows": [...]}`. `CompositionalExecutor` emits `failed_step_reason="missing output_schema keys: schema_sha"` (per `composition.py` finding-#12 path). Without this analyzer, that event is a DuckDB row nobody reads. With this analyzer, it becomes a Chapter 6 number: "X% of AGENT-step failures are compression-loss, Y% are wrong-value, Z% are exceptions."
+
+       **The signal already exists — no instrumentation work needed.** Step 14.6 + §12 finding #12 populated three fields on `EvaluationRecord`:
+       - `failed_step_name: str | None` — the chain step whose output failed validation.
+       - `failed_step_reason: str | None` — free-text reason; missing-key variants follow a stable prefix pattern ("missing output_schema keys: ...").
+       - `output_shape_mismatch: bool` + `output_shape_missing_keys: str` (JSON list) — task-boundary version for `OutputContract`.
+
+       So Step 13.8 is purely a READER + classifier — no new write-side plumbing.
+
+       **What.** New `scripts/analyze_compression_loss.py`. Reads `data/eval/evaluations.duckdb`, classifies every failure row into one of five categories, reports per-condition + per-type rates, identifies most-frequently-dropped keys.
+
+       **Failure-classification taxonomy** (mutually exclusive, exhaustive for chain failures):
+       1. **`compression_loss_subtask`** — `failed_step_reason` matches prefix "missing output_schema keys:" (per-step schema violation at a handoff). **This is the T3-second-failure-mode signal.**
+       2. **`compression_loss_task`** — `output_shape_mismatch=True` AND `output_shape_missing_keys` non-empty (task-boundary contract violation via Step 14.6). Failure surfaced at CLI exit, not mid-chain. Also T3-second-failure.
+       3. **`wrong_value`** — chain ran to completion, all keys present, but `output_in_range=False` (authored validator rejected the value content, e.g. T16 AGENT producing a plausible but wrong `root_cause_metric`). NOT compression loss — this is Pillar 1 reasoning failure or Pillar 2 Tier 3 gap.
+       4. **`exception`** — `failed_step_reason` indicates Python exception (`TypeError`, `KeyError`, `ValueError`, network errors, etc.). Typically Pillar 2 Tier 2 probe would have caught; if it didn't, that's a verification-gate coverage gap, not compression loss.
+       5. **`timeout`** / **`gate_rejection`** / **`other`** — residual buckets.
+
+       The classifier is a single regex/substring match pass over `failed_step_reason` with a priority order; `compression_loss_*` wins over `exception` if both could match (a missing-key error is-a `KeyError`, but its dominant framing is the schema violation).
+
+       **Output (three views):**
+       1. **Per-condition summary table.** Rows = `{full, no_verification, no_optimization, static}`; columns = `total_failures`, `compression_loss_rate` (subtask + task combined), `wrong_value_rate`, `exception_rate`, `timeout_rate`. Answers "does removing verification / removing optimization shift the balance of failure causes?"
+       2. **Per-capability-type table.** Rows = `{MCP_TOOL, SKILL, AGENT}`; same columns. **Expected signal:** AGENT > SKILL > MCP_TOOL compression-loss rate (more LLM reasoning = more opportunity to drop a declared key). If MCP_TOOL shows non-zero compression-loss, that's a decomposer bug (decomposer declared a key the MCP generator wasn't asked to produce).
+       3. **Most-frequently-dropped keys table.** Top 10 `(capability_type, missing_key_name, frequency)` rows. Points Chapter 6 at the specific decomposer / generator prompts that need tightening.
+
+       **Implementation sketch.** ~150-200 LOC, standalone script (no new schema, no harness changes):
+       ```python
+       # Read
+       con = duckdb.connect(db_path, read_only=True)
+       rows = con.execute("""
+           SELECT condition, capability_type, failed_step_name,
+                  failed_step_reason, output_shape_mismatch,
+                  output_shape_missing_keys, output_in_range, gate_passed
+           FROM evaluation_runs
+           WHERE chain_success = FALSE OR output_in_range = FALSE
+       """).fetchall()
+
+       # Classify
+       for row in rows:
+           category = classify_failure(row)  # regex/prefix match, priority order
+           missing = extract_missing_keys(row)  # parse "missing output_schema keys: [...]" OR row.output_shape_missing_keys JSON
+
+       # Aggregate + print
+       print_per_condition_table(...)
+       print_per_type_table(...)
+       print_most_dropped_keys_table(...)
+       ```
+
+       CLI flags: `--db`, `--condition <name>`, `--output-dir`, `--csv`, `--top-n` (default 10 for most-dropped keys).
+
+       **Unit tests** (`tests/unit/test_analyze_compression_loss.py`, ~10-12 tests):
+       - `classify_failure` priority rules (subtask-level wins over exception when both match).
+       - `extract_missing_keys` from both sources (`failed_step_reason` prefix parsing + JSON column parsing).
+       - Empty DB → empty tables, no division-by-zero.
+       - Single-condition filter → only that condition in output.
+       - Per-type aggregation sanity (known row distribution in / expected table out).
+
+       **Integration sanity.** After implementation, run against stale `data/eval/` if present (disclaimer: data is stale per CLAUDE.md) to smoke-test that the SQL + classification don't raise. Real numbers come from Phase 4 Step 18 output.
+
+       **Chapter 6 claim this enables.** "The typed-state-communication mechanism (Pillar 1 §3.4 + Step 14.6 + §12 finding #12) reduces compression loss from X% (no_verification condition, no per-step schema validation path) to Y% (full condition). Remaining compression loss is concentrated in AGENT-type capabilities (Z% vs W% for SKILL), indicating the MCP_TOOL deterministic executor is least susceptible and AGENT reasoning most susceptible — consistent with the proposal's §Pillar 1 classification rationale that AGENT is for stateful/uncertain work."
+
+       **What this does NOT claim.** It does not measure "fraction of correctly-declared output_schema keys" — that requires knowing ground-truth schema per task, which we don't have. It measures observable failures only — compression loss that produced *no* observable failure (downstream agent hallucinated a plausible substitute for the dropped key and the authored validator happened not to catch it) stays invisible. That's a Chapter 6 limitation disclosure, not a fix.
+
+       **Out of scope.** Measuring context-window utilization (that's `analyze_context_utilization.py`). Measuring prompt-caching efficiency. Retroactive re-runs to improve the signal (Phase 4 eval data is the instrument). Adding new `failed_step_reason` categories to the writer side (that's a §12 audit item if surfaced).
+
+       **Priority.** After Step 13.7 (LangFuse audit) and before Step 14 (smoke tests) — same build-ahead-of-eval pattern as Steps 18.5 / 18.7 / 18.8. Not a Phase 4 blocker because it only READS eval output; can technically ship during Phase 4 while eval runs. But recommended pre-eval so Chapter 6's compression-loss claim is operational the moment Step 18 finishes.
+
+       **§Bootstrapping coupling.** This step closes the single acknowledged measurement gap in `docs/verification/01_bootstrapping_problem.md` §6 drift table row #1 ("Context economy measurement only captures peak utilization, not compression-loss"). When this lands, update that row to `✅ RESOLVED via Step 13.8`.
+
 14. Run Phase 4 smoke tests end to end: full `pytest tests/unit/`, `test_pipeline`, `test_verification`, `test_auto_optimizer`, `test_mint`, 20-task pilot at one run per task. (~1–2 hours hands-on plus wait time)
 14a. ✅ **Step 18.5 — Gini + Core-Work Classification Accuracy + persistent invocation log — DONE 2026-04-17** (commit `ad4908e`, 586 LOC across 7 files, +10 unit tests → 1336/1336). Full proposal-aligned delivery (not a proxy):
 
@@ -1549,3 +1672,122 @@ The only thing I need from you before I start executing is the answer to the tim
 - **If not, how many hours do you have?** I'll map that to one of the two fall-back options (merge-all-three-defer-split, or merge-SKILL-AGENT-only-defer-everything-else) and rewrite Phase 2 accordingly.
 
 I won't touch `operations.py` or `loop.py` or start any Phase 2 work until you answer. I also won't write any more planning docs until the current plan is executed — this one is the ceiling.
+
+---
+
+## 11. Thesis write-up disclosures to capture (do NOT edit `docs/thesis_proposal.md`)
+
+Per the rule established in §8 (*"thesis_proposal.md — the contract. The rolled-back original. Do not modify."*), implementation realities that diverge from or scope-limit the proposal's claims must be captured here and then written into the thesis body chapters (Chapter 4 / Chapter 5 / Chapter 6 / Chapter 7.2 Limitations) — never back-patched into the proposal itself.
+
+This section is the canonical holding area for those disclosures. Each item below is something Chapter 4/5/6/7 must acknowledge in prose. When a chapter is drafted, copy the disclosure text into the chapter and leave a `[captured in Chapter X §Y]` note in the entry below so we can track coverage.
+
+### 11.1 Pillar 3 Split — coverage verification is MCP_TOOL-only (not split itself)
+
+**Target chapter:** Chapter 5.3 (*"Evolutionary Operations: Split, Merge, Prune"*) + Chapter 7.2 Limitations + Chapter 7.3 Future Directions.
+
+**Distinction to preserve in prose:** `split()` itself applies uniformly to all three capability types (9/9 operation × type matrix, landed in B1 Steps 6 + 8). What is MCP_TOOL-only is the *collective coverage cross-check* (`verify_coverage()` in `src/verification/coverage.py`) that replays the parent's recorded failures against the new variants to assert each failure mode is actually fixed.
+
+**Rationale to include:** The proposal's Pillar 3 Split clause frames specialization as *"input subspaces where the capability breaks"* — this presupposes stable per-input failure semantics that only deterministic executors satisfy. For LLM-mediated SKILL/AGENT, the same input yields variable output per invocation, so *"did the variant fix the failure on input X?"* collapses into *"did the variant happen to succeed on this replay?"* — which tells us nothing; the parent might also happen to succeed on replay purely from LLM variance. SKILL and AGENT splits therefore rely on the three-tier verification gate per variant for safety, without a collective *"variants cover the parent's failure surface"* guarantee.
+
+**Chapter 7 future work item:** per-variant replay statistics or LLM-judged correctness for nondeterministic split coverage.
+
+**Cross-references:** §12 pre-registered finding #5 (full Pillar 1 × Pillar 3 tension analysis), `src/verification/coverage.py` lines 47–79 (inline docstring), `docs/verification/01_bootstrapping_problem.md` §6 drift row #3.
+
+**Status:** Not yet captured in any chapter draft.
+
+### 11.2 Token-cost-per-task — measurement operationalization and caveats
+
+**Target chapter:** Chapter 6.1 (*"Testbed Description"*) methodology subsection AND Chapter 7.2 Limitations.
+
+**What to write:** The proposal's §Evaluation Strategy §Metrics lists *"Token cost per task: Total tokens consumed including capability definitions, generation, verification, and execution."* That metric is operationalized by backfilling LangFuse GENERATION observations onto evaluation runs. GENERATION in LangFuse nomenclature = any LLM call — so the backfill DOES capture generation + verification + execution LLM tokens (decomposer, classifier, generator, Tier 2/3 verifier, SKILL/AGENT executor all counted). Non-LLM compute (Docker sandbox execution, pip install wall-clock) genuinely has zero tokens by the proposal's own definition.
+
+**Simplifications to disclose in Chapter 7.2 Limitations:**
+
+- **Timestamp-window matching with per-condition averaging fallback.** `scripts/backfill_token_costs.py` maps GENERATIONs to eval runs by timestamp; when exact per-run matching is ambiguous, falls back to per-condition averages. Introduces tail-level estimation error but per-condition aggregates stay accurate.
+- **Static-baseline and T01–T03 JIT runs hardcoded to zero tokens.** Static bypasses LLM entirely (correct by construction). T01–T03 are registry-match tasks assumed to match MCP_TOOL seeds with no execution LLM — if a future seed upgrade puts a SKILL or AGENT on that path, the zero-token assumption silently under-counts.
+- **Embedding-call tokens conditional on GENERATION-span instrumentation.** If `registry.search()` doesn't emit a LangFuse GENERATION span, embedding-call tokens aren't captured. Status: to be confirmed as part of Step 13.7 LangFuse tracing audit.
+
+**Cross-references:** `scripts/backfill_token_costs.py` docstring lines 1–22, Step 13.7 detail above, `docs/verification/01_bootstrapping_problem.md` §6 drift row #4.
+
+**Status:** Not yet captured in any chapter draft. Embedding-call instrumentation answer depends on Step 13.7 outcome.
+
+### 11.3 Context economy — compression-loss measurement coverage
+
+**Target chapter:** Chapter 6.4 (*"Analysis and Discussion"*) context-economy subsection + Chapter 7.2 Limitations.
+
+**What to write:** The proposal's §Bootstrapping §T3 (Context economy) names *two* failure modes — naive-verbose (hits token limits, adds noise) AND aggressive-compression (loses critical details). Both are measured empirically:
+
+- **Under-compression / utilization peak** — `scripts/analyze_context_utilization.py` computes peak `input_tokens / context_window` per agent/task.
+- **Over-compression / information loss** — `scripts/analyze_compression_loss.py` (Step 13.8 pre-eval deliverable) classifies chain failures into compression-loss (subtask-level + task-level) / wrong-value / exception / timeout over the `failed_step_reason` + `output_shape_mismatch` + `output_shape_missing_keys` runtime validation signal.
+
+**Limitation to disclose in Chapter 7.2:** Compression loss that produces *no* observable failure (downstream agent hallucinates a plausible substitute for the dropped key and the authored validator happens not to catch it) stays invisible to the instrument. The analyzer quantifies observable compression-loss failures only.
+
+**Cross-references:** Step 13.8 detail above (full analyzer spec), `docs/verification/01_bootstrapping_problem.md` §6 drift row #1 (resolved via Step 13.8).
+
+**Status:** Not yet captured in any chapter draft. Script not yet built (Step 13.8 pre-eval).
+
+### 11.4 Tier 1.5 sandbox import probe — cost-optimization, not a new methodological tier
+
+**Target chapter:** Chapter 4.5 (*"Verification Gate: Integration with the Pipeline"*).
+
+**What to write:** Full disclosure framing already staged in Step 12.5 detail block above — copy verbatim when drafting Chapter 4.5. Key points: the proposal §Pillar 2 names exactly three tiers; the implemented gate adds a Tier 1.5 between Tier 1 and Tier 2; Tier 1.5 is a cost-optimization that catches operational-correctness failure modes (`wrong_pip_package`, `import_error`, `fence_compile_error`) NOT in the proposal's LLM-failure-mode taxonomy; without Tier 1.5, Tier 2 still catches these via `ModuleNotFoundError`, just more expensively; do NOT frame Tier 1.5 as a new thesis contribution — it's a gate implementation detail.
+
+**Status:** Disclosure text drafted in Step 12.5 above; not yet captured in Chapter 4.5 draft.
+
+### 11.5 Adversarial Tier 3 timeout — fail-closed (Step 14.11)
+
+**Target chapter:** Chapter 4.4 (*"Tier 3: Adversarial Probing Agent"*) + Chapter 4.5.
+
+**What to write:** Original Tier 3 implementation failed **open** on adversarial-probe timeout (`overall_passed=True` + `adversarial_timeout` note), which contradicts the proposal's *"must pass all three tiers"* contract. Step 14.11 flipped this to fail-closed (HIGH severity, triggers the verification_node retry loop) and bumped the 300s ceiling to 480s. The fix aligns the implementation with the proposal-literal contract.
+
+**Cross-references:** Step 14.11 detail above.
+
+**Status:** Not yet captured in any chapter draft.
+
+### 11.6 Tier 3 capability-type coverage gap — SKILL/AGENT prose-only not probed (Chapter 7 future work)
+
+**Target chapter:** Chapter 7.3 Future Directions.
+
+**What to write:** The adversarial Tier 3 prober crafts inputs + executes via `sandbox_execute` + observes outputs — which IS behavioral probing per the proposal. The drift is a **capability-type coverage gap**: prose-only SKILL/AGENT artifacts are not probed because `sandbox_execute`'s payload construction requires inlined executable source. This is tracked as Chapter 7 future work (per-runtime behavioral prober for prose-only capabilities), not a pre-eval fix.
+
+**Earlier mischaracterization to NOT reintroduce:** an earlier draft framed this as a "white-box vs black-box methodology substitution" — that was overstated and was recharacterized 2026-04-16 across 10 cross-references. The drift is capability-type coverage, not methodology substitution.
+
+**Cross-references:** `docs/perf_fixes_2026_04_14.md` §3e, `MEMORY.md` "Tier 3 coverage-gap drift (2026-04-16 recharacterization)".
+
+**Status:** Not yet captured in any chapter draft.
+
+### 11.7 Pillar 3 evolutionary taxonomy — implementation mechanism beyond proposal sketch (Chapter 5)
+
+**Target chapter:** Chapter 3.1 (*"Task Decomposition and Skill Gap Detection"*) OR Chapter 5.1 (*"The Specificity-Generality Spectrum: Formal Framework"*).
+
+**What to write:** The proposal's §Pillar 1 mentions hierarchical embeddings (domain → capability → specific skill) for gap detection. The implementation ships a richer mechanism: an **evolutionary domain taxonomy** (`src/orchestrator/taxonomy.py`) that grows one category at a time as MINT encounters new kinds of tasks, plus an `is_generic` flag that bypasses strict domain filtering for cross-domain-reusable capabilities. Starts empty, stays coherent across sessions, generalizes beyond the Business Analytics testbed to any vertical (medical, legal, factory sim, etc.) without manual re-vocabularying. This is an **improvement over proposal** framing — a second evolutionary mechanism alongside Pillar 3 operations.
+
+**Cross-references:** Phase 2 Step 3.5f, CLAUDE.md §"Evolutionary Taxonomy (complete 2026-04-14)", `MEMORY.md` Step 3.5f entry.
+
+**Status:** Not yet captured in any chapter draft.
+
+---
+
+### 11.8 MCP tool loading strategy — importlib subprocess, not persistent FastMCP servers
+
+**Target chapter:** Chapter 3.5 (*"Implementation with LangGraph, MCP, and Claude Code"*) + Chapter 7.3 Future Directions.
+
+**What to write:** The proposal's §Tech Stack Mapping lists *"Tool serving (generated MCP tools): MCP SDK (Python/TypeScript)"* and §Pillar 1 Step 5 describes *"the generated artifact is deployed into an isolated environment — a **sandboxed MCP server**, a skill folder, or a contained agent session"*. The natural reading is that each generated MCP tool becomes a persistent FastMCP subprocess server with a JSON-RPC endpoint the orchestrator connects to.
+
+The implementation ships a simpler mechanism: **dynamic `importlib` import inside a sandboxed Docker subprocess** (`src/orchestrator/tool_loader.py`). No ports, no persistent server processes, no health checks, no zombie-process risk. The orchestrator imports the generated module by path, calls the async function directly, and tears the subprocess down after each invocation. Functional contract with FastMCP is identical (typed input/output schemas, structured responses); operational lifecycle is not.
+
+**Rationale for the simplification:** persistent MCP servers add process-lifecycle complexity (port allocation, health monitoring, crash recovery, graceful shutdown) that is orthogonal to the thesis's three-pillar claims. The JIT pipeline + verification gate + granularity optimizer all work identically whether the tool is served by a subprocess-per-call or a long-running server. Deferring persistent MCP deployment keeps the thesis scope focused on the research contributions.
+
+**Chapter 7 future-work item:** full MCP server deployment with subprocess lifecycle management (port allocation, health checks, graceful shutdown, crash recovery), enabling cross-process tool reuse and external MCP-client interop. This would also unlock cross-protocol interoperability (MCP + A2A) which is already listed in §7.3.
+
+**Cross-references:** CLAUDE.md §MCP Tool Loading Strategy, `src/orchestrator/tool_loader.py` module docstring, §9 "What NOT to worry about right now" (original tracking location), `docs/verification/01_bootstrapping_problem.md` §6 drift row #2.
+
+**Status:** Not yet captured in any chapter draft.
+
+---
+
+### 11.9 Process rule — thesis_proposal.md is immutable
+
+When writing up the thesis chapters, anything that would otherwise edit `docs/thesis_proposal.md` gets added here first, then flows into the chapter prose. The proposal is preserved as the rolled-back original so the contract-vs-implementation narrative stays honest: *"the proposal said X; the implementation ships X with scope Y and improvement Z."* Editing the proposal retroactively would erase that narrative.
+
+If you ever catch me editing `thesis_proposal.md`, stop me — I should be editing this §11 instead.
