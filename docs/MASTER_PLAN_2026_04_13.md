@@ -837,6 +837,66 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
        - **Methodology nugget.** `test_mint`'s PASS semantics (structural-only) vs `EvaluationHarness`'s PASS semantics (validator-invoked) is a real gap in the local feedback loop. A mid-future improvement would be to let `test_mint` optionally invoke the per-task validator for tasks that have one (T16 does). Not in scope now; noted for future consideration.
        - Finding #9 methodology lesson: not every surfaced deviation is a code drift — some are evaluation-definition drifts. The §12 audit row is the right channel for both.
 
+   18. **`--allow-network` CLI flag is a cosmetic no-op — runtime sandbox is offline-only, and no live-API capability can actually run — ⚠ Drift + ⚠ Testbed realism gap (2026-04-18, surfaced during the Pillar 2 audit writeup for `docs/verification/03_pillar_2_verification.md`).** Eleventh §12 finding. Different shape from findings #10-#17: not a silent-fallback drift inside the gate itself, but a **dead user-facing capability toggle** that advertises runtime network access the pipeline does not deliver. The discovery also exposes a testbed-realism gap: MINT today cannot generate or verify any capability that depends on fetching from an external API, because every runtime sandbox invocation is hardcoded to `--network none`.
+
+       **The empirical surface (file:line receipts).** Full trace across `src/`:
+
+       | # | File:line | What happens to `allow_network` |
+       |---|---|---|
+       | 1 | `src/cli/app.py:57-59` | `--allow-network` typer option declared |
+       | 2 | `src/cli/app.py:75` | Forwarded to `execute_task(allow_network=...)` |
+       | 3 | `src/cli/runner.py:1510` | Accepted as a `kwarg` on `execute_task` |
+       | 4 | `src/cli/runner.py:1624-1625` | Appended to LangFuse `_trace_tags` list |
+       | 5 | `src/cli/runner.py:1636` | Written to LangFuse `metadata` dict |
+       | 6 | *(nowhere else)* | **End of flow. Never threaded into `TaskState`, `create_pipeline(...)`, `verification_node`, `gate.verify`, `_execute_mcp_tool`, `_execute_compositional_chain`, `_execute_skill_or_agent`, or any `sandbox_execute` / `sandbox_execute_in_workspace` call.** |
+
+       Verified with `grep -rn "allow_network" src/` + reading every call site: the flag is **used in exactly two lines** of `execute_task`, both cosmetic (tracing tags / metadata). It is never passed to the pipeline factory, never added to `TaskState` (no field exists in `src/schemas/task.py`), never plumbed into any runtime executor. The single `allow_network` parameter on `sandbox_execute` (`src/verification/sandbox_tool.py:129`) defaults to `False` everywhere and **no call site in the codebase** overrides it to `True` for real runtime execution.
+
+       **Runtime executors, one per line, all hardcoded offline:**
+       - `src/cli/runner.py:855` — single-artifact MCP_TOOL exec: `sandbox_execute(sandbox_code, timeout=exec_timeout, extra_packages=extra_pkgs or None)` (no `allow_network` kwarg → default `False`).
+       - `tests/evaluation/execution.py:823-828` — compositional chain MCP_TOOL step: `sandbox_execute_in_workspace(sandbox_code, workspace_path=..., timeout=..., extra_packages=...)` (no kwarg).
+       - `tests/evaluation/execution.py:534` — SKILL backend: `llm.bind_tools([sandbox_execute])`. The LLM *could* in theory pass `allow_network=True` itself, but `src/orchestrator/prompts/skill_generator.py:112-120` never mentions the flag so it has no reason to.
+       - `tests/evaluation/execution.py:1094` — AGENT backend: `tools=[sandbox_execute]`. `src/orchestrator/prompts/agent_generator.py:22` explicitly instructs the generator *"the script runs with --network none"*, steering the LLM away from ever toggling the flag.
+       - `src/verification/behavioral.py` (Tier 2) and `src/verification/adversarial.py:239-268` (Tier 3): both use `sandbox_execute` with the default offline behavior; Tier 3's adversarial system prompt (`adversarial.py:140`) *depends on* `--network none` being the default — that's what makes the "network-disconnect" attack pattern observable.
+
+       **Why it matters for the thesis.**
+
+       1. **User-surface dishonesty.** `mint run --allow-network "fetch stock data for AAPL"` today succeeds silently: the flag is accepted, the trace gets an `allow-network` tag, the pipeline generates a tool that tries to call a network library, runtime sandbox blocks the call, the tool fabricates or errors, and the user has no way to tell the flag did nothing. Viva-level indefensible.
+       2. **Testbed realism cap.** Proposal §Evaluation Strategy lists the Business Analytics Pipeline as the chosen testbed with *"data ingestion from heterogeneous sources"* as a named challenge. The current 20-task testbed sidesteps this by using file fixtures (CSV / Parquet / XLSX mounted into `/workspace`) — defensible, but it means the proposal's "heterogeneous sources" dimension is reduced to "heterogeneous file formats". A Chapter 6 reviewer could reasonably ask *"does MINT work when the data source is an API?"* and today the honest answer is *"no, that path is closed at the sandbox boundary."*
+       3. **Tier 3 adversarial coverage narrows.** The proposal's Tier 3 network-disconnect attack (`docs/thesis_proposal.md` line 147: *"Tests whether the tool behaves differently when network connectivity is simulated as unavailable"*) is effectively unused in the current eval because **no tool legitimately tries to use the network in the first place**. Real tools always succeed offline, fake ones never try; there's no contrast for the attack to surface. Plumbing the flag makes this attack pattern non-vacuous.
+       4. **F2 failure mode (silent fallback) can't surface.** Proposal §Pillar 2's F2 is specifically *"the tool wraps API calls in broad exception handlers that return synthetic data when the real call fails"*. No API = no F2 surface = that part of the verification-contribution claim is partially untested.
+
+       **Fix scope — see Step 14.12 below for implementation detail.** Four-part resolution, offline-by-default preserved throughout:
+
+       **Part A (plumbing, mandatory before Phase 5 OR explicit Chapter 7 deferral).** Thread `allow_network` from CLI / eval-harness entry points through `TaskState` + `create_pipeline(...)` + every runtime executor + Tier 2/3 verification. Each `sandbox_execute` / `sandbox_execute_in_workspace` call must read an explicit per-run policy. Generator prompts (skill_generator.py, agent_generator.py, mcp_tool_generator.py) get conditional instructions when network is allowed. A new `GeneratedArtifact.needs_network: bool` field on `src/schemas/task.py` so the classifier / generator can declare network dependency per capability, and the gate + executor honor it per-artifact.
+
+       **Part B (verification test against a live free-API endpoint).** Add a Tier 2/3 probe capability that exercises a known-free public endpoint (e.g. `https://api.github.com/zen`, `https://httpbin.org/get`, `https://worldtimeapi.org/api/timezone/Etc/UTC`, or similar zero-auth read-only endpoints). The test serves two purposes: (1) proves the flag actually changes runtime behavior (before-fix: assertion fails because sandbox is offline; after-fix: assertion passes); (2) anchors the Tier 3 network-disconnect attack on a tool that genuinely makes a network call, so the attack pattern becomes non-vacuous. Canonical form:
+
+       ```python
+       # scripts/test_allow_network.py (new)
+       # Verifies the --allow-network flag actually works end-to-end.
+       # A GeneratedArtifact with source_code that calls urllib.request
+       # against https://api.github.com/zen should:
+       #   allow_network=False → fail at runtime (URLError / network unreachable)
+       #   allow_network=True  → succeed, return a non-empty zen quote string
+       # Both paths are asserted; both are real Docker invocations (no mocks).
+       ```
+
+       And a Tier 2 behavioral test addition: when `artifact.needs_network=True`, `behavioral.py` should include a probe that invokes the tool twice — once with network allowed, once forced offline — and asserts the offline invocation fails or returns an error marker (real tool) rather than plausible-looking fake output (contaminated tool).
+
+       **Part C (persistent `mint config` toggle, user-requested 2026-04-18).** Offline-by-default is the correct security posture, but users who routinely work with API-dependent capabilities shouldn't have to remember `--allow-network` on every invocation. Add `mint config set network.allow true/false` mirroring the existing `mint config set optimizer.{prune,split,merge}` pattern (§12 finding #8, `src/cli/settings.py`). Precedence: per-invocation flag > persistent setting > default (`False`, offline). Add a `--no-allow-network` flag so the user can explicitly override-down when the setting says on. Rich-panel visibility cue printed on every network-enabled invocation (regardless of which layer enabled it), identifying the source — offline runs stay silent. Full surface + tests detailed in Step 14.12 Part C.
+
+       **Part D (one network-dependent testbed task, optional).** New `T21` in `tests/evaluation/tasks.py` that fetches from a zero-auth endpoint so Chapter 6 has at least one empirical data point for the network-enabled path. Optional pre-Phase-5; can land in Chapter 7 future work if time is tight.
+
+       **Methodology lesson (eleventh same-class finding this series).** This is **not** the same shape as findings #14-#16 (silent fallback inside a retry loop). It is a new shape: **a user-facing feature flag that flows only into telemetry, never into behavior**. Future audits of CLI flags / env vars / settings-file keys should trace every option from `src/cli/app.py` or `src/config.py` through to its first behavior-changing call site; flags whose only readers are logging / tracing sinks are candidates for either (a) removal as vestigial, or (b) real plumbing. Grep pattern for a future sweep: `grep -rn 'os.getenv\|typer.Option\|Field(default' src/ | grep -v __pycache__` then for each hit, confirm at least one non-logging consumer exists downstream.
+
+       **Phase 5 eval impact.** Current eval runs are unaffected — the testbed is all-file-fixture, no task would pass through the network path even if it existed. The fix is **forward-looking**: either land it before Phase 5 AND add one network-dependent task to the testbed (T21 or similar), OR defer the plumbing to Chapter 7 and disclose the current state honestly (§11.10 below). Landing it without a network-dependent task produces no eval delta — which is fine if the driver is "close the user-surface-dishonesty hole" rather than "measure a new thing".
+
+       **Cross-references:**
+       - `docs/verification/03_pillar_2_verification.md` §7 "Loose ends / honest gaps" — this finding is the same cluster as the *"Tier 3 fail-open on non-timeout errors"* gap listed there; they are different surfaces of the same "verification gate is slightly less strict than the proposal's contract" pattern.
+       - `src/verification/sandbox_tool.py:129, 303` — the one place in the codebase where `allow_network` actually changes Docker behavior; everything above it is plumbing.
+       - Finding #9 methodology lesson applies: not every drift is a code bug — some are unrealized user-surface capabilities. The §12 audit row is the right channel for both.
+
    **When to do this.** After Steps 4-11 land (so Pillar 3 is in its final form and doesn't need re-auditing), but before Phase 3 Step 14 (smoke tests and pilot). The audit output informs what gets fixed in Phase 3 and what gets disclosed in Chapter 4 writing post-eval.
 
 13. **AGENT execution timeout + sticky-flag pattern.** (~1.5-2 hours, added 2026-04-14 after the 19:01 test_mint run surfaced this.) Same class of bug as the decomposition timeout that Fix 2b addressed — a hard cutoff on a variance-prone runtime, this time inside `tests/evaluation/execution.py::execute_agent_artifact`. The generated incident-triage agent completed pipeline generation + verification fine, then hit the 480s agent-execution hard timeout during its adaptive investigation (reasoning-mode wall-clock variance on a long-running DeepAgent, same story we already saw on decomposition). The previous 14:44 run passed at 584.4s total because the agent happened to fit under 480s that time; the 19:01 run didn't.
@@ -1335,6 +1395,144 @@ Here is the actual dependency-ordered sequence. I've grouped it into three phase
 
     **Priority:** ship between Step 13 and Steps 4–11 (the B1 Pillar 3 main block). Same tier as Step 14.7 and Step 13 — a small-scope, pre-eval correctness fix. Do NOT ship after the B1 block starts — B1 is ~20h of deep Pillar 3 work and interleaving a Pillar 2 change in the middle adds merge-conflict risk for no benefit.
 
+14.12. **`--allow-network` plumbing + live-API verification test** (~3-4 hours, added 2026-04-18 after the Pillar 2 audit for `docs/verification/03_pillar_2_verification.md` surfaced the dead-flag trace. See §12 finding #18 for the full drift narrative + evidence; this step is the implementation.)
+
+    **Motivation.** The `--allow-network` CLI flag advertises runtime network access but dies at `src/cli/runner.py:1636` as a LangFuse-metadata-only entry. No runtime sandbox call receives it; every `sandbox_execute` / `sandbox_execute_in_workspace` invocation defaults to `--network none`. This produces three concrete problems: (1) user-surface dishonesty — the flag is accepted but does nothing; (2) testbed realism cap — no capability that requires API access can be generated or verified end-to-end; (3) the proposal's Tier 3 network-disconnect attack (line 147) runs against tools that don't try to use the network anyway, making the attack vacuous.
+
+    **Scope — Part A: Plumb the flag end-to-end (~2 h).**
+
+    - **`src/schemas/task.py`:**
+      - Add `TaskState.allow_network: bool = Field(default=False, description="When True, runtime sandbox allows outbound network in Phase 2")`.
+      - Add `GeneratedArtifact.needs_network: bool = Field(default=False, description="Declared by the generator when the capability legitimately requires network access at runtime")`.
+
+    - **`src/cli/runner.py::execute_task`:** after line 1605 (`initial_state = TaskState(...)`), thread `allow_network=allow_network` into `TaskState` construction. Thread it into `_execute_mcp_tool(artifact, file_paths, parsed_params, allow_network=...)` (line 1896), `_execute_compositional_chain(..., allow_network=...)` (line 1875), and `_execute_skill_or_agent(..., allow_network=...)` (lines 1921, 1936).
+
+    - **`src/cli/runner.py::_execute_mcp_tool` line 855:** change to `sandbox_execute(sandbox_code, timeout=exec_timeout, extra_packages=extra_pkgs or None, allow_network=allow_network)`. Signature gains `allow_network: bool = False`.
+
+    - **`tests/evaluation/execution.py::execute_mcp_tool_in_chain` line 823:** change to `sandbox_execute_in_workspace(..., allow_network=allow_network)`. Signature gains the parameter. `CompositionalExecutor` in `src/orchestrator/composition.py` threads it through from `TaskState.allow_network`.
+
+    - **`tests/evaluation/execution.py::execute_skill_artifact` / `execute_agent_artifact`:** pass `allow_network` to the bound `sandbox_execute` tool. For SKILL (line 534), wrap the tool in a closure that applies the policy — same pattern as `_make_probe_sandbox_execute` in `adversarial.py:198`. For AGENT (line 1094), same closure wrapper on the `tools=[...]` list.
+
+    - **`src/verification/gate.py::verify`:** accept an optional `allow_network` kwarg (default `False`) and pass it down to `behavioral.run(artifact, allow_network=...)` and `adversarial.probe(artifact, allow_network=...)`. Rationale: an artifact with `needs_network=True` that's verified with network *disabled* will spuriously fail Tier 2 (real API call errors) and Tier 3's network-disconnect attack becomes trivially "suspicious" on every invocation. The gate must verify the artifact in the same network-policy regime it will run under.
+
+    - **`src/verification/behavioral.py::run`:** accept `allow_network` kwarg; forward to every `sandbox_execute` call inside. Additionally: when `artifact.needs_network=True`, add a new test category `_test_network_disconnect_differential` that invokes the tool twice (allow_network=True, allow_network=False) and asserts the offline run fails or returns an error marker, not plausible-looking fake output — this is the direct F2 ("silent fallback") detector the proposal names.
+
+    - **`src/verification/adversarial.py::probe`:** accept `allow_network` kwarg; forward to `_make_probe_sandbox_execute`'s returned closure default. The adversarial system prompt's network-disconnect attack pattern (`ADVERSARIAL_SYSTEM_PROMPT` lines 139-146) already assumes `--network none`; when `allow_network=True`, add a sentence: *"The sandbox allows network in this probe run. Test whether the tool ALSO behaves differently when you explicitly disable network by passing `allow_network=False` to sandbox_execute — legitimate network tools should fail cleanly, contaminated tools will return plausible output."*
+
+    - **`src/orchestrator/prompts/mcp_tool_generator.py`, `skill_generator.py`, `agent_generator.py`:** conditional prose branch when `allow_network=True`. Current prompts (e.g. `agent_generator.py:22`) say *"runs first with network, then the script runs with --network none"* — that stays for the offline default. Added branch: *"When `allow_network=True`, Phase 2 also has network access. You may import `httpx`, `requests`, or `urllib` and make outbound calls. If your tool legitimately requires network, set `needs_network=True` in your response."*
+
+    - **`src/cli/app.py::run`:** already has `--allow-network`. Add short help pointer: *"Allow generated tools to make outbound network requests at runtime. Without this flag, all code executes in `--network none` Docker isolation."*
+
+    - **`tests/evaluation/harness.py`:** add `allow_network: bool = False` to `EvaluationHarness.__init__`; plumb to `TaskState` on every task run. The 400-record eval stays offline by default; only tasks with `needs_network=True` in `tests/evaluation/tasks.py` would trigger the online path.
+
+    **Scope — Part B: Live-API verification test (~1 h).**
+
+    New integration test script: `scripts/test_allow_network.py`. Modeled on `scripts/test_verification.py` (same file structure, same `--verbose` / `--help` conventions). Tests:
+
+    1. **`test_network_allowed_succeeds`** — construct a known-good `GeneratedArtifact` whose `source_code` calls `urllib.request.urlopen("https://api.github.com/zen", timeout=5).read().decode()`. Pass `needs_network=True`, `pip_packages=[]` (stdlib only). Run through `verify(artifact, allow_network=True)` + `_execute_mcp_tool(..., allow_network=True)`. Assert Tier 2/3 pass + runtime returns a non-empty string. This is the positive control: the flag actually works.
+
+    2. **`test_network_blocked_fails_cleanly`** — same artifact, but `allow_network=False`. Assert the runtime call errors with a URLError / socket-level failure, NOT with a plausible-looking fabricated response. Tier 2's `_test_network_disconnect_differential` should flag this as a legitimate error, not suspicious.
+
+    3. **`test_fake_network_tool_rejected`** — adversarial fixture: an artifact that *claims* to call `api.github.com` but actually returns a hardcoded `"Zen of Python"` string. `allow_network=False` — the hardcoded return path fires and Tier 2/3 should reject it (existing hardcoded-data detection + output-variation catches this). This is the negative control: contaminated tools still get caught regardless of network policy.
+
+    4. **`test_allow_network_flag_changes_docker_behavior`** — assert at the primitive layer: `sandbox_execute(code, allow_network=True)` actually runs with `--network bridge` and `sandbox_execute(code, allow_network=False)` runs with `--network none`. Use a probe that prints `socket.gethostbyname("api.github.com")` — succeeds online, raises `gaierror` offline. Regression guard for anyone who later silently reverts the plumbing.
+
+    **Free-API endpoint choice.** `https://api.github.com/zen` is first choice — no auth, tiny response (~20-50 byte philosophical quote), GitHub's stated purpose for the endpoint is exactly this kind of liveness check, and it's in most test suites already so the CI cost story is well-understood. Backups if GitHub rate-limits CI: `https://httpbin.org/get` (zero-auth echo), `https://worldtimeapi.org/api/timezone/Etc/UTC` (zero-auth time). Document the chosen endpoint + the backup list in the test script's module docstring so the next person knows why the test is hitting that host.
+
+    **Scope — Part C: Persistent `mint config` toggle for network access (~45 min, user-requested 2026-04-18).**
+
+    Offline-by-default is the correct security posture, but users who routinely work with API-dependent capabilities should not have to remember `--allow-network` on every invocation. Mirror the existing `mint config set optimizer.{prune,split,merge}` pattern (§12 finding #8, `src/cli/settings.py`) so that `--allow-network` has a persistent complement — opt-in, explicit, atomic-write-safe.
+
+    **New CLI surface:**
+
+    ```bash
+    # One-shot (existing, preserved verbatim — no behavior change)
+    mint run "fetch bitcoin price" --allow-network
+
+    # Persistent opt-in (new)
+    mint config set network.allow true     # future runs default to network=on
+    mint config set network.allow false    # back to offline-by-default
+    mint config unset network.allow        # remove the key, revert to defaults
+    mint config show                        # existing command, now prints network.allow row too
+
+    # Per-invocation override (new — explicit opt-out when settings say opt-in)
+    mint run "some task" --no-allow-network
+    ```
+
+    **Precedence rule (identical to existing optimizer-config rule):**
+
+    1. Per-invocation flag (`--allow-network` / `--no-allow-network`) wins if present.
+    2. Otherwise, read `data/cli/settings.json::network.allow` (boolean).
+    3. Otherwise, fall through to the default: `False` (offline).
+
+    **Scope of code changes:**
+
+    - **`src/cli/settings.py`:** add `get_network_allow_from_settings(settings: dict) -> bool | None` mirroring `get_optimizer_config_from_settings`. Returns `None` when the key is absent (so the caller can distinguish "no preference" from "explicitly False" — needed for precedence layering). Returns the boolean when present, ignores malformed values (log warning, return `None`).
+
+    - **`src/cli/app.py`:**
+      - `run` command: add `--no-allow-network: bool = False` companion flag (typer's `--flag/--no-flag` pair). Resolve the effective value with the precedence rule above and pass to `execute_task(allow_network=effective_value)`.
+      - `config set` / `config unset` / `config show` subcommands (already exist for `optimizer.*`): extend the validator to accept `network.allow` as a known key with `bool` type. Reject `mint config set network.allow maybe` with a clear error message matching the existing optimizer-config error shape.
+
+    - **`src/cli/runner.py::execute_task`:** no signature change — the flag resolution happens in `app.py` before the runner is called. The runner receives the already-resolved boolean, same as today.
+
+    - **`src/cli/display.py::show_config`:** add a `Network` row to the `mint config show` table, displaying `network.allow = true/false/(default: false)` — same format as the existing optimizer rows.
+
+    **Visibility cues (UX layer).** Offline-by-default is a safety guarantee; when it's overridden, the user should always see it, both for one-shot and persistent opt-ins. Reuse the existing `_trace_tags.append("allow-network")` path in `runner.py:1624-1625` + add a Rich-panel line:
+
+    ```
+    [yellow]⚠ Network access enabled[/yellow] — generated tools can make outbound requests
+    [dim]  source: --allow-network flag[/dim]           # or
+    [dim]  source: persistent setting (mint config show)[/dim]
+    ```
+
+    The panel line prints at the top of every `mint run` invocation where `allow_network=True`, regardless of which layer enabled it. Offline runs print nothing extra (default path is silent). Disclosure principle: opt-in paths are always loud; the default path is always quiet.
+
+    **Tests to add (on top of Parts A + B tests):**
+    - `tests/unit/test_cli_settings.py::test_network_allow_persists_across_invocations` — write `network.allow=true` via `save_settings`, call `get_network_allow_from_settings`, assert `True`.
+    - `tests/unit/test_cli_settings.py::test_network_allow_malformed_returns_none` — write `network.allow="maybe"`, assert the getter logs a warning and returns `None` (so precedence falls through to default).
+    - `tests/unit/test_cli_app.py::test_allow_network_flag_overrides_persistent_setting` — settings say `network.allow=false`, invoke with `--allow-network`, assert resolved value is `True`.
+    - `tests/unit/test_cli_app.py::test_no_allow_network_flag_overrides_persistent_true` — settings say `network.allow=true`, invoke with `--no-allow-network`, assert resolved value is `False`.
+    - `tests/unit/test_cli_app.py::test_default_when_neither_flag_nor_setting_present` — no flag, no setting, assert resolved value is `False`.
+
+    Total additional tests for Part C: 5. Combined with Parts A + B: **14 tests total for Step 14.12**.
+
+    **Why this is Part C and not a separate step.** The `mint config set` machinery already exists (shipped in `3b2e4ff` / §12 finding #8). Adding one more key (`network.allow`) is ~45 min of strictly-additive work that reuses the exact same atomic-write / precedence / display pipeline. Splitting it into a separate step would create two commits against the same settings.py file with no architectural boundary between them — same file, same pattern, same session. Keep it inside Step 14.12.
+
+    **Scope — Part D: One network-dependent testbed task (~30-45 min).**
+
+    New task `T21 — fetch-and-summarize-public-api` in `tests/evaluation/tasks.py`:
+    - Prompt: *"Fetch the current server time from `https://worldtimeapi.org/api/timezone/Etc/UTC` and return `{timezone, utc_datetime, day_of_week}`."* Deterministic output shape, non-deterministic content (time changes each call) — good stress test for consistency / behavioral probing.
+    - `expected_type=CapabilityType.MCP_TOOL`, `output_contract=OutputContract(required_keys=["timezone", "utc_datetime", "day_of_week"])`.
+    - Validator: asserts the three keys exist, `timezone == "Etc/UTC"`, `utc_datetime` matches an ISO-8601 regex, `day_of_week` is an int in [0, 6].
+    - Gated by `needs_network=True` in the task metadata; only runs when harness is called with `allow_network=True`.
+
+    This adds exactly one task to the testbed so the 400-record eval stays calibrated. For Phase 5 it's optional — if time is tight, ship Parts A + B + C and defer T21 to Chapter 7.
+
+    **Tests to add** (beyond the Part B integration tests, all under `tests/unit/`):
+    - `tests/unit/test_sandbox_tool.py::test_allow_network_true_passes_bridge` — mock `subprocess.run`, assert Docker args contain `--network bridge` when `allow_network=True`.
+    - `tests/unit/test_sandbox_tool.py::test_allow_network_false_passes_none` — symmetric regression guard.
+    - `tests/unit/test_behavioral.py::test_network_disconnect_differential_flags_fake_api` — construct a fake-API artifact, run behavioral suite with both network policies, assert the differential check fires.
+    - `tests/unit/test_gate.py::test_verify_forwards_allow_network` — assert `verify(artifact, allow_network=True)` passes the kwarg through to `behavioral.run` and `adversarial.probe` (mock both, inspect call args).
+    - `tests/unit/test_runner.py::test_execute_task_threads_allow_network_to_state` — assert the CLI entry point actually populates `TaskState.allow_network`.
+
+    Total test additions: ~5 unit + 4 integration = 9 tests.
+
+    **Trade-off analysis.**
+
+    - **Why not just delete the dead flag?** Considered. Rejected because: (a) the proposal's Tier 3 network-disconnect attack is named verbatim and today has no non-vacuous surface to attack — plumbing the flag gives it one; (b) the Chapter 6 reviewer question *"does MINT work for API-dependent capabilities?"* currently has the answer *"no"* instead of *"yes, behind a flag, with Part B as evidence"*; (c) the plumbing work is ~3-4 h vs. ~15 min for deletion — not a large delta if the plumbing also unlocks evaluation realism.
+    - **Why a free public API instead of a mock HTTP server?** A mock would prove the plumbing works but wouldn't prove the Docker `--network bridge` flag actually grants real outbound access. The network-disconnect attack pattern needs a real external hostname to be non-vacuous. The CI cost is negligible (one GET per test run) and the three fallback endpoints cover rate-limit outages.
+    - **Network-test flakiness.** External API availability is a flakiness source. Mitigation: test script exits 0 with a `[SKIP]` line (not failure) when all three endpoints are unreachable AND the test script can see that `socket.gethostbyname("github.com")` itself fails from the host — distinguishing "our fix is broken" from "the internet is broken at CI time". Preserves the never-raises contract at the test-harness layer.
+    - **Chapter 4 disclosure.** Part A's plumbing is proposal-aligned (just finishes what the flag promised); no Chapter 4.5 caveat needed. Part B's live-API test is a **Chapter 6 methodology addition** (*"verification was additionally validated against a live-API capability to close the network-disconnect attack vacuity gap"*) — write ~½ paragraph when drafting Chapter 6.2 Baselines.
+
+    **Priority and sequencing.**
+
+    - **If pre-eval time permits:** ship Parts A + B + C before Phase 5 (~4-4.5 h total). Add Part D (T21) if ≥45 min of margin remains. Order: Part A plumbing → Part B tests → Part C CLI persistent toggle → (optional) Part D T21 → Part A unit tests → run `scripts/test_allow_network.py` manually to confirm the full round-trip works → run `mint config set network.allow true` then `mint run "fetch zen quote"` to eyeball the persistent-toggle path → `mint config unset network.allow` to restore offline-by-default.
+    - **If only ~2 h available:** ship Parts A + C only (plumbing + persistent toggle, no live-API test). The toggle + plumbing together already close the user-surface-dishonesty hole; Part B is "prove it with a live endpoint" which can land post-eval as a sanity-check integration test. Disclose the remaining Part-B gap in §11.10 until it lands.
+    - **If pre-eval time is tight:** defer to post-Phase-5 as a Chapter 7 item + §11.10 disclosure. The current eval is already a consistent offline-only story; adding the flag mid-eval would require a re-run for consistency.
+    - **Do NOT ship this interleaved with any other Pillar 2 or executor change.** The plumbing touches ~9 files across CLI, orchestrator, verification, and eval harness — same-session-only commit discipline per the session-coherence rule, otherwise merge conflicts with Steps 13/14.7/14.11 stackups are hard to untangle.
+
+    **Cross-reference:** §12 finding #18 is the full drift narrative; this Step is the "what to change" counterpart. If §11.10 (Chapter 7 disclosure) gets written up, reference this Step for the implementation sketch.
+
 **Phase 3 — Remaining pre-eval and validation (~8-10.5 hours, revised 2026-04-17 end of session +2-3 h for Step 13.7 LangFuse tracing audit, then +1.5-2 h for Step 13.8 compression-loss analyzer).**
 
 12. ✅ **DONE 2026-04-16 — File output fix for SKILL/AGENT last steps (Option B, not Option A).** Decomposer prompt Rule 15 + `_ensure_file_writer_last_step` validator append a deterministic MCP_TOOL writer as the last subtask when `state.output_contract.required_files` is non-empty. The writer becomes a regular gap — classified as MCP_TOOL, generated, three-tier-verified, registered, eligible for Pillar 3 operations. An initial Option A implementation (executor-level synthesis with hardcoded format list) was implemented then reverted in the same session after a proposal-alignment review surfaced a five-pillar drift — see §12 finding #10 for the methodology nugget. 8 new tests (`TestEnsureFileWriterLastStep`). Affects T07 (CSV) and T11 (Excel) in the eval testbed.
@@ -1783,6 +1981,24 @@ The implementation ships a simpler mechanism: **dynamic `importlib` import insid
 **Cross-references:** CLAUDE.md §MCP Tool Loading Strategy, `src/orchestrator/tool_loader.py` module docstring, §9 "What NOT to worry about right now" (original tracking location), `docs/verification/01_bootstrapping_problem.md` §6 drift row #2.
 
 **Status:** Not yet captured in any chapter draft.
+
+---
+
+### 11.10 `--allow-network` runtime plumbing + network-dependent testbed tasks
+
+**Target chapter:** Chapter 4.5 (if Step 14.12 lands pre-eval — honest-Pillar-2 note) OR Chapter 7.2 Limitations + Chapter 7.3 Future Directions (if Step 14.12 is deferred).
+
+**What to write (deferred-to-Chapter-7 form, in case Step 14.12 slips post-eval):**
+
+> *"The current implementation enforces `--network none` on every runtime sandbox invocation. The CLI surface includes an `--allow-network` flag, but at the evaluated commit the flag flows into LangFuse metadata only — it does not reach the runtime executor or the verification gate. As a consequence, (1) no generated capability can legitimately fetch from an external API at runtime, (2) the proposal's Tier 3 network-disconnect attack pattern (§Pillar 2 line 147) is vacuous in our evaluation because no tool genuinely attempts a network call, and (3) the Pillar 2 F2 failure mode ('silent fallback: the tool wraps API calls in broad exception handlers that return synthetic data when the real call fails') has no empirical surface to measure against. The Business Analytics testbed sidesteps this by using file fixtures (CSV / Parquet / XLSX) for data ingestion; this keeps the eval reproducible but constrains the proposal's 'heterogeneous sources' dimension to 'heterogeneous file formats'. Future work plumbs the flag end-to-end (TaskState → executors → gate → generator prompts), adds a per-artifact `needs_network` classifier field, adds one or more API-dependent testbed tasks (e.g. fetch-and-summarize against a zero-auth endpoint), and enables Tier 2's network-disconnect differential probe as a dedicated F2 detector."*
+
+**What to write (landed-pre-eval form, if Step 14.12 ships):**
+
+> *"Runtime network access is opt-in, offline-by-default. Users enable it per-invocation via `mint run --allow-network` or persistently via `mint config set network.allow true`; the two routes follow identical precedence rules to the existing optimizer-config toggles (per-invocation flag > persistent setting > default). Offline-by-default is the security posture; opt-in paths are always loudly signaled in the CLI output. Generated capabilities carry a `needs_network` flag set by the classifier / generator; when True, the verification gate runs in the same network-policy regime as execution. Tier 2 includes a network-disconnect differential probe for `needs_network=True` artifacts — the tool is invoked once with network allowed and once forced offline; plausible-looking output in the offline run flags silent-fallback (F2) contamination. This closes the Tier 3 network-disconnect attack vacuity gap identified during the §12 pre-eval audit (finding #18). Part of the 400-record eval includes T21, a live-API task against `worldtimeapi.org`, as empirical evidence that the flag changes real runtime behavior."*
+
+**Cross-references:** §12 finding #18 (full drift narrative), Step 14.12 (implementation scope), `docs/verification/03_pillar_2_verification.md` §7 (honest-gaps list where this is cross-noted).
+
+**Status:** Not yet captured in any chapter draft. Wording to pick (deferred vs landed) depends on Step 14.12 outcome.
 
 ---
 
