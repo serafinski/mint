@@ -225,6 +225,40 @@ class MetricsStore:
         ).fetchone()
         return row[0] if row else 0
 
+    def fetch_events_since(self, cutoff: datetime) -> list[dict]:
+        """Return all capability_events with occurred_at >= cutoff.
+
+        Used by the evaluation harness to flush per-task capability_events
+        (prune / split / merged / verification_rollback / etc.) to the
+        persistent EvaluationStore's cycle_events table after each task's
+        pipeline.invoke (Step 18.7 follow-up). Caller passes a pre-task
+        timestamp snapshot so only events from this task's pipeline run
+        are returned.
+
+        Each returned dict matches the shape
+        ``EvaluationStore.record_cycle_events`` expects:
+        ``{capability_id, event_type, details}``.
+
+        Returns an empty list if no events have occurred since cutoff.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT capability_id, event_type, details
+            FROM capability_events
+            WHERE occurred_at >= ?
+            ORDER BY occurred_at
+            """,
+            [cutoff],
+        ).fetchall()
+        return [
+            {
+                "capability_id": row[0],
+                "event_type": row[1],
+                "details": row[2] or "",
+            }
+            for row in rows
+        ]
+
     def fetch_invocations_for_task(self, task_id: str) -> list[dict]:
         """Return all invocations recorded against a given task_id.
 

@@ -77,6 +77,48 @@ CREATE INDEX IF NOT EXISTS idx_invocation_events_condition
     ON invocation_events(condition);
 CREATE INDEX IF NOT EXISTS idx_invocation_events_cap
     ON invocation_events(capability_id);
+
+-- Step 18.7 follow-up (2026-04-17 end of session): persistent per-cycle
+-- utility-score snapshot for proposal-aligned KL convergence analysis.
+-- Proposal §Pillar 3 §Formal Framework defines utility as
+-- U(c) = α·reuse·success − β·token_cost − γ·maintenance. The online
+-- metric (src/optimizer/loop.py::_compute_kl_divergence) uses exactly
+-- this — we now persist it so post-hoc analyzers (Step 18.7 analyze_
+-- longitudinal.py) can compute the SAME KL series, not an invocation-
+-- count proxy. Flushed by the harness after each task's pipeline.invoke
+-- via compute_all_utilities(registry, metrics_store).
+CREATE TABLE IF NOT EXISTS cycle_utility_scores (
+    id                        VARCHAR PRIMARY KEY,
+    run_id                    VARCHAR NOT NULL,
+    condition                 VARCHAR NOT NULL,
+    task_id                   VARCHAR NOT NULL,
+    capability_id             VARCHAR NOT NULL,
+    utility_score             DOUBLE NOT NULL,
+    occurred_at               TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_cycle_utility_run
+    ON cycle_utility_scores(run_id, condition);
+
+-- Step 18.7 follow-up: persistent per-cycle capability_events log,
+-- mirroring MetricsStore.capability_events which is in-memory per run.
+-- Enables true per-type operation counts (prune / split / merge /
+-- verification_rollback / etc.) per cycle in the longitudinal analyzer,
+-- replacing the active-cap-delta proxy of the pre-follow-up
+-- analyze_longitudinal.py.
+CREATE TABLE IF NOT EXISTS cycle_events (
+    id                        VARCHAR PRIMARY KEY,
+    run_id                    VARCHAR NOT NULL,
+    condition                 VARCHAR NOT NULL,
+    task_id                   VARCHAR NOT NULL,
+    capability_id             VARCHAR NOT NULL,
+    event_type                VARCHAR NOT NULL,
+    details                   VARCHAR NOT NULL DEFAULT '',
+    occurred_at               TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_cycle_events_run
+    ON cycle_events(run_id, condition);
+CREATE INDEX IF NOT EXISTS idx_cycle_events_type
+    ON cycle_events(event_type);
 """
 
 # Idempotent migrations for upgrading existing DBs to the Stage 1
@@ -233,6 +275,99 @@ class EvaluationStore:
                 id, run_id, condition, task_id, capability_id,
                 capability_type, success, token_cost, latency_ms, occurred_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        return len(rows)
+
+    def record_cycle_utility_scores(
+        self,
+        *,
+        run_id: str,
+        condition: str,
+        task_id: str,
+        scores: dict[str, float],
+    ) -> int:
+        """Persist per-capability utility scores after one task cycle.
+
+        Expected caller: the harness, after ``pipeline.invoke()`` returns,
+        calls ``src.optimizer.utility.compute_all_utilities(registry,
+        metrics_store)`` and passes the result here. Enables post-hoc
+        proposal-aligned KL convergence analysis using the actual utility
+        score distribution, not an invocation-count proxy.
+
+        Returns number of rows inserted; 0 on empty input.
+        """
+        if not scores:
+            return 0
+        now = datetime.now(UTC)
+        rows = [
+            [
+                uuid.uuid4().hex,
+                run_id,
+                condition,
+                task_id,
+                cap_name,
+                float(score),
+                now,
+            ]
+            for cap_name, score in scores.items()
+        ]
+        self._conn.executemany(
+            """
+            INSERT INTO cycle_utility_scores (
+                id, run_id, condition, task_id, capability_id,
+                utility_score, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        return len(rows)
+
+    def record_cycle_events(
+        self,
+        *,
+        run_id: str,
+        condition: str,
+        task_id: str,
+        events: list[dict],
+    ) -> int:
+        """Persist a batch of capability_events for one task cycle.
+
+        Each event dict: ``capability_id`` (required str), ``event_type``
+        (required str — e.g. "pruned", "split", "merged",
+        "verification_rollback"), ``details`` (optional str).
+
+        Expected caller: the harness, after ``pipeline.invoke()``, fetches
+        MetricsStore.capability_events entries that occurred during that
+        task's pipeline invocation (typically via a timestamp cursor) and
+        passes them here. Enables true per-type operation counts per
+        cycle in the Step 18.7 analyzer, replacing the active-cap-delta
+        proxy.
+
+        Returns number of rows inserted; 0 on empty input.
+        """
+        if not events:
+            return 0
+        now = datetime.now(UTC)
+        rows = []
+        for ev in events:
+            rows.append([
+                uuid.uuid4().hex,
+                run_id,
+                condition,
+                task_id,
+                ev["capability_id"],
+                ev["event_type"],
+                ev.get("details", "") or "",
+                now,
+            ])
+        self._conn.executemany(
+            """
+            INSERT INTO cycle_events (
+                id, run_id, condition, task_id, capability_id,
+                event_type, details, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

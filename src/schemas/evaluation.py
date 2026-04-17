@@ -15,12 +15,23 @@ from src.schemas.capability import CapabilityType
 
 
 class BaselineCondition(StrEnum):
-    """The evaluation conditions compared in the thesis."""
+    """The evaluation conditions compared in the thesis.
+
+    The first four are the proposal's four ablation baselines (§Evaluation
+    Strategy). ``LONGITUDINAL`` is added for ``scripts/run_longitudinal.py``
+    — it's not one of the four ablation conditions, it's a separate
+    sequencing protocol (one snapshot restore, 40 sequential tasks, shared
+    registry + metrics — exercises Pillar 3 convergence under accumulated
+    history). Analysis pipelines MUST filter by condition explicitly when
+    computing per-baseline metrics (see ``analyze_results.py``'s exclusion
+    of ``static`` in classification accuracy for analogous reasoning).
+    """
 
     FULL = "full"
     NO_VERIFICATION = "no_verification"
     NO_OPTIMIZATION = "no_optimization"
     STATIC = "static"
+    LONGITUDINAL = "longitudinal"
 
 
 class TaskTier(StrEnum):

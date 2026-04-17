@@ -1,0 +1,314 @@
+"""Unit tests for scripts/analyze_longitudinal.py helpers (Step 18.7)."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(ROOT))
+
+from scripts.analyze_longitudinal import (  # noqa: E402
+    _detect_convergence,
+    _kl_divergence_between_snapshots,
+    _load_cycle_data,
+    _table_exists,
+)
+from src.registry.evaluation_store import EvaluationStore  # noqa: E402
+from src.schemas.evaluation import EvaluationRecord  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# _kl_divergence_between_snapshots
+# ---------------------------------------------------------------------------
+
+
+class TestKLDivergenceBetweenSnapshots:
+    def test_both_empty_returns_zero(self):
+        assert _kl_divergence_between_snapshots({}, {}) == 0.0
+
+    def test_prev_empty_curr_populated_returns_zero(self):
+        # First-cycle sentinel — we're seeing the first real snapshot, so
+        # KL against nothing is 0.0 by convention.
+        assert _kl_divergence_between_snapshots({}, {"a": 1.0}) == 0.0
+
+    def test_prev_populated_curr_empty_returns_inf(self):
+        # Catastrophic — all caps disappeared between snapshots.
+        assert _kl_divergence_between_snapshots({"a": 1.0}, {}) == float("inf")
+
+    def test_identical_distributions_near_zero(self):
+        kl = _kl_divergence_between_snapshots(
+            {"a": 0.5, "b": 0.3, "c": 0.2},
+            {"a": 0.5, "b": 0.3, "c": 0.2},
+        )
+        # epsilon-smoothing means it's not exactly 0, but very small
+        assert 0.0 <= kl < 0.001
+
+    def test_different_distributions_non_trivial(self):
+        # Opposite distributions → higher KL than near-identical
+        kl_similar = _kl_divergence_between_snapshots(
+            {"a": 0.5, "b": 0.5}, {"a": 0.55, "b": 0.45},
+        )
+        kl_different = _kl_divergence_between_snapshots(
+            {"a": 0.9, "b": 0.1}, {"a": 0.1, "b": 0.9},
+        )
+        assert kl_different > kl_similar
+        assert kl_different > 0.5
+
+    def test_negative_utility_scores_handled(self):
+        # Utility scores can be negative (U = α·reuse·success − β·cost − γ·maint).
+        # The analyzer must shift to non-negative + normalize; it should not raise.
+        kl = _kl_divergence_between_snapshots(
+            {"a": -0.5, "b": 0.3, "c": 0.7},
+            {"a": -0.3, "b": 0.4, "c": 0.6},
+        )
+        assert np.isfinite(kl)
+        assert kl >= 0.0
+
+    def test_union_of_keys_handled(self):
+        # New cap appears in curr but not in prev — should still compute KL
+        kl = _kl_divergence_between_snapshots(
+            {"a": 0.5, "b": 0.5},
+            {"a": 0.4, "b": 0.4, "c": 0.2},  # c is new
+        )
+        assert np.isfinite(kl)
+        assert kl > 0.0
+
+    def test_converged_trajectory_produces_small_kl(self):
+        # After convergence, consecutive snapshots should have near-zero KL
+        stable = {f"cap-{i}": 1.0 / (i + 1) for i in range(10)}
+        kl = _kl_divergence_between_snapshots(stable, stable)
+        assert kl < 0.001
+
+
+# ---------------------------------------------------------------------------
+# _detect_convergence
+# ---------------------------------------------------------------------------
+
+
+class TestDetectConvergence:
+    def test_never_converged_returns_none(self):
+        kls = [0.5, 0.4, 0.3, 0.2]  # all above threshold 0.01
+        assert _detect_convergence(kls, threshold=0.01, min_consecutive=3) is None
+
+    def test_converged_immediately_returns_first_cycle(self):
+        kls = [0.001, 0.001, 0.001, 0.001, 0.001]
+        # First cycle where 3 consecutive sub-threshold values starts: cycle 1
+        assert _detect_convergence(kls, threshold=0.01, min_consecutive=3) == 1
+
+    def test_converged_after_warmup(self):
+        kls = [0.5, 0.3, 0.2, 0.005, 0.004, 0.003, 0.002]
+        # Sub-threshold run starts at index 3 (cycle 4); needs 3 consecutive
+        # → converges at cycle (3+1) - (3-1) = 2. Wait let me re-check my algorithm.
+        # _detect_convergence: i is 0-indexed; returns (i+1) - (min_consecutive-1)
+        # when run_len reaches min_consecutive. At i=3: run_len=1; i=4: 2; i=5: 3 → returns (6)-(2) = 4
+        result = _detect_convergence(kls, threshold=0.01, min_consecutive=3)
+        assert result == 4
+
+    def test_single_dip_not_convergence(self):
+        # Only 1 consecutive sub-threshold, not min 3
+        kls = [0.5, 0.3, 0.005, 0.4, 0.2]
+        assert _detect_convergence(kls, threshold=0.01, min_consecutive=3) is None
+
+    def test_converged_then_diverged_then_reconverged(self):
+        # Converges at cycle 3 (indices 0,1,2), then KL blows up at index 3,
+        # then sub-threshold again at 4,5,6 — first detection is the first
+        # qualifying window.
+        kls = [0.005, 0.004, 0.003, 0.5, 0.001, 0.001, 0.001]
+        # First: indices 0,1,2 — all sub-threshold → converged at cycle 1
+        assert _detect_convergence(kls, threshold=0.01, min_consecutive=3) == 1
+
+    def test_min_consecutive_one(self):
+        # Edge case: min_consecutive=1 means first sub-threshold cycle counts
+        kls = [0.5, 0.3, 0.005, 0.4]
+        assert _detect_convergence(kls, threshold=0.01, min_consecutive=1) == 3
+
+    def test_empty_list_returns_none(self):
+        assert _detect_convergence([], threshold=0.01, min_consecutive=3) is None
+
+    def test_shorter_than_min_consecutive_returns_none(self):
+        kls = [0.001, 0.001]  # only 2, need 3
+        assert _detect_convergence(kls, threshold=0.01, min_consecutive=3) is None
+
+
+# ---------------------------------------------------------------------------
+# _table_exists
+# ---------------------------------------------------------------------------
+
+
+class TestTableExists:
+    def test_existing_table_returns_true(self):
+        with EvaluationStore() as store:
+            assert _table_exists(store._conn, "evaluation_runs") is True
+
+    def test_missing_table_returns_false(self):
+        with EvaluationStore() as store:
+            assert _table_exists(store._conn, "does_not_exist") is False
+
+    def test_step_18_5_and_follow_up_tables_exist(self):
+        with EvaluationStore() as store:
+            # All the tables the Step 18.7 analyzer queries should exist
+            # on a freshly-initialized store.
+            assert _table_exists(store._conn, "invocation_events") is True
+            assert _table_exists(store._conn, "cycle_utility_scores") is True
+            assert _table_exists(store._conn, "cycle_events") is True
+
+
+# ---------------------------------------------------------------------------
+# _load_cycle_data — integration with EvaluationStore
+# ---------------------------------------------------------------------------
+
+
+def _base_record(**overrides) -> EvaluationRecord:
+    defaults = dict(
+        run_id="test_run",
+        condition="longitudinal",
+        task_id="T01",
+        task_tier="trivial",
+        attempt_count=1,
+        capability_type="mcp_tool",
+        gate_passed=True,
+        output_in_range=True,
+        token_cost=0,
+        attempt_latency_ms=100,
+        failure_reason="none",
+        registry_snapshot_id="snap",
+        seed=42,
+        is_pilot=False,
+    )
+    defaults.update(overrides)
+    return EvaluationRecord(**defaults)
+
+
+class TestLoadCycleData:
+    def test_empty_db_returns_empty_list(self):
+        with EvaluationStore() as store:
+            assert _load_cycle_data(store._conn) == []
+
+    def test_only_static_runs_returns_empty(self):
+        with EvaluationStore() as store:
+            store.record_run(_base_record(condition="static"))
+            assert _load_cycle_data(store._conn) == []
+
+    def test_longitudinal_runs_in_timestamp_order(self):
+        from datetime import UTC, datetime, timedelta
+        base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
+        with EvaluationStore() as store:
+            store.record_run(_base_record(task_id="T02", timestamp=base + timedelta(minutes=2)))
+            store.record_run(_base_record(task_id="T01", timestamp=base + timedelta(minutes=1)))
+            store.record_run(_base_record(task_id="T03", timestamp=base + timedelta(minutes=3)))
+
+            cycles = _load_cycle_data(store._conn)
+            # Should be ordered by timestamp
+            assert [c["task_id"] for c in cycles] == ["T01", "T02", "T03"]
+            assert [c["cycle"] for c in cycles] == [1, 2, 3]
+
+    def test_utility_scores_loaded_when_available(self):
+        with EvaluationStore() as store:
+            store.record_run(_base_record(task_id="T01"))
+            store.record_cycle_utility_scores(
+                run_id="test_run", condition="longitudinal", task_id="T01",
+                scores={"cap-a": 0.9, "cap-b": 0.5},
+            )
+            cycles = _load_cycle_data(store._conn)
+            assert len(cycles) == 1
+            assert cycles[0]["utility_scores"] == {"cap-a": 0.9, "cap-b": 0.5}
+
+    def test_events_loaded_when_available(self):
+        with EvaluationStore() as store:
+            store.record_run(_base_record(task_id="T01"))
+            store.record_cycle_events(
+                run_id="test_run", condition="longitudinal", task_id="T01",
+                events=[
+                    {"capability_id": "cap-a", "event_type": "pruned",
+                     "details": "zero invocations"},
+                    {"capability_id": "cap-b", "event_type": "split",
+                     "details": "into [v1, v2]"},
+                ],
+            )
+            cycles = _load_cycle_data(store._conn)
+            assert len(cycles) == 1
+            events = cycles[0]["events"]
+            assert len(events) == 2
+            assert {e["event_type"] for e in events} == {"pruned", "split"}
+
+    def test_cumulative_invocations_snapshot_per_cycle(self):
+        """Invocations from cycle N appear in cycle N's snapshot AND all later ones."""
+        from datetime import UTC, datetime, timedelta
+        base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
+        with EvaluationStore() as store:
+            # Cycle 1
+            store.record_run(_base_record(task_id="T01", timestamp=base + timedelta(minutes=1)))
+            store._conn.execute(
+                "INSERT INTO invocation_events (id, run_id, condition, task_id, "
+                "capability_id, capability_type, success, token_cost, latency_ms, occurred_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ["inv1", "test_run", "longitudinal", "T01",
+                 "cap-a", "mcp_tool", True, 0, 0,
+                 base + timedelta(minutes=1, seconds=30)],
+            )
+            # Cycle 2
+            store.record_run(_base_record(task_id="T02", timestamp=base + timedelta(minutes=2)))
+            store._conn.execute(
+                "INSERT INTO invocation_events (id, run_id, condition, task_id, "
+                "capability_id, capability_type, success, token_cost, latency_ms, occurred_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ["inv2", "test_run", "longitudinal", "T02",
+                 "cap-b", "mcp_tool", True, 0, 0,
+                 base + timedelta(minutes=2, seconds=30)],
+            )
+            cycles = _load_cycle_data(store._conn)
+            assert len(cycles) == 2
+            # Cycle 1's cumulative: just cap-a
+            assert cycles[0]["cumulative_invocations"] == {"cap-a": 1}
+            # Cycle 2's cumulative: both caps
+            assert cycles[1]["cumulative_invocations"] == {"cap-a": 1, "cap-b": 1}
+            # Active cap counts
+            assert cycles[0]["active_cap_count"] == 1
+            assert cycles[1]["active_cap_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: synthesize a mini longitudinal DB and verify analyzer reads it
+# ---------------------------------------------------------------------------
+
+
+class TestEndToEnd:
+    def test_analyzer_produces_cycles_with_all_fields(self):
+        """Verify _load_cycle_data + downstream processing produces a
+        record with all expected fields when all four tables are populated.
+        """
+        from datetime import UTC, datetime, timedelta
+        base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
+        with EvaluationStore() as store:
+            for i in range(1, 4):
+                ts = base + timedelta(minutes=i)
+                store.record_run(_base_record(task_id=f"T{i:02d}", timestamp=ts))
+                store.record_cycle_utility_scores(
+                    run_id="test_run", condition="longitudinal", task_id=f"T{i:02d}",
+                    scores={"cap-a": 0.5, "cap-b": 0.3},
+                )
+                store.record_cycle_events(
+                    run_id="test_run", condition="longitudinal", task_id=f"T{i:02d}",
+                    events=[{"capability_id": "cap-a",
+                             "event_type": "pruned" if i == 2 else "merged",
+                             "details": ""}],
+                )
+            cycles = _load_cycle_data(store._conn)
+            assert len(cycles) == 3
+            for c in cycles:
+                # All four data sources should be populated
+                assert "cycle" in c
+                assert "task_id" in c
+                assert "run_id" in c
+                assert "timestamp" in c
+                assert "cumulative_invocations" in c
+                assert "incremental_invocations" in c
+                assert "active_cap_count" in c
+                assert "utility_scores" in c
+                assert "events" in c
+                assert c["utility_scores"] == {"cap-a": 0.5, "cap-b": 0.3}
+                assert len(c["events"]) == 1

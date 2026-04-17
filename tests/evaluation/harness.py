@@ -269,11 +269,16 @@ class EvaluationHarness:
 
         # Step 5: execute each task
         records: list[EvaluationRecord] = []
+        from datetime import UTC, datetime
         for i, task in enumerate(shuffled_tasks):
             logger.info(
                 "──── Task %d/%d: %s (%s) ────",
                 i + 1, len(shuffled_tasks), task.task_id, task.tier,
             )
+            # Step 18.7 follow-up: capture the pre-task timestamp so the
+            # post-task cycle_events flush (below) can filter MetricsStore's
+            # capability_events to just this task's events.
+            task_events_cutoff = datetime.now(UTC)
             record = self._run_one_task(
                 task=task,
                 condition=condition,
@@ -306,6 +311,42 @@ class EvaluationHarness:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Failed to flush invocation_events for task %s: %s",
+                    task.task_id, exc,
+                )
+
+            # Step 18.7 follow-up (2026-04-17 end of session): persist
+            # per-cycle utility-score snapshot + capability_events batch
+            # for proposal-aligned KL convergence analysis (utility-score
+            # distribution instead of invocation-count proxy) and true
+            # per-type operation counts per cycle (prune/split/merge/
+            # verification_rollback instead of active-cap-delta proxy).
+            # Both are never-raises wrapped — flush failure must not
+            # break the eval loop.
+            try:
+                from src.optimizer.utility import compute_all_utilities
+                utilities = compute_all_utilities(registry, metrics_store)
+                self._store.record_cycle_utility_scores(
+                    run_id=run_id,
+                    condition=condition,
+                    task_id=task.task_id,
+                    scores=utilities,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to flush cycle_utility_scores for task %s: %s",
+                    task.task_id, exc,
+                )
+            try:
+                task_events = metrics_store.fetch_events_since(task_events_cutoff)
+                self._store.record_cycle_events(
+                    run_id=run_id,
+                    condition=condition,
+                    task_id=task.task_id,
+                    events=task_events,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to flush cycle_events for task %s: %s",
                     task.task_id, exc,
                 )
 
