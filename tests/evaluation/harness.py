@@ -293,62 +293,23 @@ class EvaluationHarness:
             self._store.record_run(record)
             records.append(record)
 
-            # Step 18.5 (2026-04-17): persist per-task invocation events
-            # to the EvaluationStore's invocation_events table for Chapter
-            # 6 Gini analysis. MetricsStore is in-memory (shared across
-            # tasks within a run for optimizer accumulation); this flush
-            # copies only the invocations tagged with this task's task_id
-            # to disk, keyed by (run_id, condition, task_id). Never-raises
-            # — failure here must not break the eval loop.
-            try:
-                task_invocations = metrics_store.fetch_invocations_for_task(task.task_id)
-                self._store.record_invocation_events(
-                    run_id=run_id,
-                    condition=condition,
-                    task_id=task.task_id,
-                    events=task_invocations,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to flush invocation_events for task %s: %s",
-                    task.task_id, exc,
-                )
-
-            # Step 18.7 follow-up (2026-04-17 end of session): persist
-            # per-cycle utility-score snapshot + capability_events batch
-            # for proposal-aligned KL convergence analysis (utility-score
-            # distribution instead of invocation-count proxy) and true
-            # per-type operation counts per cycle (prune/split/merge/
-            # verification_rollback instead of active-cap-delta proxy).
-            # Both are never-raises wrapped — flush failure must not
-            # break the eval loop.
-            try:
-                from src.optimizer.utility import compute_all_utilities
-                utilities = compute_all_utilities(registry, metrics_store)
-                self._store.record_cycle_utility_scores(
-                    run_id=run_id,
-                    condition=condition,
-                    task_id=task.task_id,
-                    scores=utilities,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to flush cycle_utility_scores for task %s: %s",
-                    task.task_id, exc,
-                )
-            try:
-                task_events = metrics_store.fetch_events_since(task_events_cutoff)
-                self._store.record_cycle_events(
-                    run_id=run_id,
-                    condition=condition,
-                    task_id=task.task_id,
-                    events=task_events,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to flush cycle_events for task %s: %s",
-                    task.task_id, exc,
-                )
+            # Step 18.5 + 18.7 (2026-04-17): persist per-task cycle state
+            # (invocation_events + cycle_utility_scores + cycle_events) to
+            # the EvaluationStore for Chapter 6 Gini + KL convergence +
+            # per-type op-count analyses. Factored out to
+            # ``tests.evaluation.cycle_flush.flush_task_cycle_state`` so
+            # the longitudinal scripts (which inline their own task loops)
+            # call the same code path. Never-raises.
+            from tests.evaluation.cycle_flush import flush_task_cycle_state
+            flush_task_cycle_state(
+                eval_store=self._store,
+                metrics_store=metrics_store,
+                registry=registry,
+                run_id=run_id,
+                condition=condition,
+                task_id=task.task_id,
+                task_events_cutoff=task_events_cutoff,
+            )
 
         return records
 

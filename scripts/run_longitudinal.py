@@ -142,11 +142,17 @@ def main() -> None:
     cumulative_success = 0
     cumulative_total = 0
 
+    from tests.evaluation.cycle_flush import flush_task_cycle_state, now_utc
+
     for i, task in enumerate(task_sequence):
         logger.info("=" * 60)
         logger.info("Task %d/%d: %s", i + 1, len(task_sequence), task.task_id)
         logger.info("=" * 60)
 
+        # Step 18.7 / 18.8 (2026-04-17): capture the pre-task timestamp so
+        # the post-task cycle_events flush can filter MetricsStore's
+        # capability_events to just this task's events.
+        task_events_cutoff = now_utc()
         t_start = time.monotonic()
 
         # Create pipeline with optimizer enabled
@@ -212,6 +218,21 @@ def main() -> None:
 
         eval_store.record_run(record)
         records.append(record)
+
+        # Step 18.7 / 18.8 (2026-04-17): persist per-task cycle state
+        # (invocation_events + cycle_utility_scores + cycle_events) for
+        # Chapter 6 KL convergence + per-type op-count analyses via
+        # scripts/analyze_longitudinal.py. Never-raises — flush failure
+        # must not break the longitudinal loop.
+        flush_task_cycle_state(
+            eval_store=eval_store,
+            metrics_store=metrics_store,
+            registry=registry,
+            run_id=run_id,
+            condition="longitudinal",
+            task_id=task.task_id,
+            task_events_cutoff=task_events_cutoff,
+        )
 
         cumulative_total += 1
         if record.success:

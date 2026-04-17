@@ -411,6 +411,46 @@ def _print_header(title: str) -> None:
     print(f"{'=' * 80}")
 
 
+def _detect_shift_point(cycles: list[dict]) -> int | None:
+    """Return the 1-indexed cycle number at which a distribution_shift
+    event was recorded, or None if no such event exists.
+
+    Set by ``scripts/run_longitudinal_shift.py`` via a synthetic
+    ``cycle_events`` row with ``event_type='distribution_shift'`` and
+    ``capability_id='__system__'``. The marker is written AT cycle
+    ``shift_at`` (last Phase A task) — the shift effectively takes place
+    at the boundary between this cycle and the next.
+    """
+    for c in cycles:
+        for ev in c.get("events", []):
+            if ev["event_type"] == "distribution_shift":
+                return c["cycle"]
+    return None
+
+
+def _classify_adaptation(
+    phase_a_cycles_to_converge: int | None,
+    phase_b_cycles_to_reconverge: int | None,
+) -> str:
+    """Three-tier classifier for the Phase A → Phase B adaptation pattern.
+
+    - "graceful": Phase B re-converges within ≤ 2x Phase A's convergence time
+    - "sluggish": Phase B re-converges but takes 2x-5x Phase A's time
+    - "collapse": Phase B never re-converges (> 5x or None)
+    - "indeterminate": Phase A never converged; we can't make the comparison
+    """
+    if phase_a_cycles_to_converge is None:
+        return "indeterminate (Phase A never converged — can't compare)"
+    if phase_b_cycles_to_reconverge is None:
+        return "collapse (Phase B never re-converged)"
+    ratio = phase_b_cycles_to_reconverge / max(1, phase_a_cycles_to_converge)
+    if ratio <= 2.0:
+        return f"graceful adaptation ({ratio:.1f}x Phase A time)"
+    if ratio <= 5.0:
+        return f"sluggish adaptation ({ratio:.1f}x Phase A time)"
+    return f"collapse-leaning ({ratio:.1f}x Phase A time)"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Longitudinal KL convergence analyzer (Step 18.7)",
@@ -519,6 +559,80 @@ def main() -> int:
             finite_kls = [k for k in convergence_kls[1:] if np.isfinite(k)]
             if finite_kls:
                 print(f"     Final KL: {convergence_kls[-1]:.4f}, min KL: {min(finite_kls):.4f}")
+
+    # --- Distribution-shift analysis (Step 18.8, Pillar 3 RQ #3) ---
+    shift_cycle = _detect_shift_point(cycles)
+    if shift_cycle is not None:
+        _print_header(
+            "Distribution-Shift Analysis — Pillar 3 RQ #3"
+        )
+        print(f"  Shift point detected at cycle {shift_cycle}")
+        print(f"  Phase A: cycles 1..{shift_cycle} ({shift_cycle} cycles)")
+        print(f"  Phase B: cycles {shift_cycle + 1}..{len(cycles)} "
+              f"({len(cycles) - shift_cycle} cycles)")
+
+        # Phase A convergence (within Phase A only)
+        phase_a_kls = convergence_kls[:shift_cycle]
+        phase_a_convergence_offset = (
+            _detect_convergence(
+                phase_a_kls[1:], args.threshold, args.min_consecutive,
+            )
+            if len(phase_a_kls) > 1 else None
+        )
+        phase_a_converged_cycle = (
+            phase_a_convergence_offset + 1 if phase_a_convergence_offset is not None else None
+        )
+
+        # KL spike magnitude in the window around the shift (shift_cycle and
+        # the 3 cycles post-shift). Helps Chapter 6 describe how disruptive
+        # the shift was.
+        spike_window = convergence_kls[shift_cycle:shift_cycle + 4]
+        finite_spike = [k for k in spike_window if np.isfinite(k)]
+        kl_spike = max(finite_spike) if finite_spike else None
+
+        # Phase B re-convergence (cycles after shift). Index into
+        # convergence_kls starts at shift_cycle; we run _detect_convergence
+        # on that slice, then offset back to 1-indexed full-sequence cycle.
+        phase_b_kls = convergence_kls[shift_cycle:]
+        phase_b_offset = (
+            _detect_convergence(phase_b_kls, args.threshold, args.min_consecutive)
+            if phase_b_kls else None
+        )
+        phase_b_reconverged_cycle = (
+            phase_b_offset + shift_cycle if phase_b_offset is not None else None
+        )
+        phase_b_reconverged_within = (
+            phase_b_reconverged_cycle - shift_cycle
+            if phase_b_reconverged_cycle is not None else None
+        )
+
+        print()
+        if phase_a_converged_cycle is not None:
+            print(f"  Phase A cycles-to-converge:       {phase_a_converged_cycle}")
+        else:
+            print(f"  Phase A cycles-to-converge:       (did not converge)")
+        if kl_spike is not None:
+            print(f"  KL spike magnitude at shift:      {kl_spike:.4f}")
+        else:
+            print(f"  KL spike magnitude at shift:      (unavailable)")
+        if phase_b_reconverged_within is not None:
+            print(f"  Phase B cycles-to-re-converge:    "
+                  f"{phase_b_reconverged_within} cycles post-shift"
+                  f" (at absolute cycle {phase_b_reconverged_cycle})")
+        else:
+            print(f"  Phase B cycles-to-re-converge:    (did not re-converge within window)")
+
+        print()
+        verdict = _classify_adaptation(
+            phase_a_converged_cycle,
+            phase_b_reconverged_within,
+        )
+        print(f"  Adaptation verdict: {verdict}")
+        print()
+        print("  Interpretation guide:")
+        print("    - graceful  (<= 2x Phase A time): registry adapts without structural collapse")
+        print("    - sluggish  (2x-5x):               registry adapts but slowly — possibly over-fit to Phase A")
+        print("    - collapse  (> 5x or never):       registry was Phase-A-specific — not a general optimizer")
 
     # --- Gini range + seeded-vs-evolved comparison (Pillar 3 RQ #1) ---
     if ginis:
