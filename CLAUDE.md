@@ -246,7 +246,7 @@ The sandbox resolves dependencies dynamically — no hardcoded package lists. Th
 
 ## Current State
 
-**Iteration 6 — Evaluation & Analysis.** Phase 2 (B1 + Pillar 3 fixes) in progress. See `docs/MASTER_PLAN_2026_04_13.md` for the active fix list and Phase 3-5 sequencing. For the live test count and pipeline status, run `uv run pytest tests/unit/ -q`.
+**Iteration 6 — Evaluation & Analysis.** Phase 2 **nearly complete** as of 2026-04-17 end of session: B1 Pillar 3 main block (Steps 4-8), pre-B1 fixes (14.7 / 13 / 14.11), §12 findings #8/#6b/#10-#17, Steps 9/9.5/10/11 all landed. Step 9.5b closeout shipped 2026-04-17 (`test_auto_optimizer.py` pipeline-wiring rewrite + `test_split_merge.py` extended with 3 new integration tests — MCP_TOOL merge + AGENT split + AGENT merge — closing the Pillar 3 matrix to 9/9 at the LLM-integration layer). Remaining Phase 2: Step 12 audit. Remaining Phase 3: Step 12.5 (Tier 1.5 sandbox import probe), Step 13.5 (test hygiene), Step 14 gaps (test_behavioral.py fail-open + schema_context generator tests). Remaining pre-eval analyzers: Step 18.5 (Gini + classification accuracy) + Step 18.7 (new `analyze_longitudinal.py`). Then Phase 5 eval (~18h unattended). See `docs/MASTER_PLAN_2026_04_13.md` for the live fix list and `MEMORY.md` for the verified session state. For the live test count, run `uv run pytest tests/unit/ -q` (1326 passing at 2026-04-17 end of session).
 
 ## Stable Interfaces
 
