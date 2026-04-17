@@ -236,6 +236,46 @@ class TestBuildSandboxCode:
         assert override_pos != -1, "__name__ override not found in sandbox code"
         assert override_pos < source_pos, "__name__ override must precede inlined source"
 
+    def test_main_guard_neutralized_end_to_end_subprocess(self):
+        """Execute the generated sandbox code in a real Python interpreter.
+
+        Complements the string-position check above: runs the payload via
+        ``python -c`` so the actual interpreter evaluates the ``__name__``
+        override. If the neutralization were ever broken (e.g. override
+        appears after the source, or the override line is mutated), the
+        inlined ``raise RuntimeError("main fired")`` would fire and the
+        subprocess would exit non-zero. A clean exit + well-formed JSON on
+        stdout proves the override works at runtime — not just lexically.
+        """
+        import subprocess
+        import sys
+
+        src = (
+            'async def my_tool(n: int):\n'
+            '    return n * 2\n'
+            'if __name__ == "__main__":\n'
+            '    raise RuntimeError("main fired")\n'
+        )
+        code = _build_sandbox_code(src, "my_tool", {"n": 21})
+
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert proc.returncode == 0, (
+            f"sandbox code exited non-zero — __name__ neutralization likely broken. "
+            f"stderr: {proc.stderr!r}"
+        )
+        assert "main fired" not in proc.stderr, (
+            "RuntimeError from __main__ guard fired — override did not take effect"
+        )
+        payload = json.loads(proc.stdout.strip())
+        assert payload["error"] is None
+        assert payload["result"] == "42"
+
 
 # ---------------------------------------------------------------------------
 # run() — full behavioral test suite

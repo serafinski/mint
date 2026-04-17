@@ -551,6 +551,62 @@ class TestChainExecution:
         fixture_contents = mock_agent.call_args[0][2]
         assert "step_0_output.json" in fixture_contents
 
+    @patch("tests.evaluation.execution.execute_skill_artifact")
+    @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
+    def test_per_type_fixture_routing_mcp_vs_skill(self, mock_mcp, mock_skill):
+        """MCP_TOOL steps receive a filesystem workspace Path; SKILL/AGENT
+        steps receive a ``{filename: content}`` dict. A regression that
+        blurred this boundary (e.g. handed MCP_TOOL a fixture_contents dict
+        or SKILL a raw Path) would silently break fixture access without
+        tripping any of the happy-path chain tests. Phase 3.5c established
+        this routing; keep it guarded.
+        """
+        mock_mcp.return_value = {"data": [1, 2, 3]}
+        mock_skill.return_value = {"analysis": "done"}
+
+        arts = [
+            _make_artifact("loader", CapabilityType.MCP_TOOL, gap_query="load",
+                           source_code="async def loader(): pass"),
+            _make_artifact("analyzer", CapabilityType.SKILL, gap_query="analyze",
+                           skill_content="# Analyze"),
+        ]
+        subtasks = [
+            _make_subtask("load", ["load"]),
+            _make_subtask("analyze", ["analyze"], depends_on=[0]),
+        ]
+        resolution = {
+            "load": CapabilityReference(
+                source="generated", capability_name="loader",
+                capability_type=CapabilityType.MCP_TOOL,
+            ),
+            "analyze": CapabilityReference(
+                source="generated", capability_name="analyzer",
+                capability_type=CapabilityType.SKILL,
+            ),
+        }
+
+        ex = self._make_chain_executor(subtasks=subtasks, resolution=resolution, artifacts=arts)
+        chain_result = ex.run()
+        assert chain_result.chain_success is True
+
+        # MCP_TOOL backend: workspace_path kwarg is a Path; no fixture_contents param exists.
+        mock_mcp.assert_called_once()
+        mcp_kwargs = mock_mcp.call_args.kwargs
+        assert "workspace_path" in mcp_kwargs
+        assert isinstance(mcp_kwargs["workspace_path"], Path)
+        assert "fixture_contents" not in mcp_kwargs
+        # Positional args carry no dict either.
+        for arg in mock_mcp.call_args.args:
+            assert not isinstance(arg, dict), (
+                "MCP_TOOL step received a dict — should only get workspace Path + source code"
+            )
+
+        # SKILL backend: third positional arg is the fixture_contents dict.
+        mock_skill.assert_called_once()
+        skill_fixture_contents = mock_skill.call_args[0][2]
+        assert isinstance(skill_fixture_contents, dict)
+        assert "step_0_output.json" in skill_fixture_contents
+
     @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
     def test_registry_match_in_chain(self, mock_exec):
         """Registry-matched capability used in a chain step."""

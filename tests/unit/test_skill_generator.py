@@ -582,6 +582,88 @@ class TestGenerateSingleSkill:
         assert len(captured_prompts) >= 1
         assert custom_context in captured_prompts[0]
 
+    def test_schema_context_reaches_prompt(self, tmp_path):
+        """Phase 3.5c wires ``build_schema_context(gap, subtasks)`` into the
+        SKILL generator prompt so each step's SKILL.md workflow knows its
+        upstream input keys and required output keys. Guard the injection
+        path with distinctive key tokens so a future refactor that drops
+        the plumbing is caught immediately.
+        """
+        from src.orchestrator.generators.utils import build_schema_context
+        from src.schemas.task import SubTask
+
+        upstream = SubTask(
+            description="Load raw inventory feed",
+            required_capabilities=["load_feed"],
+            depends_on=[],
+            output_schema={"loaded_feed_fixture": "list of SKU records"},
+        )
+        downstream = SubTask(
+            description="Reorder inventory by demand",
+            required_capabilities=["csv-loader"],
+            depends_on=[0],
+            output_schema={"reorder_plan_fixture": "list of reorder rows"},
+        )
+        schema_ctx = build_schema_context(self._gap(), [upstream, downstream])
+        assert schema_ctx, "build_schema_context must return a non-empty contract for this fixture"
+
+        captured_prompts: list = []
+
+        class _MockResponse:
+            def __init__(self_, content):
+                self_.content = content
+
+        class _MockLLM:
+            def invoke(self_, prompt, config=None):
+                captured_prompts.append(prompt)
+                return _MockResponse(VALID_SKILL_MD)
+
+        with patch(
+            "src.orchestrator.generators.skill._get_llm",
+            return_value=_MockLLM(),
+        ):
+            _generate_single_skill(
+                self._gap(),
+                task_context="context",
+                output_dir=tmp_path,
+                schema_context=schema_ctx,
+            )
+
+        assert len(captured_prompts) >= 1
+        prompt = captured_prompts[0]
+        assert "Input/Output Schema Contract" in prompt
+        assert "loaded_feed_fixture" in prompt
+        assert "reorder_plan_fixture" in prompt
+
+    def test_empty_schema_context_omits_contract_section(self, tmp_path):
+        """Legacy decompositions without output_schema produce an empty
+        contract string — the generator must not emit a dangling heading.
+        """
+        captured_prompts: list = []
+
+        class _MockResponse:
+            def __init__(self_, content):
+                self_.content = content
+
+        class _MockLLM:
+            def invoke(self_, prompt, config=None):
+                captured_prompts.append(prompt)
+                return _MockResponse(VALID_SKILL_MD)
+
+        with patch(
+            "src.orchestrator.generators.skill._get_llm",
+            return_value=_MockLLM(),
+        ):
+            _generate_single_skill(
+                self._gap(),
+                task_context="context",
+                output_dir=tmp_path,
+                schema_context="",
+            )
+
+        assert len(captured_prompts) >= 1
+        assert "Input/Output Schema Contract" not in captured_prompts[0]
+
     def test_all_special_char_query_uses_forced_name(self, tmp_path):
         """When gap.query is all special chars, forced_name (hash-based slug) is used."""
         content_no_name = "---\ndescription: Some skill.\n---\n\n# Body\n"

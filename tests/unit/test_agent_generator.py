@@ -630,6 +630,84 @@ class TestGenerateSingleAgent:
         assert len(captured_prompts) >= 1
         assert custom_context in captured_prompts[0]
 
+    def test_schema_context_reaches_prompt(self, tmp_path):
+        """Phase 3.5c wires ``build_schema_context(gap, subtasks)`` into the
+        AGENT generator prompt so each agent's system prompt knows its
+        upstream input keys and required output keys. Guard the injection
+        path with distinctive key tokens so a future refactor that drops
+        the plumbing is caught immediately.
+        """
+        from src.orchestrator.generators.utils import build_schema_context
+        from src.schemas.task import SubTask
+
+        upstream = SubTask(
+            description="Collect raw incident logs",
+            required_capabilities=["collect_logs"],
+            depends_on=[],
+            output_schema={"raw_incident_fixture": "list of log records"},
+        )
+        downstream = SubTask(
+            description="Monitor data quality on collected logs",
+            required_capabilities=["data-quality-monitor"],
+            depends_on=[0],
+            output_schema={"quality_verdict_fixture": "dict with pass/fail + findings"},
+        )
+        schema_ctx = build_schema_context(self._gap(), [upstream, downstream])
+        assert schema_ctx, "build_schema_context must return a non-empty contract for this fixture"
+
+        captured_prompts: list = []
+        valid_result = self._VALID_RESULT
+
+        class _MockStructuredLLM:
+            def invoke(self_, prompt, config=None):
+                captured_prompts.append(prompt)
+                return valid_result
+
+        class _MockLLM:
+            def with_structured_output(self_, schema):
+                return _MockStructuredLLM()
+
+        with patch("src.orchestrator.generators.agent._get_llm", return_value=_MockLLM()):
+            _generate_single_agent(
+                self._gap(),
+                task_context="context",
+                output_dir=tmp_path,
+                schema_context=schema_ctx,
+            )
+
+        assert len(captured_prompts) >= 1
+        prompt = captured_prompts[0]
+        assert "Input/Output Schema Contract" in prompt
+        assert "raw_incident_fixture" in prompt
+        assert "quality_verdict_fixture" in prompt
+
+    def test_empty_schema_context_omits_contract_section(self, tmp_path):
+        """Legacy decompositions without output_schema produce an empty
+        contract string — the generator must not emit a dangling heading.
+        """
+        captured_prompts: list = []
+        valid_result = self._VALID_RESULT
+
+        class _MockStructuredLLM:
+            def invoke(self_, prompt, config=None):
+                captured_prompts.append(prompt)
+                return valid_result
+
+        class _MockLLM:
+            def with_structured_output(self_, schema):
+                return _MockStructuredLLM()
+
+        with patch("src.orchestrator.generators.agent._get_llm", return_value=_MockLLM()):
+            _generate_single_agent(
+                self._gap(),
+                task_context="context",
+                output_dir=tmp_path,
+                schema_context="",
+            )
+
+        assert len(captured_prompts) >= 1
+        assert "Input/Output Schema Contract" not in captured_prompts[0]
+
     def test_repair_prompt_includes_validation_errors(self, tmp_path):
         """When first attempt fails validation, the repair LLM call receives the error messages."""
         captured_prompts: list = []

@@ -665,6 +665,66 @@ class TestStepPositionInPrompt:
         user_msg = next(m for m in captured if m["role"] == "user")
         assert "Step Position (HARD CONSTRAINT)" not in user_msg["content"]
 
+    def test_schema_context_reaches_prompt(self):
+        """Phase 3.5c wires ``build_schema_context(gap, subtasks)`` into the
+        MCP tool generator prompt so each step knows its upstream input keys
+        and required output keys. A regression that disconnected this
+        plumbing (e.g. dropped the ``schema_context`` kwarg, stopped
+        formatting the section into the user prompt, or swallowed the
+        output of ``build_schema_context``) would silently produce schema-
+        blind tools. Guard the injection path with distinctive key tokens.
+        """
+        from src.orchestrator.generators.utils import build_schema_context
+
+        upstream = SubTask(
+            description="Parse the input CSV",
+            required_capabilities=["parse_csv"],
+            depends_on=[],
+            output_schema={"parsed_rows_fixture": "list[dict] of row records"},
+        )
+        downstream = SubTask(
+            description="Aggregate parsed rows",
+            required_capabilities=["aggregate_rows"],
+            depends_on=[0],
+            output_schema={"aggregate_summary_fixture": "dict of per-group totals"},
+        )
+        gap = ClassifiedGap(
+            description="Aggregate rows",
+            query="aggregate_rows",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="deterministic",
+        )
+        schema_ctx = build_schema_context(gap, [upstream, downstream])
+        assert schema_ctx, "build_schema_context must return a non-empty contract for this fixture"
+
+        captured: list = []
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._capture_messages(captured),
+        ):
+            generate_single_tool(gap, schema_context=schema_ctx)
+
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "Input/Output Schema Contract" in user_msg["content"]
+        assert "parsed_rows_fixture" in user_msg["content"]
+        assert "aggregate_summary_fixture" in user_msg["content"]
+
+    def test_empty_schema_context_omits_contract_section(self):
+        """When ``build_schema_context`` returns empty (legacy decomposition
+        without ``output_schema``), the generator must NOT emit a stray
+        ``## Input/Output Schema Contract`` heading with nothing under it.
+        """
+        captured: list = []
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._capture_messages(captured),
+        ):
+            generate_single_tool(self._gap(), schema_context="")
+
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "Input/Output Schema Contract" not in user_msg["content"]
+
 
 # ---------------------------------------------------------------------------
 # generate_mcp_tool node — routing logic (patches generate_single_tool)
