@@ -157,14 +157,14 @@ All ✅ rows below have landed with verified commit hashes. Active TBD list:
 | 6.6 | Step 13.7 — LangFuse tracing audit | ~2-3 h | **YES — blocks row 7** |
 | ~~6.7~~ | ~~Step 18.6 — M3 definition-string token cost~~ | ~~~2-3 h~~ | ✅ **DONE 2026-04-18** — `CapabilityDescriptor.definition_token_cost` field wired at all four registration touch points; idempotent backfill `scripts/backfill_definition_token_costs.py` executed on CLI store (20/20 populated); 13 new unit tests (1443 → 1456); `tiktoken` added as explicit dep. U(c) unchanged — runtime still drives, definition cost side-by-side per §11.12 disclosure. Serialization-scope methodology captured in §11.12. |
 | 6.8 | Step 13.8 — Compression-loss analyzer | ~1.5-2 h | Post-eval reader; can land after row 7 |
-| 6.9 | Step 18.9 — M5 time-to-first-correct filter narrowing (helper already exists, needs `gate_passed AND output_in_range` filter + p95/stdev) *(added 2026-04-18)* | ~15 min | Not blocking — pure post-hoc reader over eval output |
+| ~~6.9~~ | ~~Step 18.9 — M5 time-to-first-correct filter narrowing~~ | ~~~15 min~~ | ✅ **DONE 2026-04-18** — `print_latency_summary` WHERE clause narrowed to `gate_passed AND output_in_range AND NOT is_pilot`; SELECT extended with p50 / p95 / stdev (sample) + per-condition excluded-row count with exclusion-rationale note. 7 new unit tests (1456 → 1463). Flips `docs/verification/05_evaluation_strategy.md` M5 ⚠️ → ✅. |
 | 6.10 | Step 18.10 — M2 mock contamination manual audit + analyzer reader *(added 2026-04-18)* | ~3-5 h (~1h tooling + 2-4h human audit) | Pre-Chapter 6 — M2 reported as *"deferred"* if not done |
 | (Phase 3 smoke) | `test_pipeline.py` → `test_verification.py` → `test_auto_optimizer.py` → `test_mint.py` → `run_pilot --condition full --n-runs 1` | ~1-2 h hands-on | **YES — blocks row 7** |
 | 7 | Phase 4 Step 18 — 400-record eval | ~18 h unattended (~$6) | — |
 | 8 | Phase 4 Step 19 — Longitudinal run (optional) | several h unattended | — |
 | 8.1 | Phase 4 Step 18.8 — Distribution-shift run | several h unattended | — |
 
-**Pre-eval hands-on remaining: ~14.25-22 h** (was ~16.25-25 h; −~2-3 h from Step 18.6 landing 2026-04-18). All three Phase 4 runs are parallelizable (different DBs). Step 18.10's human-audit portion (~2-4 h) happens post-Step-18 (400-record eval) since it needs real generated capabilities to sample from — does not extend the pre-eval critical path.
+**Pre-eval hands-on remaining: ~14-21.75 h** (was ~14.25-22 h; −~15 min from Step 18.9 landing 2026-04-18). All three Phase 4 runs are parallelizable (different DBs). Step 18.10's human-audit portion (~2-4 h) happens post-Step-18 (400-record eval) since it needs real generated capabilities to sample from — does not extend the pre-eval critical path.
 
 ---
 

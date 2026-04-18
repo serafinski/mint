@@ -759,31 +759,89 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> None:
-    """Average latency per condition for JIT runs (excludes static)."""
+    """M5 time-to-first-correct execution per condition (Step 18.9).
+
+    Per proposal §Evaluation Strategy M5: *"Latency from task input to
+    verified correct output, including any JIT generation time."* The
+    pipeline stops at the first verified-correct output, so for **successful
+    runs** ``attempt_latency_ms`` equals time-to-first-correct by
+    construction. Failed runs (``gate_passed=False`` OR
+    ``output_in_range=False``) have ``attempt_latency_ms`` = wall-clock-
+    until-give-up, which violates M5's precondition (there was no first
+    correct output) and must be excluded before aggregation.
+
+    Reports mean / median / p95 / stdev over successful runs per condition,
+    plus the count of excluded rows with the exclusion rationale.
+    """
     rows = conn.execute(
         """
         SELECT condition,
+               COUNT(*) AS n_included,
                AVG(attempt_latency_ms) / 1000.0 AS avg_sec,
                MEDIAN(attempt_latency_ms) / 1000.0 AS median_sec,
-               MIN(attempt_latency_ms) / 1000.0 AS min_sec,
-               MAX(attempt_latency_ms) / 1000.0 AS max_sec
+               QUANTILE_CONT(attempt_latency_ms, 0.95) / 1000.0 AS p95_sec,
+               STDDEV_SAMP(attempt_latency_ms) / 1000.0 AS stdev_sec
         FROM evaluation_runs
-        WHERE is_pilot = FALSE AND condition != 'static'
+        WHERE gate_passed
+          AND output_in_range
+          AND NOT is_pilot
         GROUP BY condition
         ORDER BY condition
         """
     ).fetchall()
+
+    excluded_counts = conn.execute(
+        """
+        SELECT condition, COUNT(*)
+        FROM evaluation_runs
+        WHERE (NOT gate_passed OR NOT output_in_range)
+          AND NOT is_pilot
+        GROUP BY condition
+        ORDER BY condition
+        """
+    ).fetchall()
+    excluded_by_condition = dict(excluded_counts)
+
     lines = [
         f"\n{'='*80}",
-        "  Latency Summary (seconds, JIT conditions only)",
+        "  M5 Time-to-first-correct Execution (seconds, successful runs only)",
         f"{'='*80}",
     ]
-    header = f"{'Condition':<22} {'Mean':>8} {'Median':>8} {'Min':>8} {'Max':>8}"
+    header = (
+        f"{'Condition':<22} {'n':>5} {'Mean':>8} {'Median':>8} "
+        f"{'p95':>8} {'Stdev':>8}"
+    )
     lines.append(header)
     lines.append("-" * len(header))
-    for r in rows:
-        label = CONDITION_LABELS.get(r[0], r[0])
-        lines.append(f"{label:<22} {r[1]:>8.1f} {r[2]:>8.1f} {r[3]:>8.1f} {r[4]:>8.1f}")
+
+    if not rows:
+        lines.append("(no successful runs — nothing to summarize)")
+    else:
+        for condition, n, avg, med, p95, stdev in rows:
+            label = CONDITION_LABELS.get(condition, condition)
+            # stdev is NULL when n < 2; render as '-' to avoid NaN-looking output.
+            stdev_str = f"{stdev:>8.1f}" if stdev is not None else f"{'-':>8}"
+            lines.append(
+                f"{label:<22} {n:>5d} {avg:>8.1f} {med:>8.1f} {p95:>8.1f} {stdev_str}"
+            )
+
+    total_excluded = sum(excluded_by_condition.values())
+    lines.append("")
+    lines.append(
+        f"Excluded: {total_excluded} non-pilot runs where "
+        f"gate_passed=False OR output_in_range=False"
+    )
+    if total_excluded > 0:
+        per_cond = ", ".join(
+            f"{CONDITION_LABELS.get(c, c)}={n}"
+            for c, n in sorted(excluded_by_condition.items())
+        )
+        lines.append(f"         by condition: {per_cond}")
+    lines.append(
+        "         (failed runs have no 'first correct output' — total "
+        "wall-clock is not time-to-first-correct for them)"
+    )
+
     for line in lines:
         print(line)
 
