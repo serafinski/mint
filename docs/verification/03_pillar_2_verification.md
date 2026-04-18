@@ -236,7 +236,7 @@ The proposal claims Pillar 2 is *"a novel contribution"* not present in EvoMAC, 
 - `docs/thesis_proposal.md` §Pillar 2 lines 101–152 — source of the claims audited.
 - `docs/MASTER_PLAN_2026_04_13.md` §12 findings #14 (verification fail-closed), #15 (decomposition fail-closed), #16 (classification fail-closed), and Step 12.5 (Tier 1.5 disclosure framing).
 - `docs/MASTER_PLAN_2026_04_13.md` Step 14.11 — Tier 3 timeout fail-closed.
-- `docs/perf_fixes_2026_04_14.md` §2c-3 — Tier 3 AGENT coverage recharacterization.
+- `docs/archive/perf_fixes_2026_04_14.md` §2c-3 — Tier 3 AGENT coverage recharacterization.
 - `CLAUDE.md` §Verification Gate (Tiered Cost Optimization), §Three-layer strict-gate pattern.
 - `MEMORY.md::project_sandbox_import_check` — Tier 1.5 closure note.
 - `MEMORY.md::Tier 3 coverage-gap drift` — 2026-04-16 recharacterization.

@@ -525,7 +525,7 @@ Three compounding factors: (a) decomposer produces short hyphen-case slugs for `
 
 **Fix:** dual-query search in `detect_gaps` — query with both the slug AND the corresponding `SubTask.description`, take the max. The decomposer already produces both; we just don't use the description for retrieval. Strictly additive, zero downside.
 
-**Full plan:** `docs/registry_retrieval_fix_plan.md` — contains empirical evidence, root cause, ranked fix options, concrete implementation scope, and five open questions to resolve before implementation.
+**Full plan:** `docs/archive/registry_retrieval_fix_plan.md` — contains empirical evidence, root cause, ranked fix options, concrete implementation scope, and five open questions to resolve before implementation.
 
 **Tracked in master plan:** Phase 2 **Step 14.5 — Registry dual-query search**, positioned after Step 14 (decomposition coherence) and before Step 13 (AGENT execution timeout). ~2.5-3 hours including an empirical sweep across all 11 seeded caps.
 
