@@ -70,6 +70,46 @@ class HumanLabel(StrEnum):
     PARTIAL = "partial"
 
 
+class GeneratedArtifactSnapshot(BaseModel):
+    """Record-write-time snapshot of a generated capability's source (Step 18.10).
+
+    Persisted inside ``EvaluationRecord.generated_artifact_sources`` so the
+    proposal §M2 manual contamination audit can read full source bodies
+    from the DB without depending on the registry's snapshot-isolated
+    state (which wipes generated capabilities between runs).
+
+    The ``source_body`` is polymorphic by ``capability_type``:
+
+    * ``MCP_TOOL``  → raw Python ``source_code``.
+    * ``SKILL``     → full ``skill_content`` (SKILL.md body incl. YAML).
+    * ``AGENT``     → ``json.dumps(agent_config)`` — keeps system_prompt
+      plus any subagent configs the parent delegates to.
+
+    Not a place for truncation. M2 audit requires human reading of the
+    complete source to catch contamination patterns (hardcoded literals
+    buried deep in a function, silent try/except blocks, mock-contamination
+    keyed off task phrasing) that an automated scanner misses.
+    """
+
+    capability_name: str = Field(..., description="Registry name of the generated capability")
+    capability_type: CapabilityType = Field(
+        ..., description="MCP_TOOL / SKILL / AGENT — discriminates source_body semantics"
+    )
+    source_body: str = Field(
+        ...,
+        description=(
+            "Full source body. Polymorphic by capability_type: Python source "
+            "(MCP_TOOL), SKILL.md text (SKILL), or json.dumps(agent_config) "
+            "(AGENT). Never truncated — M2 audit requires complete inspection."
+        ),
+    )
+    domain: str | None = Field(
+        default=None, description="Taxonomy-assigned domain for audit context"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
 class EvaluationRecord(BaseModel):
     """One pipeline run on one task under one baseline condition.
 
@@ -229,6 +269,20 @@ class EvaluationRecord(BaseModel):
             "Required filenames that were absent from chain_output_files. "
             "Empty list when the contract is satisfied OR when no file "
             "outputs were declared. Sorted for stable diffing."
+        ),
+    )
+
+    # --- M2 audit source persistence (Step 18.10 Option B) ---
+    generated_artifact_sources: list[GeneratedArtifactSnapshot] = Field(
+        default_factory=list,
+        description=(
+            "Record-write-time snapshots of every generated capability's "
+            "source body. Enables proposal §M2 manual contamination audit "
+            "post-eval without depending on the registry's snapshot-isolated "
+            "state (restore_clean_snapshot wipes caps between runs). Empty "
+            "list for runs that generated no artifacts (static, registry-"
+            "match T01-T03), for legacy rows from before Step 18.10 landed, "
+            "and — by design — for runs that failed before generation."
         ),
     )
 

@@ -846,6 +846,105 @@ def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> None:
         print(line)
 
 
+def _clopper_pearson_ci(
+    successes: int, n: int, *, confidence: float = 0.95
+) -> tuple[float, float]:
+    """Return (lower, upper) bounds of a Clopper-Pearson binomial CI.
+
+    Uses scipy.stats.beta.ppf (exact method). Graceful on n=0 → (0, 0).
+    Graceful on successes=0 → (0, upper). Graceful on successes=n → (lower, 1).
+    """
+    if n == 0:
+        return (0.0, 0.0)
+    from scipy.stats import beta  # local import — heavy dep
+    alpha = 1.0 - confidence
+    lower = 0.0 if successes == 0 else float(beta.ppf(alpha / 2, successes, n - successes + 1))
+    upper = 1.0 if successes == n else float(beta.ppf(1 - alpha / 2, successes + 1, n - successes))
+    return (lower, upper)
+
+
+def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
+    """M2 mock-contamination rate per condition (Step 18.10).
+
+    Reads ``human_label`` from ``evaluation_runs`` for non-pilot rows
+    under JIT conditions. Reports per-condition: n_sampled, n_correct,
+    n_contaminated, n_partial, contamination_rate, 95% Clopper-Pearson CI.
+
+    Proposal §Evaluation Strategy M2: *"What fraction of generated
+    capabilities contain hardcoded/fabricated elements? (Measured by
+    manual audit of a sample.)"* Graceful fallback when no labels are
+    populated yet: prints a single "audit not performed" line instead
+    of empty tables.
+    """
+    rows = conn.execute(
+        """
+        SELECT condition,
+               SUM(CASE WHEN human_label = 'correct'      THEN 1 ELSE 0 END) AS n_correct,
+               SUM(CASE WHEN human_label = 'contaminated' THEN 1 ELSE 0 END) AS n_contaminated,
+               SUM(CASE WHEN human_label = 'partial'      THEN 1 ELSE 0 END) AS n_partial,
+               COUNT(*)                                                      AS n_sampled
+        FROM evaluation_runs
+        WHERE human_label IS NOT NULL
+          AND NOT is_pilot
+        GROUP BY condition
+        ORDER BY condition
+        """
+    ).fetchall()
+
+    print()
+    print("=" * 100)
+    print("  M2 Mock-Contamination Rate (manual audit of sampled capabilities)")
+    print("=" * 100)
+
+    if not rows:
+        print(
+            "  Audit not performed — `human_label` is unpopulated. "
+            "Run `uv run scripts/audit_contamination.py` after Step 18 to "
+            "label a stratified sample, then re-run this analyzer. "
+            "Chapter 6 §M2 should report as *deferred* until the audit lands."
+        )
+        return
+
+    header = (
+        f"{'Condition':<22} {'n':>4} {'Correct':>9} {'Contam.':>9} "
+        f"{'Partial':>9} {'Contam.%':>10} {'95% CI':>22}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    total_c, total_x, total_p, total_n = 0, 0, 0, 0
+    for condition, n_correct, n_contam, n_partial, n_sampled in rows:
+        label = CONDITION_LABELS.get(condition, condition)
+        rate = 100.0 * n_contam / n_sampled if n_sampled else 0.0
+        lo, hi = _clopper_pearson_ci(int(n_contam), int(n_sampled))
+        ci_str = f"[{lo * 100:.1f}%, {hi * 100:.1f}%]"
+        print(
+            f"{label:<22} {n_sampled:>4d} {n_correct:>9d} {n_contam:>9d} "
+            f"{n_partial:>9d} {rate:>9.1f}% {ci_str:>22}"
+        )
+        total_c += int(n_correct)
+        total_x += int(n_contam)
+        total_p += int(n_partial)
+        total_n += int(n_sampled)
+
+    # Pool across conditions only when there are multiple — a single-condition
+    # "pooled" row would just be a duplicate of the per-condition row.
+    if len(rows) > 1 and total_n > 0:
+        rate = 100.0 * total_x / total_n
+        lo, hi = _clopper_pearson_ci(total_x, total_n)
+        print("-" * len(header))
+        print(
+            f"{'Pooled':<22} {total_n:>4d} {total_c:>9d} {total_x:>9d} "
+            f"{total_p:>9d} {rate:>9.1f}% [{lo * 100:.1f}%, {hi * 100:.1f}%]"
+        )
+
+    print(
+        "\n  Methodology: manual audit of stratified random sample (Step 18.10). "
+        "Labels populated via `scripts/audit_contamination.py`. See master plan "
+        "§11 for the sampling protocol and labelling criteria."
+    )
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -906,6 +1005,11 @@ def main() -> None:
 
     # ── Gini coefficient of capability invocation counts (§Metrics) ──────
     print_gini_summary(conn)
+
+    # ── M2 mock contamination rate (Step 18.10, proposal §M2) ────────────
+    # Graceful fallback prints "audit not performed" when human_label
+    # column is unpopulated.
+    print_contamination_rate(conn)
 
     conn.close()
 

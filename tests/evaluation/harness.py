@@ -57,8 +57,8 @@ from src.orchestrator.output_contract_resolver import (
 from src.orchestrator.tool_loader import ToolLoader
 from src.registry.evaluation_store import EvaluationStore
 from src.registry.store import SkillRegistry, seed_registry
-from src.schemas.evaluation import EvaluationRecord
-from src.schemas.task import OutputContract, TaskState
+from src.schemas.evaluation import EvaluationRecord, GeneratedArtifactSnapshot
+from src.schemas.task import GeneratedArtifact, OutputContract, TaskState
 from tests.evaluation.snapshots import restore_clean_snapshot, take_clean_snapshot
 from tests.evaluation.tasks import TaskDefinition
 
@@ -92,6 +92,66 @@ class HarnessConfig:
     # network access (e.g. T21 fetch-and-summarize-public-api) run under
     # this flag.
     allow_network: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Step 18.10 Option B — capture generated artifact sources at record-write
+# time so the post-eval manual contamination audit can read full source
+# bodies even after snapshot isolation has wiped the registry.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_artifacts(
+    artifacts: list[GeneratedArtifact] | None,
+) -> list[GeneratedArtifactSnapshot]:
+    """Build M2-audit snapshots from the pipeline's generated artifacts.
+
+    Source body is polymorphic by type:
+        * MCP_TOOL -> source_code (raw Python)
+        * SKILL    -> skill_content (full SKILL.md)
+        * AGENT    -> json.dumps(agent_config) keeping system_prompt + subagents
+
+    Never raises — any artifact whose source body can't be extracted is
+    silently skipped so a single malformed artifact can't break
+    record_run. Empty list in / empty list out.
+    """
+    import json as _json
+    from src.schemas.capability import CapabilityType
+
+    if not artifacts:
+        return []
+
+    out: list[GeneratedArtifactSnapshot] = []
+    for art in artifacts:
+        try:
+            if art.capability_type == CapabilityType.MCP_TOOL:
+                body = art.source_code or ""
+            elif art.capability_type == CapabilityType.SKILL:
+                body = art.skill_content or ""
+            elif art.capability_type == CapabilityType.AGENT:
+                if art.agent_config is None:
+                    body = ""
+                elif isinstance(art.agent_config, dict):
+                    body = _json.dumps(art.agent_config, default=str)
+                else:
+                    body = str(art.agent_config)
+            else:
+                body = ""
+            if not body:
+                # Still snapshot the name/type so the audit can skip with
+                # a clear reason instead of silently missing an artifact.
+                body = ""
+            out.append(
+                GeneratedArtifactSnapshot(
+                    capability_name=art.capability_name,
+                    capability_type=art.capability_type,
+                    source_body=body,
+                    domain=art.domain,
+                )
+            )
+        except Exception:  # noqa: BLE001 — never-raises contract
+            continue
+    return out
 
 
 class EvaluationHarness:
@@ -380,6 +440,7 @@ class EvaluationHarness:
             output_shape_mismatch=result.get("output_shape_mismatch", False),
             output_shape_missing_keys=result.get("output_shape_missing_keys", []),
             output_shape_missing_files=result.get("output_shape_missing_files", []),
+            generated_artifact_sources=result.get("generated_artifact_sources", []),
         )
 
     # -- condition implementations -------------------------------------------
@@ -623,6 +684,9 @@ def _extract_result_compositional(
             "output_shape_mismatch": False,
             "output_shape_missing_keys": [],
             "output_shape_missing_files": [],
+            # Step 18.10: snapshot even gate-rejected artifacts — they're
+            # still relevant for an M2 audit (did the gate catch mocks?).
+            "generated_artifact_sources": _snapshot_artifacts(artifacts),
         }
 
     # Run the compositional chain
@@ -714,6 +778,8 @@ def _extract_result_compositional(
         "output_shape_missing_files": (
             shape_check.missing_files if shape_check is not None else []
         ),
+        # Step 18.10 — snapshot every generated artifact for M2 audit.
+        "generated_artifact_sources": _snapshot_artifacts(artifacts),
     }
 
 
@@ -989,6 +1055,8 @@ def _extract_result(
         "failed_step_index": None,
         "failed_step_name": None,
         "failed_step_reason": None,
+        # Step 18.10 — snapshot generated artifacts for M2 audit.
+        "generated_artifact_sources": _snapshot_artifacts(artifacts),
         "output_shape_mismatch": (
             shape_check is not None and not shape_check.satisfied
         ),

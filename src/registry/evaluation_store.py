@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     output_shape_mismatch     BOOLEAN NOT NULL DEFAULT FALSE,
     output_shape_missing_keys VARCHAR NOT NULL DEFAULT '[]',
     output_shape_missing_files VARCHAR NOT NULL DEFAULT '[]',
+    generated_artifact_sources VARCHAR NOT NULL DEFAULT '[]',
     timestamp                 TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -144,6 +145,10 @@ _MIGRATIONS = [
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_mismatch BOOLEAN",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_missing_keys VARCHAR",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_missing_files VARCHAR",
+    # Step 18.10 Option B — per-record source-body snapshots for M2 audit.
+    # Needed because snapshot isolation wipes the registry between runs, so
+    # post-eval audit tool cannot reconstruct source from chroma alone.
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS generated_artifact_sources VARCHAR",
 ]
 
 
@@ -192,8 +197,9 @@ class EvaluationStore:
                 generated_artifact_count, capability_types,
                 failed_step_index, failed_step_name, failed_step_reason,
                 output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
+                generated_artifact_sources,
                 timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 row_id,
@@ -227,10 +233,45 @@ class EvaluationStore:
                 record.output_shape_mismatch,
                 json.dumps(record.output_shape_missing_keys),
                 json.dumps(record.output_shape_missing_files),
+                json.dumps(
+                    [s.model_dump(mode="json") for s in record.generated_artifact_sources]
+                ),
                 record.timestamp,
             ],
         )
         return row_id
+
+    def update_human_label(self, row_id: str, label: str | None) -> bool:
+        """Set ``human_label`` on one evaluation_runs row. Step 18.10.
+
+        Returns True if a row was updated, False if ``row_id`` did not exist.
+        Label must be one of ``HumanLabel`` enum values (correct /
+        contaminated / partial) or None to clear. Idempotent — re-labeling
+        the same row with the same value is a no-op from the caller's
+        perspective.
+
+        Raises ``ValueError`` if ``label`` is not a known HumanLabel
+        value and not None; this catches typos in the audit tool before
+        a bad value hits the DB (the column is VARCHAR and would accept
+        anything otherwise).
+        """
+        valid = {"correct", "contaminated", "partial", None}
+        if label not in valid:
+            raise ValueError(
+                f"label must be one of {sorted(v for v in valid if v)} "
+                f"or None; got {label!r}"
+            )
+        cursor = self._conn.execute(
+            "UPDATE evaluation_runs SET human_label = ? WHERE id = ?",
+            [label, row_id],
+        )
+        # DuckDB's execute returns the connection, not an affected-rows
+        # count. We check whether the row existed by doing a SELECT after.
+        existed = self._conn.execute(
+            "SELECT 1 FROM evaluation_runs WHERE id = ? LIMIT 1",
+            [row_id],
+        ).fetchone()
+        return existed is not None
 
     def record_invocation_events(
         self,
@@ -417,6 +458,7 @@ class EvaluationStore:
                    generated_artifact_count, capability_types,
                    failed_step_index, failed_step_name, failed_step_reason,
                    output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
+                   generated_artifact_sources,
                    timestamp
             FROM evaluation_runs
             {where}
@@ -517,6 +559,7 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         generated_artifact_count, capability_types,
         failed_step_index, failed_step_name, failed_step_reason,
         output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
+        generated_artifact_sources,
         timestamp,
     ) = row
     # DuckDB may return naive datetimes — normalise to UTC-aware
@@ -535,6 +578,31 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         except (ValueError, TypeError):
             return []
         return [str(x) for x in value] if isinstance(value, list) else []
+
+    def _decode_artifact_sources(blob: object) -> list:
+        """Parse the generated_artifact_sources JSON column into snapshots.
+
+        Never raises — malformed JSON / old rows → empty list, which
+        triggers the audit tool's fallback (registry lookup) path.
+        """
+        from src.schemas.evaluation import GeneratedArtifactSnapshot
+        if not blob:
+            return []
+        try:
+            value = json.loads(blob) if isinstance(blob, str) else blob
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(value, list):
+            return []
+        out = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            try:
+                out.append(GeneratedArtifactSnapshot(**item))
+            except Exception:  # noqa: BLE001 — never-raises contract
+                continue
+        return out
 
     return EvaluationRecord(
         run_id=run_id,
@@ -567,5 +635,6 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         output_shape_mismatch=bool(output_shape_mismatch) if output_shape_mismatch is not None else False,
         output_shape_missing_keys=_decode_str_list(output_shape_missing_keys),
         output_shape_missing_files=_decode_str_list(output_shape_missing_files),
+        generated_artifact_sources=_decode_artifact_sources(generated_artifact_sources),
         timestamp=timestamp,
     )
