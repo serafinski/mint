@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from pydantic import Field as PydanticField  # aliased; generated-tool code also imports Field
 
 from src.orchestrator.schema_extraction import extract_mcp_tool_signature
+from src.registry.token_count import count_definition_tokens
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import GeneratedArtifact
 
@@ -331,15 +332,26 @@ class ToolLoader:
         effective_is_generic = bool(artifact.is_generic)
 
         fallback_desc = artifact.capability_name.replace("-", " ").replace("_", " ")
+        resolved_description = description or artifact.description or fallback_desc
+        definition_token_cost = count_definition_tokens(
+            artifact.model_copy(
+                update={
+                    "description": resolved_description,
+                    "input_schema": input_schema,
+                    "output_schema": output_schema,
+                }
+            )
+        )
         descriptor = CapabilityDescriptor(
             name=artifact.capability_name,
-            description=description or artifact.description or fallback_desc,
+            description=resolved_description,
             capability_type=CapabilityType.MCP_TOOL,
             domain=effective_domain,
             is_generic=effective_is_generic,
             tags=tags or [],
             input_schema=input_schema,
             output_schema=output_schema,
+            definition_token_cost=definition_token_cost,
             metadata={
                 "generated": "true",
                 "source": "jit_pipeline",

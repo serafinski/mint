@@ -250,6 +250,8 @@ def _register_artifact_directly(
                     if isinstance(artifact.agent_config, dict)
                     else str(artifact.agent_config)
                 )
+            from src.registry.token_count import count_definition_tokens
+
             descriptor = CapabilityDescriptor(
                 name=name,
                 description=artifact.description or name,
@@ -259,6 +261,7 @@ def _register_artifact_directly(
                 input_schema=dict(artifact.input_schema or {}),
                 output_schema=dict(artifact.output_schema or {}),
                 tags=list(tags or []),
+                definition_token_cost=count_definition_tokens(artifact),
                 metadata=metadata,
             )
             registry.add(descriptor)

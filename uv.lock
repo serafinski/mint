@@ -1131,6 +1131,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "rich" },
     { name = "scipy" },
+    { name = "tiktoken" },
     { name = "typer" },
 ]
 
@@ -1158,6 +1159,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "scipy", specifier = ">=1.17.1" },
+    { name = "tiktoken", specifier = ">=0.12.0" },
     { name = "typer", specifier = ">=0.15.0" },
 ]
 

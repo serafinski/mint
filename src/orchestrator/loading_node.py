@@ -157,6 +157,16 @@ def loading_node(
             )
             effective_is_generic = bool(artifact.is_generic)
 
+            from src.registry.token_count import count_definition_tokens
+
+            definition_token_cost = count_definition_tokens(
+                artifact.model_copy(
+                    update={
+                        "input_schema": input_schema,
+                        "output_schema": output_schema,
+                    }
+                )
+            )
             descriptor = CapabilityDescriptor(
                 name=artifact.capability_name,
                 description=artifact.description or artifact.capability_name,
@@ -165,6 +175,7 @@ def loading_node(
                 is_generic=effective_is_generic,
                 input_schema=input_schema,
                 output_schema=output_schema,
+                definition_token_cost=definition_token_cost,
                 metadata=metadata,
             )
             registry.add(descriptor)

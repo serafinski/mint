@@ -121,6 +121,9 @@ class SkillRegistry:
             "domain": getattr(capability, "domain", "general"),
             "is_generic": getattr(capability, "is_generic", False),
             "is_active": getattr(capability, "is_active", True),
+            "definition_token_cost": int(
+                getattr(capability, "definition_token_cost", 0)
+            ),
             "tags": ",".join(getattr(capability, "tags", [])),
             "input_schema": json.dumps(getattr(capability, "input_schema", {})),
             "output_schema": json.dumps(getattr(capability, "output_schema", {})),
@@ -158,6 +161,14 @@ class SkillRegistry:
             kwargs["is_generic"] = meta["is_generic"]
         if "is_active" in model_fields and "is_active" in meta:
             kwargs["is_active"] = meta["is_active"]
+        if (
+            "definition_token_cost" in model_fields
+            and "definition_token_cost" in meta
+        ):
+            try:
+                kwargs["definition_token_cost"] = int(meta["definition_token_cost"])
+            except (ValueError, TypeError):
+                kwargs["definition_token_cost"] = 0
         if "tags" in model_fields and "tags" in meta:
             raw_tags = meta["tags"]
             kwargs["tags"] = [t for t in raw_tags.split(",") if t] if raw_tags else []
@@ -476,6 +487,10 @@ class SkillRegistry:
 
 def seed_registry(registry: SkillRegistry) -> None:
     """Seed with diverse capabilities spanning all three types."""
+    # Local imports to avoid circular deps at module import time.
+    from src.registry.token_count import count_definition_tokens
+    from src.schemas.task import GeneratedArtifact
+
     # Build kwargs for optional fields — only include if schema supports them
     model_fields = CapabilityDescriptor.model_fields
     has_domain = "domain" in model_fields
@@ -500,10 +515,34 @@ def seed_registry(registry: SkillRegistry) -> None:
             metadata["skill_content"] = skill_content
         if agent_config is not None:
             metadata["agent_config"] = agent_config
+
+        # Compute Pillar 3 M3 definition-string token cost (Step 18.6).
+        # Build a throwaway GeneratedArtifact snapshot so the same tokenizer
+        # helper the JIT / optimizer paths use also runs on seeded caps —
+        # keeps seeded-vs-evolved Chapter-5 comparisons apples-to-apples.
+        agent_config_dict: dict | None = None
+        if agent_config is not None:
+            try:
+                agent_config_dict = json.loads(agent_config)
+            except (json.JSONDecodeError, TypeError):
+                agent_config_dict = {"system_prompt": agent_config}
+        snapshot = GeneratedArtifact(
+            capability_name=name,
+            capability_type=capability_type,
+            description=description,
+            source_code=source_code,
+            skill_content=skill_content,
+            agent_config=agent_config_dict,
+            input_schema=dict(input_schema or {}),
+            output_schema=dict(output_schema or {}),
+        )
+        definition_token_cost = count_definition_tokens(snapshot)
+
         kwargs: dict = {
             "name": name,
             "description": description,
             "capability_type": capability_type,
+            "definition_token_cost": definition_token_cost,
             "metadata": metadata,
         }
         if has_domain:
