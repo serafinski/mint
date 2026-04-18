@@ -180,6 +180,23 @@ class EvaluationRecord(BaseModel):
         default=None,
         description="Name of the failed step (None on success).",
     )
+    failed_step_reason: str | None = Field(
+        default=None,
+        description=(
+            "Free-text reason string produced by the compositional "
+            "executor when a chain step fails — specifically the "
+            "'<type> output missing declared schema keys [...]' message "
+            "from the §12 finding #12 AGENT/SKILL output_schema "
+            "compliance check, or 'agent_execution_timeout' / "
+            "'agent_execution_error' for AGENT-specific failure modes. "
+            "Persisted (Step 13.8) so post-hoc analyzers can distinguish "
+            "compression-loss-at-handoff failures from generic chain "
+            "failures — `failure_reason` enum flattens all three into "
+            "'chain_step_failed' by necessity, but the free-text string "
+            "carries the signal needed to classify the T3 "
+            "aggressive-compression failure mode."
+        ),
+    )
 
     # --- Output contract (Step 14.6) ---
     # Records the result of comparing the pipeline's final output against

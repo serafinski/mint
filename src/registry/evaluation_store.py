@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     capability_types          VARCHAR NOT NULL DEFAULT '[]',
     failed_step_index         INTEGER,
     failed_step_name          VARCHAR,
+    failed_step_reason        VARCHAR,
     output_shape_mismatch     BOOLEAN NOT NULL DEFAULT FALSE,
     output_shape_missing_keys VARCHAR NOT NULL DEFAULT '[]',
     output_shape_missing_files VARCHAR NOT NULL DEFAULT '[]',
@@ -135,6 +136,10 @@ _MIGRATIONS = [
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS capability_types VARCHAR",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_index INTEGER",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_name VARCHAR",
+    # Step 13.8 — free-text reason string from CompositionalExecutor (§12 finding
+    # #12 schema-key violations + AGENT timeout/error). Needed to classify
+    # compression_loss_subtask failures in scripts/analyze_compression_loss.py.
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_reason VARCHAR",
     # Step 14.6 — output contract check
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_mismatch BOOLEAN",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_missing_keys VARCHAR",
@@ -185,10 +190,10 @@ class EvaluationStore:
                 required_capability_count, matched_in_registry_count,
                 chain_length, chain_success, matched_and_executed_count,
                 generated_artifact_count, capability_types,
-                failed_step_index, failed_step_name,
+                failed_step_index, failed_step_name, failed_step_reason,
                 output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
                 timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 row_id,
@@ -218,6 +223,7 @@ class EvaluationStore:
                 json.dumps(record.capability_types),
                 record.failed_step_index,
                 record.failed_step_name,
+                record.failed_step_reason,
                 record.output_shape_mismatch,
                 json.dumps(record.output_shape_missing_keys),
                 json.dumps(record.output_shape_missing_files),
@@ -409,7 +415,7 @@ class EvaluationStore:
                    required_capability_count, matched_in_registry_count,
                    chain_length, chain_success, matched_and_executed_count,
                    generated_artifact_count, capability_types,
-                   failed_step_index, failed_step_name,
+                   failed_step_index, failed_step_name, failed_step_reason,
                    output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
                    timestamp
             FROM evaluation_runs
@@ -509,7 +515,7 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         required_capability_count, matched_in_registry_count,
         chain_length, chain_success, matched_and_executed_count,
         generated_artifact_count, capability_types,
-        failed_step_index, failed_step_name,
+        failed_step_index, failed_step_name, failed_step_reason,
         output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
         timestamp,
     ) = row
@@ -557,6 +563,7 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         capability_types=capability_types_list,
         failed_step_index=failed_step_index,
         failed_step_name=failed_step_name,
+        failed_step_reason=failed_step_reason,
         output_shape_mismatch=bool(output_shape_mismatch) if output_shape_mismatch is not None else False,
         output_shape_missing_keys=_decode_str_list(output_shape_missing_keys),
         output_shape_missing_files=_decode_str_list(output_shape_missing_files),

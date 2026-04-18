@@ -376,6 +376,7 @@ class EvaluationHarness:
             capability_types=result.get("capability_types", []),
             failed_step_index=result.get("failed_step_index"),
             failed_step_name=result.get("failed_step_name"),
+            failed_step_reason=result.get("failed_step_reason"),
             output_shape_mismatch=result.get("output_shape_mismatch", False),
             output_shape_missing_keys=result.get("output_shape_missing_keys", []),
             output_shape_missing_files=result.get("output_shape_missing_files", []),
@@ -616,6 +617,7 @@ def _extract_result_compositional(
             "capability_types": cap_types,
             "failed_step_index": None,
             "failed_step_name": None,
+            "failed_step_reason": None,
             # Step 14.6: gate-blocked runs never reached terminal state, so
             # the contract check is not meaningfully evaluated here.
             "output_shape_mismatch": False,
@@ -702,6 +704,7 @@ def _extract_result_compositional(
         "capability_types": cap_types,
         "failed_step_index": chain_result.failed_step_index,
         "failed_step_name": chain_result.failed_step_name,
+        "failed_step_reason": chain_result.failed_step_reason,
         "output_shape_mismatch": (
             shape_check is not None and not shape_check.satisfied
         ),
@@ -985,6 +988,7 @@ def _extract_result(
         "capability_types": capability_types_list,
         "failed_step_index": None,
         "failed_step_name": None,
+        "failed_step_reason": None,
         "output_shape_mismatch": (
             shape_check is not None and not shape_check.satisfied
         ),
