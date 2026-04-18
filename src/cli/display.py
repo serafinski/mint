@@ -799,7 +799,7 @@ def show_history(
         return
 
     table = Table(title="Invocation History", expand=False)
-    table.add_column("Time", style="dim")
+    table.add_column("When", style="dim")
     table.add_column("Capability", style="bold")
     table.add_column("Task", max_width=35)
     table.add_column("Success", justify="center")
@@ -808,7 +808,7 @@ def show_history(
     for r in records:
         success = "[green]\u2713[/green]" if r.success else "[red]\u2717[/red]"
         table.add_row(
-            f"{r.invoked_at:%H:%M:%S}",
+            f"{r.invoked_at:%Y-%m-%d %H:%M:%S}",
             r.capability_id,
             r.task_id[:35],
             success,
