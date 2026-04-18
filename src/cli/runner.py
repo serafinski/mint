@@ -53,6 +53,7 @@ def _save_last_run(
     no_optimizer: bool,
     enable_optimizer: bool,
     timeout: int | None,
+    allow_network: bool = False,
 ) -> None:
     """Persist last run config for `mint retry`."""
     data = {
@@ -63,6 +64,7 @@ def _save_last_run(
         "no_optimizer": no_optimizer,
         "enable_optimizer": enable_optimizer,
         "timeout": timeout,
+        "allow_network": allow_network,
     }
     path = _data_dir() / "cli" / _LAST_RUN_FILE
     path.write_text(json.dumps(data, indent=2))
@@ -754,7 +756,13 @@ def _match_files_to_params(
     return inputs
 
 
-def _execute_mcp_tool(artifact: Any, file_paths: list[Path], params: dict) -> dict:
+def _execute_mcp_tool(
+    artifact: Any,
+    file_paths: list[Path],
+    params: dict,
+    *,
+    allow_network: bool = False,
+) -> dict:
     """Execute an MCP tool artifact inside the Docker sandbox.
 
     Binary files (Excel, Parquet, Pickle, etc.) are base64-encoded before
@@ -762,6 +770,10 @@ def _execute_mcp_tool(artifact: Any, file_paths: list[Path], params: dict) -> di
     extensions count as binary is governed by ``BINARY_EXTENSIONS`` in
     ``src/config.py`` — the business-analytics testbed commonly uses
     ``.xlsx``, ``.parquet``, and ``.pkl`` files.
+
+    When ``allow_network`` is True, the sandbox runs with ``--network bridge``
+    so tools that legitimately need outbound HTTP (APIs, web scraping) can
+    reach the network. Default is offline-by-default for safety (Step 14.12).
     """
     from src.verification.behavioral import _extract_function_name
     from src.verification.sandbox_tool import resolve_extra_packages, sandbox_execute
@@ -852,7 +864,12 @@ asyncio.run(_run())
     else:
         extra_pkgs = resolve_extra_packages(source_code)
     exec_timeout = 60 if extra_pkgs else 30
-    result = sandbox_execute(sandbox_code, timeout=exec_timeout, extra_packages=extra_pkgs or None)
+    result = sandbox_execute(
+        sandbox_code,
+        timeout=exec_timeout,
+        extra_packages=extra_pkgs or None,
+        allow_network=allow_network,
+    )
 
     if not result.get("success") or not result.get("stdout"):
         stderr = (result.get("stderr") or "")[:300]
@@ -886,6 +903,7 @@ def _execute_skill_or_agent(
     timeout_s: int | None = None,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    allow_network: bool = False,
 ) -> dict:
     # Minimal task-like object for execution.py compatibility
     from dataclasses import dataclass, field
@@ -921,12 +939,14 @@ def _execute_skill_or_agent(
                 artifact, cli_task, fixture_contents,
                 langfuse_tags=langfuse_tags,
                 langfuse_session_id=langfuse_session_id,
+                allow_network=allow_network,
             )
         else:
             raw = _exec_mod.execute_agent_artifact(
                 artifact, cli_task, fixture_contents,
                 langfuse_tags=langfuse_tags,
                 langfuse_session_id=langfuse_session_id,
+                allow_network=allow_network,
             )
             # Step 13: read the sticky meta immediately so a later
             # agent call can't overwrite it before we surface the
@@ -992,6 +1012,7 @@ def _execute_compositional_chain(
     *,
     invoke_config: dict | None = None,
     metrics_store: Any | None = None,
+    allow_network: bool = False,
 ) -> tuple[dict | None, Any | None, str | None, dict[str, bytes], list[dict]]:
     """Run a compositional chain when multiple subtasks are present.
 
@@ -1040,6 +1061,7 @@ def _execute_compositional_chain(
         metrics_store=metrics_store,
         langfuse_tags=_lf_meta.get("langfuse_tags"),
         langfuse_session_id=_lf_meta.get("langfuse_session_id"),
+        allow_network=allow_network,
     )
 
     exec_error: str | None = None
@@ -1151,6 +1173,7 @@ def _try_registry_match(
     *,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    allow_network: bool = False,
 ) -> tuple[Any | None, dict | None]:
     """Attempt to execute a registry-matched capability."""
     _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
@@ -1199,7 +1222,9 @@ def _try_registry_match(
 
     try:
         if proxy.capability_type == CapabilityType.MCP_TOOL:
-            output = _execute_mcp_tool(proxy, file_paths, params) or None
+            output = _execute_mcp_tool(
+                proxy, file_paths, params, allow_network=allow_network,
+            ) or None
         else:
             output = (
                 _execute_skill_or_agent(
@@ -1207,6 +1232,7 @@ def _try_registry_match(
                     timeout_s=timeout_s,
                     langfuse_tags=langfuse_tags,
                     langfuse_session_id=langfuse_session_id,
+                    allow_network=allow_network,
                 ) or None
             )
     except Exception as exc:
@@ -1508,6 +1534,7 @@ def execute_task(
     json_output: bool = False,
     verbose: bool = False,
     allow_network: bool = False,
+    allow_network_source: str | None = None,
 ) -> int:
     """Run a task through the full JIT pipeline with live progress."""
     _load_env()
@@ -1522,6 +1549,7 @@ def execute_task(
         no_optimizer,
         enable_optimizer,
         timeout,
+        allow_network=allow_network,
     )
 
     file_paths = _resolve_files(files)
@@ -1602,6 +1630,7 @@ def execute_task(
     initial_state = TaskState(
         task_description=task_prompt,
         output_contract=output_contract,
+        allow_network=allow_network,
     )
 
     # Build rich LangFuse tracing config
@@ -1667,6 +1696,18 @@ def execute_task(
                 expand=False,
             )
         )
+        # Step 14.12: loud opt-in disclosure — offline-by-default paths stay
+        # silent, opt-in paths always print the warning so users can see the
+        # posture change at a glance. The ``allow_network_source`` string
+        # is resolved in ``src/cli/app.py`` before ``execute_task`` is
+        # called (flag vs. persistent setting).
+        if allow_network:
+            source_label = allow_network_source or "enabled"
+            console.print(
+                f"[yellow]⚠ Network access enabled[/yellow] — "
+                "generated tools can make outbound requests\n"
+                f"[dim]  source: {source_label}[/dim]"
+            )
         console.print()
 
         # Accumulate partial state updates into full state
@@ -1876,6 +1917,7 @@ def execute_task(
             final_state, file_paths, task_prompt, json_output, console,
             invoke_config=invoke_config,
             metrics_store=metrics_store,
+            allow_network=allow_network,
         )
     else:
         # ---------------------------------------------------------------
@@ -1893,7 +1935,9 @@ def execute_task(
             if cap_type == CapabilityType.MCP_TOOL:
                 if not json_output:
                     console.print(f"\n[dim]Executing {artifact.capability_name}...[/dim]")
-                output = _execute_mcp_tool(artifact, file_paths, parsed_params) or None
+                output = _execute_mcp_tool(
+                    artifact, file_paths, parsed_params, allow_network=allow_network,
+                ) or None
             elif cap_type in (CapabilityType.SKILL, CapabilityType.AGENT):
                 if not json_output:
                     exec_label = f"Executing {cap_type_label}: {artifact.capability_name}"
@@ -1925,6 +1969,7 @@ def execute_task(
                                 timeout_s=timeout,
                                 langfuse_tags=_lf_meta.get("langfuse_tags"),
                                 langfuse_session_id=_lf_meta.get("langfuse_session_id"),
+                                allow_network=allow_network,
                             )
                             or None
                         )
@@ -1955,6 +2000,7 @@ def execute_task(
             final_state, file_paths, parsed_params, task_prompt, timeout,
             langfuse_tags=_lf_meta_match.get("langfuse_tags"),
             langfuse_session_id=_lf_meta_match.get("langfuse_session_id"),
+            allow_network=allow_network,
         )
         if proxy:
             artifact = proxy

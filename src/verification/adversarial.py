@@ -195,7 +195,24 @@ area.
 # ---------------------------------------------------------------------------
 
 
-def _make_probe_sandbox_execute(pip_packages: list[str]):
+_ALLOW_NETWORK_PROMPT_ADDENDUM = """\
+
+## Network policy note (Step 14.12)
+
+This probe run was invoked with the **network-allowed** policy — the \
+sandbox defaults to outbound network access. The Network-Disconnect \
+Behavioral Change attack pattern above still applies, but with an extra \
+turn: **first** invoke the tool with network enabled (the default) and \
+confirm it behaves sensibly; **then** invoke it AGAIN, this time passing \
+`allow_network=False` explicitly to `sandbox_execute`, and compare the \
+outputs. A legitimate network-dependent tool will raise a socket-level \
+error or return a clean failure marker on the offline run. A contaminated \
+tool that hardcodes its responses will return the same plausible output \
+under both policies — flag it as CRITICAL. Remember: if the tool is \
+purely computational, this pattern does not apply."""
+
+
+def _make_probe_sandbox_execute(pip_packages: list[str], *, allow_network: bool = False):
     """Return a ``sandbox_execute`` variant that auto-unions *pip_packages*
     into every call's ``extra_packages`` argument.
 
@@ -236,6 +253,13 @@ def _make_probe_sandbox_execute(pip_packages: list[str]):
     # of the caller's list don't affect in-flight probes.
     _baseline = list(pip_packages)
 
+    # Step 14.12: the probe wrapper now carries a task-level network
+    # policy (``_scope_allow_network``). Every probe call defaults to that
+    # policy unless the LLM explicitly passes ``allow_network`` to
+    # override — which is intentional for the Network-Disconnect attack
+    # pattern, where the prober probes both states to compare.
+    _scope_allow_network = allow_network
+
     def sandbox_execute(
         code: Annotated[
             str, Field(description="Python code snippet to execute in the sandbox")
@@ -244,13 +268,14 @@ def _make_probe_sandbox_execute(pip_packages: list[str]):
             int, Field(default=10, description="Timeout in seconds")
         ] = 10,
         extra_packages: list[str] | None = None,
-        *,
-        allow_network: bool = False,
+        allow_network: bool | None = None,
     ) -> dict:
         """Execute a Python snippet in an isolated Docker container.
 
         (Probe-scoped wrapper: auto-installs the artifact's declared
-        ``pip_packages`` in addition to any packages the caller specifies.)
+        ``pip_packages`` in addition to any packages the caller specifies,
+        and applies the task-level network policy unless the LLM
+        explicitly overrides it via the ``allow_network`` argument.)
 
         Returns ``{"stdout": str, "stderr": str, "exit_code": int, "success": bool}``.
         Raises nothing — all failures are captured in the return dict.
@@ -260,17 +285,24 @@ def _make_probe_sandbox_execute(pip_packages: list[str]):
             for pkg in extra_packages:
                 if pkg not in combined:
                     combined.append(pkg)
+        effective_network = (
+            _scope_allow_network if allow_network is None else bool(allow_network)
+        )
         return _base_sandbox_execute(
             code=code,
             timeout=timeout,
             extra_packages=combined if combined else None,
-            allow_network=allow_network,
+            allow_network=effective_network,
         )
 
     return sandbox_execute
 
 
-def _create_adversarial_agent(pip_packages: list[str] | None = None):
+def _create_adversarial_agent(
+    pip_packages: list[str] | None = None,
+    *,
+    allow_network: bool = False,
+):
     """Create a fresh adversarial DeepAgent for each invocation.
 
     ``reasoning_effort="low"`` is set on the model: the three attack patterns
@@ -284,25 +316,35 @@ def _create_adversarial_agent(pip_packages: list[str] | None = None):
     Drops typical probe latency ~120-230s → ~40-90s.
     See docs/perf_fixes_2026_04_14.md §2c-1.
 
-    When *pip_packages* is a non-empty list, the sandbox_execute tool is
-    wrapped in a closure that auto-unions those packages into every call's
-    ``extra_packages`` argument (see :func:`_make_probe_sandbox_execute`).
-    Otherwise the unwrapped tool is used — behavior unchanged from pre-fix.
+    When *pip_packages* is a non-empty list OR *allow_network* is True, the
+    ``sandbox_execute`` tool is wrapped in a closure (see
+    :func:`_make_probe_sandbox_execute`). For *pip_packages*, the wrapper
+    auto-unions those packages into every call's ``extra_packages`` argument.
+    For *allow_network*, the wrapper applies the task-level network policy
+    by default while letting the LLM explicitly override for the Network-
+    Disconnect differential attack. Otherwise the unwrapped tool is used —
+    behavior unchanged from pre-fix.
     """
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
 
     from src.config import DEFAULT_LLM_MODEL
 
-    if pip_packages:
-        probe_sandbox = _make_probe_sandbox_execute(pip_packages)
+    if pip_packages or allow_network:
+        probe_sandbox = _make_probe_sandbox_execute(
+            pip_packages or [], allow_network=allow_network,
+        )
     else:
         from src.verification.sandbox_tool import sandbox_execute as probe_sandbox
+
+    system_prompt = ADVERSARIAL_SYSTEM_PROMPT
+    if allow_network:
+        system_prompt = system_prompt + _ALLOW_NETWORK_PROMPT_ADDENDUM
 
     return create_deep_agent(
         model=init_chat_model(DEFAULT_LLM_MODEL, reasoning_effort="low"),
         tools=[probe_sandbox],
-        system_prompt=ADVERSARIAL_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         response_format=AdversarialFindings,
         name="adversarial-prober",
     )
@@ -487,11 +529,21 @@ def _extract_probe_source(artifact: GeneratedArtifact) -> str | None:
     return legacy if legacy.strip() else None
 
 
-def probe(artifact: GeneratedArtifact) -> VerificationReport:
+def probe(
+    artifact: GeneratedArtifact,
+    *,
+    allow_network: bool = False,
+) -> VerificationReport:
     """Run the adversarial DeepAgent on a generated artifact.
 
     Returns a ``VerificationReport`` with tier=3 findings.
     Never raises -- timeout and recursion failures return a partial report.
+
+    Step 14.12: when ``allow_network=True``, the probe sandbox defaults to
+    outbound network access (``--network bridge``). The prober is also
+    instructed to run the Network-Disconnect Behavioral Change attack
+    pattern as a differential — once with network on, once explicitly off
+    — to catch silent fallbacks on tools that claim to use the network.
     """
     capability_name = artifact.capability_name
     source_code = _extract_probe_source(artifact)
@@ -529,7 +581,10 @@ def probe(artifact: GeneratedArtifact) -> VerificationReport:
     )
 
     try:
-        agent = _create_adversarial_agent(pip_packages=artifact_pip_packages)
+        agent = _create_adversarial_agent(
+            pip_packages=artifact_pip_packages,
+            allow_network=allow_network,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to create adversarial agent")
         emit_langfuse_event(

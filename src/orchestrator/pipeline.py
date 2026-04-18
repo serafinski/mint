@@ -158,8 +158,12 @@ def create_pipeline(
         def _optimizer_node(state: TaskState) -> Command:
             nonlocal _prev_optimizer_scores
             try:
+                # Step 14.12: carry the task's network policy into the
+                # optimizer subgraph so merge/split variant verification
+                # runs under the same policy the triggering task uses.
                 init_state = OptimizerState(
-                    previous_utility_scores=_prev_optimizer_scores
+                    previous_utility_scores=_prev_optimizer_scores,
+                    allow_network=bool(getattr(state, "allow_network", False)),
                 )
                 result = _opt_loop.invoke(init_state)
                 # Carry current utility scores forward for the next pipeline run.

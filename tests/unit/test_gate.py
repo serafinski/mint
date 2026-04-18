@@ -155,8 +155,8 @@ def test_mcp_clean_passes_all_tiers(mock_behavioral, mock_adversarial):
 
     assert report.overall_passed is True
     assert report.tier_reached == 3
-    mock_behavioral.assert_called_once_with(artifact)
-    mock_adversarial.assert_called_once_with(artifact)
+    mock_behavioral.assert_called_once_with(artifact, allow_network=False)
+    mock_adversarial.assert_called_once_with(artifact, allow_network=False)
 
 
 # ---------------------------------------------------------------------------
@@ -768,3 +768,41 @@ def test_verify_never_raises_on_unexpected_exception(mock_static_scan):
     gate_finding = next(f for f in report.findings if f.category == "gate_error")
     assert gate_finding.severity == Severity.MEDIUM
     assert report.overall_passed is True  # fail open
+
+
+# ---------------------------------------------------------------------------
+# Step 14.12 — allow_network plumbing
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_verify_forwards_allow_network_true(mock_behavioral, mock_adversarial):
+    """verify(artifact, allow_network=True) must forward the kwarg to
+    both behavioral.run and adversarial.probe so Tier 2 / Tier 3 probe
+    under the same network policy the artifact will execute under.
+    """
+    artifact = _make_artifact(source_code=_CLEAN_MCP_CODE)
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    verify(artifact, allow_network=True)
+
+    mock_behavioral.assert_called_once_with(artifact, allow_network=True)
+    mock_adversarial.assert_called_once_with(artifact, allow_network=True)
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_verify_defaults_allow_network_false(mock_behavioral, mock_adversarial):
+    """Omitting allow_network keeps the offline-by-default posture."""
+    artifact = _make_artifact(source_code=_CLEAN_MCP_CODE)
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    verify(artifact)
+
+    _, kwargs_b = mock_behavioral.call_args
+    _, kwargs_a = mock_adversarial.call_args
+    assert kwargs_b.get("allow_network") is False
+    assert kwargs_a.get("allow_network") is False

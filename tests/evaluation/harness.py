@@ -86,6 +86,13 @@ class HarnessConfig:
     # Optional: LangFuse callback handler (passed to pipeline invocations)
     langfuse_handler: Any | None = None
 
+    # Step 14.12: when True, TaskState is initialised with
+    # ``allow_network=True`` for every task in the run; the 400-record
+    # core eval stays offline by default. Tasks that legitimately need
+    # network access (e.g. T21 fetch-and-summarize-public-api) run under
+    # this flag.
+    allow_network: bool = False
+
 
 class EvaluationHarness:
     """Orchestrates evaluation runs across all four baseline conditions."""
@@ -498,6 +505,7 @@ class EvaluationHarness:
         initial_state = TaskState(
             task_description=task.task_prompt,
             output_contract=contract,
+            allow_network=self._config.allow_network,
         )
         try:
             final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
@@ -539,6 +547,7 @@ def _extract_result_compositional(
     metrics_store: Any | None = None,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    allow_network: bool = False,
 ) -> dict:
     """Compositional execution path — run all artifacts in dependency order.
 
@@ -625,6 +634,7 @@ def _extract_result_compositional(
         metrics_store=metrics_store,
         langfuse_tags=langfuse_tags,
         langfuse_session_id=langfuse_session_id,
+        allow_network=allow_network,
     )
 
     chain_result = executor.run(task_id=task.task_id)
@@ -728,6 +738,8 @@ def _extract_result(
     attempt_count = _get("attempt_count", 0)
     subtasks = _get("subtasks", []) or []
     classified_gaps = _get("classified_gaps", []) or []
+    # Step 14.12 — preserve task-level network policy through execution.
+    allow_network = bool(_get("allow_network", False))
 
     # ---------------------------------------------------------------
     # Compositional execution path (Phase 3): when the task was
@@ -747,6 +759,7 @@ def _extract_result(
             metrics_store=metrics_store,
             langfuse_tags=langfuse_tags,
             langfuse_session_id=langfuse_session_id,
+            allow_network=allow_network,
         )
 
     # ---------------------------------------------------------------
@@ -833,6 +846,7 @@ def _extract_result(
                 artifact, task, loader,
                 langfuse_tags=langfuse_tags,
                 langfuse_session_id=langfuse_session_id,
+                allow_network=allow_network,
             )
             output_in_range = task.validator(output)
             if gate_passed and not output_in_range:
@@ -903,6 +917,7 @@ def _extract_result(
                     proxy_artifact, task, loader,
                     langfuse_tags=langfuse_tags,
                     langfuse_session_id=langfuse_session_id,
+                    allow_network=allow_network,
                 )
                 output_in_range = task.validator(output)
                 if not output_in_range:
@@ -989,6 +1004,7 @@ def _execute_artifact(
     *,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    allow_network: bool = False,
 ) -> dict:
     """Execute a generated artifact with fixture data and return its output."""
     from src.schemas.capability import CapabilityType
@@ -1002,6 +1018,7 @@ def _execute_artifact(
             artifact, task, fixture_contents,
             langfuse_tags=langfuse_tags,
             langfuse_session_id=langfuse_session_id,
+            allow_network=allow_network,
         )
     elif cap_type == CapabilityType.AGENT:
         from tests.evaluation.execution import _read_fixture_contents, execute_agent_artifact
@@ -1011,6 +1028,7 @@ def _execute_artifact(
             artifact, task, fixture_contents,
             langfuse_tags=langfuse_tags,
             langfuse_session_id=langfuse_session_id,
+            allow_network=allow_network,
         )
     elif cap_type != CapabilityType.MCP_TOOL:
         logger.debug("Unknown artifact type: %s", cap_type)
@@ -1113,7 +1131,12 @@ asyncio.run(_run())
     # Allow more time when dynamic deps need installation (Phase 1 pip + Phase 2 exec).
     exec_timeout = 60 if extra_pkgs else 30
     logger.debug("Sandbox extra_packages=%s timeout=%s", extra_pkgs, exec_timeout)
-    result = sandbox_execute(sandbox_code, timeout=exec_timeout, extra_packages=extra_pkgs or None)
+    result = sandbox_execute(
+        sandbox_code,
+        timeout=exec_timeout,
+        extra_packages=extra_pkgs or None,
+        allow_network=allow_network,
+    )
     if not result.get("success") or not result.get("stdout"):
         logger.warning(
             "Sandbox execution for %s failed: exit_code=%s success=%s stderr=%s",

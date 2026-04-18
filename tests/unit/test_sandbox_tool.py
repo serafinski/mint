@@ -409,3 +409,67 @@ class TestSandboxExecuteWithPackages:
         assert len(docker_cmds) >= 3
 
 
+# ---------------------------------------------------------------------------
+# Step 14.12 — allow_network plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestAllowNetworkFlag:
+    """The ``allow_network`` kwarg must toggle Docker's --network flag."""
+
+    def test_allow_network_true_passes_bridge(self):
+        """allow_network=True → ``--network bridge`` on the core path."""
+        captured: list[str] = []
+
+        def capture(*args, **kwargs):
+            captured.extend(args[0])
+            return _make_proc()
+
+        with patch("subprocess.run", side_effect=capture):
+            sandbox_execute("pass", allow_network=True)
+
+        assert "--network" in captured
+        idx = captured.index("--network")
+        assert captured[idx + 1] == "bridge"
+
+    def test_allow_network_false_passes_none(self):
+        """Default (offline): ``--network none``. Regression guard for the
+        silent-revert scenario — if the flag defaults change, this fires.
+        """
+        captured: list[str] = []
+
+        def capture(*args, **kwargs):
+            captured.extend(args[0])
+            return _make_proc()
+
+        with patch("subprocess.run", side_effect=capture):
+            sandbox_execute("pass", allow_network=False)
+
+        assert "--network" in captured
+        idx = captured.index("--network")
+        assert captured[idx + 1] == "none"
+
+    def test_allow_network_with_extra_packages_bridge_on_exec_phase(self):
+        """When extra_packages are installed, Phase 1 (install) always uses
+        bridge; Phase 2 (exec) honors allow_network.
+        """
+        calls: list[list[str]] = []
+
+        def capture(*args, **kwargs):
+            calls.append(list(args[0]))
+            return _make_proc()
+
+        with patch("subprocess.run", side_effect=capture):
+            sandbox_execute("pass", extra_packages=["numpy"], allow_network=True)
+
+        # Find the final "docker run --rm" (execute phase) — the one
+        # passing --rm, not the install phase which uses --name.
+        exec_runs = [
+            c for c in calls if c and c[0] == "docker" and "--rm" in c
+        ]
+        assert exec_runs, "exec phase docker run missing"
+        exec_cmd = exec_runs[-1]
+        idx = exec_cmd.index("--network")
+        assert exec_cmd[idx + 1] == "bridge"
+
+

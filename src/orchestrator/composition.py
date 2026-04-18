@@ -131,6 +131,7 @@ class CompositionalExecutor:
         metrics_store: Any | None = None,
         langfuse_tags: list[str] | None = None,
         langfuse_session_id: str | None = None,
+        allow_network: bool = False,
     ) -> None:
         self.subtasks = subtasks
         self.resolution = resolution
@@ -141,6 +142,10 @@ class CompositionalExecutor:
         self.metrics_store = metrics_store
         self.langfuse_tags = langfuse_tags
         self.langfuse_session_id = langfuse_session_id
+        # Step 14.12: task-level network policy threaded into every step
+        # executor (MCP_TOOL / SKILL / AGENT) so downstream ``sandbox_execute``
+        # calls honor the same policy the CLI / harness resolved at task entry.
+        self.allow_network = allow_network
 
         # Index artifacts by gap_query for quick lookup
         self._artifact_by_query: dict[str, GeneratedArtifact] = {}
@@ -422,6 +427,7 @@ class CompositionalExecutor:
             workspace_path=workspace,
             pip_packages=pip_packages,
             capability_name=ref.capability_name,
+            allow_network=self.allow_network,
         )
 
     def _execute_skill_step(
@@ -446,6 +452,7 @@ class CompositionalExecutor:
             fixture_contents,
             langfuse_tags=self.langfuse_tags,
             langfuse_session_id=self.langfuse_session_id,
+            allow_network=self.allow_network,
         )
 
     def _collect_union_output_schema(
@@ -529,6 +536,7 @@ class CompositionalExecutor:
             langfuse_tags=self.langfuse_tags,
             langfuse_session_id=self.langfuse_session_id,
             output_schema=output_schema,
+            allow_network=self.allow_network,
         )
 
         # Step 13: capture the sticky meta on failure so ``run()`` can

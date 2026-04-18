@@ -743,8 +743,9 @@ class TestPipPackagesPropagation:
         """
         captured: dict = {}
 
-        def fake_create(pip_packages=None):
+        def fake_create(pip_packages=None, *, allow_network=False):
             captured["pip_packages"] = list(pip_packages or [])
+            captured["allow_network"] = allow_network
             return _mock_agent_invoke(_clean_findings())
 
         artifact = GeneratedArtifact(
@@ -772,8 +773,9 @@ class TestPipPackagesPropagation:
         """
         captured: dict = {}
 
-        def fake_create(pip_packages=None):
+        def fake_create(pip_packages=None, *, allow_network=False):
             captured["pip_packages"] = list(pip_packages or [])
+            captured["allow_network"] = allow_network
             return _mock_agent_invoke(_clean_findings())
 
         artifact = GeneratedArtifact(

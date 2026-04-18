@@ -143,11 +143,22 @@ def _static_scan(artifact: GeneratedArtifact) -> VerificationReport:
 # ---------------------------------------------------------------------------
 
 
-def verify(artifact: GeneratedArtifact) -> VerificationReport:
+def verify(
+    artifact: GeneratedArtifact,
+    *,
+    allow_network: bool = False,
+) -> VerificationReport:
     """Run the full tiered verification gate on a generated artefact.
 
     Returns a ``VerificationReport`` summarising findings from every tier
     that was executed.  Always returns — never raises.
+
+    Step 14.12: when ``allow_network=True``, Tier 2 behavioral and Tier 3
+    adversarial probes run under ``--network bridge`` so the artifact is
+    verified in the same network-policy regime it will execute under.
+    Verifying a network-dependent artifact with network *disabled* would
+    spuriously fail Tier 2 (real API call errors) and make Tier 3's
+    network-disconnect attack trivially "suspicious" on every invocation.
     """
     name = artifact.capability_name
     all_findings: list[VerificationFinding] = []
@@ -155,7 +166,10 @@ def verify(artifact: GeneratedArtifact) -> VerificationReport:
     # Track the current tier so the error handler can report accurately.
     current_tier = [1]  # mutable container for closure access
     try:
-        return _verify_inner(artifact, name, all_findings, current_tier)
+        return _verify_inner(
+            artifact, name, all_findings, current_tier,
+            allow_network=allow_network,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Verification gate error for '%s' at tier %d: %s — PASSING (fail-open policy). "
@@ -182,6 +196,8 @@ def _verify_inner(
     name: str,
     all_findings: list[VerificationFinding],
     current_tier: list[int],
+    *,
+    allow_network: bool = False,
 ) -> VerificationReport:
     """Inner implementation of verify() — called by the public wrapper."""
     # ------------------------------------------------------------------
@@ -231,7 +247,7 @@ def _verify_inner(
     # ------------------------------------------------------------------
     current_tier[0] = 2
     logger.debug("Running Tier 2 behavioural tests on %s", name)
-    t2_findings = behavioral.run(artifact)
+    t2_findings = behavioral.run(artifact, allow_network=allow_network)
     all_findings.extend(t2_findings)
 
     t2_has_critical_or_high = any(
@@ -270,7 +286,7 @@ def _verify_inner(
     # ------------------------------------------------------------------
     current_tier[0] = 3
     logger.debug("Running Tier 3 adversarial probe on %s", name)
-    t3_report = adversarial.probe(artifact)
+    t3_report = adversarial.probe(artifact, allow_network=allow_network)
     all_findings.extend(t3_report.findings)
 
     has_blocking = any(

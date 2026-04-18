@@ -200,6 +200,20 @@ class GeneratedArtifact(BaseModel):
             "recall losses on generic caps."
         ),
     )
+    needs_network: bool = Field(
+        default=False,
+        description=(
+            "Declared by the generator when the capability legitimately "
+            "requires outbound network access at runtime (e.g. calls an "
+            "external HTTP API). Used by the verification gate to (a) run "
+            "Tier 2 behavioral tests under the same network policy the "
+            "capability will execute under and (b) trigger the optional "
+            "network-disconnect differential check that compares on/off "
+            "behaviors to catch silent fallbacks. Offline-by-default tools "
+            "leave this False — an MCP_TOOL that does pure local computation "
+            "never needs to set it. Step 14.12."
+        ),
+    )
     generated_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="When this artifact was generated",
@@ -492,6 +506,20 @@ class TaskState(BaseModel):
             "exit code, and fails the task cleanly rather than shipping a "
             "mis-classified artifact. Same sticky-flag pattern as "
             "decomposition_succeeded and verification_succeeded."
+        ),
+    )
+    allow_network: bool = Field(
+        default=False,
+        description=(
+            "When True, runtime sandbox execution and the verification gate "
+            "(Tier 2 + Tier 3) allow outbound network access — Docker runs "
+            "with ``--network bridge`` instead of ``--network none``. Set "
+            "by the CLI from the ``--allow-network`` flag (overridable via "
+            "``mint config set network.allow true``) and by the evaluation "
+            "harness for tasks flagged as network-dependent. Offline-by-"
+            "default (False) preserves the standard safety posture. "
+            "Plumbed through CompositionalExecutor → execution backends and "
+            "gate.verify(). Step 14.12."
         ),
     )
 

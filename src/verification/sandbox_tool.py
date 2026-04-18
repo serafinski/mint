@@ -242,7 +242,11 @@ def _sandbox_execute_with_install(
     _VALID_PKG = _re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?([<>=!~]+[A-Za-z0-9.*]+)?$")
     packages = [p for p in packages if _VALID_PKG.match(p)]
     if not packages:
-        return sandbox_execute(code, timeout=timeout)
+        # All package names failed validation — fall back to the no-install
+        # path while preserving the caller's network policy (Step 14.12:
+        # silently dropping allow_network here would turn the
+        # _VALID_PKG rejection into a covert offline-mode demotion).
+        return sandbox_execute(code, timeout=timeout, allow_network=allow_network)
 
     # Phase 1: install packages (with network, 60s timeout)
     pip_args = ", ".join(repr(p) for p in packages)

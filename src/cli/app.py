@@ -55,11 +55,57 @@ def run(
     ] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Debug logging")] = False,
     allow_network: Annotated[
-        bool, typer.Option("--allow-network", help="Allow generated tools to access the network")
+        bool, typer.Option(
+            "--allow-network",
+            help=(
+                "Allow generated tools to make outbound network requests at "
+                "runtime. Without this flag, all code executes in "
+                "`--network none` Docker isolation. Persistent default can "
+                "be set via `mint config set network.allow true`."
+            ),
+        )
+    ] = False,
+    no_allow_network: Annotated[
+        bool, typer.Option(
+            "--no-allow-network",
+            help=(
+                "Force-disable network access for this invocation even "
+                "when `mint config set network.allow true` is persisted."
+            ),
+        )
     ] = False,
 ) -> None:
     """Run a task through the JIT capability synthesis pipeline."""
+    from src.cli.display import err_console
     from src.cli.runner import execute_task
+    from src.cli.settings import get_network_allow_from_settings, load_settings
+
+    if allow_network and no_allow_network:
+        err_console.print(
+            "[red]--allow-network and --no-allow-network are mutually "
+            "exclusive.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    # Step 14.12 — precedence: per-invocation flag > persistent setting > default.
+    # ``allow_network_source`` is surfaced in the Rich warning panel so the
+    # user can see WHY the network was enabled.
+    resolved_network = False
+    network_source: str | None = None
+    if allow_network:
+        resolved_network = True
+        network_source = "--allow-network flag"
+    elif no_allow_network:
+        resolved_network = False
+        network_source = None
+    else:
+        persisted = get_network_allow_from_settings(load_settings(_settings_path()))
+        if persisted is True:
+            resolved_network = True
+            network_source = "persistent setting (mint config show)"
+        elif persisted is False:
+            resolved_network = False
+            network_source = None
 
     code = execute_task(
         task,
@@ -72,7 +118,8 @@ def run(
         output_dir=output_dir,
         json_output=json,
         verbose=verbose,
-        allow_network=allow_network,
+        allow_network=resolved_network,
+        allow_network_source=network_source,
     )
     raise SystemExit(code)
 
@@ -165,7 +212,7 @@ def history(
 
 config_app = typer.Typer(
     name="config",
-    help="Manage persistent CLI settings (currently: per-operation optimizer config).",
+    help="Manage persistent CLI settings (optimizer config + network access).",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -173,6 +220,8 @@ app.add_typer(config_app, name="config")
 
 _VALID_OPTIMIZER_OPS = ("prune", "split", "merge")
 _VALID_OPTIMIZER_SETTINGS = ("auto", "on", "off")
+_VALID_NETWORK_KEYS = ("allow",)
+_VALID_BOOL_STRINGS = {"true": True, "false": False, "1": True, "0": False}
 
 
 def _settings_path() -> Path:
@@ -184,10 +233,10 @@ def _settings_path() -> Path:
 @config_app.command("set")
 def config_set(
     key: Annotated[str, typer.Argument(
-        help="Setting key (e.g., optimizer.prune, optimizer.split, optimizer.merge)"
+        help="Setting key (e.g., optimizer.prune, optimizer.split, optimizer.merge, network.allow)"
     )],
     value: Annotated[str, typer.Argument(
-        help="Setting value (auto | on | off for optimizer operations)"
+        help="Setting value (optimizer: auto | on | off; network.allow: true | false)"
     )],
 ) -> None:
     """Set a persistent CLI setting.
@@ -198,37 +247,65 @@ def config_set(
       each accepts ``auto`` (threshold-gated), ``on`` (always run), or
       ``off`` (never run). Per-invocation flags (``--no-optimizer``,
       ``--enable-optimizer``) still override these per run.
+    - ``network.allow`` — ``true`` / ``false``. When true, ``mint run``
+      allows generated tools to make outbound network requests by
+      default. Per-invocation flags (``--allow-network`` /
+      ``--no-allow-network``) still override per run. Step 14.12.
     """
     from src.cli.display import console, err_console
     from src.cli.settings import load_settings, save_settings
 
-    if not key.startswith("optimizer."):
-        err_console.print(
-            f"[red]Unknown setting key '{key}'. Supported: "
-            f"optimizer.prune, optimizer.split, optimizer.merge.[/red]"
-        )
-        raise typer.Exit(code=1)
+    if key.startswith("optimizer."):
+        op = key.split(".", 1)[1]
+        if op not in _VALID_OPTIMIZER_OPS:
+            err_console.print(
+                f"[red]Unknown optimizer operation '{op}'. Valid: "
+                f"{', '.join(_VALID_OPTIMIZER_OPS)}.[/red]"
+            )
+            raise typer.Exit(code=1)
 
-    op = key.split(".", 1)[1]
-    if op not in _VALID_OPTIMIZER_OPS:
-        err_console.print(
-            f"[red]Unknown optimizer operation '{op}'. Valid: "
-            f"{', '.join(_VALID_OPTIMIZER_OPS)}.[/red]"
-        )
-        raise typer.Exit(code=1)
+        if value not in _VALID_OPTIMIZER_SETTINGS:
+            err_console.print(
+                f"[red]Invalid value '{value}'. Valid: "
+                f"{', '.join(_VALID_OPTIMIZER_SETTINGS)}.[/red]"
+            )
+            raise typer.Exit(code=1)
 
-    if value not in _VALID_OPTIMIZER_SETTINGS:
-        err_console.print(
-            f"[red]Invalid value '{value}'. Valid: "
-            f"{', '.join(_VALID_OPTIMIZER_SETTINGS)}.[/red]"
-        )
-        raise typer.Exit(code=1)
+        path = _settings_path()
+        settings = load_settings(path)
+        settings.setdefault("optimizer", {})[op] = value
+        save_settings(path, settings)
+        console.print(f"[green]Set {key} = {value}[/green] ({path})")
+        return
 
-    path = _settings_path()
-    settings = load_settings(path)
-    settings.setdefault("optimizer", {})[op] = value
-    save_settings(path, settings)
-    console.print(f"[green]Set {key} = {value}[/green] ({path})")
+    if key.startswith("network."):
+        sub = key.split(".", 1)[1]
+        if sub not in _VALID_NETWORK_KEYS:
+            err_console.print(
+                f"[red]Unknown network setting '{sub}'. Valid: "
+                f"{', '.join(_VALID_NETWORK_KEYS)}.[/red]"
+            )
+            raise typer.Exit(code=1)
+        bool_value = _VALID_BOOL_STRINGS.get(value.lower())
+        if bool_value is None:
+            err_console.print(
+                f"[red]Invalid value '{value}'. network.allow expects "
+                "'true' or 'false'.[/red]"
+            )
+            raise typer.Exit(code=1)
+        path = _settings_path()
+        settings = load_settings(path)
+        settings.setdefault("network", {})[sub] = bool_value
+        save_settings(path, settings)
+        console.print(f"[green]Set {key} = {bool_value}[/green] ({path})")
+        return
+
+    err_console.print(
+        f"[red]Unknown setting key '{key}'. Supported: "
+        f"optimizer.prune, optimizer.split, optimizer.merge, "
+        f"network.allow.[/red]"
+    )
+    raise typer.Exit(code=1)
 
 
 @config_app.command("show")
@@ -244,7 +321,9 @@ def config_show() -> None:
     if not settings:
         console.print(f"[dim]No settings saved yet ({path}).[/dim]")
         console.print(
-            "[dim]Defaults: optimizer.{prune,split,merge} = auto (threshold-gated).[/dim]"
+            "[dim]Defaults:[/dim]\n"
+            "[dim]  optimizer.{prune,split,merge} = auto (threshold-gated)[/dim]\n"
+            "[dim]  network.allow = false (offline sandbox)[/dim]"
         )
         return
     console.print(f"[bold]Settings ({path}):[/bold]")
@@ -253,12 +332,13 @@ def config_show() -> None:
 
 @config_app.command("reset")
 def config_reset() -> None:
-    """Reset ALL settings to defaults (all optimizer operations back to 'auto').
+    """Reset ALL settings to defaults (optimizer ops → 'auto', network → offline).
 
     Deletes ``data/cli/settings.json``. Per-invocation flags
-    (``--no-optimizer`` / ``--enable-optimizer``) and the in-memory
-    defaults are unchanged. This does NOT wipe generated capabilities,
-    metrics, or the registry — use ``mint reset`` for that.
+    (``--no-optimizer`` / ``--enable-optimizer`` / ``--allow-network`` /
+    ``--no-allow-network``) and the in-memory defaults are unchanged.
+    This does NOT wipe generated capabilities, metrics, or the registry —
+    use ``mint reset`` for that.
     """
     from src.cli.display import console
 
@@ -267,19 +347,19 @@ def config_reset() -> None:
         path.unlink()
         console.print(
             f"[green]Reset all settings to defaults[/green] ([dim]{path}[/dim] deleted). "
-            "optimizer.{prune,split,merge} = auto."
+            "optimizer.{prune,split,merge} = auto; network.allow = false."
         )
     else:
         console.print(
             "[dim]No settings file exists; already at defaults "
-            "(optimizer.{prune,split,merge} = auto).[/dim]"
+            "(optimizer.{prune,split,merge} = auto; network.allow = false).[/dim]"
         )
 
 
 @config_app.command("unset")
 def config_unset(
     key: Annotated[str, typer.Argument(
-        help="Setting key to unset (e.g., optimizer.split)"
+        help="Setting key to unset (e.g., optimizer.split, network.allow)"
     )],
 ) -> None:
     """Unset a persistent CLI setting (revert to default).
@@ -289,26 +369,48 @@ def config_unset(
     from src.cli.display import console, err_console
     from src.cli.settings import load_settings, save_settings
 
-    if not key.startswith("optimizer."):
-        err_console.print(f"[red]Unknown setting key '{key}'.[/red]")
-        raise typer.Exit(code=1)
+    if key.startswith("optimizer."):
+        op = key.split(".", 1)[1]
+        if op not in _VALID_OPTIMIZER_OPS:
+            err_console.print(f"[red]Unknown optimizer operation '{op}'.[/red]")
+            raise typer.Exit(code=1)
 
-    op = key.split(".", 1)[1]
-    if op not in _VALID_OPTIMIZER_OPS:
-        err_console.print(f"[red]Unknown optimizer operation '{op}'.[/red]")
-        raise typer.Exit(code=1)
+        path = _settings_path()
+        settings = load_settings(path)
+        optimizer = settings.get("optimizer", {})
+        if op in optimizer:
+            del optimizer[op]
+            if not optimizer:
+                settings.pop("optimizer", None)
+            save_settings(path, settings)
+            console.print(f"[green]Unset {key} (revert to default 'auto')[/green]")
+        else:
+            console.print(f"[dim]{key} was not set (already at default).[/dim]")
+        return
 
-    path = _settings_path()
-    settings = load_settings(path)
-    optimizer = settings.get("optimizer", {})
-    if op in optimizer:
-        del optimizer[op]
-        if not optimizer:
-            settings.pop("optimizer", None)
-        save_settings(path, settings)
-        console.print(f"[green]Unset {key} (revert to default 'auto')[/green]")
-    else:
-        console.print(f"[dim]{key} was not set (already at default).[/dim]")
+    if key.startswith("network."):
+        sub = key.split(".", 1)[1]
+        if sub not in _VALID_NETWORK_KEYS:
+            err_console.print(f"[red]Unknown network setting '{sub}'.[/red]")
+            raise typer.Exit(code=1)
+
+        path = _settings_path()
+        settings = load_settings(path)
+        network = settings.get("network", {})
+        if sub in network:
+            del network[sub]
+            if not network:
+                settings.pop("network", None)
+            save_settings(path, settings)
+            console.print(
+                f"[green]Unset {key} (revert to default: offline).[/green]"
+            )
+        else:
+            console.print(f"[dim]{key} was not set (already at default).[/dim]")
+        return
+
+    err_console.print(f"[red]Unknown setting key '{key}'.[/red]")
+    raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +729,18 @@ def retry(
         bool | None,
         typer.Option("--enable-optimizer", help="Override: enable optimizer"),
     ] = None,
+    allow_network: Annotated[
+        bool, typer.Option(
+            "--allow-network",
+            help="Override: allow outbound network in the sandbox for this retry.",
+        )
+    ] = False,
+    no_allow_network: Annotated[
+        bool, typer.Option(
+            "--no-allow-network",
+            help="Override: force-disable network for this retry.",
+        )
+    ] = False,
     timeout: Annotated[
         int | None, typer.Option(help="Override: execution timeout (seconds)")
     ] = None,
@@ -636,6 +750,14 @@ def retry(
     """Re-run the last task, optionally with extra hints or an edited prompt."""
     from src.cli.display import err_console
     from src.cli.runner import execute_task, load_last_run
+    from src.cli.settings import get_network_allow_from_settings, load_settings
+
+    if allow_network and no_allow_network:
+        err_console.print(
+            "[red]--allow-network and --no-allow-network are mutually "
+            "exclusive.[/red]"
+        )
+        raise typer.Exit(code=1)
 
     last = load_last_run()
     if not last:
@@ -670,6 +792,31 @@ def retry(
     files = [Path(f) for f in last.get("files", [])] or None
     params = last.get("params") or None
 
+    # Step 14.12: network precedence for retry. Same rule as `mint run`
+    # (flag > persistent setting > last-run fallback > default False).
+    # Retry adds a "last run" tier so that if a user ran with
+    # ``--allow-network`` originally, the retry inherits it without
+    # needing to re-pass the flag.
+    resolved_network = False
+    network_source: str | None = None
+    if allow_network:
+        resolved_network = True
+        network_source = "--allow-network flag (retry override)"
+    elif no_allow_network:
+        resolved_network = False
+        network_source = None
+    else:
+        persisted = get_network_allow_from_settings(load_settings(_settings_path()))
+        if persisted is True:
+            resolved_network = True
+            network_source = "persistent setting (mint config show)"
+        elif persisted is False:
+            resolved_network = False
+            network_source = None
+        elif last.get("allow_network"):
+            resolved_network = True
+            network_source = "inherited from previous run"
+
     # Use overrides if provided, otherwise fall back to last run's flags
     code = execute_task(
         task_text,
@@ -691,6 +838,8 @@ def retry(
         timeout=timeout if timeout is not None else last.get("timeout"),
         json_output=json,
         verbose=verbose,
+        allow_network=resolved_network,
+        allow_network_source=network_source,
     )
     raise SystemExit(code)
 

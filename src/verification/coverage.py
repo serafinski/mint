@@ -254,6 +254,7 @@ def _variant_handles_case(
     failure: InvocationRecord,
     *,
     timeout: int = 15,
+    allow_network: bool = False,
 ) -> tuple[bool, str | None]:
     """Return (handled, error_message) for a single variant × case replay.
 
@@ -297,7 +298,10 @@ def _variant_handles_case(
     code = _build_replay_code(source_code, func_name, input_args_json)
     try:
         sandbox_result = sandbox_execute(
-            code, timeout=timeout, extra_packages=extra_pkgs,
+            code,
+            timeout=timeout,
+            extra_packages=extra_pkgs,
+            allow_network=allow_network,
         )
     except Exception as exc:  # noqa: BLE001
         return False, (
@@ -369,6 +373,8 @@ def _variant_handles_case(
 def verify_coverage(
     variants: list[GeneratedArtifact],
     failure_cases: list[InvocationRecord],
+    *,
+    allow_network: bool = False,
 ) -> CoverageReport:
     """Verify split variants collectively cover the parent's failure cases.
 
@@ -447,7 +453,9 @@ def verify_coverage(
 
         for variant in variants:
             try:
-                handled, error_msg = _variant_handles_case(variant, failure)
+                handled, error_msg = _variant_handles_case(
+                    variant, failure, allow_network=allow_network,
+                )
             except Exception as exc:  # noqa: BLE001
                 # Defensive guard — _variant_handles_case is "never raises"
                 # but if it does, the coverage verifier must still return

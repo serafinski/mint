@@ -559,12 +559,25 @@ def _test_latency(
 # ---------------------------------------------------------------------------
 
 
-def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
+def run(
+    artifact: GeneratedArtifact,
+    *,
+    allow_network: bool = False,
+) -> list[VerificationFinding]:
     """Run all six behavioral test categories on an MCP_TOOL artifact.
 
     Categories: nonexistent entity, consistency, boundary, timeout,
     latency (variance), and output variation.  SKILL/AGENT artifacts
     have no ``source_code`` and are skipped with an INFO finding.
+
+    Step 14.12: when ``allow_network=True``, every sandbox execution inside
+    this tier runs with ``--network bridge`` instead of ``--network none``
+    so artifacts that legitimately require network access can be behavior-
+    tested. Additionally, when ``artifact.needs_network=True``, a
+    differential disconnect test fires: the tool is invoked twice (network
+    on, network off) and flagged if the offline run returns a plausible
+    dict rather than a clean error — a direct detector for the F2
+    "silent fallback" failure mode.
 
     Returns a list of ``VerificationFinding`` objects (tier=2).
     """
@@ -601,6 +614,7 @@ def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
     if extra_pkgs:
         dep_check = sandbox_execute(
             'print("deps_ok")', timeout=60, extra_packages=extra_pkgs,
+            allow_network=allow_network,
         )
         if not dep_check.get("success"):
             stderr = dep_check.get("stderr", "")
@@ -614,7 +628,9 @@ def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
                 )
             ]
 
-    _sandbox = partial(sandbox_execute, extra_packages=extra_pkgs)
+    _sandbox = partial(
+        sandbox_execute, extra_packages=extra_pkgs, allow_network=allow_network,
+    )
 
     schema = extract_parameter_schema(source_code)
     if not schema:
@@ -629,4 +645,120 @@ def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
     findings.extend(_test_latency(source_code, func_name, schema, _sandbox))
     findings.extend(_test_output_variation(source_code, func_name, schema, _sandbox))
 
+    # Step 14.12: network-disconnect differential. Only fires when the
+    # generator declared the capability legitimately needs network AND the
+    # enclosing context allows network — otherwise the test is either
+    # vacuous (offline tool doesn't need network) or invalid (network
+    # should be blocked, so the on-comparison isn't meaningful).
+    if allow_network and getattr(artifact, "needs_network", False):
+        findings.extend(
+            _test_network_disconnect_differential(
+                source_code, func_name, schema, extra_pkgs,
+            )
+        )
+
     return findings
+
+
+def _test_network_disconnect_differential(
+    source_code: str,
+    func_name: str,
+    schema: dict[str, dict],
+    extra_pkgs: list[str] | None,
+) -> list[VerificationFinding]:
+    """Run the tool twice (network on, network off) and flag silent fallbacks.
+
+    Direct detector for proposal §Pillar 2 F2 (silent fallbacks). A tool that
+    claims to fetch live data but actually returns hardcoded values will
+    succeed identically under both network policies — that matches the
+    contaminated pattern. A legitimate network tool fails cleanly with a
+    socket-level error when network is disabled.
+
+    Flags:
+      * CRITICAL — offline run returned plausible-looking output (dict, no
+        error marker). Strong contamination signal.
+      * MEDIUM — both runs failed (can't distinguish: might be broken tool
+        rather than contaminated).
+      * INFO — offline run failed as expected and online run succeeded
+        (legitimate network tool).
+
+    Step 14.12.
+    """
+    # Use boundary inputs as the canonical "normal" invocation.
+    inputs = _generate_boundary_inputs(schema)
+    code = _build_sandbox_code(source_code, func_name, inputs)
+
+    on_result = sandbox_execute(
+        code, timeout=30, extra_packages=extra_pkgs, allow_network=True,
+    )
+    off_result = sandbox_execute(
+        code, timeout=30, extra_packages=extra_pkgs, allow_network=False,
+    )
+
+    def _parse(payload: dict) -> tuple[bool, dict | str]:
+        """Return (produced_plausible_dict, parsed_value)."""
+        if not payload.get("success"):
+            return False, payload.get("stderr", "")[:300]
+        stdout = (payload.get("stdout") or "").strip()
+        if not stdout:
+            return False, ""
+        try:
+            last_line = stdout.splitlines()[-1]
+            parsed = json.loads(last_line)
+        except (json.JSONDecodeError, IndexError):
+            return False, stdout[:300]
+        if not isinstance(parsed, dict):
+            return False, parsed
+        if "error" in parsed:
+            return False, parsed["error"]
+        return True, parsed.get("result", parsed)
+
+    on_ok, on_value = _parse(on_result)
+    off_ok, off_value = _parse(off_result)
+
+    if off_ok:
+        # Offline produced a plausible dict — strong silent-fallback signal.
+        return [
+            VerificationFinding(
+                tier=2,
+                category="network_silent_fallback",
+                severity=Severity.CRITICAL,
+                message=(
+                    "Tool declared needs_network=True but returned plausible "
+                    "output with network disabled. Likely hardcoded data or "
+                    "silent fallback (proposal §Pillar 2 F2)."
+                ),
+                location="network_disconnect_differential",
+            )
+        ]
+
+    if on_ok and not off_ok:
+        # Legitimate network tool.
+        return [
+            VerificationFinding(
+                tier=2,
+                category="network_disconnect_differential",
+                severity=Severity.INFO,
+                message=(
+                    "Network-disconnect differential passed: tool succeeds "
+                    "online and fails cleanly offline."
+                ),
+            )
+        ]
+
+    if not on_ok and not off_ok:
+        # Both failed — can't classify.
+        return [
+            VerificationFinding(
+                tier=2,
+                category="network_disconnect_differential",
+                severity=Severity.MEDIUM,
+                message=(
+                    "Tool failed under both network policies; cannot verify "
+                    "network-disconnect semantics."
+                ),
+            )
+        ]
+
+    # on_ok=False, off_ok=True already handled above — shouldn't reach here.
+    return []

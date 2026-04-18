@@ -77,6 +77,7 @@ def verify_and_register_or_rollback(
     event_details: str,
     tags: list[str] | None = None,
     domain: str | None = None,
+    allow_network: bool = False,
 ) -> tuple[bool, str | None]:
     """Verify an artifact through the three-tier gate and register atomically.
 
@@ -134,7 +135,7 @@ def verify_and_register_or_rollback(
 
     # --- Gate ---
     try:
-        report = verify(artifact)
+        report = verify(artifact, allow_network=allow_network)
     except Exception as exc:  # noqa: BLE001
         reason = f"verify() raised unexpectedly: {exc}"
         logger.warning(
@@ -611,6 +612,7 @@ def split(
     capability_id: str,
     *,
     llm_model: str = "",
+    allow_network: bool = False,
 ) -> list[str] | None:
     """Split a capability into specialized variants for its input subspaces.
 
@@ -669,11 +671,20 @@ def split(
         raise KeyError(f"Capability '{capability_id}' not found in registry")
 
     if cap.capability_type == CapabilityType.MCP_TOOL:
-        return _split_tools(cap, registry, metrics_store, llm_model=llm_model)
+        return _split_tools(
+            cap, registry, metrics_store,
+            llm_model=llm_model, allow_network=allow_network,
+        )
     if cap.capability_type == CapabilityType.SKILL:
-        return _split_skills(cap, registry, metrics_store, llm_model=llm_model)
+        return _split_skills(
+            cap, registry, metrics_store,
+            llm_model=llm_model, allow_network=allow_network,
+        )
     if cap.capability_type == CapabilityType.AGENT:
-        return _split_agents(cap, registry, metrics_store, llm_model=llm_model)
+        return _split_agents(
+            cap, registry, metrics_store,
+            llm_model=llm_model, allow_network=allow_network,
+        )
 
     raise ValueError(
         f"split() does not support capability_type={cap.capability_type.value}"
@@ -809,6 +820,7 @@ def _merge_tools(
     metrics_store: MetricsStore,
     *,
     llm_model: str,
+    allow_network: bool = False,
 ) -> str | None:
     """Per-type merge for MCP_TOOL parents.
 
@@ -899,6 +911,7 @@ def _merge_tools(
         event_details=f"from {[c.name for c in caps]}",
         tags=all_tags,
         domain=caps[0].domain,
+        allow_network=allow_network,
     )
     if not ok:
         logger.warning(
@@ -922,6 +935,7 @@ def _merge_skills(
     metrics_store: MetricsStore,
     *,
     llm_model: str,
+    allow_network: bool = False,
 ) -> str | None:
     """Per-type merge for SKILL parents.
 
@@ -1024,6 +1038,7 @@ def _merge_skills(
         event_details=f"from {[c.name for c in caps]}",
         tags=all_tags,
         domain=caps[0].domain,
+        allow_network=allow_network,
     )
     if not ok:
         logger.warning(
@@ -1046,6 +1061,7 @@ def _merge_agents(
     metrics_store: MetricsStore,
     *,
     llm_model: str,
+    allow_network: bool = False,
 ) -> str | None:
     """Per-type merge for AGENT parents.
 
@@ -1179,6 +1195,7 @@ def _merge_agents(
         event_details=f"from {[c.name for c in caps]}",
         tags=all_tags,
         domain=caps[0].domain,
+        allow_network=allow_network,
     )
     if not ok:
         logger.warning(
@@ -1201,6 +1218,7 @@ def merge(
     capability_ids: list[str],
     *,
     llm_model: str = "",
+    allow_network: bool = False,
 ) -> str | None:
     """Merge multiple capabilities into a single broader capability.
 
@@ -1261,11 +1279,20 @@ def merge(
 
     cap_type = next(iter(types))
     if cap_type == CapabilityType.MCP_TOOL:
-        return _merge_tools(caps, registry, metrics_store, llm_model=llm_model)
+        return _merge_tools(
+            caps, registry, metrics_store,
+            llm_model=llm_model, allow_network=allow_network,
+        )
     if cap_type == CapabilityType.SKILL:
-        return _merge_skills(caps, registry, metrics_store, llm_model=llm_model)
+        return _merge_skills(
+            caps, registry, metrics_store,
+            llm_model=llm_model, allow_network=allow_network,
+        )
     if cap_type == CapabilityType.AGENT:
-        return _merge_agents(caps, registry, metrics_store, llm_model=llm_model)
+        return _merge_agents(
+            caps, registry, metrics_store,
+            llm_model=llm_model, allow_network=allow_network,
+        )
 
     raise ValueError(f"merge() does not support capability_type={cap_type.value}")
 
@@ -1395,7 +1422,10 @@ def _summarize_failures_for_prompt(
 
 
 def _split_phase_b_verify_all(
-    artifacts: list[GeneratedArtifact], context: str,
+    artifacts: list[GeneratedArtifact],
+    context: str,
+    *,
+    allow_network: bool = False,
 ) -> tuple[bool, str | None]:
     """Phase B of the split flow: verify each variant via gate.verify() only.
 
@@ -1410,7 +1440,7 @@ def _split_phase_b_verify_all(
 
     for artifact in artifacts:
         try:
-            report = _gate_verify(artifact)
+            report = _gate_verify(artifact, allow_network=allow_network)
         except Exception as exc:  # noqa: BLE001
             reason = f"gate.verify raised on variant '{artifact.capability_name}': {exc}"
             logger.warning("split phase B (%s): %s", context, reason)
@@ -1499,6 +1529,7 @@ def _split_tools(
     metrics_store: MetricsStore,
     *,
     llm_model: str,
+    allow_network: bool = False,
 ) -> list[str] | None:
     """Per-type split for MCP_TOOL parents.
 
@@ -1597,7 +1628,9 @@ def _split_tools(
         )
 
     # Phase B — verify each variant through the gate.
-    ok, reason = _split_phase_b_verify_all(artifacts, parent.name)
+    ok, reason = _split_phase_b_verify_all(
+        artifacts, parent.name, allow_network=allow_network,
+    )
     if not ok:
         logger.warning(
             "_split_tools: phase B rejected split of %s — %s. Parent stays active.",
@@ -1610,7 +1643,9 @@ def _split_tools(
 
     # Phase C — collective coverage verification (MCP_TOOL replay).
     try:
-        coverage = verify_coverage(artifacts, failure_cases)
+        coverage = verify_coverage(
+            artifacts, failure_cases, allow_network=allow_network,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "_split_tools: verify_coverage raised on %s: %s. Parent stays active.",
@@ -1648,6 +1683,7 @@ def _split_skills(
     metrics_store: MetricsStore,
     *,
     llm_model: str,
+    allow_network: bool = False,
 ) -> list[str] | None:
     """Per-type split for SKILL parents.
 
@@ -1753,7 +1789,9 @@ def _split_skills(
         )
 
     # Phase B — gate per variant.
-    ok, reason = _split_phase_b_verify_all(artifacts, parent.name)
+    ok, reason = _split_phase_b_verify_all(
+        artifacts, parent.name, allow_network=allow_network,
+    )
     if not ok:
         logger.warning(
             "_split_skills: phase B rejected split of %s — %s. Parent stays active.",
@@ -1767,7 +1805,9 @@ def _split_skills(
     # Phase C — coverage dispatches to unverifiable_type (vacuous pass)
     # per MCP_TOOL-only scope. Still called for consistency with the
     # MCP_TOOL path and to make future Chapter 7 extensions drop in.
-    coverage = verify_coverage(artifacts, failure_cases)
+    coverage = verify_coverage(
+        artifacts, failure_cases, allow_network=allow_network,
+    )
     if not coverage.all_covered:
         # Should be impossible for SKILL (coverage is vacuous) but
         # guarded for robustness — if verify_coverage ever tightens
@@ -1791,6 +1831,7 @@ def _split_agents(
     metrics_store: MetricsStore,
     *,
     llm_model: str,
+    allow_network: bool = False,
 ) -> list[str] | None:
     """Per-type split for AGENT parents.
 
@@ -1945,7 +1986,9 @@ def _split_agents(
         )
 
     # Phase B — gate per variant.
-    ok, reason = _split_phase_b_verify_all(artifacts, parent.name)
+    ok, reason = _split_phase_b_verify_all(
+        artifacts, parent.name, allow_network=allow_network,
+    )
     if not ok:
         logger.warning(
             "_split_agents: phase B rejected split of %s — %s. Parent stays active.",
@@ -1957,7 +2000,9 @@ def _split_agents(
         return None
 
     # Phase C — vacuous for AGENT per MCP_TOOL-only scope.
-    coverage = verify_coverage(artifacts, failure_cases)
+    coverage = verify_coverage(
+        artifacts, failure_cases, allow_network=allow_network,
+    )
     if not coverage.all_covered:
         logger.warning(
             "_split_agents: coverage unexpectedly rejected AGENT split of %s — "

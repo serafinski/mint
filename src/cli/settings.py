@@ -1,9 +1,9 @@
 """Atomic, multi-process-safe settings file for the MINT CLI.
 
-Persists user preferences (currently: per-operation optimizer config per
-§12 finding #8) across ``mint run`` invocations. Settings file lives at
-``data/cli/settings.json`` and is written via write-to-temp + rename +
-``fcntl.flock`` — the same pattern as
+Persists user preferences across ``mint run`` invocations: per-operation
+optimizer config (§12 finding #8) and network-access policy (Step 14.12).
+Settings file lives at ``data/cli/settings.json`` and is written via
+write-to-temp + rename + ``fcntl.flock`` — the same pattern as
 :class:`src.orchestrator.taxonomy.DomainTaxonomy`.
 
 **Why a dedicated module.** The evolutionary taxonomy has its own file
@@ -18,9 +18,12 @@ a partially-written state.
 - ``optimizer``: dict with ``prune`` / ``split`` / ``merge`` →
   ``"auto" | "on" | "off"`` (see
   :class:`src.schemas.optimizer_config.OptimizerConfig`).
+- ``network``: dict with ``allow`` → bool. When true, ``mint run``
+  defaults to ``--allow-network`` (Step 14.12). Absent key → offline.
 
 Missing keys are interpreted as "use defaults" — a fresh install with no
-settings file gets all-defaults behavior (all operations ``"auto"``).
+settings file gets all-defaults behavior (optimizer ops ``"auto"``,
+network offline).
 """
 
 from __future__ import annotations
@@ -126,3 +129,33 @@ def get_optimizer_config_from_settings(settings: dict[str, Any]) -> dict[str, st
         for k, v in opt.items()
         if k in ("prune", "split", "merge") and isinstance(v, str)
     }
+
+
+def get_network_allow_from_settings(settings: dict[str, Any]) -> bool | None:
+    """Extract the persistent ``network.allow`` toggle from a settings blob.
+
+    Returns:
+        * ``True`` or ``False`` when the key is present and holds a bool.
+        * ``None`` when the key is absent or malformed. The caller MUST
+          distinguish "no preference" (fall through to CLI flag / default)
+          from "explicitly False" (offline by user request), which is why
+          we return a tri-state rather than a bool.
+
+    Step 14.12 — mirrors :func:`get_optimizer_config_from_settings` so the
+    two persistent toggles share the same precedence semantics:
+
+        per-invocation flag  >  persistent setting  >  default (False)
+    """
+    net = settings.get("network")
+    if not isinstance(net, dict):
+        return None
+    allow = net.get("allow")
+    if isinstance(allow, bool):
+        return allow
+    if allow is None:
+        return None
+    logger.warning(
+        "CLI settings: network.allow must be a bool (got %r) — ignoring",
+        allow,
+    )
+    return None

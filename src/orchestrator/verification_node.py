@@ -103,6 +103,32 @@ def verification_node(
     if gate_fn is None:
         gate_fn = _stub_gate
 
+    # Step 14.12: when the task carries ``allow_network=True``, thread it
+    # through to the real gate so Tier 2 / Tier 3 probe under the same
+    # network policy the artifact will execute under. The stub gate
+    # ignores this kwarg, so wrapping unconditionally is safe — but we
+    # guard with a capability check to preserve signatures that don't
+    # accept it (legacy tests patch gate_fn with a strict 1-arg lambda).
+    import inspect as _inspect
+
+    task_allow_network = bool(getattr(state, "allow_network", False))
+    if task_allow_network:
+        try:
+            sig = _inspect.signature(gate_fn)
+            accepts_network = "allow_network" in sig.parameters or any(
+                p.kind == _inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_network = False
+        if accepts_network:
+            _original_gate_fn = gate_fn
+
+            def _gate_fn_with_network(artifact):  # type: ignore[misc]
+                return _original_gate_fn(artifact, allow_network=True)
+
+            gate_fn = _gate_fn_with_network
+
     new_attempt_count = state.attempt_count + 1
     errors: list[str] = list(state.errors)
 

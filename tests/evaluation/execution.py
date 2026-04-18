@@ -283,6 +283,42 @@ def _format_fixture_message(fixture_contents: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
+def _make_network_scoped_sandbox(allow_network: bool):
+    """Return a ``sandbox_execute`` variant that forces a network policy.
+
+    Mirrors the closure pattern in
+    ``src.verification.adversarial._make_probe_sandbox_execute``. SKILL and
+    AGENT execution backends bind ``sandbox_execute`` as an LLM tool; the
+    LLM cannot set ``allow_network`` itself (it's a keyword-only safety
+    knob, not a tool-schema parameter). This wrapper applies the task's
+    declared policy to every invocation. Step 14.12.
+    """
+    from src.verification.sandbox_tool import (
+        sandbox_execute as _base_sandbox_execute,
+    )
+    from typing import Annotated as _Annotated
+
+    def sandbox_execute(
+        code: _Annotated[str, Field(description="Python code snippet to execute in the sandbox")],
+        timeout: _Annotated[int, Field(default=10, description="Timeout in seconds")] = 10,
+        extra_packages: list[str] | None = None,
+    ) -> dict:
+        """Execute a Python snippet in an isolated Docker container.
+
+        (Network-policy-scoped wrapper: outbound network is permitted iff
+        the enclosing task was invoked with ``--allow-network`` or
+        ``mint config set network.allow true``.)
+        """
+        return _base_sandbox_execute(
+            code=code,
+            timeout=timeout,
+            extra_packages=extra_packages,
+            allow_network=allow_network,
+        )
+
+    return sandbox_execute
+
+
 def _fixtures_to_workspace_files(fixture_contents: dict[str, str]) -> dict:
     """Convert fixtures to DeepAgents ``StateBackend`` workspace-file format.
 
@@ -483,6 +519,7 @@ def execute_skill_artifact(
     *,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    allow_network: bool = False,
 ) -> dict:
     """Execute a SKILL artifact via constrained LLM with tool calling.
 
@@ -496,6 +533,7 @@ def execute_skill_artifact(
             artifact, task, fixture_contents,
             langfuse_tags=langfuse_tags,
             langfuse_session_id=langfuse_session_id,
+            allow_network=allow_network,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Skill execution failed for %s: %s", getattr(task, "task_id", "?"), exc)
@@ -509,12 +547,18 @@ def _execute_skill_inner(
     *,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    allow_network: bool = False,
 ) -> dict:
     from langchain.chat_models import init_chat_model
     from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
     from src.config import DEFAULT_LLM_MODEL
-    from src.verification.sandbox_tool import sandbox_execute
+
+    # Step 14.12: wrap sandbox_execute in a closure that enforces the task-
+    # level network policy. The SKILL executor binds this wrapper as the
+    # LLM tool, so every tool call inherits the same policy — the LLM
+    # can't override it mid-execution.
+    sandbox_execute = _make_network_scoped_sandbox(allow_network)
 
     skill_content = getattr(artifact, "skill_content", None) or ""
     result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
@@ -664,6 +708,8 @@ def execute_mcp_tool_in_chain(
     workspace_path: Path,
     pip_packages: list[str] | None = None,
     capability_name: str = "tool",
+    *,
+    allow_network: bool = False,
 ) -> dict:
     """Execute an MCP_TOOL as one step of a chain with workspace state passing.
 
@@ -825,6 +871,7 @@ asyncio.run(_run())
         workspace_path=workspace_path,
         timeout=exec_timeout,
         extra_packages=extra_pkgs or None,
+        allow_network=allow_network,
     )
 
     # Log chain step diagnostics from stderr (always, not just on failure)
@@ -956,6 +1003,7 @@ def execute_agent_artifact(
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
     output_schema: dict[str, str] | None = None,
+    allow_network: bool = False,
 ) -> dict:
     """Execute an AGENT artifact via DeepAgent with progressive skill disclosure.
 
@@ -984,6 +1032,7 @@ def execute_agent_artifact(
             langfuse_tags=langfuse_tags,
             langfuse_session_id=langfuse_session_id,
             output_schema=output_schema,
+            allow_network=allow_network,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent execution failed for %s: %s", getattr(task, "task_id", "?"), exc)
@@ -1007,12 +1056,17 @@ def _execute_agent_inner(
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
     output_schema: dict[str, str] | None = None,
+    allow_network: bool = False,
 ) -> dict:
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
 
     from src.config import DEFAULT_LLM_MODEL
-    from src.verification.sandbox_tool import sandbox_execute
+
+    # Step 14.12: wrap sandbox_execute in a closure that enforces the task-
+    # level network policy. The lead agent and every subagent receive the
+    # same wrapper — policy can't be escalated mid-run.
+    sandbox_execute = _make_network_scoped_sandbox(allow_network)
 
     agent_config = getattr(artifact, "agent_config", None) or {}
     system_prompt = agent_config.get("system_prompt", _AGENT_SYSTEM_FALLBACK)

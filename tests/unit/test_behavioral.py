@@ -631,3 +631,175 @@ class TestLatencyVariance:
         findings = _test_latency(CLEAN_TOOL, "compute_sum", {}, mock_sandbox)
         assert findings == []
         assert mock_sandbox.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Step 14.12 — allow_network plumbing + network-disconnect differential
+# ---------------------------------------------------------------------------
+
+
+class TestAllowNetworkPropagates:
+    """``run(artifact, allow_network=True)`` must forward the flag to every
+    ``sandbox_execute`` call inside Tier 2.
+    """
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_allow_network_true_forwards_to_dep_check(self, mock_sandbox):
+        """Dependency pre-check receives allow_network=True."""
+        mock_sandbox.return_value = _sandbox_success("42")
+        artifact = GeneratedArtifact(
+            capability_name="net-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            pip_packages=["requests"],
+        )
+
+        run(artifact, allow_network=True)
+
+        # The dep_check call is the first one with extra_packages=...
+        dep_calls = [
+            c for c in mock_sandbox.call_args_list
+            if c.kwargs.get("extra_packages") == ["requests"]
+        ]
+        assert dep_calls
+        assert all(c.kwargs.get("allow_network") is True for c in dep_calls)
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_allow_network_false_by_default(self, mock_sandbox):
+        """Omitting the flag keeps offline-by-default."""
+        mock_sandbox.return_value = _sandbox_success("42")
+        artifact = GeneratedArtifact(
+            capability_name="offline-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+        )
+
+        run(artifact)
+
+        # The partial wraps sandbox_execute; the dep_check isn't present when
+        # extra_packages is empty. Instead assert the partial's keyword.
+        # The findings should run the behavioral tests via partial(sandbox_execute, ...)
+        # with allow_network=False keyword bound.
+        # This test passes iff run() returns without crashing and no call to
+        # sandbox_execute leaked an unexpected allow_network=True.
+        calls_with_true = [
+            c for c in mock_sandbox.call_args_list
+            if c.kwargs.get("allow_network") is True
+        ]
+        assert calls_with_true == []
+
+
+class TestNetworkDisconnectDifferential:
+    """Tier 2's new differential test fires only when needs_network=True AND
+    allow_network=True. It catches silent fallbacks (F2 in proposal §Pillar 2).
+    """
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_differential_flags_silent_fallback(self, mock_sandbox):
+        """Both on and off produce plausible dicts → CRITICAL silent fallback."""
+        # Both calls return plausible "result" payload.
+        mock_sandbox.return_value = {
+            "stdout": json.dumps({"result": "live data"}) + "\n",
+            "stderr": "",
+            "exit_code": 0,
+            "success": True,
+        }
+        artifact = GeneratedArtifact(
+            capability_name="fake-api-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            needs_network=True,
+        )
+
+        findings = run(artifact, allow_network=True)
+
+        silent_fallback = [
+            f for f in findings if f.category == "network_silent_fallback"
+        ]
+        assert len(silent_fallback) == 1
+        assert silent_fallback[0].severity == Severity.CRITICAL
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_differential_legitimate_network_tool_passes(self, mock_sandbox):
+        """Online succeeds, offline fails → INFO finding (legitimate)."""
+        call_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            # First few calls (standard behavioral tests) succeed;
+            # then the differential: allow_network=True → success,
+            # allow_network=False → failure.
+            if kwargs.get("allow_network") is True:
+                return {
+                    "stdout": json.dumps({"result": "live data"}) + "\n",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "success": True,
+                }
+            else:
+                return {
+                    "stdout": "",
+                    "stderr": "socket.gaierror",
+                    "exit_code": 1,
+                    "success": False,
+                }
+
+        mock_sandbox.side_effect = side_effect
+        artifact = GeneratedArtifact(
+            capability_name="legit-api-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            needs_network=True,
+        )
+
+        findings = run(artifact, allow_network=True)
+        diffs = [
+            f for f in findings
+            if f.category == "network_disconnect_differential"
+        ]
+        assert len(diffs) == 1
+        assert diffs[0].severity == Severity.INFO
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_differential_skipped_when_needs_network_false(self, mock_sandbox):
+        """needs_network=False → differential never fires."""
+        mock_sandbox.return_value = _sandbox_success("42")
+        artifact = GeneratedArtifact(
+            capability_name="pure-compute",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            needs_network=False,
+        )
+
+        findings = run(artifact, allow_network=True)
+        diffs = [
+            f for f in findings
+            if f.category in (
+                "network_disconnect_differential",
+                "network_silent_fallback",
+            )
+        ]
+        assert diffs == []
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_differential_skipped_when_allow_network_false(self, mock_sandbox):
+        """Even with needs_network=True, if the run is offline the
+        differential is vacuous and doesn't fire.
+        """
+        mock_sandbox.return_value = _sandbox_success("42")
+        artifact = GeneratedArtifact(
+            capability_name="offline-run",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            needs_network=True,
+        )
+
+        findings = run(artifact, allow_network=False)
+        diffs = [
+            f for f in findings
+            if f.category in (
+                "network_disconnect_differential",
+                "network_silent_fallback",
+            )
+        ]
+        assert diffs == []

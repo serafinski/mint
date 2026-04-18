@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from src.cli.settings import (
+    get_network_allow_from_settings,
     get_optimizer_config_from_settings,
     load_settings,
     save_settings,
@@ -81,3 +82,113 @@ class TestGetOptimizerConfigFromSettings:
 
     def test_non_dict_optimizer_returns_empty(self):
         assert get_optimizer_config_from_settings({"optimizer": "on"}) == {}
+
+
+# ---------------------------------------------------------------------------
+# Step 14.12 — persistent network.allow toggle
+# ---------------------------------------------------------------------------
+
+
+class TestGetNetworkAllowFromSettings:
+    def test_empty_settings_returns_none(self):
+        assert get_network_allow_from_settings({}) is None
+
+    def test_missing_network_key_returns_none(self):
+        assert get_network_allow_from_settings({"optimizer": {"prune": "on"}}) is None
+
+    def test_explicit_true(self):
+        assert get_network_allow_from_settings({"network": {"allow": True}}) is True
+
+    def test_explicit_false(self):
+        assert get_network_allow_from_settings({"network": {"allow": False}}) is False
+
+    def test_non_dict_network_returns_none(self):
+        assert get_network_allow_from_settings({"network": "on"}) is None
+
+    def test_malformed_value_returns_none_and_warns(self, caplog):
+        with caplog.at_level("WARNING"):
+            result = get_network_allow_from_settings({"network": {"allow": "maybe"}})
+        assert result is None
+        assert any(
+            "network.allow must be a bool" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_network_allow_persists_across_invocations(self, tmp_path):
+        """Round-trip: save, reload, get_network_allow_from_settings."""
+        path = tmp_path / "settings.json"
+        save_settings(path, {"network": {"allow": True}})
+        reloaded = load_settings(path)
+        assert get_network_allow_from_settings(reloaded) is True
+
+
+class TestMintConfigCLINetworkToggle:
+    """``mint config set/unset network.allow`` through the Typer app."""
+
+    def _run(self, *args, tmp_path, monkeypatch):
+        """Invoke the Typer app with ``_settings_path`` redirected to tmp_path."""
+        from typer.testing import CliRunner
+
+        from src.cli import app as app_module
+
+        # Redirect the settings path helper so the test is hermetic.
+        monkeypatch.setattr(
+            app_module,
+            "_settings_path",
+            lambda: tmp_path / "settings.json",
+        )
+
+        runner = CliRunner()
+        return runner.invoke(app_module.app, list(args))
+
+    def test_set_network_allow_true_persists(self, tmp_path, monkeypatch):
+        result = self._run(
+            "config", "set", "network.allow", "true",
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+        )
+        assert result.exit_code == 0, result.output + (result.stderr or "")
+        settings_path = tmp_path / "settings.json"
+        assert settings_path.exists()
+        data = json.loads(settings_path.read_text())
+        assert data["network"]["allow"] is True
+
+    def test_set_network_allow_false_persists(self, tmp_path, monkeypatch):
+        result = self._run(
+            "config", "set", "network.allow", "false",
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads((tmp_path / "settings.json").read_text())
+        assert data["network"]["allow"] is False
+
+    def test_set_invalid_value_rejected(self, tmp_path, monkeypatch):
+        result = self._run(
+            "config", "set", "network.allow", "maybe",
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+        )
+        assert result.exit_code == 1
+        combined = (result.output or "") + (result.stderr or "")
+        assert "true" in combined.lower() or "false" in combined.lower()
+
+    def test_set_unknown_network_subkey_rejected(self, tmp_path, monkeypatch):
+        result = self._run(
+            "config", "set", "network.nonexistent", "true",
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+        )
+        assert result.exit_code == 1
+
+    def test_unset_network_allow_removes_key(self, tmp_path, monkeypatch):
+        # First set, then unset.
+        self._run(
+            "config", "set", "network.allow", "true",
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+        )
+        result = self._run(
+            "config", "unset", "network.allow",
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+        )
+        assert result.exit_code == 0, result.output
+        settings_path = tmp_path / "settings.json"
+        if settings_path.exists():
+            data = json.loads(settings_path.read_text())
+            assert "network" not in data or "allow" not in data.get("network", {})

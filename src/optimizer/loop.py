@@ -59,6 +59,16 @@ class OptimizerState(BaseModel):
     errors: list[str] = Field(
         default_factory=list, description="Errors encountered during optimization"
     )
+    allow_network: bool = Field(
+        default=False,
+        description=(
+            "Network policy inherited from the enclosing TaskState (Step "
+            "14.12). When True, merge/split variant verification runs with "
+            "``--network bridge`` in Tier 2 / Tier 3, and MCP_TOOL coverage "
+            "replay honors the same policy. Offline-by-default preserves "
+            "the standard safety posture."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -344,7 +354,9 @@ def create_optimization_loop(
                     continue
                 try:
                     new_ids = split(
-                        registry, metrics_store, cap_id, llm_model=llm_model
+                        registry, metrics_store, cap_id,
+                        llm_model=llm_model,
+                        allow_network=state.allow_network,
                     )
                     split_results[cap_id] = new_ids
                 except Exception as e:  # noqa: BLE001
@@ -362,7 +374,9 @@ def create_optimization_loop(
                     continue
                 try:
                     merged_id = merge(
-                        registry, metrics_store, list(pair), llm_model=llm_model
+                        registry, metrics_store, list(pair),
+                        llm_model=llm_model,
+                        allow_network=state.allow_network,
                     )
                     key = "+".join(pair)
                     merge_results[key] = merged_id
