@@ -1,0 +1,267 @@
+# Evaluation Strategy — Implementation Alignment Audit
+
+**Scope:** `docs/thesis_proposal.md` §Evaluation Strategy lines 200–229 (Testbed Options, Baselines, Metrics).
+**Audited directories:** `sandbox/`, `scripts/`, `src/`, `tools/` (plus `tests/evaluation/` as a reference target, since the harness that realizes every claim in this section lives there).
+**Date:** 2026-04-18.
+**Method:** File-by-file rundown of every source file in the four listed directories, mapped against the proposal's two testbed options, four baseline conditions, and six metrics. Every item that extends beyond the proposal wording is flagged as IMPROVEMENT or DIVERGENCE and cross-linked to its master-plan disclosure. Tests directory touched only where proposal claims are realized there (tasks, harness, execution adapters, snapshots).
+
+---
+
+## 1. What the proposal's Evaluation Strategy actually says
+
+### Testbed Options
+Two candidate testbeds:
+
+| Option | Description | Advantages |
+|---|---|---|
+| **A. Factory Simulation** | MAS-based factory with competing machines, orders, resource allocation. Tasks: scheduling optimization, breakdown diagnosis, QC analysis. | Controlled, repeatable, rich emergent behavior. |
+| **B. Business Analytics Pipeline** | Data ingestion from heterogeneous sources, ML training, inference, report generation. | Realistic capability heterogeneity, natural diversity of granularity needs. |
+
+The proposal says either is acceptable; implementation must pick one.
+
+### Baselines (four conditions)
+
+| Baseline | Description |
+|---|---|
+| **Static skills** | Fixed hand-curated library, no JIT generation. Ceiling of human-designed capabilities. |
+| **JIT without verification** | Pillar 1 runs; Pillar 2 disabled. Measures what verification contributes. |
+| **JIT without granularity optimization** | Pillars 1+2 run; Pillar 3 disabled. Measures evolutionary pressure. |
+| **Full system** | All three pillars active. |
+
+### Metrics (six)
+
+| # | Metric | Proposal wording |
+|---|---|---|
+| **M1** | End-to-end task success rate | *"Does the system actually solve the tasks?"* |
+| **M2** | Mock contamination rate | *"What fraction of generated capabilities contain hardcoded/fabricated elements? (Measured by manual audit of a sample.)"* |
+| **M3** | Capability reuse distribution | *"Gini coefficient of invocation counts across the registry. Healthy registries have moderate inequality; unhealthy ones have extreme skew."* |
+| **M4** | Token cost per task | *"Total tokens consumed including capability definitions, generation, verification, and execution."* |
+| **M5** | Time to first correct execution | *"Latency from task input to verified correct output, including any JIT generation time."* |
+| **M6** | Registry convergence | *"Number of cycles until the granularity distribution stabilizes (measured by KL divergence between consecutive registry snapshots)."* |
+
+---
+
+## 2. Verdict at a glance
+
+| Proposal claim | Realized? | Primary implementation surface |
+|---|---|---|
+| Testbed choice: Option A or B | ✅ Option B chosen | `tests/evaluation/tasks.py` — 20 data-pipeline tasks (T01–T20); Option A declined, rationale in `CLAUDE.md` §Testbed |
+| 4 baseline conditions (static / no_verification / no_optimization / full) | ✅ ALIGNED (literal) | `src/schemas/evaluation.py::BaselineCondition` + `tests/evaluation/harness.py::_run_static` / `_run_jit` |
+| `static` = fixed hand-curated library, no JIT | ✅ ALIGNED | `harness.py::_run_static_implementation` — deterministic Python functions (`_static_t01` / `_static_t02` / `_static_t03` / `_static_t05` / `_static_t09` / `_static_t19`) invoked against seeded registry |
+| `no_verification` = Pillar 1 only | ✅ ALIGNED (literal) | `harness.py::_run_jit` line 438: `verification_enabled = condition != "no_verification"` → passes through to `create_pipeline(verification_enabled=False)` |
+| `no_optimization` = Pillars 1+2 only | ✅ ALIGNED (literal) | `harness.py::_run_jit` line 438: `run_optimizer = condition == "full"` → passes `run_optimizer=False` for this condition |
+| `full` = all three pillars | ✅ ALIGNED | Same dispatcher; `run_optimizer=True AND verification_enabled=True` |
+| M1 End-to-end task success rate | ✅ ALIGNED + IMPROVED | `scripts/analyze_results.py::query_condition_summary` + Clopper-Pearson binomial CI + Fisher's exact test + Holm-Bonferroni correction |
+| M2 Mock contamination rate (manual audit) | ⚠️ FIELD DEFINED, NOT POPULATED | `EvaluationRecord.human_label` field (enum: CORRECT / CONTAMINATED / PARTIAL); `evaluation_runs.human_label` column; no harness-side auto-labelling and no analyzer reader yet |
+| M3 Capability reuse distribution (Gini) | ✅ ALIGNED (literal) | `scripts/analyze_results.py::_gini_coefficient` on persistent `invocation_events` table (Step 18.5) |
+| M4 Token cost per task | ✅ ALIGNED with scope note | `scripts/backfill_token_costs.py` reads LangFuse GENERATION observations and writes `evaluation_runs.token_cost`; analyzer `print_token_cost_summary()` aggregates per condition |
+| M5 Time to first correct execution | ⚠️ PROXIED (not per-attempt) | `EvaluationRecord.attempt_latency_ms` is total wall-clock across all retries — proposal's *"first correct"* is not instrumented per-attempt; see §5 |
+| M6 Registry convergence (KL divergence) | ✅ ALIGNED (literal) | `scripts/analyze_longitudinal.py::_kl_divergence_between_snapshots` on `cycle_utility_scores` (proposal-literal utility-score KL); convergence = first cycle where consecutive-snapshot KL stays below `--threshold` (default 0.05) for `--min-consecutive` (default 3) cycles |
+| Snapshot isolation per run | ➕ IMPROVEMENT (operational necessity) | `tests/evaluation/snapshots.py::take_clean_snapshot` / `restore_clean_snapshot` — SHA-256-hashed deterministic restore before every run |
+| Output contract check (Step 14.6) | ➕ IMPROVEMENT (orthogonal to M1) | `EvaluationRecord.output_shape_mismatch` + `output_shape_missing_keys` + `output_shape_missing_files`; realized by `src/orchestrator/output_contract_resolver.py` |
+| Core-Work Classification Accuracy (Pillar 1 RQ #1) | ➕ IMPROVEMENT (additive metric) | `scripts/analyze_results.py::print_classification_accuracy` — task-level expected-vs-primary confusion matrix; disclosed in master plan Step 18.5 |
+| Distribution-shift evaluation (Pillar 3 RQ #3) | ➕ IMPROVEMENT (moved out of Chapter 7) | `scripts/run_longitudinal_shift.py` + `analyze_longitudinal.py::_detect_shift_point` + `_classify_adaptation` three-tier verdict |
+| Longitudinal condition (not an ablation) | ➕ IMPROVEMENT | `BaselineCondition.LONGITUDINAL` enum value (5th) + `scripts/run_longitudinal.py` — 40-task sequential protocol for cross-task registry accumulation |
+| Per-run reproducibility | ➕ IMPROVEMENT | `EvaluationRecord.seed` (task-ordering RNG); `registry_snapshot_id` hash (state identity); `is_pilot` flag (exclude from primary metrics) |
+
+**Bottom line.** All four proposal baselines are realized literally through condition-specific `verification_enabled` / `run_optimizer` flags on a single `create_pipeline()` call, with the `static` condition routed to hand-written Python implementations bypassing the pipeline. Four of the six proposal metrics are realized literally (M1 success, M3 Gini, M4 token cost, M6 KL convergence). Two diverge: **M2 mock contamination** has a defined column but no auto-instrumentation — proposal wording *"manual audit of a sample"* is consistent with the field-only approach, but no audit has been performed yet and no reader exists. **M5 time-to-first-correct** is proxied by `attempt_latency_ms` (total wall-clock, all retries) — the proposal's *"first correct"* semantics would require per-attempt latency breakdown which the harness does not record. Four additive improvements strengthen the eval beyond the proposal spec (snapshot isolation, output contract check, classification accuracy, distribution-shift verdict). One infrastructural addition: `LONGITUDINAL` condition, a 5th sequencing protocol orthogonal to the four ablations.
+
+---
+
+## 3. File-by-file rundown
+
+Legend: **ALIGNED** = directly realizes a proposal claim. **IMPROVEMENT** = stronger mechanism than proposal sketch. **DIVERGENCE** = diverges from literal proposal wording (disclosed). **NEUTRAL** = infrastructure, does not directly bear on Evaluation Strategy claims.
+
+### 3.1 `sandbox/` (1 file)
+
+| File | Role | Maps to | Alignment |
+|---|---|---|---|
+| `sandbox/Dockerfile` | Minimal `python:3.12-slim` image with only `mcp` + `pydantic` preinstalled; `uv` is used inside for fast per-invocation package install. Used by the eval harness's `_execute_artifact` → `sandbox_execute` → Docker subprocess path for MCP_TOOL execution. | M1 (execution correctness), M5 (execution latency proxy). | NEUTRAL for Evaluation Strategy per se — runtime substrate. Shared with Pillar 2 (see `03_pillar_2_verification.md`). |
+
+### 3.2 `src/schemas/evaluation.py` — THE EVALUATION CONTRACT
+
+| File | Role | Maps to | Alignment |
+|---|---|---|---|
+| `evaluation.py` (240 LOC) | `BaselineCondition` StrEnum with 5 values: `FULL`, `NO_VERIFICATION`, `NO_OPTIMIZATION`, `STATIC`, `LONGITUDINAL`. Proposal's four ablations are the first four; `LONGITUDINAL` is a 5th sequencing protocol (40 sequential tasks on a shared registry, used only by `run_longitudinal.py` / `run_longitudinal_shift.py` — analyzers filter it out of primary ablation tables). `TaskTier` (TRIVIAL/MODERATE/COMPLEX). `FailureReason` (8 values: NONE, GENERATION_FAILED, TIER1/2/3, OUTPUT_REJECTED, NO_SOURCE_CODE, CHAIN_STEP_FAILED, AGENT_EXECUTION_TIMEOUT, AGENT_EXECUTION_ERROR). `HumanLabel` (CORRECT/CONTAMINATED/PARTIAL — M2 surface). `EvaluationRecord` (BaseModel, `extra="forbid"`) with 35+ fields including run_id, condition, task_id, tier, attempt_count, capability_type, verification_tier_reached, gate_passed, output_in_range, token_cost, attempt_latency_ms, failure_reason, registry_snapshot_id, seed, is_pilot, human_label, timestamp + decomposition/chain fields + Step 14.6 output-contract fields. Composite `record.success = gate_passed AND output_in_range` (lines 236–239). | 4 baselines + 6 metrics surface. | ALIGNED + IMPROVEMENT (additive fields: decomposition detail, chain detail, Step 14.6 output contract, is_pilot flag, seed). |
+
+### 3.3 `src/registry/evaluation_store.py` — THE EVALUATION PERSISTENCE LAYER
+
+| File | Role | Maps to | Alignment |
+|---|---|---|---|
+| `evaluation_store.py` (150+ LOC header audited) | DuckDB persistence for evaluation outcomes. **Four tables:** (1) `evaluation_runs` — one row per (run_id, condition, task_id), primary table mirroring `EvaluationRecord`, 30+ columns including `human_label VARCHAR` nullable (M2 surface, populated only by manual audit). (2) `invocation_events` (Step 18.5) — per-capability per-task invocation log; (run_id, condition, task_id, capability_id, capability_type, success, token_cost, latency_ms, occurred_at) — substrate for Gini (M3). (3) `cycle_utility_scores` (Step 18.7) — per-cycle utility-score snapshot per capability for proposal-literal KL convergence (M6). (4) `cycle_events` (Step 18.7) — per-cycle capability_events log (prune/split/merge/verification_rollback/distribution_shift), enabling per-type op counts in the longitudinal analyzer. All four indexed by (run_id, condition) or (event_type). Idempotent `ALTER TABLE IF NOT EXISTS` migrations for backward compat (Step 14.6 output-contract columns, Step 18.5 additions). | M1, M3, M4, M5, M6. | ALIGNED + IMPROVEMENT. Tables 2/3/4 are additive and not explicit in proposal but required to satisfy M3/M4/M6 post-hoc. |
+
+### 3.4 `src/registry/metrics.py`, `src/registry/store.py`
+
+Covered in `04_pillar_3_granularity_optimizer.md` §3.3. Relevant to Evaluation Strategy because `MetricsStore.record_invocation` is the operational write target that `tests/evaluation/cycle_flush.py::flush_task_cycle_state` drains into `invocation_events` + `cycle_utility_scores` + `cycle_events` after every task. NEUTRAL for this audit.
+
+### 3.5 `src/schemas/` (other files)
+
+| File | Role | Maps to | Alignment |
+|---|---|---|---|
+| `capability.py`, `task.py`, `verification.py`, `metrics.py`, `optimizer_config.py` | Pillar 1/2/3 state types. Peripheral for Evaluation Strategy. | — | NEUTRAL. |
+
+### 3.6 `src/orchestrator/output_contract_resolver.py` — STEP 14.6 (ORTHOGONAL TO M1)
+
+| File | Role | Maps to | Alignment |
+|---|---|---|---|
+| `output_contract_resolver.py` | `resolve_output_contract(task_prompt, task_definition=task)` — inspects the task's authored `OutputContract` (typed `required_keys: set[str]` + `required_files: set[str]`) and returns it to the harness for `TaskState.output_contract` propagation. The contract is checked at compositional-chain completion (`CompositionalExecutor`) and single-artifact path (`_extract_result`); result is recorded on `EvaluationRecord.output_shape_mismatch` + `output_shape_missing_keys` + `output_shape_missing_files`. This axis is deliberately **orthogonal to M1**: a run can pass `output_in_range` (validator-level value correctness) but fail the contract check (shape correctness), or vice versa. | IMPROVEMENT — adds *shape verification* as a two-axis companion to the proposal's value-correctness M1. | IMPROVEMENT. Disclosed in `CLAUDE.md` §Structured State Communication at three granularities (Task-level = Step 14.6). |
+
+### 3.7 `src/orchestrator/pipeline.py` and other orchestrator files
+
+Pipeline wiring for Pillar 1 (see `02_pillar_1_jit_pipeline.md`). Relevant here only because `create_pipeline(run_optimizer=..., verification_enabled=...)` is the dispatcher that realizes the `full` / `no_verification` / `no_optimization` baseline conditions through exactly those two flags. NEUTRAL for Evaluation Strategy claims per se.
+
+### 3.8 `src/verification/` (all 8 files)
+
+Pillar 2 surface (see `03_pillar_2_verification.md`). Relevant here only because the `no_verification` condition sets `verification_enabled=False` to bypass `gate.verify`. NEUTRAL.
+
+### 3.9 `src/optimizer/` (4 files)
+
+Pillar 3 surface (see `04_pillar_3_granularity_optimizer.md`). Relevant here:
+- `utility.py::compute_all_utilities(registry, metrics_store)` is called by the evaluation harness's cycle flush helper (`tests/evaluation/cycle_flush.py`) to snapshot utility scores into `cycle_utility_scores` after every task (M6 substrate).
+- `loop.py::_compute_kl_divergence` is the exact formula mirrored in `scripts/analyze_longitudinal.py::_kl_divergence_between_snapshots` — post-hoc analyzer computes the SAME KL as the online optimizer.
+- `simulation.py::compare_baselines()` provides synthetic-data visualization for RQ1 comparison (orthogonal to the real 4-condition baseline comparison).
+
+NEUTRAL for Evaluation Strategy; cross-referenced for M6.
+
+### 3.10 `src/cli/` (4 files)
+
+| File | Role | Maps to | Alignment |
+|---|---|---|---|
+| `app.py`, `runner.py` | User-facing `mint` CLI; writes per-run verification sidecars (`data/mint_output/<cap_name>_<ts>.verification.json`) — ad-hoc free-form task entry point, NOT the eval harness. `mint feedback --wrong` records wrong-output invocations for Pillar 3 split feedback (§12 finding #6b). | Orthogonal user surface. | NEUTRAL for Evaluation Strategy — the testbed eval uses `scripts/run_pilot.py` → `EvaluationHarness`, not the CLI. |
+| `display.py`, `settings.py` | Rich UX + config I/O. | — | NEUTRAL. |
+
+### 3.11 `src/mcp_tools/fibonacci.py`
+
+Reference hand-built MCP tool. Used only as a sanity check for `sandbox_execute`. NEUTRAL.
+
+### 3.12 `src/config.py`
+
+| File | Role | Maps to | Alignment |
+|---|---|---|---|
+| `config.py` | Centralized constants: `DEFAULT_LLM_MODEL="openai:gpt-5-mini"` (env `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env `JIT_SANDBOX_IMAGE`), `FILE_SIZE_LIMIT_BYTES`, `BINARY_EXTENSIONS`, `AUTO_OPTIMIZER_THRESHOLD=20`. No eval-specific constants — they live in `scripts/run_pilot.py` + `tests/evaluation/harness.py::HarnessConfig`. | Infrastructure. | NEUTRAL. |
+
+### 3.13 `scripts/` (21 files) — THE EVALUATION DRIVERS
+
+| File | Role | Maps to | Alignment |
+|---|---|---|---|
+| `run_pilot.py` (220 LOC) | Primary evaluation runner. CLI flags: `--condition {full,no_verification,no_optimization,static}` (default `full`), `--all-tasks` (20 tasks), `--all-conditions` (run all 4), `--tasks IDS` (explicit task list), `--n-runs N` (default 1 for pilot; module docstring says *"use 8 for full eval"* but proposal figure 4×20×5=400 aligns with `--n-runs 5`). Constructs `HarnessConfig` with fixed `chroma_dir=data/eval/chroma`, `mcp_tools_dir=src/mcp_tools`, `skills_dir=data/eval/skills`, `db_path=data/eval/metrics.duckdb`, `base_seed=42`. LangFuse callback handler wired when env vars are present. Calls `harness.prepare()` once, then per-condition `run_pilot()` or `run_condition()` loops. Prints per-condition summary + final cross-condition summary. Final `langfuse.flush()` before exit. | 4 baselines primary driver. | ALIGNED — literal mapping from proposal's 4 conditions to `ALL_CONDITIONS` list + `argparse choices`. Minor operational note: default `--n-runs=1` is pilot-sized; proposal's 5 runs requires explicit flag. |
+| `analyze_results.py` (~850 LOC) | Primary Chapter 6 analyzer. Produces: **(M1)** `query_condition_summary` + `binom_ci` (Clopper-Pearson 95% CI) + `fisher_exact_2x2` + `holm_bonferroni` correction — per-task, per-condition Fisher vs static baseline, with multiple-comparisons correction, disaggregated into retrieval (T01–T03) vs synthesis (T04–T20). **(M3)** `_gini_coefficient(counts)` — O(n log n), formula `(2·Σ (i+1)·x_i) / (n·Σx) − (n+1)/n`; `print_gini_summary` reports per-condition mean/stdev Gini + aggregate across all runs. **(M4)** `print_token_cost_summary` — reads `evaluation_runs.token_cost` (backfilled from LangFuse by `backfill_token_costs.py`), per-condition total + avg per JIT task. **Failure breakdown** via `query_failure_breakdown` — count by (condition, failure_reason). **Core-Work Classification Accuracy** (additive, Pillar 1 RQ #1) — `print_classification_accuracy` with 3×3 confusion matrix + per-expected-type row accuracy, JIT conditions only (excludes `static`). | M1, M3, M4, plus additive Core-Work Classification Accuracy. | ALIGNED + IMPROVEMENT (Fisher + Holm + Classification Accuracy are additive; proposal requires only the raw success rate). |
+| `backfill_token_costs.py` (655 LOC) | LangFuse → DuckDB token-cost attribution. Reads `/api/public/observations?type=GENERATION` from LangFuse, maps generation traces to `evaluation_runs` rows by timestamp overlap (±120s buffer) and/or explicit `run_id` tag. Attribution: `static` = 0 tokens (no LLM); `longitudinal` = total_tokens / n_tasks (all tasks run pipeline); eval `full` / `no_verification` / `no_optimization` = total_tokens / n_jit_tasks (retrieval tasks T01–T03 treated as 0-cost). Writes back to `evaluation_runs.token_cost`; also exports CSV `token_costs_per_run.csv`. Covers proposal M4's *"total tokens ... including capability definitions, generation, verification, and execution"* via the LangFuse aggregate, with the scope note that retrieval tasks bypass JIT and static bypasses LLM entirely. | M4 primary instrumentation. | ALIGNED. Infrastructure piece; not in proposal but required because token cost is post-hoc attributable rather than pipeline-time recordable (the harness itself doesn't know token usage because generation happens inside LangGraph nodes that don't thread totals back). |
+| `analyze_longitudinal.py` (772 LOC) | Longitudinal / convergence analyzer (Pillar 3 RQ #1/#2/#3). Proposal-literal KL on `cycle_utility_scores` (mirrors `src/optimizer/loop.py::_compute_kl_divergence`). Convergence: first cycle where consecutive-snapshot KL stays below `--threshold` (default 0.05) for `--min-consecutive` (default 3) cycles — this is **M6**. Also outputs convergence curve CSV + optional PNG; per-type operation counts from `cycle_events`; Gini trajectory per cycle; seeded-vs-evolved Gini delta (Pillar 3 RQ #1); Step 18.8 extensions: `_detect_shift_point` + `_classify_adaptation` three-tier verdict (*"graceful"* ≤2×, *"sluggish"* 2×–5×, *"collapse"* >5× or never) for distribution-shift adaptation. Graceful fallback to invocation-count KL on legacy DBs via `_table_exists()` check. | M6 + Pillar 3 RQ #1/#2/#3 (see `04_pillar_3_granularity_optimizer.md`). | ALIGNED (literal KL) + IMPROVEMENT (shift adaptation + seeded-vs-evolved Gini beyond proposal). |
+| `run_longitudinal.py` (311 LOC) | 40-task sequential protocol on a shared registry + metrics store. Writes to `data/eval/longitudinal.duckdb`. Uses `tests/evaluation/cycle_flush.py::flush_task_cycle_state` after each task (Step 18.7 wiring). Analyzed by `analyze_longitudinal.py` for M6. Not an ablation; uses `BaselineCondition.LONGITUDINAL`. | M6 empirical substrate. | IMPROVEMENT — not in proposal; necessary substrate for M6. |
+| `run_longitudinal_shift.py` (432 LOC) | Two-phase longitudinal with `--shift-at` boundary + `--phase-a-tasks` / `--phase-b-tasks` / `--total`. Writes `distribution_shift` event to `cycle_events` at the boundary. | Pillar 3 RQ #3 (distribution-shift stability). | IMPROVEMENT (Step 18.8); moved out of Chapter 7 future work. |
+| `analyze_context_utilization.py` | Measures per-DeepAgent peak context consumption (max input_tokens across GENERATION observations per trace / 128k context window) from existing LangFuse traces. Summary table by agent type + optional per-trace detail, CSV export. | Auxiliary — adjacent to M4 but distinct (measures *context fill* not *total tokens*). | IMPROVEMENT — not in proposal; supports §Context economy tension discussion. |
+| `migrate_business_domain_labels.py` | One-off migration for the evolutionary taxonomy (Step 3.5f). NOT evaluation-related. | — | NEUTRAL. |
+| `validate_contract_extractor.py` | Unit validation for Step 14.6 `resolve_output_contract`. NOT evaluation per se. | — | NEUTRAL. |
+| `step10_merge_candidates.py` | Pillar 3 diagnostic (see `04_pillar_3_granularity_optimizer.md`). | — | NEUTRAL for Evaluation Strategy. |
+| `test_prune.py`, `test_split_merge.py`, `test_auto_optimizer.py`, `test_feedback_split.py` | Pillar 3 integration tests (see `04_pillar_3_granularity_optimizer.md`). | — | NEUTRAL. |
+| `test_registry_matching.py` | Pillar 1 diagnostic (registry 9-outcome classification). | — | NEUTRAL. |
+| `test_verification.py` | Pillar 2 integration test (three-tier gate on good/bad artifacts). | — | NEUTRAL. |
+| `test_pipeline.py`, `test_mint.py`, `test_execution_backends.py`, `test_cli_settings.py` | Pipeline / CLI / backend smoke tests. | — | NEUTRAL. |
+| `analyze_results.py` (covered above) | — | — | — |
+
+**Verdict on scripts.** The four primary analyzers (`run_pilot.py`, `analyze_results.py`, `backfill_token_costs.py`, `analyze_longitudinal.py`) cover M1, M3, M4, and M6 literally. The two longitudinal runners (`run_longitudinal.py`, `run_longitudinal_shift.py`) extend the eval beyond the proposal's ablation-only framing into Pillar 3 RQ #2/#3. No script explicitly computes M5 (time to first correct) or M2 (mock contamination); see §4 findings #10, #11.
+
+### 3.14 `tools/` (2 files)
+
+| File | Role | Maps to | Alignment |
+|---|---|---|---|
+| `quick_validate.py` | Structural SKILL.md validation (Pillar 2 Tier 0 pre-check). Not evaluation-driver per se; runs during pipeline. | — | NEUTRAL for Evaluation Strategy. |
+| `init_skill.py` | Scaffolds a new SKILL directory. Author-facing. | — | NEUTRAL. |
+
+### 3.15 `tests/evaluation/` (cross-referenced, not in audit scope but ALL evaluation claims live here)
+
+| File | Role | Maps to | Alignment |
+|---|---|---|---|
+| `tasks.py` (1263 LOC) | 20 `TaskDefinition` frozen dataclass instances T01–T20. Type distribution: **8 MCP_TOOL** (T01/T02/T03/T05/T06/T07/T09/T18 — deterministic), **6 SKILL** (T04/T11/T12/T14/T15/T20 — policy-driven), **6 AGENT** (T08/T10/T13/T16/T17/T19 — adaptive). Tier distribution: 3 trivial (T01/T02/T03), 5 moderate (T05/T06/T07/T18/T19/T20), 12 complex (T04/T08/T09/T10/T11/T12/T13/T14/T15/T16/T17). Each task carries: `task_prompt`, `fixture_paths`, `validator` (deterministic ground-truth checker), `file_validator` (for file-writing tasks), `output_contract` (Step 14.6 typed shape), `has_static_coverage` flag + `static_capability_name` (for the `static` baseline), `is_pilot` flag. `_EXPECTED_TYPES` dict retrofitted via `object.__setattr__` at import — 20/20 populated. `ALL_TASKS = [T01..T20]`, `PILOT_TASKS = [T01, T07, T05]`. | Testbed (Option B) literal realization. | ALIGNED. |
+| `harness.py` (1414 LOC) | `EvaluationHarness` orchestrator. `prepare()` → snapshot once. `run_condition(condition, tasks)` runs `n_runs` iterations with per-iteration random seed + task shuffle; `run_pilot(tasks, condition)` is single-run convenience. Per-run: `restore_clean_snapshot()` → fresh `SkillRegistry` + `seed_registry()` → fresh `MetricsStore` → per-task `_run_one_task()` → `record_run()` to `EvaluationStore` → `flush_task_cycle_state()` drains per-cycle state. `_run_one_task` dispatches: `static` → `_run_static` → `_run_static_implementation(task_id, fixture_paths)` (6 hand-written Python implementations: `_static_t01/02/03/05/09/19`); else → `_run_jit(task, condition, ...)` → builds pipeline with `run_optimizer = condition == "full"` and `verification_enabled = condition != "no_verification"`, invokes it, extracts results via `_extract_result()` (single-artifact path) or `_extract_result_compositional()` (multi-step chain). | 4 baselines + per-run isolation + 400-record eval infrastructure. | ALIGNED. |
+| `execution.py` (1208 LOC) | Three backend dispatchers — `execute_mcp_tool_in_chain`, `execute_skill_artifact`, `execute_agent_artifact` — the runtime substrate for the three capability types. Each produces output the harness's validator compares against ground truth (M1). | M1 execution substrate. | ALIGNED. |
+| `snapshots.py` (125 LOC) | `take_clean_snapshot()` (once before eval) → SHA-256 hash of `chroma_dir` + `mcp_tools_dir` + `skills_dir` → writes `meta.json`. `restore_clean_snapshot()` (before every run) → `shutil.copytree` restore from snapshot. ID is deterministic and reproducible. | Per-run isolation substrate. | IMPROVEMENT — not in proposal but required for valid per-run independence. |
+| `cycle_flush.py` | `flush_task_cycle_state()` helper — drains `MetricsStore`'s in-memory per-run invocations + `compute_all_utilities(registry, metrics_store)` output into `EvaluationStore.invocation_events` + `cycle_utility_scores` + `cycle_events`. Called after every task by both `harness.py` and `run_longitudinal.py`. | M3, M6 substrate. | IMPROVEMENT. |
+
+---
+
+## 4. Full findings table
+
+Findings scored against the proposal's Testbed / 4 Baselines / 6 Metrics. Column **Status**: `✅` aligned; `✅+` improved; `➕` additive feature beyond proposal; `⚠️` partial / disclosed divergence; `ℹ️` disclosed scope note.
+
+| # | Area | Proposal wording | Implementation | Status | Where | Note |
+|---|---|---|---|---|---|---|
+| 1 | Testbed choice | Option A (Factory Sim) or Option B (Business Analytics) | Option B chosen — 20 data-pipeline tasks with heterogeneous capability types (8 MCP_TOOL / 6 SKILL / 6 AGENT) | ✅ | `tests/evaluation/tasks.py` + `CLAUDE.md` §Testbed | Rationale: Option B naturally produces diverse capability types, whereas factory sim would collapse to mostly-AGENT scheduling. |
+| 2 | Baseline `static` | *"A fixed, hand-curated library with no JIT generation"* | `_run_static()` routes to 6 hand-written Python functions (`_static_t01/02/03/05/09/19`) via registry lookup on `task.static_capability_name`; pipeline is not invoked | ✅ | `tests/evaluation/harness.py::_run_static` + `_run_static_implementation` | 6 of 20 tasks have static coverage — `static` condition reports no-match for the other 14 (realistic ceiling for a human-designed library that hasn't seen these tasks). |
+| 3 | Baseline `no_verification` | *"The generation pipeline (Pillar 1) runs without the verification layer (Pillar 2). Measures how much verification actually contributes"* | `verification_enabled = condition != "no_verification"` → `create_pipeline(verification_enabled=False)` → gate's `_verify_inner` returns a fail-open `VerificationReport` with `overall_passed=True` | ✅ | `tests/evaluation/harness.py::_run_jit` line 438 + `src/verification/gate.py` | Literal realization via a single flag. |
+| 4 | Baseline `no_optimization` | *"Pillars 1 + 2 run, but generated capabilities accumulate at whatever granularity they were born with. Measures whether evolutionary pressure matters"* | `run_optimizer = condition == "full"` → `create_pipeline(run_optimizer=False)` → optimizer subgraph not wired after loading_node | ✅ | `tests/evaluation/harness.py::_run_jit` line 438 + `src/orchestrator/pipeline.py` | Literal. |
+| 5 | Baseline `full` | *"All three pillars active"* | Default condition: `run_optimizer=True`, `verification_enabled=True` | ✅ | `tests/evaluation/harness.py::_run_jit` + `src/orchestrator/pipeline.py::create_pipeline` | Literal. |
+| 6 | 5th condition `longitudinal` | (not in proposal) | `BaselineCondition.LONGITUDINAL` enum value; used only by `run_longitudinal.py` / `run_longitudinal_shift.py`. Analyzer filters it out of ablation tables. | ➕ | `src/schemas/evaluation.py` lines 17–34 + `scripts/run_longitudinal.py` | IMPROVEMENT — substrate for Pillar 3 RQ #2/#3. Explicitly not an ablation. |
+| 7 | M1 End-to-end task success rate | *"Does the system actually solve the tasks?"* | `EvaluationRecord.success = gate_passed AND output_in_range` (two-axis). `analyze_results.py::query_condition_summary` reports counts + Clopper-Pearson 95% binomial CI + Fisher's exact test vs static (per task) + Holm-Bonferroni correction. Disaggregated into retrieval (T01–T03) vs synthesis (T04–T20). | ✅+ | `src/schemas/evaluation.py::EvaluationRecord.success` + `scripts/analyze_results.py::binom_ci` / `fisher_exact_2x2` / `holm_bonferroni` | Literal M1 + additive statistical rigor. |
+| 8 | M2 Mock contamination rate — manual audit | *"What fraction of generated capabilities contain hardcoded/fabricated elements? (Measured by manual audit of a sample.)"* | `HumanLabel` StrEnum (CORRECT / CONTAMINATED / PARTIAL) + `EvaluationRecord.human_label` field + `evaluation_runs.human_label` column. No harness auto-labelling. No analyzer currently reads `human_label`. | ⚠️ | `src/schemas/evaluation.py` lines 65–70, 225–227 + `src/registry/evaluation_store.py` line 41 | PARTIAL. Proposal says *"manual audit of a sample"* which is consistent with the field-only approach, but (a) no audit has been performed, (b) no analyzer reads the column, (c) there is no documented sampling protocol. See §5 and §7. |
+| 9 | M3 Capability reuse distribution (Gini) | *"Gini coefficient of invocation counts across the registry"* | `_gini_coefficient(counts: dict[str,int])` — O(n log n), formula `(2·Σ (i+1)·x_i) / (n·Σx) − (n+1)/n`. `print_gini_summary()` reports per-condition mean + stdev Gini + aggregate. Source: `invocation_events` table (per-capability per-task log, Step 18.5). | ✅ | `scripts/analyze_results.py::_gini_coefficient` + `print_gini_summary` + `src/registry/evaluation_store.py::invocation_events` table | Literal. |
+| 10 | M4 Token cost per task | *"Total tokens consumed including capability definitions, generation, verification, and execution"* | `evaluation_runs.token_cost` column; populated post-hoc by `scripts/backfill_token_costs.py` which reads LangFuse GENERATION observations and attributes per-run totals. `analyze_results.py::print_token_cost_summary` aggregates per condition. Scope: covers generation + verification + execution tokens (all LLM calls the pipeline makes); definition-string size (schema size for MCP tools, instruction size for Skills) is NOT separately tracked — it is absorbed into the per-invocation runtime cost via LangFuse input-token counts. | ✅ ℹ️ | `scripts/backfill_token_costs.py` + `scripts/analyze_results.py::print_token_cost_summary` | SCOPE NOTE: see §5 for disclosure of the runtime-vs-definition framing (same note as Pillar 3 §M3 Token cost — the two audits agree). Retrieval tasks T01–T03 = 0 tokens (no JIT); static condition = 0 tokens. |
+| 11 | M5 Time to first correct execution | *"Latency from task input to verified correct output, including any JIT generation time"* | `EvaluationRecord.attempt_latency_ms` — total wall-clock for the entire `_run_one_task()` invocation, including all retries (decomposition + classification + generation + verification loops + compositional execution). **NOT broken out per-attempt**; there is no `first_correct_at_attempt_n` field; no instrumentation of WHEN during the retry loop the first valid output was produced. | ⚠️ | `tests/evaluation/harness.py` line 344 + `src/schemas/evaluation.py::EvaluationRecord.attempt_latency_ms` | PARTIAL. Total wall-clock is a weak proxy — it conflates successful runs that produced a correct output on attempt #1 with ones that produced it on attempt #3. For successful runs the number equals time-to-first-correct; for failed runs the number is wall-time-until-give-up, which is NOT what the proposal asks for. See §5 and §7. |
+| 12 | M6 Registry convergence (KL) | *"Number of cycles until the granularity distribution stabilizes (measured by KL divergence between consecutive registry snapshots)"* | **Primary:** `analyze_longitudinal.py::_kl_divergence_between_snapshots` on `cycle_utility_scores` snapshots — mirrors `src/optimizer/loop.py::_compute_kl_divergence` exactly (same formula, same numeric stabilization). Convergence = first cycle where consecutive-snapshot KL stays below `--threshold` (default 0.05) for `--min-consecutive` (default 3) cycles. **Fallback:** invocation-count KL on legacy DBs via `_table_exists()` check. **Sensitivity:** histogram-based KL in `src/optimizer/simulation.py` for visualization. | ✅ | `scripts/analyze_longitudinal.py` + `src/optimizer/loop.py::_compute_kl_divergence` + `src/registry/evaluation_store.py::cycle_utility_scores` table | Literal. Primary metric is proposal-literal (utility-score KL); thesis Chapter 6 must declare it primary. Fully cross-referenced in `04_pillar_3_granularity_optimizer.md` §RQ2. |
+| 13 | Number of runs per condition | (not explicit, proposal implies 5 via 4×20×5=400 framing) | `HarnessConfig.n_runs` (default 1 for pilot); `run_pilot.py` docstring says `--n-runs 5` for full eval. CLAUDE.md anchors the target at 5 runs → 400 records. | ✅ ℹ️ | `scripts/run_pilot.py` line 12 + line 79 default + `CLAUDE.md` §Testbed | Default is pilot-sized; full eval requires explicit `--n-runs 5` flag. |
+| 14 | Snapshot isolation per run | (not in proposal) | `take_clean_snapshot()` once before eval — SHA-256 hash of chroma + mcp_tools + skills dirs. `restore_clean_snapshot()` before every run — `shutil.copytree` overwrite. Identity verifiable via `registry_snapshot_id` on every `EvaluationRecord`. | ➕ | `tests/evaluation/snapshots.py` | IMPROVEMENT. Necessary for valid per-run independence. All four conditions start from the SAME snapshot; differences are purely pipeline-routing, not initial-state artifacts. |
+| 15 | Per-run seed + task shuffle | (not in proposal) | `HarnessConfig.base_seed=42`; per-iteration seed derived from base_seed + run_index; `rng.shuffle(tasks)` per run. `EvaluationRecord.seed` records the per-run seed for reproducibility. | ➕ | `tests/evaluation/harness.py` lines 177–179 + `src/schemas/evaluation.py::EvaluationRecord.seed` | IMPROVEMENT. Task-ordering variance is a legitimate nuisance variable the harness actively randomizes across. |
+| 16 | Output contract check (Step 14.6) | (not in proposal; orthogonal to M1) | `EvaluationRecord.output_shape_mismatch` + `output_shape_missing_keys` + `output_shape_missing_files`. Check is pure set-comparison against `task.output_contract.required_keys` + `required_files`. Realized by `CompositionalExecutor` / `_extract_result` at chain completion; CLI exit code 3 on mismatch. | ➕ | `src/schemas/evaluation.py` lines 184–216 + `src/orchestrator/output_contract_resolver.py` + `CLAUDE.md` §Structured State Communication | IMPROVEMENT. Adds a *shape verification axis* orthogonal to `output_in_range` (value verification). A run can satisfy one axis and fail the other — particularly exposes LLM shape-drift in AGENT runs where the structured-output response_format is loose. |
+| 17 | Classification accuracy (Pillar 1 RQ #1) | (not in proposal §Evaluation; proposal §Pillar 1 RQ #1 asks the question without prescribing the metric) | `print_classification_accuracy` — task-level expected (`TaskDefinition.expected_type`) vs classified (`EvaluationRecord.capability_type` primary type in chain) with 3×3 confusion matrix + per-expected-type row accuracy + overall accuracy. JIT conditions only (excludes `static`). | ➕ | `scripts/analyze_results.py::print_classification_accuracy` + `tests/evaluation/tasks.py::_EXPECTED_TYPES` | IMPROVEMENT (Step 18.5). Operational proxy for Pillar 1 RQ #1; four-reason framing preserved in code docstring (purpose is correct routing; per-gap ground truth undefined; structural overrides contaminate per-gap; per-task is proposal's natural granularity). |
+| 18 | Distribution-shift evaluation (Pillar 3 RQ #3) | (proposal §Pillar 3 RQ #3 asks the question; §Evaluation is silent on operationalization) | `run_longitudinal_shift.py` (phased runner with `--phase-a-tasks` / `--phase-b-tasks` / `--shift-at` / `--total`) writes `distribution_shift` event to `cycle_events` at the boundary. `analyze_longitudinal.py::_detect_shift_point` + `_classify_adaptation` three-tier verdict (*"graceful"* ≤2×, *"sluggish"* 2×–5×, *"collapse"* >5× or never). | ➕ | `scripts/run_longitudinal_shift.py` + `scripts/analyze_longitudinal.py` | IMPROVEMENT (Step 18.8). Moves Pillar 3 RQ #3 out of Chapter 7 future work into pre-eval scope. |
+| 19 | Failure reason breakdown | (not in proposal) | 8-value `FailureReason` enum: NONE, GENERATION_FAILED, TIER1, TIER2, TIER3, OUTPUT_REJECTED, NO_SOURCE_CODE, CHAIN_STEP_FAILED, AGENT_EXECUTION_TIMEOUT, AGENT_EXECUTION_ERROR. `query_failure_breakdown` reports count by (condition, failure_reason). | ➕ | `src/schemas/evaluation.py::FailureReason` + `scripts/analyze_results.py::query_failure_breakdown` | IMPROVEMENT. Necessary for Chapter 6 diagnostic tables. |
+| 20 | Registry accumulation within a run | (proposal implies cross-task registry reuse) | Registry persists WITHIN a run (tasks in the same run can reuse capabilities generated by earlier tasks); resets BETWEEN runs (snapshot restore). | ✅ | `tests/evaluation/harness.py` lines 242, 252–263 | Supports proposal's implicit *"self-developing"* framing — a system that only ever generated fresh capabilities on every task would not be self-developing. |
+| 21 | Pilot subset | (not in proposal) | `PILOT_TASKS = [T01, T07, T05]`; `is_pilot=True` flag on records; `run_pilot()` convenience method. Pilot records excluded from primary metrics. | ➕ | `tests/evaluation/tasks.py` line 1255 + `src/schemas/evaluation.py::EvaluationRecord.is_pilot` | IMPROVEMENT. Calibration runs for cost-controlled iteration. |
+| 22 | Manual human_label field | (proposal M2 prescribes manual audit) | `HumanLabel` enum + `EvaluationRecord.human_label` column. Ready for Iteration 6 manual audit pass. | ⚠️ | `src/schemas/evaluation.py` + `src/registry/evaluation_store.py` | FIELD EXISTS, AUDIT NOT YET PERFORMED. See finding #8 and §7. |
+| 23 | LangFuse tracing integration | (not in proposal) | `CallbackHandler` piped through `config={"callbacks": [langfuse_handler]}` in pipeline.invoke. Per-task tags: run_id, task_id, condition, tier, file_formats. Session ID = run_id. | ➕ | `scripts/run_pilot.py` lines 114–121 + `tests/evaluation/harness.py` lines 459–473 | IMPROVEMENT. Observability substrate; required for M4 post-hoc backfill. |
+| 24 | Statistical rigor (binomial CI + Fisher + Holm) | (not in proposal) | Clopper-Pearson 95% binomial CI; Fisher's exact test (per-task vs static); Holm-Bonferroni multiple-comparisons correction. | ➕ | `scripts/analyze_results.py::binom_ci` / `fisher_exact_2x2` / `holm_bonferroni` | IMPROVEMENT. Proposal asks for success rate; implementation computes it with statistical rigor appropriate to thesis-level reporting. |
+
+---
+
+## 5. Deliberate divergences — summary
+
+The implementation diverges from the proposal's literal wording in exactly two places. Both are disclosed, neither is silent drift.
+
+| Divergence | Proposal wording | Implementation | Why | Disclosure |
+|---|---|---|---|---|
+| **M2 Mock contamination rate** | *"What fraction of generated capabilities contain hardcoded/fabricated elements? (Measured by manual audit of a sample.)"* | `HumanLabel` enum and `human_label` column are defined on `EvaluationRecord` / `evaluation_runs`. No auto-instrumentation; no analyzer currently reads the column; no documented sampling protocol; no audit has been performed. | The proposal explicitly scopes M2 to *manual audit of a sample*, so a column that is only populated post-hoc by an analyst is consistent with the prescribed methodology. The gap is operational: the audit pass hasn't been performed yet, and there is no code that either prompts the analyst or reads their labels downstream. Chapter 6 must either (a) perform the audit and populate the column before reporting M2, or (b) disclose that M2 is deferred. **Recommended pre-eval step** (~2–3h): add `print_contamination_rate(conn)` to `analyze_results.py` with a graceful *"no human labels populated"* fallback; establish a documented sampling protocol (e.g., stratified random sample of 30 capabilities per condition, analyst labels via CLI prompt). | `src/schemas/evaluation.py` lines 65–70, 225–227; this audit §7 item #1. |
+| **M5 Time to first correct execution** | *"Latency from task input to verified correct output, including any JIT generation time"* | `attempt_latency_ms` is total wall-clock across *all* retries (decomposition + classification + generation + verification + compositional execution). Not broken out per-attempt; no `first_correct_at_attempt_n` field; no instrumentation of WHEN the first correct output was produced during the retry loop. | For successful runs the total wall-clock equals time-to-first-correct (there was exactly one correct attempt and the run ended). For runs with retries before success, the total includes the wasted retries. For unsuccessful runs, the number is wall-time-until-give-up — not what the proposal asks for. The current metric is a strict *upper bound* on time-to-first-correct for successful runs, and uninformative for unsuccessful runs. **Recommended pre-eval step** (~2–3h): add `first_correct_latency_ms` to `EvaluationRecord`, instrument in `_extract_result` / `verification_node` to record the cumulative elapsed ms at the first successful verification gate, set to `None` on unsuccessful runs. This would move M5 from PARTIAL to ALIGNED. | `tests/evaluation/harness.py` line 344; this audit §7 item #2. |
+
+Additive pieces that extend the proposal without diverging from it: snapshot isolation (`tests/evaluation/snapshots.py`), per-run seed + task shuffle, output contract check (Step 14.6), classification accuracy metric (Step 18.5), distribution-shift verdict (Step 18.8), longitudinal sequencing condition, LangFuse tracing, Clopper-Pearson binomial CI + Fisher's exact + Holm-Bonferroni multiple-comparisons correction, 8-value failure reason breakdown. None contradict the proposal; all strengthen the realization of the 4 baselines + 6 metrics.
+
+---
+
+## 6. Metric instrumentation — proposal-to-code map
+
+| Metric | Proposal wording | Instrumentation path |
+|---|---|---|
+| **M1 End-to-end task success rate** | *"Does the system actually solve the tasks?"* | **Per-record:** `EvaluationRecord.success = gate_passed AND output_in_range`. `output_in_range` computed by `TaskDefinition.validator(output)` OR `file_validator(output, output_files)`. **Aggregation:** `scripts/analyze_results.py::query_condition_summary` + `binom_ci` (Clopper-Pearson 95% CI) + `fisher_exact_2x2` (vs static) + `holm_bonferroni` (multiple-comparisons correction). Disaggregated into retrieval (T01–T03) vs synthesis (T04–T20). |
+| **M2 Mock contamination rate** | *"What fraction of generated capabilities contain hardcoded/fabricated elements? (Measured by manual audit of a sample.)"* | **Field:** `EvaluationRecord.human_label` (HumanLabel enum: CORRECT / CONTAMINATED / PARTIAL). **Column:** `evaluation_runs.human_label VARCHAR` nullable. **Protocol:** Iteration 6 manual audit pass; not yet performed. **Reader:** none — `analyze_results.py` does not currently reference `human_label`. ⚠️ |
+| **M3 Capability reuse distribution (Gini)** | *"Gini coefficient of invocation counts across the registry"* | **Per-invocation log:** `invocation_events` table (run_id, condition, task_id, capability_id, capability_type, success, token_cost, latency_ms, occurred_at), flushed after every task by `tests/evaluation/cycle_flush.py::flush_task_cycle_state`. **Computation:** `scripts/analyze_results.py::_gini_coefficient(counts)` — O(n log n), formula `(2·Σ (i+1)·x_i) / (n·Σx) − (n+1)/n`. **Reporting:** `print_gini_summary()` — per-condition mean + stdev + aggregate across all runs. |
+| **M4 Token cost per task** | *"Total tokens consumed including capability definitions, generation, verification, and execution"* | **Source:** LangFuse GENERATION observations (all LLM calls tagged with run_id). **Backfill:** `scripts/backfill_token_costs.py` — maps generations to runs by timestamp overlap or explicit tag, attributes totals to `evaluation_runs.token_cost`. **Attribution rules:** static = 0 tokens (no LLM); longitudinal = total / n_tasks (all tasks hit pipeline); `full` / `no_verification` / `no_optimization` = total / n_jit_tasks (retrieval T01–T03 skip JIT → 0 tokens attributed, synthesis tasks split the remainder). **Reporting:** `analyze_results.py::print_token_cost_summary` — per-condition total + avg per JIT task. |
+| **M5 Time to first correct execution** | *"Latency from task input to verified correct output, including any JIT generation time"* | **Current surface:** `EvaluationRecord.attempt_latency_ms` — total wall-clock from `_run_one_task` start to return. **Semantic gap:** conflates successful runs on attempt #1 with successful runs on attempt #3; uninformative for unsuccessful runs. ⚠️ See §5 for proposed fix. |
+| **M6 Registry convergence (KL divergence)** | *"Number of cycles until the granularity distribution stabilizes (measured by KL divergence between consecutive registry snapshots)"* | **Per-cycle snapshot:** `cycle_utility_scores` table — per-task utility-score snapshot per capability (U(c) = α·reuse·success − β·token_cost − γ·maintenance), flushed by `flush_task_cycle_state` via `src/optimizer/utility.py::compute_all_utilities`. **Computation:** `scripts/analyze_longitudinal.py::_kl_divergence_between_snapshots` mirrors `src/optimizer/loop.py::_compute_kl_divergence` — same formula (KL with ε-smoothing + shift-to-non-negative + normalization). **Convergence detection:** first cycle where consecutive-snapshot KL stays below `--threshold` (default 0.05) for `--min-consecutive` (default 3) cycles. **Reporting:** cycles-to-convergence scalar + convergence curve CSV + optional PNG + per-type op counts from `cycle_events`. |
+
+---
+
+## 7. Loose ends / honest gaps
+
+| Gap | Severity | Notes |
+|---|---|---|
+| **M2 mock contamination rate has no audit, no reader** | Medium | The `human_label` column exists; no harness auto-populates it; no analyzer reads it. Chapter 6 will report M2 as *"deferred to post-audit analysis"* unless the audit is performed before the 400-record eval concludes. **Recommended pre-eval step** (~2–3h): (a) add `print_contamination_rate(conn, sample_size=30)` to `analyze_results.py` with a graceful empty-column fallback; (b) document the sampling protocol (stratified random 30 per condition); (c) add CLI helper to drive analyst labelling against `evaluation_runs` rows. Without this, M2 cannot be reported in Chapter 6. |
+| **M5 time-to-first-correct is proxied by total wall-clock** | Medium | `attempt_latency_ms` is an upper bound for successful runs and uninformative for unsuccessful runs — not the proposal-literal quantity. **Recommended pre-eval step** (~2–3h): add `first_correct_latency_ms` to `EvaluationRecord` + column migration + instrumentation in `verification_node` to record cumulative elapsed ms at first successful gate pass (None for unsuccessful runs). Moves M5 from ⚠️ to ✅. |
+| **Default `--n-runs=1` vs eval target of 5** | Low (operational) | `run_pilot.py` defaults to 1 run (pilot); proposal-aligned 400-record eval is `--n-runs 5 --all-tasks --all-conditions`. Docstring line 12 names it; CLAUDE.md anchors it. Not a correctness gap — just a default for quick iteration. Chapter 6 reporting commands must pass `--n-runs 5`. |
+| **Static condition covers 6/20 tasks** | Low (expected) | Only T01, T02, T03, T05, T09, T19 have `has_static_coverage=True`. The other 14 tasks return a no-match failure under `static` — realistic ceiling for a human-designed library, not a bug. Disclosed in §3.15. |
+| **Token cost at "definition" granularity not separately tracked** | Low (same scope note as Pillar 3 M3) | Proposal M4 says *"including capability definitions"* which could be read as *the schema/instruction text loaded into the prompt*. Implementation absorbs this into LangFuse input-token counts per invocation. Same scope note as the Pillar 3 audit's M3 Token cost divergence. Chapter 5 / 6 should disclose once. |
+| **LONGITUDINAL is a 5th condition, not an ablation** | Disclosure needed | `BaselineCondition` enum has 5 values; analyzers MUST filter by condition explicitly when computing per-baseline metrics (docstring on `BaselineCondition` already calls this out, `analyze_results.py::CONDITIONS` hardcodes the 4-ablation list). Chapter 6 prose must not confuse the reader — the four ablations are what the proposal asks for; the 5th condition serves Pillar 3 RQ #2/#3 and is reported separately in the longitudinal analyzer. |
+| **Pilot subset excluded from primary metrics** | Disclosure needed | `is_pilot=True` records must be filtered out of Chapter 6 tables. `analyze_results.py` currently does not filter by `is_pilot`; if pilot runs share the same `data/eval/metrics.duckdb`, they will contaminate primary metrics. **Recommended pre-eval step** (~30 min): add `WHERE is_pilot=FALSE` filter to all `query_*` functions in `analyze_results.py`, OR document that pilot runs must use a separate DB path. |
+| **No mock contamination rate instrumented via adversarial probing** | N/A (different axis) | Tier 3 adversarial probing is an *artifact-level* check (per capability, at generation time). M2 is a *sample-level* reporting metric aggregated across the eval. These are orthogonal: even with 100% Tier-3-passing artifacts, a manual audit might find some with plausible-but-wrong output patterns. M2 is not a Tier 3 output. |
+
+---
+
+## 8. Citations
+
+- `docs/thesis_proposal.md` §Evaluation Strategy lines 200–229 — source of the claims audited.
+- `docs/MASTER_PLAN_2026_04_13.md` Step 14.6 (OutputContract — orthogonal shape-verification axis), Step 18.5 (Gini + Core-Work Classification Accuracy + `invocation_events` table), Step 18.7 (utility-score KL longitudinal analyzer + `cycle_utility_scores` + `cycle_events`), Step 18.8 (distribution-shift script + adaptation verdict).
+- `docs/MASTER_PLAN_2026_04_13.md` §12 findings #6b (feedback-driven split), #8 (per-op optimizer config), #10/#11/#12 (structured state communication at three granularities), #13 (multi-file writers parallel), #14/#15/#16 (three-layer strict-gate pattern), #17 (T16 prompt + AGENT symptom-bias disclosure).
+- `CLAUDE.md` §Testbed (Option B chosen; 20 tasks; 4 baseline conditions; 5 runs each = 400 records; balanced spread across MCP_TOOL / SKILL / AGENT; task definitions in `tests/evaluation/tasks.py`).
+- `CLAUDE.md` §Three Distinct Execution Backends (MCP_TOOL sandbox no-LLM / SKILL constrained LLM / AGENT full DeepAgent — the substrate for per-task success adjudication).
+- `CLAUDE.md` §Three-layer strict-gate pattern (exit codes 2 / 5 / 4 for decomposition / classification / verification layers; sticky flags).
+- `MEMORY.md` §Step 18.5 / 18.7 / 18.8 summaries; §Current State 2026-04-17.
+- Prior audits in the same series: `docs/verification/01_bootstrapping_problem.md`, `docs/verification/02_pillar_1_jit_pipeline.md`, `docs/verification/03_pillar_2_verification.md`, `docs/verification/04_pillar_3_granularity_optimizer.md`.
