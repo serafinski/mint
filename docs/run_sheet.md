@@ -4,7 +4,7 @@ At-a-glance command sequence for the thesis evaluation pipeline (Phase 3 smoke �
 
 **Source of truth:** `docs/MASTER_PLAN_2026_04_13.md` §6.1. This file is the distilled run sheet — if anything here disagrees with the master plan, the plan wins.
 
-**Last updated:** 2026-04-19 (after Step 13.6 Parts A+B+C+D + gap closure (registry FN audit) + nice-to-have #1 (Tier 2 probe breakdown)).
+**Last updated:** 2026-04-19 (after Step 13.6 Parts A+B+C+D + gap closure (registry FN audit) + nice-to-have #1 (Tier 2 probe breakdown) + **Step 13.5 full test-suite audit + cleanup**: all 1,578 audited tests resolved to 100% KEEP; +46 net new tests via coverage closures; 0 WEAK / 0 DUPLICATE / 0 SUSPICIOUS remaining).
 
 ---
 
@@ -16,7 +16,7 @@ At-a-glance command sequence for the thesis evaluation pipeline (Phase 3 smoke �
 | `.env` populated | `OPENAI_API_KEY` + `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` + `LANGFUSE_HOST` |
 | Live internet | `test_allow_network.py` hits `api.github.com/zen`; skips cleanly if offline |
 | `uv` installed, repo checked out | All commands run via `uv run …` from repo root |
-| **Step 13.5 test hygiene pass done** | Master plan blocker for Phase 3 smoke — do this first (~2–3 h) |
+| ~~**Step 13.5 test hygiene pass done**~~ | ✅ **DONE 2026-04-19** — full 1,578-test audit + cleanup pass completed. 0 WEAK / 0 DUPLICATE / 0 SUSPICIOUS. No remaining pre-eval blocker. |
 
 ---
 
@@ -26,7 +26,7 @@ Run sequentially; each gate must pass before the next. If any fails, **stop** an
 
 | # | Command | Why | Time |
 |---|---|---|---:|
-| 1 | `uv run pytest tests/unit/ -q` | Hermetic baseline — 1547 unit tests. Must be 100% pass. | ~3 min |
+| 1 | `uv run pytest tests/unit/ -q` | Hermetic baseline — **1,600 unit tests** (post-Step-13.5 cleanup). Must be 100% pass. | ~3 min |
 | 2 | `uv run scripts/test_pipeline.py` | Pillar 1 pipeline e2e (decompose → classify → generate → verify → register), real LLM | ~5 min |
 | 3 | `uv run scripts/test_verification.py` | Pillar 2 three-tier gate (Tier 1 / 1.5 / 2 / 3) on known-good + known-bad, real Docker + real adversarial | ~3 min |
 | 4 | `uv run scripts/test_allow_network.py` | Pillar 2 Tier 2 network-disconnect differential; `--network bridge` vs `--network none` Docker plumbing (Step 14.12) | ~2 min |
@@ -97,8 +97,13 @@ Not on the main path. Call these to debug a specific regression.
 
 ## Outstanding pre-eval work (per master plan TBD)
 
-- **Step 13.5** — Test suite hygiene pass (~2–3 h). Blocks Phase 3 smoke.
-- That's it. Step 13.6 (scripts hygiene + Part D schedule update), Step 13.7 (LangFuse audit), and all analyzer scripts are closed as of 2026-04-19.
+**Nothing.** All pre-eval blockers closed as of 2026-04-19:
+- Step 13.5 (test suite hygiene) ✅ — full audit + cleanup done this session
+- Step 13.6 (scripts hygiene + Part D schedule update) ✅
+- Step 13.7 (LangFuse audit) ✅
+- All analyzer scripts ✅
+
+**Phase 3 smoke is immediately runnable.** Step 18 (the 400-record eval) runs once Phase 3 smoke passes.
 
 ---
 
