@@ -167,14 +167,59 @@ class TestBuildExecutionOrder:
         assert order.index(1) < order.index(3)
         assert order.index(2) < order.index(3)
 
-    def test_cycle_falls_back_to_linear(self):
+    def test_cycle_fails_closed(self):
+        """Security audit finding #12 (2026-04-20): cycles return None
+        (fail-closed) instead of silently linearising. Pre-fix code
+        reported ``chain_success=True`` on what was actually a malformed
+        plan — now callers must handle None as a chain-fatal error."""
         subtasks = [
             _make_subtask("step 0", ["a"], depends_on=[1]),
             _make_subtask("step 1", ["b"], depends_on=[0]),
         ]
         ex = self._executor(subtasks)
-        order = ex.build_execution_order()
-        assert order == [0, 1]
+        assert ex.build_execution_order() is None
+
+    def test_out_of_range_depends_on_fails_closed(self):
+        """Reporter's repro: ``depends_on=[99]`` pre-fix hit IndexError
+        downstream. Post-fix build_execution_order returns None loudly."""
+        subtasks = [
+            _make_subtask("step 0", ["a"]),
+            _make_subtask("step 1", ["b"], depends_on=[99]),
+        ]
+        ex = self._executor(subtasks)
+        assert ex.build_execution_order() is None
+
+    def test_negative_depends_on_fails_closed(self):
+        """Reporter's repro: ``depends_on=[-1]`` pre-fix phantom-executed
+        the last subtask. Post-fix negative indices fail closed."""
+        subtasks = [
+            _make_subtask("step 0", ["a"]),
+            _make_subtask("step 1", ["b"], depends_on=[-1]),
+        ]
+        ex = self._executor(subtasks)
+        assert ex.build_execution_order() is None
+
+    def test_self_loop_fails_closed(self):
+        subtasks = [
+            _make_subtask("step 0", ["a"]),
+            _make_subtask("step 1", ["b"], depends_on=[1]),  # self-reference
+        ]
+        ex = self._executor(subtasks)
+        assert ex.build_execution_order() is None
+
+    def test_run_on_invalid_dag_returns_chain_failure(self):
+        """End-to-end: run() with a cyclic DAG must return a
+        chain_success=False ChainResult with a descriptive reason —
+        not silently succeed via the old linear-fallback path."""
+        subtasks = [
+            _make_subtask("step 0", ["a"], depends_on=[1]),
+            _make_subtask("step 1", ["b"], depends_on=[0]),
+        ]
+        ex = self._executor(subtasks)
+        result = ex.run()
+        assert result.chain_success is False
+        assert result.failed_step_reason is not None
+        assert "DAG" in result.failed_step_reason or "cycle" in result.failed_step_reason.lower()
 
     def test_no_dependencies_preserves_all(self):
         subtasks = [
@@ -1540,3 +1585,64 @@ class TestRecordStepInvocationPopulatesFields:
         # Row has NULL input_args → get_recent_failures filters it out.
         failures = metrics.get_recent_failures("thing-doer")
         assert len(failures) == 0
+
+
+class TestMatchToArtifactAgentConfigNormalization:
+    """Security audit finding #9 (2026-04-19): registry metadata stores
+    ``agent_config`` as a JSON string (ChromaDB primitives-only
+    constraint), but ``GeneratedArtifact.agent_config`` is typed
+    ``dict | None``. Pre-fix ``_match_to_artifact`` passed the string
+    straight into the schema constructor, crashing with Pydantic
+    ``ValidationError`` on every registry-matched AGENT row — zero-
+    biasing AGENT reuse telemetry through the compositional path.
+    Post-fix uses the shared ``decode_agent_config_metadata`` helper.
+    """
+
+    def _make_match(self, meta: dict) -> MatchItem:
+        cap = CapabilityDescriptor(
+            name="registry-agent",
+            description="registry agent",
+            capability_type=CapabilityType.AGENT,
+            metadata=meta,
+        )
+        return MatchItem(capability=cap, score=0.9)
+
+    def test_json_string_agent_config_decoded_to_dict(self):
+        match = self._make_match({
+            "agent_config": '{"system_prompt": "you are a helper", "skills": []}'
+        })
+        ref = CapabilityReference(
+            source="registry", capability_name="registry-agent",
+            capability_type=CapabilityType.AGENT,
+        )
+
+        artifact = CompositionalExecutor._match_to_artifact(match, ref)
+
+        assert isinstance(artifact.agent_config, dict)
+        assert artifact.agent_config["system_prompt"] == "you are a helper"
+
+    def test_malformed_json_falls_back_to_none(self):
+        """Malformed JSON → agent_config=None. Better than crashing the
+        chain with ValidationError."""
+        match = self._make_match({
+            "agent_config": "{this is not valid json",
+        })
+        ref = CapabilityReference(
+            source="registry", capability_name="registry-agent",
+            capability_type=CapabilityType.AGENT,
+        )
+
+        artifact = CompositionalExecutor._match_to_artifact(match, ref)
+
+        assert artifact.agent_config is None
+
+    def test_missing_agent_config_stays_none(self):
+        match = self._make_match({})
+        ref = CapabilityReference(
+            source="registry", capability_name="registry-agent",
+            capability_type=CapabilityType.AGENT,
+        )
+
+        artifact = CompositionalExecutor._match_to_artifact(match, ref)
+
+        assert artifact.agent_config is None

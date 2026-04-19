@@ -170,6 +170,214 @@ class TestExtractFunctionName:
 
 
 # ---------------------------------------------------------------------------
+# Security audit finding #8 — decorator-aware entrypoint selection (2026-04-19)
+# ---------------------------------------------------------------------------
+
+
+class TestFindMcpToolFunction:
+    """Decorator-aware selection — the FastMCP ``@mcp.tool`` decorator is
+    the only unambiguous signal identifying the tool entrypoint. Pre-fix
+    call sites used ordering heuristics (``dir()`` alphabetical or
+    ``ast.walk`` source order) that picked the wrong function when a
+    helper was defined before the decorated entrypoint.
+    """
+
+    def test_helper_first_then_decorated_entrypoint(self):
+        """Reporter's repro: helper defined first in source, decorated
+        entrypoint second. Pre-fix picked ``helper_format_rows``; post-fix
+        must pick the decorated ``summarize_sales``."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+async def helper_format_rows(rows):
+    return [str(r) for r in rows]
+
+@mcp.tool()
+async def summarize_sales(data):
+    return {"total": sum(data)}
+"""
+        assert _find_mcp_tool_function(src) == "summarize_sales"
+
+    def test_entrypoint_first_then_helper(self):
+        """Same pair in reversed source order — decorator wins regardless."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+@mcp.tool()
+async def summarize_sales(data):
+    return {"total": sum(data)}
+
+async def helper_format_rows(rows):
+    return [str(r) for r in rows]
+"""
+        assert _find_mcp_tool_function(src) == "summarize_sales"
+
+    def test_alphabetical_before_decorator_selects_decorated(self):
+        """``apple_helper`` alphabetically first, ``zebra_tool`` decorated.
+        Regression guard for the ToolLoader ``dir()`` alphabetical bug."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+async def apple_helper():
+    return 1
+
+@mcp.tool()
+async def zebra_tool():
+    return 2
+"""
+        assert _find_mcp_tool_function(src) == "zebra_tool"
+
+    def test_bare_decorator_accepted(self):
+        """``@mcp.tool`` without call parens — must still match."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+@mcp.tool
+async def the_tool():
+    return 1
+"""
+        assert _find_mcp_tool_function(src) == "the_tool"
+
+    def test_ignores_unrelated_decorators(self):
+        """``@lru_cache``, ``@contextmanager`` etc. must not match."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+@lru_cache(maxsize=32)
+async def cached_helper():
+    return 1
+
+@mcp.tool()
+async def the_tool():
+    return 2
+"""
+        assert _find_mcp_tool_function(src) == "the_tool"
+
+    def test_no_decorator_returns_none(self):
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+async def undecorated():
+    return 1
+"""
+        assert _find_mcp_tool_function(src) is None
+
+    def test_multiple_decorated_ambiguous_returns_none(self):
+        """Two ``@mcp.tool`` functions — caller must surface as a failure,
+        not silently pick one."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+@mcp.tool()
+async def first():
+    return 1
+
+@mcp.tool()
+async def second():
+    return 2
+"""
+        assert _find_mcp_tool_function(src) is None
+
+    def test_nested_async_def_not_selected(self):
+        """Nested ``async def`` inside a helper must not count — only
+        top-level public async defs are considered."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+async def outer():
+    @mcp.tool()
+    async def inner():
+        return 1
+    return inner
+
+@mcp.tool()
+async def real_tool():
+    return 2
+"""
+        assert _find_mcp_tool_function(src) == "real_tool"
+
+    def test_private_decorated_ignored(self):
+        """Leading-underscore functions are private by convention and
+        must be skipped even if decorated."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+@mcp.tool()
+async def _private_tool():
+    return 1
+
+@mcp.tool()
+async def public_tool():
+    return 2
+"""
+        assert _find_mcp_tool_function(src) == "public_tool"
+
+    def test_parse_error_returns_none(self):
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        assert _find_mcp_tool_function("async def broken(:") is None
+
+
+class TestExtractFunctionNameFallbackChain:
+    """``_extract_function_name`` is the backwards-compatible entrypoint
+    that every MCP-tool caller already uses. Post-fix it resolves via a
+    fallback chain: decorator-first, then single-public-async with a
+    warning, then None for ambiguous cases."""
+
+    def test_decorator_takes_precedence_over_source_order(self):
+        """Pre-fix picked helper (first in source); post-fix picks decorated."""
+        src = """
+async def helper_format_rows(rows):
+    return rows
+
+@mcp.tool()
+async def summarize_sales(data):
+    return {}
+"""
+        assert _extract_function_name(src) == "summarize_sales"
+
+    def test_legacy_single_async_fallback_emits_warning(self, caplog):
+        """Legacy artifacts without @mcp.tool — fall back with a WARNING."""
+        import logging
+
+        src = """
+async def legacy_tool(x):
+    return x
+"""
+        with caplog.at_level(logging.WARNING, logger="src.verification.behavioral"):
+            result = _extract_function_name(src)
+        assert result == "legacy_tool"
+        assert any(
+            "no @mcp.tool-decorated function" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_ambiguous_no_decorator_multiple_public_returns_none(self):
+        """Two undecorated public async defs — cannot pick one safely."""
+        src = """
+async def first():
+    return 1
+
+async def second():
+    return 2
+"""
+        assert _extract_function_name(src) is None
+
+    def test_ambiguous_multiple_decorated_returns_none(self):
+        """Two decorated functions — caller must fail verification."""
+        src = """
+@mcp.tool()
+async def first():
+    return 1
+
+@mcp.tool()
+async def second():
+    return 2
+"""
+        assert _extract_function_name(src) is None
+
+
+# ---------------------------------------------------------------------------
 # Input generators
 # ---------------------------------------------------------------------------
 

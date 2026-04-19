@@ -93,34 +93,25 @@ def loading_node(
     ]
 
     registered = 0
-    host_loadable = 0
+    # Security audit finding #1 (2026-04-19): pre-fix, this node called
+    # ``loader.load_tool(artifact)`` which invoked ``spec.loader.exec_module``
+    # in the current Python process — executing arbitrary top-level code
+    # from LLM-generated source on the host, AFTER the three-tier gate had
+    # signed off. The Docker-based gate (Tier 1.5 / Tier 2 / Tier 3) already
+    # covers import + behavioural + adversarial checks in the sandbox; the
+    # host import was a duplicate smoke test and the only host-execution
+    # path for generated code. Removing it aligns the code with the
+    # CLAUDE.md claim that MCP tools are "loaded via importlib dynamic
+    # import in a sandboxed subprocess" and with the Pillar-2 trust
+    # boundary the thesis claims. Finding #5's two ``dir()`` alphabetical-
+    # selection sites in ``ToolLoader.load_tool`` / ``execute_tool`` are
+    # simultaneously rendered unreachable from production flow; those
+    # methods remain in ``tool_loader.py`` for the unit tests that
+    # exercise them directly, marked as non-production paths.
     for artifact in mcp_artifacts:
-        # --- Load (host importlib) ---
-        loaded = None
-        try:
-            loaded = loader.load_tool(artifact)
-            host_loadable += 1
-        except Exception as exc:  # noqa: BLE001
-            # Host import failed (e.g., missing pandas/numpy). The tool can
-            # still be executed in the Docker sandbox which installs deps
-            # dynamically. Register it with source_code so it's reusable.
-            logger.warning(
-                "Host import failed for '%s': %s (registering with source_code only)",
-                artifact.capability_name,
-                exc,
-            )
-
-        # --- Smoke-test (only if host-loadable) ---
-        if loaded is not None:
-            smoke = loader.execute_tool(loaded, inputs={})
-            if not smoke.success:
-                logger.warning(
-                    "Smoke-test failed for tool '%s' (will still register): %s",
-                    artifact.capability_name,
-                    smoke.error,
-                )
-
-        # --- Register (always, regardless of host loadability) ---
+        # --- Register (source_code is what downstream execution reads;
+        # no host-side import or smoke test is needed — the sandbox is
+        # the only execution path). ---
         try:
             loader.register_tool(artifact, registry)
             registered += 1
@@ -263,11 +254,10 @@ def loading_node(
     else:
         status = TaskStatus.COMPLETED
         logger.info(
-            "Loading complete: %d/%d MCP tools registered (%d host-loadable), "
+            "Loading complete: %d/%d MCP tools registered, "
             "%d skill/agent artifacts on disk, %d new errors",
             registered,
             len(mcp_artifacts),
-            host_loadable,
             len(non_mcp_artifacts),
             new_errors,
         )

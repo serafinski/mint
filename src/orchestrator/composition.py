@@ -174,13 +174,49 @@ class CompositionalExecutor:
     # DAG construction
     # ------------------------------------------------------------------
 
-    def build_execution_order(self) -> list[int]:
+    def build_execution_order(self) -> list[int] | None:
         """Return subtask indices in topological (dependency) order.
 
-        Falls back to linear index order on ``CycleError``.
+        Security audit finding #12 (2026-04-20): fail-closed on invalid
+        DAGs rather than silently falling back to linear order or letting
+        out-of-range ``depends_on`` indices crash the execution loop.
+        Returns ``None`` on:
+
+        - **Out-of-range index**: any ``depends_on`` value outside
+          ``0 <= idx < len(subtasks)`` (reporter's repros: ``[99]`` →
+          IndexError, ``[-1]`` → phantom execution of the last subtask).
+        - **Self-loop**: a subtask depending on itself.
+        - **Cycle**: ``graphlib.CycleError`` from the topological sort.
+
+        Callers must treat ``None`` as a chain-fatal error and record a
+        descriptive ``failed_step_reason`` — the old "fall back to linear
+        order on CycleError" path silently linearised cycles and reported
+        ``chain_success=True`` on what was actually a malformed plan.
         """
-        if len(self.subtasks) <= 1:
-            return list(range(len(self.subtasks)))
+        n = len(self.subtasks)
+        if n <= 1:
+            return list(range(n))
+
+        # Bounds + self-loop validation BEFORE topological sort. graphlib
+        # accepts nonexistent predecessors silently (they become
+        # no-predecessor nodes) which is the root cause of the phantom-
+        # execution bug.
+        for i, st in enumerate(self.subtasks):
+            for dep in st.depends_on:
+                if not (0 <= dep < n):
+                    logger.error(
+                        "Subtask %d has out-of-range depends_on index %d "
+                        "(valid range: 0..%d). Failing chain closed.",
+                        i, dep, n - 1,
+                    )
+                    return None
+                if dep == i:
+                    logger.error(
+                        "Subtask %d depends on itself (self-loop). "
+                        "Failing chain closed.",
+                        i,
+                    )
+                    return None
 
         graph: dict[int, set[int]] = {}
         for i, st in enumerate(self.subtasks):
@@ -189,11 +225,14 @@ class CompositionalExecutor:
         try:
             sorter = graphlib.TopologicalSorter(graph)
             return list(sorter.static_order())
-        except graphlib.CycleError:
-            logger.warning(
-                "Cycle detected in subtask dependencies; falling back to linear order"
+        except graphlib.CycleError as exc:
+            logger.error(
+                "Cycle detected in subtask dependencies: %s. "
+                "Failing chain closed (no linear-order fallback). "
+                "Security audit finding #12.",
+                exc,
             )
-            return list(range(len(self.subtasks)))
+            return None
 
     # ------------------------------------------------------------------
     # Workspace management
@@ -357,14 +396,25 @@ class CompositionalExecutor:
 
     @staticmethod
     def _match_to_artifact(match: MatchItem, ref: CapabilityReference) -> GeneratedArtifact:
-        """Reconstruct a ``GeneratedArtifact`` proxy from a registry match."""
+        """Reconstruct a ``GeneratedArtifact`` proxy from a registry match.
+
+        Security audit finding #9 (2026-04-19): pre-fix this handed the
+        raw ``agent_config`` string from ChromaDB metadata straight into
+        the schema constructor, which crashes with ``ValidationError`` on
+        every registry-matched AGENT row. Now uses the shared
+        ``decode_agent_config_metadata`` helper so composition, CLI
+        registry-match, and store snapshot construction all follow one
+        policy.
+        """
+        from src.schemas.task import decode_agent_config_metadata
+
         meta = getattr(match.capability, "metadata", {}) or {}
         return GeneratedArtifact(
             capability_name=ref.capability_name,
             capability_type=ref.capability_type,
             source_code=meta.get("source_code"),
             skill_content=meta.get("skill_content"),
-            agent_config=meta.get("agent_config"),
+            agent_config=decode_agent_config_metadata(meta.get("agent_config")),
             description=getattr(match.capability, "description", None),
             generated_at=datetime.now(UTC),
         )
@@ -645,6 +695,24 @@ class CompositionalExecutor:
         """
         execution_order = self.build_execution_order()
 
+        # Security audit finding #12 (2026-04-20): None means the DAG is
+        # malformed (cycle, out-of-range depends_on, self-loop). Fail
+        # closed with a descriptive reason — the pre-fix code silently
+        # linearised cycles and reported chain_success=True.
+        if execution_order is None:
+            return ChainResult(
+                chain_length=max(1, len(self.subtasks)),
+                chain_success=False,
+                step_results=[],
+                failed_step_index=None,
+                failed_step_name=None,
+                failed_step_reason=(
+                    "Invalid compositional DAG — cycle, self-loop, or "
+                    "out-of-range depends_on index detected by "
+                    "build_execution_order. Chain failed closed per "
+                    "security audit finding #12."
+                ),
+            )
         if not execution_order:
             return ChainResult(
                 chain_length=1,

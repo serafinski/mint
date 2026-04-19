@@ -13,8 +13,31 @@ For deepagents CLI:
  init_skill.py my-skill --path ~/.deepagents/agent/skills
 """
 
+import re
 import sys
 from pathlib import Path
+
+# Whitelist matching the DeepAgents skill naming policy enforced by
+# ``tools/quick_validate.py``: hyphen-case, lowercase letters + digits
+# + hyphens, 1-64 chars, must start with a letter. Security audit finding
+# #2 (2026-04-19) — an unvalidated ``skill_name`` joined with the base
+# path allows ``..`` path-traversal at ``mkdir`` time, creating the
+# skill directory above ``--path``.
+_SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+
+
+def _validate_skill_name(skill_name: str) -> None:
+    """Raise ValueError if ``skill_name`` violates the hyphen-case policy.
+
+    Matches the constraint advertised in CLAUDE.md's DeepAgents Skill
+    Ecosystem section and enforced by ``tools/quick_validate.py``. Keeps
+    the two tools in sync.
+    """
+    if not _SKILL_NAME_RE.fullmatch(skill_name):
+        raise ValueError(
+            f"Invalid skill_name {skill_name!r}: must be hyphen-case "
+            "(lowercase letters, digits, hyphens; 1-64 chars; lead with a letter)."
+        )
 
 SKILL_TEMPLATE = """---
 name: {skill_name}
@@ -200,14 +223,33 @@ def init_skill(skill_name, path):
     """Initialize a new skill directory with template SKILL.md.
 
     Args:
-        skill_name: Name of the skill
-        path: Path where the skill directory should be created
+        skill_name: Name of the skill. Must match the hyphen-case policy
+            enforced by ``_validate_skill_name``. ``..`` and other
+            path-separator sequences are rejected.
+        path: Path where the skill directory should be created.
 
     Returns:
-        Path to created skill directory, or None if error
+        Path to created skill directory, or None if error.
+
+    Raises:
+        ValueError: When ``skill_name`` fails policy validation or the
+            resolved skill directory would escape ``path``. Surfacing the
+            error before any filesystem writes closes the security audit
+            finding #2 path-traversal vector.
     """
-    # Determine skill directory path
-    skill_dir = Path(path).resolve() / skill_name
+    # Layer 1: policy check — cheap, catches typos and the common case.
+    _validate_skill_name(skill_name)
+
+    # Layer 2: containment check — defends against exotic inputs that
+    # slip the regex (future policy relaxation, unicode trickery, etc.).
+    # ``is_relative_to`` returns False when the resolved target escapes
+    # ``base`` via ``..`` components that Path.resolve() normalises.
+    base = Path(path).resolve()
+    skill_dir = (base / skill_name).resolve()
+    if not skill_dir.is_relative_to(base):
+        raise ValueError(
+            f"Resolved skill directory {skill_dir} is not under --path {base}."
+        )
 
     # Check if directory already exists
     if skill_dir.exists():
@@ -299,7 +341,17 @@ def main():
     print(f"   Location: {path}")
     print()
 
-    result = init_skill(skill_name, path)
+    try:
+        result = init_skill(skill_name, path)
+    except ValueError as exc:
+        print(f"❌ Error: {exc}")
+        print()
+        print("Skill name requirements:")
+        print(" - Hyphen-case identifier (e.g., 'data-analyzer')")
+        print(" - Lowercase letters, digits, and hyphens only")
+        print(" - Max 64 characters")
+        print(" - Must start with a letter")
+        sys.exit(1)
 
     if result:
         sys.exit(0)

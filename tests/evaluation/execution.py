@@ -915,7 +915,10 @@ asyncio.run(_run())
                 "Chain MCP_TOOL %s raised: %s", capability_name, str(parsed["error"])[:500]
             )
             return {}
-        return parsed.get("result", {}) or {}
+        # Security audit finding #11 (2026-04-19): preserve falsy / non-dict
+        # results via the shared helper.
+        from src.cli.output_coerce import extract_tool_result
+        return extract_tool_result(parsed)
     except (json.JSONDecodeError, KeyError, IndexError):
         logger.warning("Chain MCP_TOOL output parse failed for %s", capability_name)
         return {}

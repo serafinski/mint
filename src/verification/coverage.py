@@ -223,9 +223,15 @@ def _build_replay_code(
             try:
                 result = await {func_name}(**_kwargs)
                 # Serialize the result to JSON for comparison with the
-                # parent's recorded ``actual_output``. Use default=str to
-                # handle any non-JSON-serializable objects cleanly.
-                print(json.dumps({{"result": json.dumps(result, default=str), "error": None}}))
+                # parent's recorded ``actual_output``. Security audit
+                # finding #15 (2026-04-20): ``sort_keys=True`` MUST match
+                # ``serialize_for_invocation``'s policy at the parent
+                # side — pre-fix the asymmetry caused semantically-
+                # identical dicts (same data, different Python iteration
+                # order) to string-compare unequal, which
+                # ``_variant_handles_case`` then reported as handled=True
+                # (false-positive split coverage).
+                print(json.dumps({{"result": json.dumps(result, default=str, sort_keys=True), "error": None}}))
             except Exception as exc:
                 print(json.dumps({{
                     "result": None,
@@ -288,6 +294,29 @@ def _variant_handles_case(
         return False, (
             f"failure case task_id='{failure.task_id}' has no input_args "
             "(pre-Step-4 record or never captured)"
+        )
+
+    # Security audit finding #16 (2026-04-20): detect the truncation
+    # sentinel emitted by ``serialize_for_invocation`` on oversize
+    # payloads. Pre-fix the function emitted invalid JSON which
+    # ``json.loads`` inside the replay sandbox rejected with
+    # ``JSONDecodeError``, causing every truncated case to be silently
+    # counted as "not handled" regardless of variant behavior. Post-fix
+    # the sentinel is valid JSON; explicitly report the case as
+    # unreproducible so the CoverageReport's ``execution_errors`` list
+    # carries the accurate reason.
+    try:
+        parsed_args = json.loads(input_args_json)
+    except (json.JSONDecodeError, ValueError):
+        return False, (
+            f"failure case task_id='{failure.task_id}' has invalid JSON "
+            "in input_args (legacy truncation); case unreproducible"
+        )
+    if isinstance(parsed_args, dict) and parsed_args.get("__truncated__"):
+        size = parsed_args.get("__original_size_bytes__", "unknown")
+        return False, (
+            f"failure case task_id='{failure.task_id}' had input_args "
+            f"truncated (original size {size} bytes); case unreproducible"
         )
 
     # Resolve pip packages from the variant's declaration or via import
@@ -355,7 +384,14 @@ def _variant_handles_case(
         # Count as not handled (conservative).
         return False, None
 
-    if replay_result == parent_output:
+    # Security audit finding #15 (2026-04-20) defence-in-depth: compare
+    # parsed values, not strings. This closes key-order asymmetry (fixed
+    # at the source by the sort_keys=True addition above), whitespace
+    # differences, int-vs-float (``1`` vs ``1.0`` — ``==`` in Python
+    # returns True), and any future ``default=str`` drift between the
+    # parent and variant serialization paths. Falls back to string
+    # compare on parse failure so legacy rows still work.
+    if _semantic_equal(replay_result, parent_output):
         # Same output as the parent → variant didn't differentiate.
         # Not handled.
         return False, None
@@ -363,6 +399,18 @@ def _variant_handles_case(
     # Replay ran, produced output, and it differs from the parent's
     # recorded wrong-output. Failure mode is differentiated.
     return True, None
+
+
+def _semantic_equal(a: str, b: str) -> bool:
+    """True iff ``a`` and ``b`` parse as JSON to equal Python values.
+
+    Falls back to string equality if either side fails to parse —
+    preserves legacy behavior while fixing the key-order asymmetry.
+    """
+    try:
+        return json.loads(a) == json.loads(b)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return a == b
 
 
 # ---------------------------------------------------------------------------

@@ -343,6 +343,7 @@ class EvaluationStore:
         condition: str,
         task_id: str,
         scores: dict[str, float],
+        occurred_at: datetime | None = None,
     ) -> int:
         """Persist per-capability utility scores after one task cycle.
 
@@ -352,11 +353,17 @@ class EvaluationStore:
         proposal-aligned KL convergence analysis using the actual utility
         score distribution, not an invocation-count proxy.
 
+        ``occurred_at`` defaults to ``datetime.now(UTC)`` at insert time.
+        Tests that need deterministic per-cycle bucketing (security audit
+        finding #18: the analyzer buckets utility rows into cycles by
+        timestamp window) can pass an explicit value to ensure the row
+        lands in its intended cycle.
+
         Returns number of rows inserted; 0 on empty input.
         """
         if not scores:
             return 0
-        now = datetime.now(UTC)
+        now = occurred_at if occurred_at is not None else datetime.now(UTC)
         rows = [
             [
                 uuid.uuid4().hex,
@@ -387,6 +394,7 @@ class EvaluationStore:
         condition: str,
         task_id: str,
         events: list[dict],
+        occurred_at: datetime | None = None,
     ) -> int:
         """Persist a batch of capability_events for one task cycle.
 
@@ -401,11 +409,16 @@ class EvaluationStore:
         cycle in the Step 18.7 analyzer, replacing the active-cap-delta
         proxy.
 
+        ``occurred_at`` defaults to ``datetime.now(UTC)``. Tests that need
+        deterministic per-cycle bucketing can pass an explicit value —
+        the Step 18.7 analyzer buckets rows into cycles by timestamp
+        window (security audit finding #18).
+
         Returns number of rows inserted; 0 on empty input.
         """
         if not events:
             return 0
-        now = datetime.now(UTC)
+        now = occurred_at if occurred_at is not None else datetime.now(UTC)
         rows = []
         for ev in events:
             rows.append([

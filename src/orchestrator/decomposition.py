@@ -14,6 +14,7 @@ Operational boundaries (from CLAUDE.md):
 from __future__ import annotations
 
 import concurrent.futures
+import graphlib
 import logging
 from pathlib import Path
 from typing import Literal
@@ -151,6 +152,57 @@ def _collect_transitive_upstream_keys(
         queue.extend(predecessor.depends_on)
 
     return upstream_keys
+
+
+def _validate_depends_on_indices(subtasks: list[SubTask]) -> list[str]:
+    """Return a list of structural DAG violations in ``subtasks``.
+
+    Security audit finding #12 (2026-04-20), layer (A): the decomposition
+    LLM can emit ``depends_on`` values that reference non-existent or
+    cyclic predecessors. Pre-fix these passed through the chain-coherence
+    validator (which only checks ``requires_upstream_keys`` semantics)
+    and reached the execution-order builder, where they either crashed
+    (``[99]`` → IndexError at the run loop), phantom-executed
+    (``[-1]`` re-runs the last subtask), or silently linearised (cycle
+    → ``[0, 1, 2]`` ignoring the dependency). This validator catches
+    them at the decomposition layer so the §12 finding #15 strict-gate
+    pattern actually fires: violation → ``decomposition_succeeded=False``
+    → 3x retry → CLI exit 2 on exhaustion.
+
+    Checks:
+    - Every ``depends_on`` index ``dep`` must satisfy ``0 <= dep < len(subtasks)``.
+    - No subtask may depend on itself.
+    - The DAG must be acyclic (``graphlib.CycleError`` → violation).
+
+    Returns an empty list on clean DAGs.
+    """
+    violations: list[str] = []
+    n = len(subtasks)
+
+    for i, st in enumerate(subtasks):
+        for dep in st.depends_on:
+            if not isinstance(dep, int) or dep < 0 or dep >= n:
+                violations.append(
+                    f"Subtask {i} has out-of-range depends_on index "
+                    f"{dep!r} (valid range: 0..{n - 1})."
+                )
+            if dep == i:
+                violations.append(f"Subtask {i} depends on itself (self-loop).")
+
+    if violations:
+        # Cycle check is ill-defined when indices are already invalid.
+        return violations
+
+    try:
+        graph = {i: set(st.depends_on) for i, st in enumerate(subtasks)}
+        list(graphlib.TopologicalSorter(graph).static_order())
+    except graphlib.CycleError as exc:
+        violations.append(
+            f"Subtask dependency cycle detected: {exc.args}. "
+            "Chain cannot execute in any topological order."
+        )
+
+    return violations
 
 
 def _validate_chain_coherence(subtasks: list[SubTask]) -> list[str]:
@@ -695,6 +747,31 @@ def decomposition_node(
                     required_caps.extend(writer.required_capabilities)
                 subtasks = augmented
                 required_caps = list(dict.fromkeys(required_caps))
+
+        # Security audit finding #12 (2026-04-20), layer (A): validate
+        # the DAG's structural integrity BEFORE the semantic coherence
+        # check. Out-of-range depends_on indices and cycles are caught
+        # here so the §12 #15 decomposition strict-gate retry loop fires
+        # on malformed DAGs — pre-fix these reached the execution layer
+        # and phantom-executed / silently linearised. This mirrors the
+        # coherence-check pattern below: violations flip the sticky flag
+        # and emit a LangFuse event.
+        dag_violations = _validate_depends_on_indices(subtasks)
+        if dag_violations:
+            decomposition_succeeded = False
+            for violation in dag_violations:
+                errors.append(f"Invalid DAG: {violation}")
+                logger.warning("DecompositionAgent: %s", violation)
+            emit_langfuse_event(
+                langfuse_handler,
+                "decomposition.invalid_dag",
+                "ERROR",
+                {
+                    "violation_count": len(dag_violations),
+                    "violations": dag_violations,
+                    "subtask_count": len(subtasks),
+                },
+            )
 
         coherence_violations = _validate_chain_coherence(subtasks)
         if coherence_violations:

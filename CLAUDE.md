@@ -153,7 +153,7 @@ The evaluation testbed is the **Business Analytics Pipeline** — data ingestion
 
 ### MCP Tool Loading Strategy
 
-Generated MCP tools are loaded via `importlib` dynamic import in a sandboxed subprocess (`src/orchestrator/tool_loader.py`). **Not** persistent FastMCP server processes — no ports, health checks, or zombie process risk. Full MCP server deployment is Chapter 7 future work.
+Generated MCP tools are registered by reading `source_code` into the `SkillRegistry`; no host-side import or subprocess runs the generated code during loading. Execution happens exclusively through the Docker sandbox (`src/verification/sandbox_tool.py::sandbox_execute`) at CLI runtime (`src/cli/runner.py::_execute_mcp_tool`) and in the eval harness (`tests/evaluation/execution.py::execute_mcp_tool_in_chain`). The three-tier gate's Tier 1.5 / Tier 2 / Tier 3 also run generated code exclusively in Docker. `ToolLoader.load_tool` / `ToolLoader.execute_tool` in `src/orchestrator/tool_loader.py` remain for unit-test inspection only and are **not production paths** — security audit finding #1 (2026-04-19) removed them from `loading_node` because they ran `spec.loader.exec_module` on the host after the gate had signed off. **Not** persistent FastMCP server processes — no ports, health checks, or zombie process risk. Full MCP server deployment is Chapter 7 future work.
 
 ### Generated Skills Landing Path
 
@@ -215,6 +215,8 @@ The gate uses fail-fast tiering to avoid wasting tokens:
 | Pillar 1.1 decomposition | `src/orchestrator/decomposition.py` | `decomposition_succeeded` | `MAX_DECOMPOSITION_ATTEMPTS=3` | 2 |
 | Pillar 1.3 classification | `src/orchestrator/classifier.py::classify_gap` | `classification_succeeded` | `MAX_CLASSIFICATION_ATTEMPTS=3` | 5 |
 | Pillar 2 verification | `src/orchestrator/verification_node.py` | `verification_succeeded` | `MAX_ATTEMPTS=3` | 4 |
+| Task-level output contract | `src/orchestrator/output_contract_resolver.py` | `output_contract_matched` | — (single check) | 3 |
+| Execution (post-pipeline) — security audit #10 | `src/cli/runner.py::execute_task` | — (post-pipeline) | — (single attempt) | 6 |
 
 Each stage retries the LLM call up to N times. On exhaustion: flip the sticky flag, emit an ERROR-level LangFuse event, drop any partially-produced artifacts from state, allow the pipeline to continue to terminal state via the never-raises contract. The CLI runner detects the sticky flag and exits with a dedicated code so failure reasons are layer-specific. Pre-fix behaviour (single-attempt + silent fallback at decomposition; single-attempt + MCP_TOOL default at classification; 3x retry + fail-open at verification) let unverified / mis-classified / degraded artifacts through production — all three corrected to proposal-strict semantics. See master plan §12 findings #14/#15/#16 for full audit trails.
 

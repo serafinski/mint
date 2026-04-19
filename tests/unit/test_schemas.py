@@ -1407,3 +1407,48 @@ def test_chain_result_all_fields_roundtrip():
     assert len(roundtripped.step_timings) == 1
     assert roundtripped.step_timings[0].capability_name == "csv-parser"
     assert roundtripped.output_files == {"output.csv": b"col1,col2\n1,2\n"}
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #9 — decode_agent_config_metadata helper (2026-04-19)
+# ---------------------------------------------------------------------------
+
+
+class TestDecodeAgentConfigMetadata:
+    """Shared decoder used by composition, CLI registry-match, and store
+    snapshot construction. Ensures the three call sites agree on how to
+    unpack a ChromaDB-serialized agent_config back to a dict."""
+
+    def test_none_returns_none(self):
+        from src.schemas.task import decode_agent_config_metadata
+        assert decode_agent_config_metadata(None) is None
+
+    def test_empty_string_returns_none(self):
+        from src.schemas.task import decode_agent_config_metadata
+        assert decode_agent_config_metadata("") is None
+
+    def test_dict_passes_through(self):
+        from src.schemas.task import decode_agent_config_metadata
+        assert decode_agent_config_metadata({"a": 1}) == {"a": 1}
+
+    def test_valid_json_string_parsed(self):
+        from src.schemas.task import decode_agent_config_metadata
+        result = decode_agent_config_metadata(
+            '{"system_prompt": "hello", "skills": []}'
+        )
+        assert result == {"system_prompt": "hello", "skills": []}
+
+    def test_malformed_json_returns_none(self):
+        from src.schemas.task import decode_agent_config_metadata
+        assert decode_agent_config_metadata("{not valid json") is None
+
+    def test_json_non_dict_returns_none(self):
+        """``[1, 2, 3]`` parses as JSON but isn't a dict — reject."""
+        from src.schemas.task import decode_agent_config_metadata
+        assert decode_agent_config_metadata("[1, 2, 3]") is None
+        assert decode_agent_config_metadata('"bare string"') is None
+
+    def test_unexpected_type_returns_none(self):
+        from src.schemas.task import decode_agent_config_metadata
+        assert decode_agent_config_metadata(42) is None
+        assert decode_agent_config_metadata([1, 2]) is None

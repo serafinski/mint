@@ -31,7 +31,16 @@ from scipy import stats  # noqa: E402
 
 CONDITIONS = ["full", "no_verification", "no_optimization", "static"]
 RETRIEVAL_TASKS = {"T01", "T02", "T03"}
-ALL_TASK_IDS = [f"T{i:02d}" for i in range(1, 19)]
+
+# Security audit finding #17 (2026-04-20): pre-fix hard-coded
+# ``range(1, 19)`` silently dropped T19 and T20 from every per-task
+# table — both the only exploratory-AGENT task (T19) and the only
+# policy-SKILL task (T20), exactly the two tasks Chapter 6's per-type
+# analysis most depends on. Import from the single source of truth so
+# any future testbed extension flows through automatically.
+from tests.evaluation.tasks import ALL_TASKS  # noqa: E402
+
+ALL_TASK_IDS = [t.task_id for t in ALL_TASKS]
 SYNTHESIS_TASK_IDS = [t for t in ALL_TASK_IDS if t not in RETRIEVAL_TASKS]
 CONDITION_LABELS = {
     "static": "Static",

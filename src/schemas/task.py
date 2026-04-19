@@ -1,11 +1,46 @@
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.verification import VerificationReport
+
+
+def decode_agent_config_metadata(raw: Any) -> dict | None:
+    """Decode a ChromaDB-serialized ``agent_config`` back to a dict.
+
+    Registry metadata values must be primitives, so ``agent_config`` is
+    persisted as a JSON string by ``loading_node`` and ``seed_registry``.
+    Every call site that reconstructs a ``GeneratedArtifact`` proxy from
+    a registry row must run its ``agent_config`` through this decoder —
+    otherwise Pydantic's ``dict_type`` validator rejects the string and
+    reconstruction raises ``ValidationError``. Security audit finding #9
+    (2026-04-19): the compositional path's ``_match_to_artifact`` skipped
+    this step and crashed on every registry-matched AGENT artifact.
+
+    Accepted inputs:
+    - ``None`` / ``""`` → ``None``
+    - ``dict`` → returned unchanged (pre-serialized row)
+    - ``str`` of valid JSON that parses to a dict → parsed dict
+    - anything else (malformed JSON, non-dict JSON, unexpected type) →
+      ``None`` so callers can fail-soft rather than propagate a parse
+      error. Callers that want loud-fail semantics can check for
+      ``None`` when the raw input was truthy and emit their own error.
+    """
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        import json
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
 
 
 class TaskStatus(StrEnum):

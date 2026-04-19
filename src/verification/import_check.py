@@ -119,6 +119,27 @@ def _check_mcp_tool(
     if result.get("success", False):
         return []
 
+    # Security audit finding #6 (2026-04-19): when the sandbox dropped ALL
+    # pip requirements as malformed (PEP 508 parse failure), the result
+    # carries ``pip_requirement_rejected``. Surface as its own finding
+    # category so the Pillar 2 gate attributes the failure to the
+    # requirement string, not to ``import_error`` / ``wrong_pip_package``
+    # which would blame the source code or PyPI name.
+    rejected = result.get("pip_requirement_rejected")
+    if rejected:
+        return [
+            VerificationFinding(
+                tier=1,
+                category="pip_requirement_rejected",
+                severity=Severity.CRITICAL,
+                message=(
+                    "Generator declared pip requirements that failed PEP 508 "
+                    f"parsing: {rejected!r}. Sandbox did not attempt install."
+                ),
+                location="import_check[mcp_tool]",
+            )
+        ]
+
     stderr = (result.get("stderr") or "").strip()
     # Distinguish "pip install failed" vs "import failed" so the retry
     # loop feedback can be specific. pip-install failures surface without

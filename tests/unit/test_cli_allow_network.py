@@ -310,3 +310,89 @@ class TestRunCommandNetworkPrecedence:
             args=["some task", "--allow-network", "--no-allow-network"],
         )
         assert exit_code == 1
+
+
+class TestAllowNetworkPropagatesAcrossJsonModes:
+    """Security audit finding #7 (2026-04-19) — ``execute_task`` must pass
+    ``allow_network`` into ``_execute_skill_or_agent`` regardless of
+    ``json_output``. Pre-fix the JSON branch omitted the kwarg and the
+    default-False silently demoted explicit ``--allow-network`` opt-ins to
+    ``--network none`` for scriptable callers.
+    """
+
+    @pytest.mark.parametrize("json_output", [False, True])
+    @patch("src.cli.runner._save_output")
+    @patch("src.cli.runner._record_invocation")
+    @patch("src.cli.runner._check_docker", return_value=True)
+    @patch("src.cli.runner._create_infra")
+    @patch("src.orchestrator.pipeline.create_pipeline")
+    @patch("src.cli.runner._execute_skill_or_agent")
+    def test_allow_network_propagates_in_both_json_modes(
+        self, mock_exec, mock_create_pipeline, mock_create_infra,
+        mock_check_docker, mock_record, mock_save, json_output,
+    ):
+        from src.cli.runner import execute_task
+        from src.schemas.capability import CapabilityType
+        from src.schemas.task import GeneratedArtifact
+
+        # Capture the allow_network kwarg handed to the SKILL/AGENT executor.
+        captured: dict = {}
+
+        def _fake_exec(artifact, task_prompt, file_paths, **kwargs):
+            captured["allow_network"] = kwargs.get("allow_network")
+            return {"result": "ok"}
+
+        mock_exec.side_effect = _fake_exec
+
+        # Stub the pipeline to return a single SKILL artifact that would
+        # route through _execute_skill_or_agent.
+        artifact = GeneratedArtifact(
+            capability_name="net-skill",
+            capability_type=CapabilityType.SKILL,
+            skill_content="# net-skill\n\nexample skill",
+        )
+
+        def _fake_invoke(state, config=None):
+            return {
+                "generated_artifacts": [artifact],
+                "matches": [],
+                "subtasks": [],
+                "classified_gaps": [],
+                "required_capabilities": [],
+                "verification_results": [],
+                "decomposition_succeeded": True,
+                "classification_succeeded": True,
+                "verification_succeeded": True,
+                "output_contract": state.output_contract,
+                "allow_network": state.allow_network,
+            }
+
+        mock_pipeline = MagicMock()
+        compiled = MagicMock()
+        compiled.invoke.side_effect = _fake_invoke
+        # Non-JSON path uses pipeline.stream(...); emit the final state as
+        # a single "loading_node" event so the runner's streaming loop
+        # assigns it to final_state and proceeds to execute the artifact.
+        compiled.stream.side_effect = lambda state, config=None: iter(
+            [{"loading_node": _fake_invoke(state, config)}]
+        )
+        mock_pipeline.compile.return_value = compiled
+        mock_create_pipeline.return_value = mock_pipeline
+
+        registry = MagicMock()
+        loader = MagicMock()
+        metrics_store = MagicMock()
+        metrics_store.invocation_count_total.return_value = 0
+        mock_create_infra.return_value = (registry, loader, metrics_store)
+
+        execute_task(
+            "fetch something live",
+            json_output=json_output,
+            allow_network=True,
+        )
+
+        assert captured.get("allow_network") is True, (
+            f"json_output={json_output}: allow_network was "
+            f"{captured.get('allow_network')!r}, expected True. "
+            "Security audit finding #7 regression."
+        )

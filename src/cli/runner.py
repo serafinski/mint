@@ -885,7 +885,13 @@ asyncio.run(_run())
         if "error" in parsed:
             err_console.print(f"[yellow]Tool error: {str(parsed['error'])[:300]}[/yellow]")
             return {}
-        return parsed.get("result", {}) or {}
+        # Security audit finding #11 (2026-04-19): preserve falsy / non-dict
+        # results. ``parsed.get("result", {}) or {}`` dropped legitimate
+        # zero-valued answers and passed non-dict truthy values through
+        # unchanged (crashing downstream ``.items()`` scans). The helper
+        # distinguishes "no result key" from "falsy result".
+        from src.cli.output_coerce import extract_tool_result
+        return extract_tool_result(parsed)
     except (json.JSONDecodeError, KeyError, IndexError):
         err_console.print("[yellow]Could not parse tool output.[/yellow]")
         return {}
@@ -1204,14 +1210,13 @@ def _try_registry_match(
 
     # Reconstruct skill_content / agent_config from registry metadata
     # so SKILL/AGENT execution backends have the original instructions.
+    # Security audit finding #9 (2026-04-19): use the shared
+    # ``decode_agent_config_metadata`` helper so this path and
+    # ``composition.py::_match_to_artifact`` follow identical semantics.
+    from src.schemas.task import decode_agent_config_metadata
+
     skill_content = meta.get("skill_content")
-    agent_config = None
-    agent_config_raw = meta.get("agent_config")
-    if agent_config_raw:
-        try:
-            agent_config = json.loads(agent_config_raw) if isinstance(agent_config_raw, str) else agent_config_raw
-        except (json.JSONDecodeError, TypeError):
-            agent_config = None
+    agent_config = decode_agent_config_metadata(meta.get("agent_config"))
 
     proxy = GeneratedArtifact(
         capability_name=getattr(cap, "name", "registry-match"),
@@ -1337,8 +1342,15 @@ def _save_output(
     cap_name = getattr(artifact, "capability_name", "output") if artifact else "output"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Create a subdirectory per run: mint_output/<cap_name>_<ts>/
-    run_dir = output_dir / f"{cap_name}_{ts}"
+    # Security audit finding #13 (2026-04-20): sanitise cap_name before
+    # joining — LLM-generated artifacts can carry arbitrary names,
+    # including ``../escape`` which would write outside mint_output/.
+    # ``contained_join`` rewrites path-unsafe components to the fallback
+    # and refuses to escape the base directory.
+    from src.cli.output_coerce import _sanitise_component, contained_join
+
+    safe_cap_name = _sanitise_component(cap_name, fallback="output")
+    run_dir = output_dir / f"{safe_cap_name}_{ts}"
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1349,8 +1361,17 @@ def _save_output(
 
     saved: list[tuple[str, str]] = []  # (label, path)
 
+    # Security audit finding #11 (2026-04-19): ``output`` may be any JSON-
+    # deserialized shape (scalar / list / string / dict). Non-dict
+    # outputs crash ``.items()``; wrap via ``as_dict_for_save`` so the
+    # per-key scan handles them uniformly. The full-result JSON dump
+    # below still serializes the original shape — only the per-key
+    # inspection needs the coercion.
+    from src.cli.output_coerce import as_dict_for_save
+    scan_dict = as_dict_for_save(output)
+
     # Scan output for file-like content and save separately
-    for key, value in output.items():
+    for key, value in scan_dict.items():
         if isinstance(value, str) and len(value) > 500:
             # Detect CSV content
             first_line = value.split("\n")[0]
@@ -1364,7 +1385,13 @@ def _save_output(
                 ext = ".md"
             else:
                 ext = ".txt"
-            file_path = run_dir / f"{key}{ext}"
+            # Security audit finding #13: per-key output-file writes
+            # must not escape run_dir via crafted ``key`` values like
+            # ``"../escape"``. ``contained_join`` sanitises the key
+            # and asserts containment post-resolve.
+            file_path = contained_join(
+                run_dir, f"{key}{ext}", fallback=f"output{ext}"
+            )
             file_path.write_text(value, encoding="utf-8")
             saved.append((f"Data ({key})", str(file_path)))
 
@@ -1376,7 +1403,11 @@ def _save_output(
     # Save chain output files (CSV, Excel, Markdown, etc.)
     if output_files:
         for fname, content in output_files.items():
-            file_dest = run_dir / fname
+            # Security audit finding #13: ``output_files`` filenames come
+            # from chain-step outputs — LLM-generated, potentially carrying
+            # ``../escape.bin``. Sanitise-then-contain like the per-key
+            # scan above.
+            file_dest = contained_join(run_dir, fname, fallback="output.bin")
             file_dest.write_bytes(content)
             saved.append((f"File ({fname})", str(file_dest)))
 
@@ -1981,6 +2012,28 @@ def execute_task(
                     artifact, file_paths, parsed_params, allow_network=allow_network,
                 ) or None
             elif cap_type in (CapabilityType.SKILL, CapabilityType.AGENT):
+                # Single call site for SKILL/AGENT execution so no kwarg can
+                # drift between the spinner and JSON branches. Security audit
+                # finding #7 (2026-04-19) was exactly this class of bug:
+                # allow_network was missing in the JSON branch only, silently
+                # demoting --allow-network to --network none for scriptable
+                # callers. Conditional UI wrapper replaces the duplicate call.
+                _lf_meta = invoke_config.get("metadata", {})
+
+                def _invoke_skill_or_agent() -> dict | None:
+                    return (
+                        _execute_skill_or_agent(
+                            artifact,
+                            task_prompt,
+                            file_paths,
+                            timeout_s=timeout,
+                            langfuse_tags=_lf_meta.get("langfuse_tags"),
+                            langfuse_session_id=_lf_meta.get("langfuse_session_id"),
+                            allow_network=allow_network,
+                        )
+                        or None
+                    )
+
                 if not json_output:
                     exec_label = f"Executing {cap_type_label}: {artifact.capability_name}"
                     exec_stop = threading.Event()
@@ -2002,34 +2055,11 @@ def execute_task(
                             daemon=True,
                         )
                         t.start()
-                        _lf_meta = invoke_config.get("metadata", {})
-                        output = (
-                            _execute_skill_or_agent(
-                                artifact,
-                                task_prompt,
-                                file_paths,
-                                timeout_s=timeout,
-                                langfuse_tags=_lf_meta.get("langfuse_tags"),
-                                langfuse_session_id=_lf_meta.get("langfuse_session_id"),
-                                allow_network=allow_network,
-                            )
-                            or None
-                        )
+                        output = _invoke_skill_or_agent()
                         exec_stop.set()
                         t.join(timeout=1)
                 else:
-                    _lf_meta = invoke_config.get("metadata", {})
-                    output = (
-                        _execute_skill_or_agent(
-                            artifact,
-                            task_prompt,
-                            file_paths,
-                            timeout_s=timeout,
-                            langfuse_tags=_lf_meta.get("langfuse_tags"),
-                            langfuse_session_id=_lf_meta.get("langfuse_session_id"),
-                        )
-                        or None
-                    )
+                    output = _invoke_skill_or_agent()
         except Exception as exc:
             exec_error = f"{type(exc).__name__}: {exc}"
             err_console.print(f"[yellow]Execution error: {exec_error}[/yellow]")
@@ -2102,7 +2132,12 @@ def execute_task(
         "stage_details": stage_details,
     }
 
-    if output:
+    # Security audit finding #11 (2026-04-19): use ``is not None`` rather
+    # than truthy-check so legitimate falsy outputs (0, False, "", []) are
+    # persisted and not routed to the ``_empty`` placeholder branch. Half-B
+    # of the ``or {}`` coercion pattern — same class of bug at a higher
+    # frame than the executor-return sites.
+    if output is not None:
         _save_output(
             save_dir,
             output,
@@ -2253,8 +2288,33 @@ def execute_task(
             "to flag it for the optimizer.[/dim]"
         )
         return 0
-    # Registry matched but couldn't execute (seeded descriptor without
-    # source code) — still a valid match, not a pipeline failure
+
+    # Security audit finding #10 (2026-04-19): distinguish "non-executable
+    # seeded descriptor — nothing to execute" from "tried and failed." The
+    # pre-fix exit-0 fallback matched on ``matches and not gaps`` regardless
+    # of whether execution was attempted. That let Docker-down / AGENT-
+    # timeout / sandbox-OOM failures silently exit 0 via the registry-match
+    # path, contaminating scripted-caller success rates and contradicting
+    # the §12 strict-gate "no silent fallback" contract.
+    if artifact is not None:
+        # Something WAS attempted (we know output is falsy from above).
+        # If the artifact has an executable payload, this is a real
+        # failure — exit 6 (execution failure after successful pipeline).
+        has_payload = (
+            getattr(artifact, "source_code", None)
+            or getattr(artifact, "skill_content", None)
+            or getattr(artifact, "agent_config", None)
+        )
+        if has_payload:
+            return 6
+        # No payload — genuine seeded-descriptor case (e.g., CapabilityDescriptor
+        # from the registry without attached source_code). Still a valid
+        # match, not a pipeline failure.
+        return 0
+
+    # No artifact at all — pure registry lookup with no single winner chosen.
+    # Legacy path kept for pre-composition flows where matches are reported
+    # but never resolved to a single artifact.
     if (_get_final("matches", None) or []) and not (_get_final("gaps", None) or []):
         return 0
     return 1

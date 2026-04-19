@@ -41,9 +41,17 @@ def serialize_for_invocation(value: Any) -> str | None:
     - JSON serialization raises (unserializable sentinel, cyclic ref)
 
     Uses ``default=str`` to tolerate non-JSON-native types (``Path``,
-    ``datetime``, ``Decimal``, custom objects). Output is truncated to
-    ``_INVOCATION_FIELD_MAX_BYTES`` with an ellipsis marker — callers
-    should treat truncated JSON as lossy-but-usable for replay.
+    ``datetime``, ``Decimal``, custom objects).
+
+    **Truncation policy (security audit finding #16, 2026-04-20):** when
+    the serialized payload exceeds ``_INVOCATION_FIELD_MAX_BYTES``,
+    returns a **valid-JSON sentinel** carrying the original size rather
+    than a broken string-literal. Pre-fix the function emitted
+    ``f'{head}..."__TRUNCATED__"'`` which did not parse and caused every
+    downstream ``json.loads`` (Pillar 3 coverage replay in particular)
+    to silently treat the case as unreproducible. The sentinel shape
+    is ``{"__truncated__": true, "__original_size_bytes__": N}`` — small,
+    valid, detectable by consumers via ``parsed.get("__truncated__")``.
     """
     if value is None:
         return None
@@ -53,9 +61,12 @@ def serialize_for_invocation(value: Any) -> str | None:
         serialized = json.dumps(value, default=str, sort_keys=True)
     except (TypeError, ValueError):
         return None
-    if len(serialized.encode("utf-8")) > _INVOCATION_FIELD_MAX_BYTES:
-        head = serialized[: _INVOCATION_FIELD_MAX_BYTES // 2]
-        return f'{head}..."__TRUNCATED__"'
+    size = len(serialized.encode("utf-8"))
+    if size > _INVOCATION_FIELD_MAX_BYTES:
+        return json.dumps(
+            {"__truncated__": True, "__original_size_bytes__": size},
+            sort_keys=True,
+        )
     return serialized
 
 

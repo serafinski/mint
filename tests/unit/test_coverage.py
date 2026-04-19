@@ -591,3 +591,208 @@ class TestNeverRaises:
         report = verify_coverage([variant], [_error_case()])
         assert isinstance(report, CoverageReport)
         assert report.all_covered is False
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #16 — truncation sentinel detection (2026-04-20)
+# ---------------------------------------------------------------------------
+
+
+class TestTruncationSentinelHandling:
+    """Coverage replay must detect the ``__truncated__`` sentinel
+    emitted by ``serialize_for_invocation`` on oversize payloads and
+    report the case as unreproducible — NOT pass to the sandbox and
+    let the replay silently fail on a malformed `{"x": ...}` reconstruction.
+    Pre-fix the function emitted invalid JSON; now it emits a valid
+    sentinel and the coverage verifier has to recognise it.
+    """
+
+    def test_truncation_sentinel_reports_unreproducible(self):
+        """Sentinel failure case → returns (False, <reason mentioning truncation>)
+        without invoking the sandbox."""
+        import json
+
+        sentinel = json.dumps(
+            {"__truncated__": True, "__original_size_bytes__": 128000},
+            sort_keys=True,
+        )
+        failure = InvocationRecord(
+            capability_id="parent-cap",
+            task_id="truncated-case",
+            success=False,
+            token_cost=0,
+            latency_ms=1.0,
+            error_message="boom",
+            input_args=sentinel,
+            actual_output=None,
+        )
+        variant = _mcp_variant("any-variant")
+
+        with patch("src.verification.coverage.sandbox_execute") as mock_sbx:
+            handled, reason = _variant_handles_case(variant, failure)
+
+        assert handled is False
+        assert reason is not None
+        assert "truncated" in reason.lower()
+        assert "unreproducible" in reason.lower()
+        # Sandbox must NOT have been invoked — no point replaying a truncated input.
+        mock_sbx.assert_not_called()
+
+    def test_legacy_invalid_json_reports_unreproducible(self):
+        """Pre-fix rows carry the literal ``f'{head}..."__TRUNCATED__"'``
+        string which does not parse. The fix must tolerate these as
+        unreproducible rather than crashing the replay."""
+        failure = InvocationRecord(
+            capability_id="parent-cap",
+            task_id="legacy-truncated",
+            success=False,
+            token_cost=0,
+            latency_ms=1.0,
+            error_message="boom",
+            # Pre-fix broken format verbatim.
+            input_args='{"payload": "xxx...yyy..."__TRUNCATED__"',
+            actual_output=None,
+        )
+        variant = _mcp_variant("any-variant")
+
+        with patch("src.verification.coverage.sandbox_execute") as mock_sbx:
+            handled, reason = _variant_handles_case(variant, failure)
+
+        assert handled is False
+        assert reason is not None
+        assert "invalid json" in reason.lower() or "unreproducible" in reason.lower()
+        mock_sbx.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #15 — coverage sort_keys asymmetry (2026-04-20)
+# ---------------------------------------------------------------------------
+
+
+class TestWrongOutputCase_SemanticEquality:
+    """Pre-fix, the variant's replay output was serialized without
+    ``sort_keys=True`` while the parent's ``actual_output`` was stored
+    with ``sort_keys=True``. Dicts with the same semantic content but
+    different Python iteration order string-compared unequal, and
+    ``_variant_handles_case`` returned ``(True, None)`` (falsely handled)
+    — manufacturing positive split-coverage evidence. Post-fix: sort_keys
+    applied symmetrically + defence-in-depth ``_semantic_equal`` parses
+    both sides before comparing.
+    """
+
+    @patch("src.verification.coverage.sandbox_execute")
+    def test_key_order_asymmetry_rejected(self, mock_sandbox):
+        """Variant returns ``{"b": 2, "a": 1}`` — parent recorded
+        ``{"a": 1, "b": 2}`` (sort_keys ordering). Same semantic content,
+        different serialization. Must report handled=False."""
+        import json
+
+        # Parent stored with sort_keys=True (matches serialize_for_invocation).
+        parent_output_json = json.dumps({"a": 1, "b": 2}, default=str, sort_keys=True)
+        # Variant's sandbox would now emit with sort_keys=True too (the fix
+        # at coverage.py:228), but we're testing _semantic_equal's
+        # defence-in-depth: even if a future regression drops sort_keys,
+        # the parse-then-compare catches it.
+        variant_result_json = json.dumps({"b": 2, "a": 1}, default=str)  # different order
+        # Outer envelope (result + error) — matches _build_replay_code output.
+        mock_sandbox.return_value = {
+            "success": True,
+            "stdout": json.dumps({"result": variant_result_json, "error": None}),
+            "stderr": "",
+            "exit_code": 0,
+        }
+
+        failure = _wrong_output_case(
+            task_id="key-order-case",
+            input_args='{"x": 1}',
+            actual_output=parent_output_json,
+        )
+        variant = _mcp_variant("same-semantic-variant")
+        handled, _ = _variant_handles_case(variant, failure)
+
+        assert handled is False, (
+            "Semantically-identical outputs (same dict, different key order) "
+            "must be reported as NOT handled. Pre-fix returned True = "
+            "false-positive split coverage."
+        )
+
+    @patch("src.verification.coverage.sandbox_execute")
+    def test_int_vs_float_treated_as_equal(self, mock_sandbox):
+        """JSON ``1`` vs ``1.0`` — Python ``1 == 1.0`` is True. The
+        _semantic_equal helper preserves this across JSON boundaries."""
+        import json
+
+        parent_output_json = json.dumps({"x": 1.0}, default=str, sort_keys=True)
+        variant_result_json = json.dumps({"x": 1}, default=str, sort_keys=True)
+        mock_sandbox.return_value = {
+            "success": True,
+            "stdout": json.dumps({"result": variant_result_json, "error": None}),
+            "stderr": "",
+            "exit_code": 0,
+        }
+
+        failure = _wrong_output_case(
+            task_id="int-float-case",
+            input_args='{"x": 1}',
+            actual_output=parent_output_json,
+        )
+        variant = _mcp_variant("int-float-variant")
+        handled, _ = _variant_handles_case(variant, failure)
+
+        assert handled is False, (
+            "1 vs 1.0 must compare equal — Python treats them as ==, "
+            "so the variant did NOT differentiate the output."
+        )
+
+    @patch("src.verification.coverage.sandbox_execute")
+    def test_nested_dict_key_order_also_contained(self, mock_sandbox):
+        """Nested dicts with reordered keys — still semantically equal."""
+        import json
+
+        parent_output_json = json.dumps(
+            {"outer": {"a": 1, "b": 2}}, default=str, sort_keys=True,
+        )
+        # Intentionally emit without sort_keys to exercise _semantic_equal.
+        variant_result_json = json.dumps({"outer": {"b": 2, "a": 1}}, default=str)
+        mock_sandbox.return_value = {
+            "success": True,
+            "stdout": json.dumps({"result": variant_result_json, "error": None}),
+            "stderr": "",
+            "exit_code": 0,
+        }
+
+        failure = _wrong_output_case(
+            task_id="nested-case",
+            input_args='{"x": 1}',
+            actual_output=parent_output_json,
+        )
+        variant = _mcp_variant("nested-variant")
+        handled, _ = _variant_handles_case(variant, failure)
+
+        assert handled is False
+
+    @patch("src.verification.coverage.sandbox_execute")
+    def test_genuinely_different_output_still_handled(self, mock_sandbox):
+        """Regression guard: the fix must NOT break the legitimate
+        "variant differentiated the output" case. Different content →
+        handled=True."""
+        import json
+
+        parent_output_json = json.dumps({"answer": "wrong"}, default=str, sort_keys=True)
+        variant_result_json = json.dumps({"answer": "right"}, default=str, sort_keys=True)
+        mock_sandbox.return_value = {
+            "success": True,
+            "stdout": json.dumps({"result": variant_result_json, "error": None}),
+            "stderr": "",
+            "exit_code": 0,
+        }
+
+        failure = _wrong_output_case(
+            task_id="genuine-differentiation",
+            input_args='{"x": 1}',
+            actual_output=parent_output_json,
+        )
+        variant = _mcp_variant("correct-variant")
+        handled, _ = _variant_handles_case(variant, failure)
+
+        assert handled is True

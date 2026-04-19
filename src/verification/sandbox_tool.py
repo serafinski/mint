@@ -340,18 +340,56 @@ def _sandbox_execute_with_install(
 
     ephemeral_tag = f"jit-sandbox-eph-{uuid.uuid4().hex[:8]}"
 
-    # Validate package names: only allow alphanumeric, hyphens, underscores,
-    # dots, and version specifiers. Reject anything that looks suspicious.
-    import re as _re
+    # Security audit finding #6 (2026-04-19): validate package names via
+    # the PEP 508 grammar (``packaging.requirements.Requirement``) rather
+    # than a narrow regex that false-rejects legitimate forms like
+    # ``pandas>=2.0,<3`` (compound versions), ``pydantic[email]`` (extras),
+    # or ``requests ; python_version > "3.8"`` (env markers). The previous
+    # regex silently stripped those entries and — when ALL entries were
+    # rejected — fell through to a no-install ``sandbox_execute`` call,
+    # causing the code to fail with ``ModuleNotFoundError`` that the
+    # Pillar 2 gate mis-attributed to the generated source.
+    #
+    # Defence-in-depth against argv injection remains intact: the install
+    # call at line ~357 uses ``subprocess.run([...])`` list-form, so each
+    # package is a separate argv entry — no shell interpretation.
+    from packaging.requirements import InvalidRequirement, Requirement
 
-    _VALID_PKG = _re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?([<>=!~]+[A-Za-z0-9.*]+)?$")
-    packages = [p for p in packages if _VALID_PKG.match(p)]
-    if not packages:
-        # All package names failed validation — fall back to the no-install
-        # path while preserving the caller's network policy (Step 14.12:
-        # silently dropping allow_network here would turn the
-        # _VALID_PKG rejection into a covert offline-mode demotion).
-        return sandbox_execute(code, timeout=timeout, allow_network=allow_network)
+    good: list[str] = []
+    rejected: list[tuple[str, str]] = []
+    for p in packages:
+        try:
+            Requirement(p)
+            good.append(p)
+        except InvalidRequirement as exc:
+            rejected.append((p, str(exc)))
+
+    if rejected:
+        logger.warning(
+            "Dropping malformed pip requirements (not PEP 508): %s",
+            rejected,
+        )
+
+    if not good:
+        # Loud-fail: do NOT fall through to a no-install sandbox_execute.
+        # Pre-fix that path masked the real cause (rejected requirements)
+        # behind a ``ModuleNotFoundError`` in the generated code, which
+        # the Pillar 2 gate then blamed on the artifact. Return a
+        # ``pip_requirement_rejected`` shaped dict so callers can surface
+        # it as the correct VerificationReport finding category.
+        return {
+            "stdout": "",
+            "stderr": (
+                "All pip requirements rejected as malformed — no-install "
+                "fallback would mask missing deps. "
+                f"Rejected: {rejected}"
+            ),
+            "exit_code": -1,
+            "success": False,
+            "pip_requirement_rejected": rejected,
+        }
+
+    packages = good
 
     # Phase 1: install packages (with network, 60s timeout)
     pip_args = ", ".join(repr(p) for p in packages)

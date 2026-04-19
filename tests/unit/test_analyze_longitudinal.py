@@ -354,22 +354,32 @@ class TestEndToEnd:
     def test_analyzer_produces_cycles_with_all_fields(self):
         """Verify _load_cycle_data + downstream processing produces a
         record with all expected fields when all four tables are populated.
+
+        Security audit finding #18 (2026-04-20): pass explicit
+        ``occurred_at`` timestamps so utility/event rows land in their
+        intended cycle windows. Post-fix the analyzer buckets rows by
+        timestamp, so the test must ensure temporal ordering matches
+        the task_rows.
         """
         from datetime import UTC, datetime, timedelta
         base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
         with EvaluationStore() as store:
             for i in range(1, 4):
                 ts = base + timedelta(minutes=i)
+                # Utility / event rows occur within this task's cycle window.
+                cycle_ts = ts + timedelta(seconds=30)
                 store.record_run(_base_record(task_id=f"T{i:02d}", timestamp=ts))
                 store.record_cycle_utility_scores(
                     run_id="test_run", condition="longitudinal", task_id=f"T{i:02d}",
                     scores={"cap-a": 0.5, "cap-b": 0.3},
+                    occurred_at=cycle_ts,
                 )
                 store.record_cycle_events(
                     run_id="test_run", condition="longitudinal", task_id=f"T{i:02d}",
                     events=[{"capability_id": "cap-a",
                              "event_type": "pruned" if i == 2 else "merged",
                              "details": ""}],
+                    occurred_at=cycle_ts,
                 )
             cycles = _load_cycle_data(store._conn)
             assert len(cycles) == 3
@@ -386,3 +396,86 @@ class TestEndToEnd:
                 assert "events" in c
                 assert c["utility_scores"] == {"cap-a": 0.5, "cap-b": 0.3}
                 assert len(c["events"]) == 1
+
+
+class TestPerCycleIsolationAcrossTaskRepetitions:
+    """Security audit finding #18 (2026-04-20) regression guard.
+
+    Pre-fix, utility and event rows were keyed by ``task_id`` only. When
+    a task repeated in the sequence (default ``run_longitudinal.py
+    --n-tasks=40`` with 20 unique tasks repeats every task at least
+    once), cycle N and cycle M (both T01) both read the merged/last-
+    write-wins dict. Post-fix, rows are bucketed by timestamp window
+    against ``task_boundaries``, so each cycle sees only its own
+    utility/event rows.
+    """
+
+    def test_per_cycle_utility_snapshots_isolated_across_task_repetitions(self):
+        """Two cycles with the same task_id carry distinct utility values."""
+        from datetime import UTC, datetime, timedelta
+
+        base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
+        with EvaluationStore() as store:
+            # Cycle 1 — T01 @ t=1 min; utility cap-x = 0.1
+            ts_1 = base + timedelta(minutes=1)
+            store.record_run(_base_record(task_id="T01", timestamp=ts_1))
+            store.record_cycle_utility_scores(
+                run_id="run-1", condition="longitudinal", task_id="T01",
+                scores={"cap-x": 0.1},
+                occurred_at=ts_1 + timedelta(seconds=10),
+            )
+
+            # Cycle 2 — T01 AGAIN @ t=2 min; utility cap-x = 0.9
+            ts_2 = base + timedelta(minutes=2)
+            store.record_run(_base_record(task_id="T01", timestamp=ts_2))
+            store.record_cycle_utility_scores(
+                run_id="run-2", condition="longitudinal", task_id="T01",
+                scores={"cap-x": 0.9},
+                occurred_at=ts_2 + timedelta(seconds=10),
+            )
+
+            cycles = _load_cycle_data(store._conn)
+            assert len(cycles) == 2
+
+            # Critical assertion: cycles must have DIFFERENT utility values.
+            # Pre-fix both cycles would read {"cap-x": 0.9} (last-write-wins).
+            assert cycles[0]["utility_scores"] == {"cap-x": 0.1}, (
+                f"Cycle 1 (T01 @ {ts_1}) should report its own utility 0.1. "
+                f"Got: {cycles[0]['utility_scores']} — pre-fix regression."
+            )
+            assert cycles[1]["utility_scores"] == {"cap-x": 0.9}
+
+    def test_per_cycle_events_isolated_across_task_repetitions(self):
+        """Events from different cycles of the same task_id must not merge."""
+        from datetime import UTC, datetime, timedelta
+
+        base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
+        with EvaluationStore() as store:
+            ts_1 = base + timedelta(minutes=1)
+            store.record_run(_base_record(task_id="T01", timestamp=ts_1))
+            store.record_cycle_events(
+                run_id="run-1", condition="longitudinal", task_id="T01",
+                events=[{"capability_id": "cap-a", "event_type": "split", "details": "cycle 1"}],
+                occurred_at=ts_1 + timedelta(seconds=10),
+            )
+
+            ts_2 = base + timedelta(minutes=2)
+            store.record_run(_base_record(task_id="T01", timestamp=ts_2))
+            store.record_cycle_events(
+                run_id="run-2", condition="longitudinal", task_id="T01",
+                events=[{"capability_id": "cap-b", "event_type": "merged", "details": "cycle 2"}],
+                occurred_at=ts_2 + timedelta(seconds=10),
+            )
+
+            cycles = _load_cycle_data(store._conn)
+            assert len(cycles) == 2
+
+            # Pre-fix: cycles[0]["events"] and cycles[1]["events"] both
+            # had 2 entries (the merged list). Post-fix: each has 1.
+            assert len(cycles[0]["events"]) == 1
+            assert cycles[0]["events"][0]["event_type"] == "split"
+            assert cycles[0]["events"][0]["details"] == "cycle 1"
+
+            assert len(cycles[1]["events"]) == 1
+            assert cycles[1]["events"][0]["event_type"] == "merged"
+            assert cycles[1]["events"][0]["details"] == "cycle 2"

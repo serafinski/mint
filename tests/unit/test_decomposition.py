@@ -1506,3 +1506,126 @@ class TestEnsureFileWriterLastStep:
         # uses uppercased slug for the format label. No crash.
         assert result[-1].required_capabilities == ["write-xyz-file"]
         assert "XYZ" in result[-1].description
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #12, layer (A) — depends_on index validator (2026-04-20)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateDependsOnIndices:
+    """Decomposition-layer DAG validator. Pre-fix, invalid `depends_on`
+    indices and cycles flowed through to the execution layer and caused
+    IndexError / phantom-execution / silent-linearisation. Post-fix they
+    flip ``decomposition_succeeded=False`` and trigger the 3x retry
+    budget, matching the §12 finding #15 strict-gate pattern.
+    """
+
+    def _subtask(self, i: int, depends_on: list[int] | None = None) -> SubTask:
+        return SubTask(
+            description=f"subtask {i}",
+            required_capabilities=[f"cap-{i}"],
+            depends_on=depends_on or [],
+        )
+
+    def test_valid_dag_returns_empty_violations(self):
+        from src.orchestrator.decomposition import _validate_depends_on_indices
+
+        subtasks = [
+            self._subtask(0),
+            self._subtask(1, depends_on=[0]),
+            self._subtask(2, depends_on=[0, 1]),
+        ]
+        assert _validate_depends_on_indices(subtasks) == []
+
+    def test_empty_and_single_subtask_are_trivially_valid(self):
+        from src.orchestrator.decomposition import _validate_depends_on_indices
+
+        assert _validate_depends_on_indices([]) == []
+        assert _validate_depends_on_indices([self._subtask(0)]) == []
+
+    def test_out_of_range_positive_index(self):
+        """Reporter's repro (a): ``depends_on=[99]`` on a 3-subtask chain."""
+        from src.orchestrator.decomposition import _validate_depends_on_indices
+
+        subtasks = [
+            self._subtask(0),
+            self._subtask(1),
+            self._subtask(2, depends_on=[99]),
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert violations
+        assert any("out-of-range" in v and "99" in v for v in violations)
+
+    def test_negative_index(self):
+        """Reporter's repro (b): ``depends_on=[-1]`` phantom-executes."""
+        from src.orchestrator.decomposition import _validate_depends_on_indices
+
+        subtasks = [
+            self._subtask(0),
+            self._subtask(1, depends_on=[-1]),
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert violations
+        assert any("out-of-range" in v and "-1" in v for v in violations)
+
+    def test_self_loop(self):
+        from src.orchestrator.decomposition import _validate_depends_on_indices
+
+        subtasks = [
+            self._subtask(0),
+            self._subtask(1, depends_on=[1]),  # self-reference
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert violations
+        assert any("self-loop" in v for v in violations)
+
+    def test_two_subtask_cycle(self):
+        """Reporter's repro (c): 0↔1 mutual dependency."""
+        from src.orchestrator.decomposition import _validate_depends_on_indices
+
+        subtasks = [
+            self._subtask(0, depends_on=[1]),
+            self._subtask(1, depends_on=[0]),
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert violations
+        assert any("cycle" in v.lower() for v in violations)
+
+    def test_three_subtask_cycle(self):
+        """Larger cycles also caught: 0 → 1 → 2 → 0."""
+        from src.orchestrator.decomposition import _validate_depends_on_indices
+
+        subtasks = [
+            self._subtask(0, depends_on=[2]),
+            self._subtask(1, depends_on=[0]),
+            self._subtask(2, depends_on=[1]),
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert violations
+        assert any("cycle" in v.lower() for v in violations)
+
+    def test_diamond_dag_is_valid(self):
+        """Non-cyclic diamond (0 → 1, 0 → 2, 1+2 → 3) must pass."""
+        from src.orchestrator.decomposition import _validate_depends_on_indices
+
+        subtasks = [
+            self._subtask(0),
+            self._subtask(1, depends_on=[0]),
+            self._subtask(2, depends_on=[0]),
+            self._subtask(3, depends_on=[1, 2]),
+        ]
+        assert _validate_depends_on_indices(subtasks) == []
+
+    def test_multiple_violations_all_reported(self):
+        """When multiple violations exist, all are surfaced (caller decides
+        whether to report them all or truncate)."""
+        from src.orchestrator.decomposition import _validate_depends_on_indices
+
+        subtasks = [
+            self._subtask(0, depends_on=[99]),      # out-of-range
+            self._subtask(1, depends_on=[-1]),       # negative
+            self._subtask(2, depends_on=[2]),        # self-loop
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert len(violations) >= 3

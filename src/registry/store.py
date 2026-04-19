@@ -520,12 +520,19 @@ def seed_registry(registry: SkillRegistry) -> None:
         # Build a throwaway GeneratedArtifact snapshot so the same tokenizer
         # helper the JIT / optimizer paths use also runs on seeded caps —
         # keeps seeded-vs-evolved Chapter-5 comparisons apples-to-apples.
-        agent_config_dict: dict | None = None
-        if agent_config is not None:
-            try:
-                agent_config_dict = json.loads(agent_config)
-            except (json.JSONDecodeError, TypeError):
-                agent_config_dict = {"system_prompt": agent_config}
+        # Security audit finding #9 (2026-04-19): use the shared
+        # ``decode_agent_config_metadata`` helper.
+        from src.schemas.task import decode_agent_config_metadata
+
+        agent_config_dict = decode_agent_config_metadata(agent_config)
+        if agent_config_dict is None and isinstance(agent_config, str) and agent_config:
+            # Preserve the pre-fix behaviour at THIS site: when the string
+            # isn't valid JSON, wrap it as a bare system_prompt so the
+            # tokenizer still sees something. (Other sites prefer None —
+            # they're reconstruction paths that need a proper dict or
+            # nothing; this site is a tokenization snapshot that's fine
+            # with a best-effort wrapper.)
+            agent_config_dict = {"system_prompt": agent_config}
         snapshot = GeneratedArtifact(
             capability_name=name,
             capability_type=capability_type,

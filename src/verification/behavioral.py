@@ -66,15 +66,94 @@ def extract_parameter_schema(source_code: str) -> dict[str, dict]:
     return {}
 
 
-def _extract_function_name(source_code: str) -> str | None:
-    """Return the name of the first public async function in source_code."""
+def _find_mcp_tool_function(source_code: str) -> str | None:
+    """Return the name of the ``@mcp.tool``-decorated public async function.
+
+    Security audit finding #8 (2026-04-19): the decorator is the only
+    unambiguous signal that identifies the tool entrypoint in a FastMCP
+    module. Every pre-fix call site used an ordering heuristic (``dir()``
+    alphabetical in ``ToolLoader``, ``ast.walk`` source order elsewhere)
+    that silently picked the wrong function when a helper was defined
+    before the decorated entrypoint (reporter's repro:
+    ``helper_format_rows`` ordered before ``@mcp.tool summarize_sales``).
+
+    Returns the function name when exactly one public async def carries
+    an ``@mcp.tool`` / ``@mcp.tool()`` decorator. Returns ``None`` on
+    parse error, zero matches (fall back to the single-async heuristic
+    in ``_extract_function_name``), or multiple matches (ambiguous;
+    caller should surface this as a verification failure rather than
+    silently pick one).
+
+    Accepts both bare ``@mcp.tool`` and call-form ``@mcp.tool(...)``.
+    Ignores non-``.tool`` decorators (``@lru_cache``, ``@contextmanager``).
+    Only scans top-level nodes — nested ``async def`` inside a helper
+    doesn't count.
+    """
     try:
         tree = ast.parse(source_code)
     except SyntaxError:
         return None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and not node.name.startswith("_"):
-            return node.name
+
+    matches: list[str] = []
+    for node in ast.iter_child_nodes(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        if node.name.startswith("_"):
+            continue
+        for dec in node.decorator_list:
+            # ``@mcp.tool`` → dec is ast.Attribute; ``@mcp.tool(...)`` →
+            # dec is ast.Call whose .func is ast.Attribute.
+            target = dec.func if isinstance(dec, ast.Call) else dec
+            if isinstance(target, ast.Attribute) and target.attr == "tool":
+                matches.append(node.name)
+                break
+
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _extract_function_name(source_code: str) -> str | None:
+    """Return the name of the MCP tool entrypoint in ``source_code``.
+
+    Resolution order (security audit finding #8, 2026-04-19):
+
+    1. **Decorator match** via :func:`_find_mcp_tool_function` — unambiguous,
+       uses the FastMCP ``@mcp.tool`` signal. This is the correct answer
+       for generator output and merge/split LLM output when the FastMCP
+       pattern is followed.
+    2. **Zero decorator matches, exactly one public async def** —
+       legacy / non-FastMCP artifacts. Use that function, log a WARNING
+       that the decorator was missing.
+    3. **Ambiguous** (zero decorators + multiple public async defs, or
+       parse error) — return ``None``. Callers must fail verification
+       rather than silently pick one.
+    """
+    decorated = _find_mcp_tool_function(source_code)
+    if decorated is not None:
+        return decorated
+
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return None
+
+    public_async = [
+        node.name
+        for node in ast.iter_child_nodes(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and not node.name.startswith("_")
+    ]
+    if len(public_async) == 1:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Tool source has no @mcp.tool-decorated function; falling back "
+            "to the single public async def %r. This is a legacy pattern — "
+            "future artifacts should declare @mcp.tool explicitly.",
+            public_async[0],
+        )
+        return public_async[0]
+
+    # Zero or multiple public async defs and no decorator — ambiguous.
     return None
 
 

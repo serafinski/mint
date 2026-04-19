@@ -466,3 +466,34 @@ def test_classification_accuracy_counts_correct_classification(capsys):
     assert "Classification Accuracy" in output
     # Header plus per-condition numbers must render
     # (exact text depends on the renderer; smoke-check the section appears).
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #17 — T19/T20 drop regression (2026-04-20)
+# ---------------------------------------------------------------------------
+
+
+def test_all_task_ids_match_testbed():
+    """Pre-fix, ``ALL_TASK_IDS = [f"T{i:02d}" for i in range(1, 19)]``
+    silently excluded T19 and T20 from every per-task table. Post-fix
+    it's imported from ``tests.evaluation.tasks.ALL_TASKS`` so any
+    testbed extension flows through automatically."""
+    from scripts.analyze_results import ALL_TASK_IDS
+    from tests.evaluation.tasks import ALL_TASKS
+
+    assert sorted(ALL_TASK_IDS) == sorted(t.task_id for t in ALL_TASKS)
+    # Testbed currently at 20 tasks (T01..T20); regression guard.
+    assert "T19" in ALL_TASK_IDS
+    assert "T20" in ALL_TASK_IDS
+
+
+def test_synthesis_task_ids_include_t19_and_t20():
+    """Synthesis tasks are ALL_TASK_IDS minus retrieval (T01-T03).
+    With #17 fixed, synthesis now includes T19 + T20."""
+    from scripts.analyze_results import RETRIEVAL_TASKS, SYNTHESIS_TASK_IDS
+
+    assert "T19" in SYNTHESIS_TASK_IDS
+    assert "T20" in SYNTHESIS_TASK_IDS
+    assert "T01" not in SYNTHESIS_TASK_IDS
+    for t in RETRIEVAL_TASKS:
+        assert t not in SYNTHESIS_TASK_IDS

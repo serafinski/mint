@@ -766,9 +766,16 @@ def retry(
 
     task_text = last["task"]
 
-    # --edit: open in $EDITOR
+    # --edit: open in $EDITOR. Security audit finding #4 (2026-04-19):
+    # replaced os.system (shell=True + f-string interpolation of $EDITOR)
+    # with subprocess.run([...], shell=False) via shlex.split so the
+    # editor command cannot be shell-injected via a crafted $EDITOR.
+    # try/finally guarantees the temp file is cleaned up on every branch,
+    # including the empty-prompt SystemExit(1) case that previously leaked.
     if edit:
         import os
+        import shlex
+        import subprocess
         import tempfile
 
         editor = os.environ.get("EDITOR", "vi")
@@ -777,9 +784,12 @@ def retry(
         ) as f:
             f.write(task_text)
             tmp_path = f.name
-        os.system(f'{editor} "{tmp_path}"')
-        task_text = Path(tmp_path).read_text().strip()
-        os.unlink(tmp_path)
+        try:
+            cmd = shlex.split(editor) + [tmp_path]
+            subprocess.run(cmd, check=False)
+            task_text = Path(tmp_path).read_text().strip()
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
         if not task_text:
             err_console.print("[red]Empty prompt — aborting.[/red]")
             raise SystemExit(1)

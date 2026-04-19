@@ -237,38 +237,57 @@ def _load_cycle_data(conn: duckdb.DuckDBPyConnection) -> list[dict]:
             cycle_idx += 1
         cycle_increment[cycle_idx][cap_id] += 1
 
-    # Load per-cycle utility scores (Step 18.7 follow-up). Key by task_id.
-    # Note: if a task_id appears multiple times in the sequence (possible
-    # with n_tasks > 20), utility_scores_by_cycle will only capture the
-    # most recent flush. For the canonical longitudinal pattern (<=20
-    # tasks) this is moot; for longer runs the analyzer is still
-    # directionally correct (per-cycle utility_scores are a snapshot of
-    # the cycle's END state).
-    utility_by_task_id: dict[str, dict[str, float]] = defaultdict(dict)
+    # Security audit finding #18 (2026-04-20): bucket utility scores and
+    # events into per-cycle lists using the task_boundaries timestamp
+    # window — same pattern as cycle_increment above. Pre-fix, keying by
+    # task_id only merged all repetitions of the same task into one
+    # lookup, so cycles 1 and 5 (both T01) both returned cycle 5's
+    # utility scores. That silently collapsed the per-cycle time series
+    # and made Step 18.8 shift-detection verdicts unreliable (always
+    # "graceful adaptation" because Phase A's last cycle read Phase B-
+    # era utility values). Under the default ``--n-tasks=40`` run every
+    # task repeats at least once, so the bug fires on every real eval.
+    cycle_utility: list[dict[str, float]] = [{} for _ in task_rows]
     if _table_exists(conn, "cycle_utility_scores"):
         util_rows = conn.execute(
             """
-            SELECT task_id, capability_id, utility_score
+            SELECT task_id, capability_id, utility_score, occurred_at
             FROM cycle_utility_scores
             WHERE condition = 'longitudinal'
             ORDER BY occurred_at
             """
         ).fetchall()
-        for task_id, cap_id, score in util_rows:
-            utility_by_task_id[task_id][cap_id] = float(score)
+        c_idx = 0
+        for _util_task_id, cap_id, score, util_ts in util_rows:
+            while (
+                c_idx + 1 < len(task_boundaries)
+                and task_boundaries[c_idx + 1][0] <= util_ts
+            ):
+                c_idx += 1
+            # A single cycle's final utility flush for a given cap is the
+            # "end-of-cycle" reading — if multiple flushes land within
+            # one cycle window, the last wins (same intra-cycle semantics
+            # the pre-fix code had for a single task_id).
+            cycle_utility[c_idx][cap_id] = float(score)
 
-    events_by_task_id: dict[str, list[dict]] = defaultdict(list)
+    cycle_events: list[list[dict]] = [[] for _ in task_rows]
     if _table_exists(conn, "cycle_events"):
         event_rows = conn.execute(
             """
-            SELECT task_id, capability_id, event_type, details
+            SELECT task_id, capability_id, event_type, details, occurred_at
             FROM cycle_events
             WHERE condition = 'longitudinal'
             ORDER BY occurred_at
             """
         ).fetchall()
-        for task_id, cap_id, event_type, details in event_rows:
-            events_by_task_id[task_id].append({
+        c_idx = 0
+        for _evt_task_id, cap_id, event_type, details, evt_ts in event_rows:
+            while (
+                c_idx + 1 < len(task_boundaries)
+                and task_boundaries[c_idx + 1][0] <= evt_ts
+            ):
+                c_idx += 1
+            cycle_events[c_idx].append({
                 "capability_id": cap_id,
                 "event_type": event_type,
                 "details": details or "",
@@ -277,9 +296,6 @@ def _load_cycle_data(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     # Build cumulative snapshots
     cumulative: dict[str, int] = defaultdict(int)
     cycles: list[dict] = []
-    # NOTE: when a task_id repeats across the sequence, utility/events
-    # lookup returns the merged result — for the analyzer's purposes
-    # (cumulative KL + per-type operation counts) that's fine.
     for i, (run_id, task_id, ts) in enumerate(task_rows):
         # Add this cycle's increments
         for cap_id, n in cycle_increment[i].items():
@@ -292,8 +308,8 @@ def _load_cycle_data(conn: duckdb.DuckDBPyConnection) -> list[dict]:
             "cumulative_invocations": dict(cumulative),  # snapshot copy
             "incremental_invocations": dict(cycle_increment[i]),
             "active_cap_count": len(cumulative),
-            "utility_scores": dict(utility_by_task_id.get(task_id, {})),
-            "events": list(events_by_task_id.get(task_id, [])),
+            "utility_scores": dict(cycle_utility[i]),
+            "events": list(cycle_events[i]),
         })
     return cycles
 

@@ -660,15 +660,29 @@ class TestSerializeForInvocation:
         assert s is not None
         assert "/tmp/x.csv" in s
 
-    def test_oversize_payload_truncates(self):
+    def test_oversize_payload_truncates_to_valid_json_sentinel(self):
+        """Security audit finding #16 (2026-04-20): oversize payloads
+        return a valid-JSON sentinel, NOT a broken string literal. Pre-
+        fix the function emitted ``f'{head}..."__TRUNCATED__"'`` which
+        failed to parse — every downstream ``json.loads`` (Pillar 3
+        coverage replay in particular) silently treated the case as
+        unreproducible. Post-fix the sentinel parses to a dict carrying
+        the original size so consumers can distinguish "truncated"
+        from "bad data"."""
+        import json
+
         from src.registry.metrics import serialize_for_invocation
 
-        # 64 KiB + slack — force truncation path.
         big = {"blob": "x" * 100_000}
         s = serialize_for_invocation(big)
         assert s is not None
-        assert len(s.encode("utf-8")) <= 64 * 1024
-        assert "__TRUNCATED__" in s
+        # CRITICAL: must be valid JSON so downstream json.loads works.
+        parsed = json.loads(s)
+        assert isinstance(parsed, dict)
+        assert parsed["__truncated__"] is True
+        assert parsed["__original_size_bytes__"] > 64 * 1024
+        # Sentinel itself is small.
+        assert len(s.encode("utf-8")) < 200
 
     def test_unserializable_returns_none(self):
         """Objects that json.dumps cannot encode even with default=str
