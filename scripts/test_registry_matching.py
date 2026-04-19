@@ -857,18 +857,22 @@ def run_phase_d(
 #
 # *** Testbed-scoped measurement only ***
 #
-# The 13-category taxonomy below is the same hardcoded list used by
-# scripts/migrate_business_domain_labels.py. It is scoped to the Business
-# Analytics testbed for measurement reproducibility — NOT a production
-# mechanism. Production MINT CLI uses an evolutionary taxonomy
-# (src/orchestrator/taxonomy.py post-B1) that grows organically. See
+# The 13-category taxonomy below is a hardcoded testbed-scoped list
+# (Business Analytics domain) kept for measurement reproducibility —
+# NOT a production mechanism. Production MINT CLI uses an evolutionary
+# taxonomy (src/orchestrator/taxonomy.py post-B1) that grows organically.
+# The historical one-off migration script that seeded this same list
+# onto pre-B1 generated capabilities was deleted 2026-04-19 (Step 13.6
+# Part A); see git history for `scripts/migrate_business_domain_labels.py`
+# if the taxonomy needs to be reapplied to a legacy registry. See
 # docs/MASTER_PLAN_2026_04_13.md Section 6 Phase 2 Step 3.5 for the
 # two-layer design rationale.
 # ---------------------------------------------------------------------------
 
 
-# Hardcoded taxonomy — keep in sync with
-# scripts/migrate_business_domain_labels.py TAXONOMY_ALL.
+# Hardcoded taxonomy — testbed-scoped for the Business Analytics domain.
+# Kept in sync with the historical migration's TAXONOMY_ALL (see git
+# history for scripts/migrate_business_domain_labels.py, deleted 2026-04-19).
 PHASE_E_TAXONOMY = (
     # Functional (generic, seed-level)
     "data-processing",
@@ -1984,8 +1988,11 @@ def main() -> int:
             "the domain filter, then report the decision-gate metrics "
             "(recall preservation + false-positive reduction) for B1 "
             "Step 3.5. Implies --generalization-audit. Requires the "
-            "registry to have meaningful domain labels (run "
-            "scripts/migrate_business_domain_labels.py first)."
+            "registry to have meaningful domain labels (CLI registry "
+            "acquires them automatically via src/orchestrator/taxonomy.py "
+            "once `mint run` has been exercised; legacy registries need "
+            "the historical migration — see git history for "
+            "scripts/migrate_business_domain_labels.py, deleted 2026-04-19)."
         ),
     )
     parser.add_argument(
