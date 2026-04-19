@@ -286,6 +286,19 @@ class EvaluationRecord(BaseModel):
         ),
     )
 
+    # --- Observability cross-reference (Step 13.7 Batch B6) ---
+    langfuse_trace_id: str | None = Field(
+        default=None,
+        description=(
+            "LangFuse root trace ID captured at record write time. Enables "
+            "jump-navigation from DuckDB eval row → LangFuse trace UI without "
+            "a timestamp/session join. Read from ``handler.last_trace_id`` "
+            "after pipeline.invoke completes; None when LangFuse is disabled "
+            "or handler lookup failed. Does not affect DuckDB-native metric "
+            "computation; pure convenience for Chapter 6 debugging."
+        ),
+    )
+
     # --- Reproducibility ---
     seed: int = Field(..., description="Random seed used for task ordering in this run")
     is_pilot: bool = Field(

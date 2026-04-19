@@ -193,6 +193,32 @@ def create_optimization_loop(
         # Compute KL divergence against previous cycle
         kl = _compute_kl_divergence(state.previous_utility_scores, scores)
 
+        # Step 13.7 Batch A4 — emit KL as a LangFuse score attached to
+        # the active trace so Chapter 5.4 convergence analysis is
+        # queryable via LangFuse dashboards (not just DuckDB
+        # cycle_utility_scores). Never raises.
+        try:
+            from langfuse import get_client
+            try:
+                lf = get_client()
+                lf.score_current_trace(
+                    name="m6.kl_divergence",
+                    value=float(kl),
+                    data_type="NUMERIC",
+                    comment=f"Optimizer cycle: {len(caps)} active capabilities",
+                )
+            except AttributeError:
+                # Older SDK — fall back to lf.score on current trace
+                lf.create_score(
+                    name="m6.kl_divergence",
+                    value=float(kl),
+                    data_type="NUMERIC",
+                    comment=f"Optimizer cycle: {len(caps)} active capabilities",
+                )
+        except Exception:  # noqa: BLE001
+            # Never-raises contract — if LangFuse is unavailable, skip.
+            pass
+
         return Command(
             update={
                 "capabilities_snapshot": caps,

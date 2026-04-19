@@ -30,12 +30,55 @@ import json
 import logging
 import re
 
+from collections import Counter
+
+from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import Severity, VerificationFinding, VerificationReport
 from src.verification import adversarial, behavioral, import_check, static_scanner
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_tier_event(
+    tier_label: str,
+    artifact: GeneratedArtifact,
+    findings: list[VerificationFinding],
+    *,
+    passed: bool,
+    skipped_remaining: bool = False,
+) -> None:
+    """Emit a LangFuse event summarising one tier's outcome (Step 13.7 Batch A1).
+
+    Never raises — uses emit_langfuse_event's silent-no-op contract.
+    Event name ``verification.tier_<label>.<pass|reject>`` plus structured
+    metadata let Chapter 4.1 cite per-tier traces by category. The severity
+    distribution + category list are the keys Chapter 4.1 needs to
+    empirically ground the Pillar 2 novelty claim (proposal line 152).
+    """
+    severity_dist = Counter(f.severity.value for f in findings)
+    category_list = sorted({f.category for f in findings})
+    level = "DEFAULT" if passed else "WARNING"
+    event_name = (
+        f"verification.tier_{tier_label}."
+        f"{'pass' if passed else 'reject'}"
+    )
+    emit_langfuse_event(
+        None,
+        event_name,
+        level,
+        {
+            "capability_name": artifact.capability_name,
+            "capability_type": artifact.capability_type.value,
+            "tier": tier_label,
+            "passed": passed,
+            "findings_count": len(findings),
+            "severity_distribution": dict(severity_dist),
+            "categories": category_list,
+            "skipped_remaining_tiers": skipped_remaining,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +255,18 @@ def _verify_inner(
             "Tier 1 rejected %s — CRITICAL finding(s) present, skipping Tier 1.5/2/3",
             name,
         )
+        _emit_tier_event(
+            "1", artifact, t1_report.findings,
+            passed=False, skipped_remaining=True,
+        )
         return VerificationReport(
             capability_name=name,
             findings=all_findings,
             overall_passed=False,
             tier_reached=t1_report.tier_reached,
         )
+
+    _emit_tier_event("1", artifact, t1_report.findings, passed=True)
 
     # ------------------------------------------------------------------
     # Tier 1.5: Sandbox import probe (fast fail on wrong pip packages,
@@ -235,12 +284,18 @@ def _verify_inner(
             "Tier 1.5 rejected %s — CRITICAL import-probe finding(s), skipping Tier 2/3",
             name,
         )
+        _emit_tier_event(
+            "1_5", artifact, t15_report.findings,
+            passed=False, skipped_remaining=True,
+        )
         return VerificationReport(
             capability_name=name,
             findings=all_findings,
             overall_passed=False,
             tier_reached=1,
         )
+
+    _emit_tier_event("1_5", artifact, t15_report.findings, passed=True)
 
     # ------------------------------------------------------------------
     # Tier 2: Behavioural testing (moderate cost)
@@ -258,12 +313,18 @@ def _verify_inner(
             "Tier 2 rejected %s — CRITICAL/HIGH finding(s), skipping Tier 3",
             name,
         )
+        _emit_tier_event(
+            "2", artifact, t2_findings,
+            passed=False, skipped_remaining=True,
+        )
         return VerificationReport(
             capability_name=name,
             findings=all_findings,
             overall_passed=False,
             tier_reached=2,
         )
+
+    _emit_tier_event("2", artifact, t2_findings, passed=True)
 
     # Tier 2 clearance: if Tier 1 had HIGH findings but Tier 2 is clean,
     # the HIGHs were false alarms (code smells that don't affect behavior).
@@ -299,6 +360,7 @@ def _verify_inner(
         overall_passed,
         len(all_findings),
     )
+    _emit_tier_event("3", artifact, t3_report.findings, passed=overall_passed)
     return VerificationReport(
         capability_name=name,
         findings=all_findings,

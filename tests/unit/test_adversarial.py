@@ -635,7 +635,7 @@ class TestPipPackagesPropagation:
             return {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
 
         with patch(
-            "src.verification.sandbox_tool.sandbox_execute",
+            "src.verification.sandbox_tool.sandbox_execute_silent",
             fake_base,
         ):
             wrapped = _make_probe_sandbox_execute([])
@@ -655,7 +655,7 @@ class TestPipPackagesPropagation:
             return {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
 
         with patch(
-            "src.verification.sandbox_tool.sandbox_execute",
+            "src.verification.sandbox_tool.sandbox_execute_silent",
             fake_base,
         ):
             wrapped = _make_probe_sandbox_execute(["pandas"])
@@ -675,7 +675,7 @@ class TestPipPackagesPropagation:
             return {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
 
         with patch(
-            "src.verification.sandbox_tool.sandbox_execute",
+            "src.verification.sandbox_tool.sandbox_execute_silent",
             fake_base,
         ):
             wrapped = _make_probe_sandbox_execute(["pandas", "numpy"])
@@ -699,7 +699,7 @@ class TestPipPackagesPropagation:
             return {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
 
         with patch(
-            "src.verification.sandbox_tool.sandbox_execute",
+            "src.verification.sandbox_tool.sandbox_execute_silent",
             fake_base,
         ):
             wrapped = _make_probe_sandbox_execute(["pandas", "numpy"])
@@ -725,7 +725,7 @@ class TestPipPackagesPropagation:
 
         caller_list = ["pandas"]
         with patch(
-            "src.verification.sandbox_tool.sandbox_execute",
+            "src.verification.sandbox_tool.sandbox_execute_silent",
             fake_base,
         ):
             wrapped = _make_probe_sandbox_execute(caller_list)

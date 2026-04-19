@@ -131,6 +131,7 @@ class CompositionalExecutor:
         metrics_store: Any | None = None,
         langfuse_tags: list[str] | None = None,
         langfuse_session_id: str | None = None,
+        langfuse_user_id: str | None = None,
         allow_network: bool = False,
     ) -> None:
         self.subtasks = subtasks
@@ -142,6 +143,10 @@ class CompositionalExecutor:
         self.metrics_store = metrics_store
         self.langfuse_tags = langfuse_tags
         self.langfuse_session_id = langfuse_session_id
+        # Step 13.7 Batch B2: allow the caller to override the default
+        # user_id. Eval harness runs produce different user_id than
+        # interactive CLI runs (enables per-source aggregation in UI).
+        self.langfuse_user_id = langfuse_user_id or "mint-cli"
         # Step 14.12: task-level network policy threaded into every step
         # executor (MCP_TOOL / SKILL / AGENT) so downstream ``sandbox_execute``
         # calls honor the same policy the CLI / harness resolved at task entry.
@@ -633,6 +638,34 @@ class CompositionalExecutor:
             task_id, len(execution_order),
         )
 
+        # Fix #3 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
+        # Capture the chain-executor's trace_id and set it in trace_context
+        # so SKILL/AGENT runtime paths (execution.py:589/1205 create their
+        # own CallbackHandler) attach their LLM GENERATIONs to THIS trace
+        # via TraceContext instead of creating fragmented sibling traces.
+        # The chain-executor span is active here (``_start_langfuse_chain_trace``
+        # called just above), so ``lf.current_trace_id`` IS set to the
+        # chain trace, even though we're outside a LangGraph node.
+        _chain_trace_id: str | None = None
+        if lf is not None:
+            try:
+                _chain_trace_id = getattr(lf, "current_trace_id", None)
+            except Exception:  # noqa: BLE001
+                pass
+        if _chain_trace_id:
+            from src.orchestrator.tracing import _trace_context_var, _trace_context_global, _trace_context_lock
+            _chain_tc_prev_var = _trace_context_var.get()
+            _chain_tc_merged = dict(_chain_tc_prev_var or {})
+            _chain_tc_merged["trace_id"] = _chain_trace_id
+            _chain_tc_token = _trace_context_var.set(_chain_tc_merged)
+            with _trace_context_lock:
+                _chain_tc_prev_global = dict(_trace_context_global)
+                _trace_context_global.clear()
+                _trace_context_global.update(_chain_tc_merged)
+        else:
+            _chain_tc_token = None
+            _chain_tc_prev_global = None
+
         try:
             for position, step_idx in enumerate(execution_order):
                 # Step 13: reset the per-step failure reason so a
@@ -845,6 +878,24 @@ class CompositionalExecutor:
                 output_files=collected_files,
             )
         finally:
+            # Fix #3 (2026-04-19): reset the trace_context we set around
+            # the chain-executor so subsequent code outside run() isn't
+            # affected. Mirrors the ContextVar + module-global reset
+            # logic in ``trace_context`` context manager.
+            if _chain_tc_token is not None:
+                try:
+                    from src.orchestrator.tracing import (
+                        _trace_context_var,
+                        _trace_context_global,
+                        _trace_context_lock,
+                    )
+                    _trace_context_var.reset(_chain_tc_token)
+                    with _trace_context_lock:
+                        _trace_context_global.clear()
+                        if _chain_tc_prev_global is not None:
+                            _trace_context_global.update(_chain_tc_prev_global)
+                except Exception:  # noqa: BLE001
+                    pass
             self.cleanup_workspace(workspace)
 
     # ------------------------------------------------------------------
@@ -887,9 +938,24 @@ class CompositionalExecutor:
                 str(t) for t in (self.langfuse_tags or [])
                 if isinstance(t, str)
             ]
+            # Step 13.7 tagging audit (2026-04-18) — append per-capability-type
+            # tags so Chapter 6 analysis can filter "show me all traces that
+            # executed an AGENT step" natively in the LangFuse UI. One
+            # `capability_type:X` tag per distinct type present in the chain.
+            try:
+                _types = {
+                    ref.capability_type.value
+                    for ref in self.resolution.values()
+                    if hasattr(ref, "capability_type")
+                }
+                for _ct in sorted(_types):
+                    clean_tags.append(f"capability_type:{_ct}")
+                clean_tags.append(f"chain_length:{chain_length}")
+            except Exception:  # noqa: BLE001
+                pass
             lf.update_current_trace(
                 name="chain-executor",
-                user_id="mint-cli",
+                user_id=self.langfuse_user_id,
                 session_id=self.langfuse_session_id,
                 tags=clean_tags,
             )
@@ -938,9 +1004,25 @@ class CompositionalExecutor:
             return None
         try:
             cap_type = ref.capability_type.value
-            step_cm = lf.start_as_current_span(
-                name=f"step-{position + 1}/{total}: {ref.capability_name}",
-            )
+            # Step 13.7 Batch C5: try typed observations (SDK v3) so
+            # LangFuse UI differentiates MCP_TOOL / SKILL / AGENT steps
+            # visually. Fall back to plain span on older SDK versions.
+            _type_map = {"mcp_tool": "tool", "agent": "agent", "skill": "span"}
+            _obs_type = _type_map.get(cap_type, "span")
+            step_cm = None
+            try:
+                start_typed = getattr(lf, "start_as_current_observation", None)
+                if start_typed is not None:
+                    step_cm = start_typed(
+                        as_type=_obs_type,
+                        name=f"step-{position + 1}/{total}: {ref.capability_name}",
+                    )
+            except Exception:  # noqa: BLE001
+                step_cm = None
+            if step_cm is None:
+                step_cm = lf.start_as_current_span(
+                    name=f"step-{position + 1}/{total}: {ref.capability_name}",
+                )
             span = step_cm.__enter__()
             span.update(
                 input={
@@ -955,29 +1037,40 @@ class CompositionalExecutor:
                     "source": ref.source,
                     "step_position": position + 1,
                     "step_total": total,
+                    "observation_type": _obs_type,
                 },
             )
             return step_cm
         except Exception:  # noqa: BLE001
             return None
 
-    @staticmethod
     def _end_langfuse_step_span(
+        self,
         step_cm: Any, success: bool, latency_ms: float, output: dict,
     ) -> None:
-        """Finalize a step span with outcome."""
+        """Finalize a step span with outcome.
+
+        Step 13.7 Batch B1 (2026-04-18): include ``failed_step_reason``
+        (the §12 finding #12 schema-violation string or AGENT timeout
+        meta) on the step-span output so LangFuse UI shows what broke
+        without a DuckDB join. Read from ``self._last_step_failure_reason``
+        which is set at the step-failure site.
+        """
         if step_cm is None:
             return
         try:
             # Update output on the span before closing the context
             from langfuse import Langfuse
             lf = Langfuse()
+            out_payload: dict = {
+                "success": success,
+                "latency_ms": round(latency_ms, 1),
+                "output_keys": list(output.keys()) if output else [],
+            }
+            if not success and self._last_step_failure_reason:
+                out_payload["failed_step_reason"] = self._last_step_failure_reason
             lf.update_current_span(
-                output={
-                    "success": success,
-                    "latency_ms": round(latency_ms, 1),
-                    "output_keys": list(output.keys()) if output else [],
-                },
+                output=out_payload,
                 level="DEFAULT" if success else "WARNING",
             )
             step_cm.__exit__(None, None, None)

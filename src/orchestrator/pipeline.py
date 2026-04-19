@@ -165,7 +165,44 @@ def create_pipeline(
                     previous_utility_scores=_prev_optimizer_scores,
                     allow_network=bool(getattr(state, "allow_network", False)),
                 )
-                result = _opt_loop.invoke(init_state)
+                # Fix #4 (2026-04-19): wrap the optimizer sub-graph in
+                # trace_context(trace_id=...) so pillar3.* events and
+                # per-variant verification events emitted by operations.py
+                # attach to the parent pipeline trace as children rather
+                # than creating standalone wrapper traces. Prefer
+                # ``state.trace_id`` (set by verification_node from its
+                # own handler lookup); fall back to a fresh handler.last_
+                # trace_id lookup in case verification_node's mutation
+                # didn't persist (LangGraph reducers take the checkpoint,
+                # not the mutated state).
+                from src.orchestrator.tracing import trace_context as _trace_context
+
+                _opt_trace_id = getattr(state, "trace_id", None)
+                if not _opt_trace_id:
+                    try:
+                        from langgraph.config import get_config as _get_lg_config
+                        _cfg = _get_lg_config()
+                        _raw_cbs = (_cfg or {}).get("callbacks")
+                        if _raw_cbs is None:
+                            _cb_iter: list = []
+                        elif isinstance(_raw_cbs, list):
+                            _cb_iter = _raw_cbs
+                        elif hasattr(_raw_cbs, "handlers"):
+                            _cb_iter = list(_raw_cbs.handlers)
+                        elif hasattr(_raw_cbs, "inheritable_handlers"):
+                            _cb_iter = list(_raw_cbs.inheritable_handlers)
+                        else:
+                            _cb_iter = []
+                        for _cb in _cb_iter:
+                            _tid = getattr(_cb, "last_trace_id", None)
+                            if _tid:
+                                _opt_trace_id = _tid
+                                break
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                with _trace_context(trace_id=_opt_trace_id):
+                    result = _opt_loop.invoke(init_state)
                 # Carry current utility scores forward for the next pipeline run.
                 if isinstance(result, dict):
                     _prev_optimizer_scores = result.get("utility_scores", {})

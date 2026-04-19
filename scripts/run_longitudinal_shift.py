@@ -277,21 +277,30 @@ def main() -> int:
             verification_enabled=True,
         ).compile()
 
+        _file_fmts = list({fp.suffix.lower().lstrip(".") for fp in task.fixture_paths}) if task.fixture_paths else []
+        _lf_tags = [
+            "longitudinal_shift",
+            "condition:longitudinal_shift",
+            f"phase:{phase_label}",
+            task.task_id,
+            f"tier:{task.tier}",
+            f"cycle:{cycle}/{args.total}",
+            f"shift_at:{args.shift_at}",
+            f"static_coverage:{str(task.has_static_coverage).lower()}",
+            *(f"format:{fmt}" for fmt in sorted(_file_fmts)),
+        ]
+        _lf_session = f"longitudinal-shift-{args.seed}"
+
         invoke_config: dict = {}
         if langfuse_handler is not None:
             invoke_config["callbacks"] = [langfuse_handler]
-            _file_fmts = list({fp.suffix.lower().lstrip(".") for fp in task.fixture_paths}) if task.fixture_paths else []
             invoke_config["metadata"] = {
-                "langfuse_session_id": f"longitudinal-shift-{args.seed}",
-                "langfuse_tags": [
-                    "longitudinal_shift",
-                    f"phase:{phase_label}",
-                    task.task_id,
-                    f"tier:{task.tier}",
-                    f"cycle:{cycle}/{args.total}",
-                    f"shift_at:{args.shift_at}",
-                    *(f"format:{fmt}" for fmt in sorted(_file_fmts)),
-                ],
+                "langfuse_session_id": _lf_session,
+                # Step 13.7 tagging audit (2026-04-18) — user_id
+                # differentiates shift runs from CLI / eval / plain
+                # longitudinal in per-user LangFuse dashboards.
+                "langfuse_user_id": "longitudinal-shift-runner",
+                "langfuse_tags": _lf_tags,
                 "task_id": task.task_id,
                 "cycle": cycle,
                 "phase": phase_label,
@@ -301,84 +310,118 @@ def main() -> int:
             }
 
         initial_state = TaskState(task_description=task.task_prompt)
-        try:
-            final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
-            result = _extract_result(final_state, task, loader)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Pipeline raised for task %s: %s", task.task_id, exc)
-            result = {
-                "gate_passed": False,
-                "output_in_range": False,
-                "failure_reason": "generation_failed",
-                "attempt_count": 0,
-            }
-
-        elapsed_ms = int((time.monotonic() - t_start) * 1000)
-
-        record = EvaluationRecord(
-            run_id=run_id,
-            condition="longitudinal",
-            task_id=task.task_id,
-            task_tier=task.tier,
-            attempt_count=result.get("attempt_count", 0),
-            capability_type=result.get("capability_type"),
-            verification_tier_reached=result.get("verification_tier_reached"),
-            gate_passed=result.get("gate_passed", False),
-            output_in_range=result.get("output_in_range", False),
-            token_cost=0,
-            attempt_latency_ms=elapsed_ms,
-            failure_reason=result.get("failure_reason", "generation_failed"),
-            registry_snapshot_id=snap_id,
-            seed=args.seed,
-            is_pilot=False,
-        )
-
-        eval_store.record_run(record)
-        records.append(record)
-
-        cumulative_total += 1
-        if record.success:
-            cumulative_success += 1
-
-        # --- Persist per-task cycle state (Step 18.7 flush helper) ---
-        flush_task_cycle_state(
-            eval_store=eval_store,
-            metrics_store=metrics_store,
-            registry=registry,
-            run_id=run_id,
-            condition="longitudinal",
-            task_id=task.task_id,
-            task_events_cutoff=task_events_cutoff,
-        )
-
-        # --- Write shift marker at the cycle boundary (Step 18.8) ---
-        # The marker is a synthetic cycle_events row with event_type
-        # "distribution_shift". Written AFTER the last Phase A task
-        # finishes + its per-task flush completes, so the marker's
-        # occurred_at is strictly after all Phase A events but before
-        # the first Phase B task's events.
-        if cycle == args.shift_at and not shift_marked:
+        # Step 13.7 tag-propagation fix (2026-04-19): wrap pipeline.invoke +
+        # per-task flush + shift-boundary emit in trace_context so events
+        # from ThreadPool workers (verification, adversarial), LangChain
+        # @tool callbacks (sandbox_execute), and post-pipeline emit sites
+        # (cycle_flush.completed, longitudinal.distribution_shift) all
+        # inherit tags/session/user.
+        from src.orchestrator.tracing import trace_context
+        with trace_context(
+            tags=_lf_tags,
+            session_id=_lf_session,
+            user_id="longitudinal-shift-runner",
+        ):
             try:
-                details = (
-                    f"phase_a=[{','.join(t.task_id for t in phase_a_tasks)}], "
-                    f"phase_b=[{','.join(t.task_id for t in phase_b_tasks)}], "
-                    f"shift_at={args.shift_at}, total={args.total}"
-                )
-                eval_store.record_cycle_events(
-                    run_id=run_id,
-                    condition="longitudinal",
-                    task_id=task.task_id,  # the LAST Phase A task
-                    events=[{
-                        "capability_id": "__system__",
-                        "event_type": "distribution_shift",
-                        "details": details,
-                    }],
-                )
-                shift_marked = True
-                logger.info("=== DISTRIBUTION SHIFT at cycle %d ===", cycle)
-                logger.info("    Phase A complete. Beginning Phase B at next cycle.")
+                final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
+                result = _extract_result(final_state, task, loader)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to write distribution_shift marker: %s", exc)
+                logger.warning("Pipeline raised for task %s: %s", task.task_id, exc)
+                result = {
+                    "gate_passed": False,
+                    "output_in_range": False,
+                    "failure_reason": "generation_failed",
+                    "attempt_count": 0,
+                }
+
+            elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+            record = EvaluationRecord(
+                run_id=run_id,
+                condition="longitudinal",
+                task_id=task.task_id,
+                task_tier=task.tier,
+                attempt_count=result.get("attempt_count", 0),
+                capability_type=result.get("capability_type"),
+                verification_tier_reached=result.get("verification_tier_reached"),
+                gate_passed=result.get("gate_passed", False),
+                output_in_range=result.get("output_in_range", False),
+                token_cost=0,
+                attempt_latency_ms=elapsed_ms,
+                failure_reason=result.get("failure_reason", "generation_failed"),
+                registry_snapshot_id=snap_id,
+                seed=args.seed,
+                is_pilot=False,
+            )
+
+            eval_store.record_run(record)
+            records.append(record)
+
+            cumulative_total += 1
+            if record.success:
+                cumulative_success += 1
+
+            # --- Persist per-task cycle state (Step 18.7 flush helper) ---
+            flush_task_cycle_state(
+                eval_store=eval_store,
+                metrics_store=metrics_store,
+                registry=registry,
+                run_id=run_id,
+                condition="longitudinal",
+                task_id=task.task_id,
+                task_events_cutoff=task_events_cutoff,
+            )
+
+            # --- Write shift marker at the cycle boundary (Step 18.8) ---
+            # The marker is a synthetic cycle_events row with event_type
+            # "distribution_shift". Written AFTER the last Phase A task
+            # finishes + its per-task flush completes, so the marker's
+            # occurred_at is strictly after all Phase A events but before
+            # the first Phase B task's events.
+            if cycle == args.shift_at and not shift_marked:
+                try:
+                    details = (
+                        f"phase_a=[{','.join(t.task_id for t in phase_a_tasks)}], "
+                        f"phase_b=[{','.join(t.task_id for t in phase_b_tasks)}], "
+                        f"shift_at={args.shift_at}, total={args.total}"
+                    )
+                    eval_store.record_cycle_events(
+                        run_id=run_id,
+                        condition="longitudinal",
+                        task_id=task.task_id,  # the LAST Phase A task
+                        events=[{
+                            "capability_id": "__system__",
+                            "event_type": "distribution_shift",
+                            "details": details,
+                        }],
+                    )
+                    shift_marked = True
+                    logger.info("=== DISTRIBUTION SHIFT at cycle %d ===", cycle)
+                    logger.info("    Phase A complete. Beginning Phase B at next cycle.")
+
+                    # Step 13.7 Batch A5 — mirror the shift boundary into
+                    # LangFuse so Chapter 6 RQ #3 adaptation-verdict prose
+                    # can cite the event cross-reference. DuckDB row already
+                    # written above; this adds the LangFuse-UI marker.
+                    try:
+                        from src.orchestrator.tracing import emit_langfuse_event
+                        emit_langfuse_event(
+                            None,
+                            "longitudinal.distribution_shift",
+                            "DEFAULT",
+                            {
+                                "cycle": cycle,
+                                "shift_at": args.shift_at,
+                                "total": args.total,
+                                "run_id": run_id,
+                                "phase_a_tasks": [t.task_id for t in phase_a_tasks],
+                                "phase_b_tasks": [t.task_id for t in phase_b_tasks],
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("LangFuse distribution_shift emit failed: %s", exc)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to write distribution_shift marker: %s", exc)
 
         status = "OK" if record.success else "FAIL"
         logger.info(

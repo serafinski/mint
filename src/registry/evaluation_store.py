@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     output_shape_missing_keys VARCHAR NOT NULL DEFAULT '[]',
     output_shape_missing_files VARCHAR NOT NULL DEFAULT '[]',
     generated_artifact_sources VARCHAR NOT NULL DEFAULT '[]',
+    langfuse_trace_id         VARCHAR,
     timestamp                 TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -149,6 +150,10 @@ _MIGRATIONS = [
     # Needed because snapshot isolation wipes the registry between runs, so
     # post-eval audit tool cannot reconstruct source from chroma alone.
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS generated_artifact_sources VARCHAR",
+    # Step 13.7 Batch B6 — LangFuse root trace ID cross-reference.
+    # Enables jump-navigation from DuckDB eval row → LangFuse trace UI
+    # without a timestamp/session join.
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS langfuse_trace_id VARCHAR",
 ]
 
 
@@ -197,9 +202,9 @@ class EvaluationStore:
                 generated_artifact_count, capability_types,
                 failed_step_index, failed_step_name, failed_step_reason,
                 output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
-                generated_artifact_sources,
+                generated_artifact_sources, langfuse_trace_id,
                 timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 row_id,
@@ -236,6 +241,7 @@ class EvaluationStore:
                 json.dumps(
                     [s.model_dump(mode="json") for s in record.generated_artifact_sources]
                 ),
+                record.langfuse_trace_id,
                 record.timestamp,
             ],
         )
@@ -458,7 +464,7 @@ class EvaluationStore:
                    generated_artifact_count, capability_types,
                    failed_step_index, failed_step_name, failed_step_reason,
                    output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
-                   generated_artifact_sources,
+                   generated_artifact_sources, langfuse_trace_id,
                    timestamp
             FROM evaluation_runs
             {where}
@@ -559,7 +565,7 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         generated_artifact_count, capability_types,
         failed_step_index, failed_step_name, failed_step_reason,
         output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
-        generated_artifact_sources,
+        generated_artifact_sources, langfuse_trace_id,
         timestamp,
     ) = row
     # DuckDB may return naive datetimes — normalise to UTC-aware
@@ -636,5 +642,6 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         output_shape_missing_keys=_decode_str_list(output_shape_missing_keys),
         output_shape_missing_files=_decode_str_list(output_shape_missing_files),
         generated_artifact_sources=_decode_artifact_sources(generated_artifact_sources),
+        langfuse_trace_id=langfuse_trace_id,
         timestamp=timestamp,
     )

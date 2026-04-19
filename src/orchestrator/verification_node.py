@@ -144,6 +144,14 @@ def verification_node(
 
     # Pass LangFuse metadata to adversarial prober (runs in worker threads
     # where get_config() is unavailable). Must be set before the pool starts.
+    #
+    # Fix #4 (2026-04-19): also populate ``state.trace_id`` from the
+    # pipeline's CallbackHandler.last_trace_id so the trace_context wrap
+    # below can thread the trace_id into ThreadPool workers. Without this,
+    # state.trace_id stays None (its default) and the workers fall back
+    # to the standalone-span path — which defeats Fix #4's whole point.
+    # handler.last_trace_id IS populated by the time verification_node runs
+    # because earlier pipeline nodes already fired LLM calls.
     try:
         from langgraph.config import get_config as _get_langgraph_config
         from src.verification.adversarial import set_langfuse_metadata
@@ -155,6 +163,38 @@ def verification_node(
             if k.startswith("langfuse_") or k in ("task_id", "condition", "run_id", "tier")
         }
         set_langfuse_metadata(lf_meta)
+
+        # Fix #4: extract last_trace_id from the CallbackHandler in the
+        # pipeline's invoke config. LangChain wraps callbacks in a
+        # BaseCallbackManager during LangGraph traversal, so we need to
+        # handle both list form (user-provided) and manager form
+        # (post-traversal). CallbackManager exposes ``handlers`` attr
+        # containing the underlying BaseCallbackHandler list.
+        if state.trace_id is None:
+            _raw_callbacks = (parent_config or {}).get("callbacks")
+            if _raw_callbacks is None:
+                _handler_iter: list = []
+            elif isinstance(_raw_callbacks, list):
+                _handler_iter = _raw_callbacks
+            elif hasattr(_raw_callbacks, "handlers"):
+                _handler_iter = list(_raw_callbacks.handlers)
+            elif hasattr(_raw_callbacks, "inheritable_handlers"):
+                _handler_iter = list(_raw_callbacks.inheritable_handlers)
+            else:
+                _handler_iter = []
+            for _cb in _handler_iter:
+                _tid = getattr(_cb, "last_trace_id", None)
+                if _tid:
+                    state.trace_id = _tid
+                    break
+            if state.trace_id is None and _handler_iter:
+                logger.debug(
+                    "Fix #4: found %d callback(s) but none had last_trace_id; "
+                    "ThreadPool events will fall back to standalone-span path. "
+                    "Handler types: %s",
+                    len(_handler_iter),
+                    [type(_cb).__name__ for _cb in _handler_iter],
+                )
     except Exception:  # noqa: BLE001
         pass
 
@@ -180,8 +220,21 @@ def verification_node(
         len(state.generated_artifacts) - len(artifacts_to_verify),
     )
 
+    # Fix #4 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
+    # wrap the ThreadPool in a trace_context(trace_id=state.trace_id) so
+    # events emitted from inside the gate / adversarial / coverage
+    # workers (which run in separate threads where neither LangGraph's
+    # contextvar nor LangFuse SDK's contextvar is available) attach to
+    # the parent pipeline trace via TraceContext instead of creating
+    # standalone wrapper traces. ~80% fewer sibling traces in the
+    # LangFuse UI; every verification.tier_*.{pass,reject},
+    # adversarial.*, verification.coverage.* event nests as a child of
+    # the originating pipeline trace.
+    from src.orchestrator.tracing import trace_context as _trace_context
+
     # Run gate_fn in parallel — each call is independent (isolated Docker sandbox).
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_VERIFICATION_WORKERS) as pool:
+    with _trace_context(trace_id=state.trace_id), \
+         concurrent.futures.ThreadPoolExecutor(max_workers=MAX_VERIFICATION_WORKERS) as pool:
         future_to_artifact = {
             pool.submit(gate_fn, artifact): artifact
             for artifact in artifacts_to_verify

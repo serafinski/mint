@@ -337,6 +337,8 @@ class EvaluationHarness:
         # Step 5: execute each task
         records: list[EvaluationRecord] = []
         from datetime import UTC, datetime
+
+        from src.orchestrator.tracing import trace_context
         for i, task in enumerate(shuffled_tasks):
             logger.info(
                 "──── Task %d/%d: %s (%s) ────",
@@ -346,39 +348,81 @@ class EvaluationHarness:
             # post-task cycle_events flush (below) can filter MetricsStore's
             # capability_events to just this task's events.
             task_events_cutoff = datetime.now(UTC)
-            record = self._run_one_task(
-                task=task,
-                condition=condition,
-                run_id=run_id,
-                registry=registry,
-                loader=loader,
-                metrics_store=metrics_store,
-                seed=seed,
-                snap_id=snap_id,
-                is_pilot=is_pilot,
-            )
-            self._store.record_run(record)
-            records.append(record)
+            # Step 13.7 tag-propagation fix (2026-04-19): wrap BOTH
+            # pipeline.invoke AND the post-task flush in trace_context so
+            # events emitted from ThreadPool workers (gate.verify,
+            # adversarial) + LangChain @tool callbacks (sandbox_execute) +
+            # post-pipeline sites (cycle_flush.completed) all inherit
+            # tags/session/user. The pipeline's own config.metadata still
+            # drives the primary path (get_config() inside nodes); this
+            # wrap just closes the fallback for non-node emit sites.
+            _lf_tags = self._build_task_lf_tags(task, condition, is_pilot)
+            with trace_context(
+                tags=_lf_tags,
+                session_id=run_id,
+                user_id="eval-harness",
+            ):
+                record = self._run_one_task(
+                    task=task,
+                    condition=condition,
+                    run_id=run_id,
+                    registry=registry,
+                    loader=loader,
+                    metrics_store=metrics_store,
+                    seed=seed,
+                    snap_id=snap_id,
+                    is_pilot=is_pilot,
+                )
+                self._store.record_run(record)
+                records.append(record)
 
-            # Step 18.5 + 18.7 (2026-04-17): persist per-task cycle state
-            # (invocation_events + cycle_utility_scores + cycle_events) to
-            # the EvaluationStore for Chapter 6 Gini + KL convergence +
-            # per-type op-count analyses. Factored out to
-            # ``tests.evaluation.cycle_flush.flush_task_cycle_state`` so
-            # the longitudinal scripts (which inline their own task loops)
-            # call the same code path. Never-raises.
-            from tests.evaluation.cycle_flush import flush_task_cycle_state
-            flush_task_cycle_state(
-                eval_store=self._store,
-                metrics_store=metrics_store,
-                registry=registry,
-                run_id=run_id,
-                condition=condition,
-                task_id=task.task_id,
-                task_events_cutoff=task_events_cutoff,
-            )
+                # Step 18.5 + 18.7 (2026-04-17): persist per-task cycle state
+                # (invocation_events + cycle_utility_scores + cycle_events) to
+                # the EvaluationStore for Chapter 6 Gini + KL convergence +
+                # per-type op-count analyses. Factored out to
+                # ``tests.evaluation.cycle_flush.flush_task_cycle_state`` so
+                # the longitudinal scripts (which inline their own task loops)
+                # call the same code path. Never-raises.
+                from tests.evaluation.cycle_flush import flush_task_cycle_state
+                flush_task_cycle_state(
+                    eval_store=self._store,
+                    metrics_store=metrics_store,
+                    registry=registry,
+                    run_id=run_id,
+                    condition=condition,
+                    task_id=task.task_id,
+                    task_events_cutoff=task_events_cutoff,
+                )
 
         return records
+
+    def _build_task_lf_tags(
+        self,
+        task: TaskDefinition,
+        condition: str,
+        is_pilot: bool,
+    ) -> list[str]:
+        """Build the per-task LangFuse tag list.
+
+        Extracted from ``_run_jit`` so the outer loop can also apply the
+        same tags to the ``trace_context`` wrap (Step 13.7 tag-propagation
+        fix). Kept in sync with the in-``_run_jit`` invoke_config.metadata
+        tag list — both call sites share this helper.
+        """
+        _file_formats = list({
+            fp.suffix.lower().lstrip(".") for fp in task.fixture_paths
+        }) if task.fixture_paths else []
+        _tags: list[str] = [
+            condition,
+            task.task_id,
+            f"tier:{task.tier}",
+            *(f"format:{fmt}" for fmt in sorted(_file_formats)),
+            f"allow_network:{str(self._config.allow_network).lower()}",
+            f"static_coverage:{str(task.has_static_coverage).lower()}",
+        ]
+        if is_pilot:
+            _tags.append("pilot")
+        return _tags
 
     def _run_one_task(
         self,
@@ -406,6 +450,7 @@ class EvaluationHarness:
                 loader,
                 metrics_store,
                 run_id=run_id,
+                is_pilot=is_pilot,
             )
 
         elapsed_ms = int((time.monotonic() - t_start) * 1000)
@@ -441,6 +486,7 @@ class EvaluationHarness:
             output_shape_missing_keys=result.get("output_shape_missing_keys", []),
             output_shape_missing_files=result.get("output_shape_missing_files", []),
             generated_artifact_sources=result.get("generated_artifact_sources", []),
+            langfuse_trace_id=result.get("langfuse_trace_id"),
         )
 
     # -- condition implementations -------------------------------------------
@@ -500,6 +546,7 @@ class EvaluationHarness:
         metrics_store: Any,
         *,
         run_id: str = "",
+        is_pilot: bool = False,
     ) -> dict:
         """JIT conditions: invoke the pipeline, then validate output."""
         from src.orchestrator.pipeline import create_pipeline
@@ -525,20 +572,35 @@ class EvaluationHarness:
             _file_formats = list({
                 fp.suffix.lower().lstrip(".") for fp in task.fixture_paths
             }) if task.fixture_paths else []
+
+            # Step 13.7 tagging audit (2026-04-18) — build the tag list
+            # to maximize analysis-time filterability. Axes:
+            # - condition: which ablation (full / no_verification / ...)
+            # - task_id / tier: per-task + per-tier aggregation
+            # - format:X: per-file-format behavior
+            # - allow_network:{true|false}: network-policy consistency
+            #   with CLI (CLI also tags this)
+            # - pilot: fast exclusion of pilot runs from primary metrics
+            # - static_coverage:{true|false}: filter retrieval vs synthesis
+            #   tasks (the 6-of-20 that static can handle)
+            _tags = self._build_task_lf_tags(task, condition, is_pilot)
+
             invoke_config["metadata"] = {
                 "langfuse_session_id": run_id,
-                "langfuse_tags": [
-                    condition,
-                    task.task_id,
-                    f"tier:{task.tier}",
-                    *(f"format:{fmt}" for fmt in sorted(_file_formats)),
-                ],
+                # user_id differentiates eval-harness traces from
+                # interactive `mint` CLI traces (which set user_id="mint-cli").
+                # Per-user LangFuse dashboards show eval-aggregate vs
+                # ad-hoc-CLI-aggregate separately.
+                "langfuse_user_id": "eval-harness",
+                "langfuse_tags": _tags,
                 "task_id": task.task_id,
                 "condition": condition,
                 "run_id": run_id,
                 "tier": task.tier,
                 "has_static_coverage": task.has_static_coverage,
                 "file_formats": _file_formats,
+                "is_pilot": is_pilot,
+                "allow_network": self._config.allow_network,
             }
 
         # Step 14.6 — resolve the output contract via the shared boundary
@@ -580,15 +642,73 @@ class EvaluationHarness:
                 "attempt_count": 0,
             }
 
+        # Step 13.7 Batch B6 — capture LangFuse root trace ID for
+        # DuckDB↔LangFuse cross-reference. Read after pipeline.invoke
+        # completes; None when LangFuse is disabled. Never raises.
+        _lf_trace_id: str | None = None
+        if self._config.langfuse_handler is not None:
+            try:
+                _lf_trace_id = getattr(
+                    self._config.langfuse_handler, "last_trace_id", None,
+                )
+            except Exception:  # noqa: BLE001
+                _lf_trace_id = None
+
         # Pass LangFuse tags to execution functions so sub-traces
         # (skill/agent execution) are tagged consistently.
         _lf_meta = invoke_config.get("metadata", {})
-        return _extract_result(
+        result = _extract_result(
             final_state, task, loader,
             metrics_store=metrics_store,
             langfuse_tags=_lf_meta.get("langfuse_tags"),
             langfuse_session_id=_lf_meta.get("langfuse_session_id"),
         )
+        if _lf_trace_id is not None:
+            result["langfuse_trace_id"] = _lf_trace_id
+
+            # Step 13.7 Batch B5 — push M1 (success) + M5 (latency) as
+            # LangFuse scores attached to the trace so Chapter 6's
+            # per-metric dashboards are queryable natively. M3 (Gini)
+            # + M6 (KL) are per-aggregate and flow via cycle_utility_scores
+            # / invocation_events. M2 (contamination) is post-eval via
+            # the audit tool. M4 (token cost) already flows via
+            # GENERATION spans.
+            try:
+                from langfuse import get_client
+                lf = get_client()
+                success_val = (
+                    float(result.get("gate_passed", False))
+                    * float(result.get("output_in_range", False))
+                )
+                for method_name in ("create_score", "score"):
+                    _create = getattr(lf, method_name, None)
+                    if _create is None:
+                        continue
+                    try:
+                        _create(
+                            trace_id=_lf_trace_id,
+                            name="m1.success",
+                            value=success_val,
+                            data_type="NUMERIC",
+                        )
+                        # M5 only reported on successful runs (precondition
+                        # per proposal §M5; failed runs have no "first correct").
+                        if success_val > 0:
+                            _create(
+                                trace_id=_lf_trace_id,
+                                name="m5.latency_ms",
+                                value=float(
+                                    result.get("chain_result_attempt_latency_ms", 0)
+                                    or 0
+                                ),
+                                data_type="NUMERIC",
+                            )
+                        break
+                    except Exception:  # noqa: BLE001
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+        return result
 
 
 # ---------------------------------------------------------------------------

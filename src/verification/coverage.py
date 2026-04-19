@@ -492,6 +492,33 @@ def verify_coverage(
     # this as status='error' rather than 'verified' so callers can
     # distinguish "variants genuinely didn't cover anything" from
     # "replay infrastructure failed on everything".
+    # Step 13.7 Batch B4: emit LangFuse event so Chapter 5.3's
+    # coverage-verification narrative is traceable in the LangFuse UI
+    # alongside the split_variant / split_rollback events. Never raises.
+    try:
+        from src.orchestrator.tracing import emit_langfuse_event
+        _cov_status = (
+            "error"
+            if (not all_covered and not coverage_map and execution_errors)
+            else "verified"
+        )
+        emit_langfuse_event(
+            None,
+            f"verification.coverage.{_cov_status}",
+            "WARNING" if not all_covered else "DEFAULT",
+            {
+                "all_covered": all_covered,
+                "n_variants": len(variants),
+                "n_failure_cases": len(failure_cases),
+                "n_covered": len(coverage_map),
+                "n_uncovered": len(uncovered),
+                "n_execution_errors": len(execution_errors),
+                "variant_names": [v.capability_name for v in variants],
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
     if not all_covered and not coverage_map and execution_errors:
         return CoverageReport(
             all_covered=False,

@@ -22,11 +22,11 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from langchain.chat_models import init_chat_model
-from langfuse.langchain import CallbackHandler as LangfuseHandler
 
 from src.config import DEFAULT_LLM_MODEL
 from pydantic import BaseModel, Field
 
+from src.orchestrator.tracing import emit_langfuse_event
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
@@ -36,12 +36,82 @@ from src.schemas.verification import Severity
 logger = logging.getLogger(__name__)
 
 
-def _langfuse_config() -> dict:
-    """Return a LangChain config dict with LangFuse callback (best-effort)."""
+def _record_and_emit_event(
+    metrics_store: MetricsStore,
+    capability_name: str,
+    event_type: str,
+    details: str = "",
+) -> None:
+    """Record a Pillar 3 op event in BOTH DuckDB and LangFuse (Step 13.7 Batch A3).
+
+    Previously only DuckDB-native via ``metrics_store.record_event``; now
+    mirrors to LangFuse as ``pillar3.<event_type>`` so Chapter 5.3's
+    per-operation narrative is traceable in the LangFuse UI without a
+    DuckDB join. Never raises — both sides are best-effort.
+
+    Event level: ``WARNING`` for rollbacks (``verification_rollback``,
+    ``split_rollback``), ``DEFAULT`` otherwise.
+    """
     try:
-        return {"callbacks": [LangfuseHandler()]}
+        metrics_store.record_event(capability_name, event_type, details)
     except Exception:  # noqa: BLE001
-        return {}
+        logger.debug("record_event failed for %s/%s", capability_name, event_type)
+
+    level = "WARNING" if event_type.endswith("_rollback") else "DEFAULT"
+    emit_langfuse_event(
+        None,
+        f"pillar3.{event_type}",
+        level,
+        {
+            "capability_name": capability_name,
+            "event_type": event_type,
+            "details": details,
+        },
+    )
+
+
+def _langfuse_config() -> dict:
+    """Return a LangChain config dict inheriting parent session_id / tags /
+    user_id from the active LangGraph config (best-effort).
+
+    Step 13.7 Batch A2 (2026-04-18): merge/split LLM traces link to the
+    triggering task's session. Without this, optimizer-path traces
+    appear orphaned in LangFuse (not joinable to the originating Phase 4
+    record) and Chapter 5.3 navigation requires a DB join.
+
+    Fix #3 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
+    Previously constructed a fresh ``LangfuseHandler()`` and added it to
+    ``base["callbacks"]``. But ``operations.py`` runs inside
+    ``optimizer_node`` which is itself a LangGraph node under the parent
+    ``pipeline.invoke`` config — where a CallbackHandler is ALREADY
+    attached. LangChain's ``.invoke(config=lf_config)`` merges callbacks
+    additively, so the same merge/split LLM call would fire BOTH handlers
+    and produce two GENERATION spans per call (pure duplicate).
+
+    Fix: omit the explicit handler. LangGraph propagates the parent
+    ``pipeline.invoke`` CallbackHandler via contextvar, so the LLM call
+    auto-traces under the parent trace — single GENERATION, correctly
+    nested under ``optimizer_node``'s graph position. Metadata inheritance
+    unchanged (tags / session / user still flow through).
+    """
+    base: dict = {}
+
+    try:
+        from langgraph.config import get_config as _get_langgraph_config
+
+        parent_config = _get_langgraph_config()
+        parent_meta = (parent_config or {}).get("metadata", {})
+        inherited = {
+            k: v for k, v in parent_meta.items()
+            if k.startswith("langfuse_")
+            or k in ("task_id", "condition", "run_id", "tier")
+        }
+        if inherited:
+            base["metadata"] = inherited
+    except Exception:  # noqa: BLE001
+        pass
+
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +211,7 @@ def verify_and_register_or_rollback(
         logger.warning(
             "verify_and_register_or_rollback(%s): %s", name, reason
         )
-        metrics_store.record_event(name, "verification_rollback", reason)
+        _record_and_emit_event(metrics_store, name, "verification_rollback", reason)
         return False, reason
 
     if not report.overall_passed:
@@ -157,7 +227,7 @@ def verify_and_register_or_rollback(
         logger.warning(
             "verify_and_register_or_rollback(%s): %s", name, reason
         )
-        metrics_store.record_event(name, "verification_rollback", reason)
+        _record_and_emit_event(metrics_store, name, "verification_rollback", reason)
         return False, reason
 
     # --- Register ---
@@ -266,7 +336,7 @@ def _register_artifact_directly(
             )
             registry.add(descriptor)
 
-        metrics_store.record_event(name, event_type, event_details)
+        _record_and_emit_event(metrics_store, name, event_type, event_details)
         logger.info(
             "_register_artifact_directly(%s): registered as %s (%s)",
             name, event_type, event_details,
@@ -278,7 +348,7 @@ def _register_artifact_directly(
         logger.warning(
             "_register_artifact_directly(%s): %s", name, reason
         )
-        metrics_store.record_event(name, "verification_rollback", reason)
+        _record_and_emit_event(metrics_store, name, "verification_rollback", reason)
         return False, reason
 
 
@@ -602,7 +672,7 @@ def prune(
         count = metrics_store.invocations_since(cap.name, cutoff)
         if count == 0:
             registry.deactivate(cap.name)
-            metrics_store.record_event(cap.name, "pruned", f"zero invocations in {window_days}d")
+            _record_and_emit_event(metrics_store, cap.name, "pruned", f"zero invocations in {window_days}d")
             logger.info("Pruned capability '%s' (zero invocations in %dd)", cap.name, window_days)
             pruned.append(cap.name)
 
@@ -926,7 +996,7 @@ def _merge_tools(
     # Atomically deactivate parents only after successful registration
     for c in caps:
         registry.deactivate(c.name)
-        metrics_store.record_event(c.name, "merged", f"into {result.name}")
+        _record_and_emit_event(metrics_store, c.name, "merged", f"into {result.name}")
 
     logger.info("Merged MCP_TOOL %s → '%s'", [c.name for c in caps], result.name)
     return result.name
@@ -1052,7 +1122,7 @@ def _merge_skills(
 
     for c in caps:
         registry.deactivate(c.name)
-        metrics_store.record_event(c.name, "merged", f"into {result.name}")
+        _record_and_emit_event(metrics_store, c.name, "merged", f"into {result.name}")
 
     logger.info("Merged SKILL %s → '%s'", [c.name for c in caps], result.name)
     return result.name
@@ -1209,7 +1279,7 @@ def _merge_agents(
 
     for c in caps:
         registry.deactivate(c.name)
-        metrics_store.record_event(c.name, "merged", f"into {result.name}")
+        _record_and_emit_event(metrics_store, c.name, "merged", f"into {result.name}")
 
     logger.info("Merged AGENT %s → '%s'", [c.name for c in caps], result.name)
     return result.name
@@ -1505,11 +1575,9 @@ def _split_finalize(
             for prev_name in registered:
                 try:
                     registry.deactivate(prev_name)
-                    metrics_store.record_event(
-                        prev_name,
+                    _record_and_emit_event(metrics_store, prev_name,
                         "split_rollback",
-                        f"phase D registration failed on sibling '{artifact.capability_name}'",
-                    )
+                        f"phase D registration failed on sibling '{artifact.capability_name}'",)
                 except Exception as rollback_exc:  # noqa: BLE001
                     logger.error(
                         "split phase D (%s): rollback of '%s' also failed: %s",
@@ -1519,9 +1587,7 @@ def _split_finalize(
         registered.append(artifact.capability_name)
 
     registry.deactivate(parent.name)
-    metrics_store.record_event(
-        parent.name, "split", f"into {registered}",
-    )
+    _record_and_emit_event(metrics_store, parent.name, "split", f"into {registered}",)
     logger.info("Split %s %s → %s", parent.capability_type.value, parent.name, registered)
     return registered
 
@@ -1639,9 +1705,7 @@ def _split_tools(
             "_split_tools: phase B rejected split of %s — %s. Parent stays active.",
             parent.name, reason,
         )
-        metrics_store.record_event(
-            parent.name, "split_rollback", f"phase B: {reason}",
-        )
+        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase B: {reason}",)
         return None
 
     # Phase C — collective coverage verification (MCP_TOOL replay).
@@ -1654,9 +1718,7 @@ def _split_tools(
             "_split_tools: verify_coverage raised on %s: %s. Parent stays active.",
             parent.name, exc,
         )
-        metrics_store.record_event(
-            parent.name, "split_rollback", f"phase C exception: {exc}",
-        )
+        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase C exception: {exc}",)
         return None
 
     if not coverage.all_covered:
@@ -1666,8 +1728,7 @@ def _split_tools(
             parent.name, coverage.status,
             coverage.uncovered_cases, len(coverage.execution_errors),
         )
-        metrics_store.record_event(
-            parent.name,
+        _record_and_emit_event(metrics_store, parent.name,
             "split_rollback",
             (
                 f"phase C coverage: status={coverage.status}, "
@@ -1800,9 +1861,7 @@ def _split_skills(
             "_split_skills: phase B rejected split of %s — %s. Parent stays active.",
             parent.name, reason,
         )
-        metrics_store.record_event(
-            parent.name, "split_rollback", f"phase B: {reason}",
-        )
+        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase B: {reason}",)
         return None
 
     # Phase C — coverage dispatches to unverifiable_type (vacuous pass)
@@ -1820,8 +1879,7 @@ def _split_skills(
             "status=%s. Parent stays active.",
             parent.name, coverage.status,
         )
-        metrics_store.record_event(
-            parent.name, "split_rollback", f"phase C (SKILL): {coverage.status}",
+        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase C (SKILL): {coverage.status}",
         )
         return None
 
@@ -1953,11 +2011,9 @@ def _split_agents(
             _MAX_AGENT_SUBAGENT_BUDGET,
             parent.name,
         )
-        metrics_store.record_event(
-            parent.name,
+        _record_and_emit_event(metrics_store, parent.name,
             "split_rollback",
-            f"subagent budget exceeded: {total_subagents} > {_MAX_AGENT_SUBAGENT_BUDGET}",
-        )
+            f"subagent budget exceeded: {total_subagents} > {_MAX_AGENT_SUBAGENT_BUDGET}",)
         return None
 
     for v in result.variants:
@@ -1997,9 +2053,7 @@ def _split_agents(
             "_split_agents: phase B rejected split of %s — %s. Parent stays active.",
             parent.name, reason,
         )
-        metrics_store.record_event(
-            parent.name, "split_rollback", f"phase B: {reason}",
-        )
+        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase B: {reason}",)
         return None
 
     # Phase C — vacuous for AGENT per MCP_TOOL-only scope.
@@ -2012,8 +2066,7 @@ def _split_agents(
             "status=%s. Parent stays active.",
             parent.name, coverage.status,
         )
-        metrics_store.record_event(
-            parent.name, "split_rollback", f"phase C (AGENT): {coverage.status}",
+        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase C (AGENT): {coverage.status}",
         )
         return None
 

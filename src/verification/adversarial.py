@@ -245,8 +245,17 @@ def _make_probe_sandbox_execute(pip_packages: list[str], *, allow_network: bool 
 
     See ``docs/MASTER_PLAN_2026_04_13.md`` §14.9 for the full rationale.
     """
+    # Fix #1 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
+    # Use the silent variant. The adversarial prober is a DeepAgent, so
+    # LangGraph's auto-tracing emits a ``type=TOOL, name=sandbox_execute``
+    # observation with full code + output + latency for every probe
+    # invocation. Using ``sandbox_execute`` (event-emitting) would double-
+    # trace — the extra ``sandbox.execute`` EVENT is pure duplicate of the
+    # TOOL observation. ~23% of sandbox.execute event volume dropped;
+    # zero information loss (TOOL observations remain, strictly more
+    # detailed than the events were).
     from src.verification.sandbox_tool import (
-        sandbox_execute as _base_sandbox_execute,
+        sandbox_execute_silent as _base_sandbox_execute,
     )
 
     # Snapshot packages at closure-creation time so subsequent mutations
@@ -681,14 +690,31 @@ def probe(
             ADVERSARIAL_TIMEOUT_S,
             capability_name,
         )
+        # Step 13.7 Batch B3: ERROR level per Step 14.11 fail-closed
+        # semantics — Tier 3 timeout causes verification rejection, which
+        # is an ERROR-class event for Chapter 4.5's retry analysis.
+        # Step 13.7 Batch B7 (partial): record agent metadata + tier-3
+        # trace context so Chapter 4.5 reviewers can count sub-probes
+        # completed before timeout via the LangFuse UI under the parent
+        # trace. True sub-probe-count instrumentation would require
+        # hooking the DeepAgent's tool-call loop — deferred to Chapter 7
+        # alongside the other DeepAgent internals.
         emit_langfuse_event(
             None,
             "adversarial.timeout",
-            "WARNING",
+            "ERROR",
             {
                 "timeout_s": ADVERSARIAL_TIMEOUT_S,
                 "capability_name": capability_name,
+                "capability_type": artifact.capability_type.value,
                 "classification": "fail_closed",
+                "reasoning_effort": "low",  # hardcoded in _create_adversarial_agent
+                "recursion_limit": ADVERSARIAL_RECURSION_LIMIT,
+                "note": (
+                    "Sub-probe count not instrumented at timeout — "
+                    "inspect parent LangFuse trace under this capability "
+                    "to count ToolUse spans emitted before cap hit."
+                ),
             },
         )
         return _timeout_report(capability_name)

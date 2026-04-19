@@ -20,9 +20,9 @@ import json
 import logging
 import threading
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Annotated, Any, Literal, NamedTuple
 
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, Field, create_model
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +283,7 @@ def _format_fixture_message(fixture_contents: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
-def _make_network_scoped_sandbox(allow_network: bool):
+def _make_network_scoped_sandbox(allow_network: bool, *, silent: bool = False):
     """Return a ``sandbox_execute`` variant that forces a network policy.
 
     Mirrors the closure pattern in
@@ -292,15 +292,32 @@ def _make_network_scoped_sandbox(allow_network: bool):
     LLM cannot set ``allow_network`` itself (it's a keyword-only safety
     knob, not a tool-schema parameter). This wrapper applies the task's
     declared policy to every invocation. Step 14.12.
+
+    Fix #1 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
+    ``silent=True`` routes to ``sandbox_execute_silent`` which skips
+    the ``sandbox.execute`` event emission. Use this for the AGENT
+    backend because ``create_deep_agent(tools=[...])`` runs its
+    tool-dispatch inside a LangGraph runnable chain — LangChain's
+    callback handler auto-traces every tool-call as a ``type=TOOL``
+    observation with strictly more detail than the event. Keep
+    ``silent=False`` (default) for the SKILL backend: its manual
+    tool-dispatch loop (``tool_calling_llm.invoke`` → Python ``for``
+    over ``response.tool_calls`` → direct ``sandbox_execute(...)`` call)
+    runs OUTSIDE any LangChain runnable, so LangChain doesn't trace it
+    — the event is the ONLY record.
     """
-    from src.verification.sandbox_tool import (
-        sandbox_execute as _base_sandbox_execute,
-    )
-    from typing import Annotated as _Annotated
+    if silent:
+        from src.verification.sandbox_tool import (
+            sandbox_execute_silent as _base_sandbox_execute,
+        )
+    else:
+        from src.verification.sandbox_tool import (
+            sandbox_execute as _base_sandbox_execute,
+        )
 
     def sandbox_execute(
-        code: _Annotated[str, Field(description="Python code snippet to execute in the sandbox")],
-        timeout: _Annotated[int, Field(default=10, description="Timeout in seconds")] = 10,
+        code: Annotated[str, Field(description="Python code snippet to execute in the sandbox")],
+        timeout: Annotated[int, Field(default=10, description="Timeout in seconds")] = 10,
         extra_packages: list[str] | None = None,
     ) -> dict:
         """Execute a Python snippet in an isolated Docker container.
@@ -1066,7 +1083,13 @@ def _execute_agent_inner(
     # Step 14.12: wrap sandbox_execute in a closure that enforces the task-
     # level network policy. The lead agent and every subagent receive the
     # same wrapper — policy can't be escalated mid-run.
-    sandbox_execute = _make_network_scoped_sandbox(allow_network)
+    #
+    # Fix #1 (2026-04-19): pass ``silent=True`` so the sandbox.execute
+    # event is NOT emitted. create_deep_agent's tool-dispatch auto-traces
+    # each tool-call as a type=TOOL observation with full code + stdout/
+    # stderr + latency + tool_call_id — the event would be pure duplicate.
+    # See docs/langfuse_redundancy_audit_2026_04_19.md Fix #1.
+    sandbox_execute = _make_network_scoped_sandbox(allow_network, silent=True)
 
     agent_config = getattr(artifact, "agent_config", None) or {}
     system_prompt = agent_config.get("system_prompt", _AGENT_SYSTEM_FALLBACK)

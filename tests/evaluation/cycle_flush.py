@@ -105,6 +105,26 @@ def flush_task_cycle_state(
             "Failed to flush cycle_events for task %s: %s", task_id, exc
         )
 
+    # Step 13.7 Batch C2: emit a LangFuse cross-reference tag linking
+    # the active trace to the just-flushed DuckDB row keys. Chapter 5/6
+    # reviewers can then navigate LangFuse → DuckDB or vice versa
+    # without a timestamp join. Never raises.
+    try:
+        from src.orchestrator.tracing import emit_langfuse_event
+        emit_langfuse_event(
+            None,
+            "cycle_flush.completed",
+            "DEFAULT",
+            {
+                "run_id": run_id,
+                "condition": condition,
+                "task_id": task_id,
+                "cutoff_iso": task_events_cutoff.isoformat(),
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def now_utc() -> datetime:
     """Wall-clock cutoff suitable for the ``task_events_cutoff`` arg.

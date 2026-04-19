@@ -29,9 +29,39 @@ from src.orchestrator.schema_extraction import (
     find_subtask_for_gap,
 )
 from src.orchestrator.tool_loader import ToolLoader
+from src.orchestrator.tracing import emit_langfuse_event
 from src.registry.store import SkillRegistry
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import TaskState, TaskStatus
+
+
+def _emit_registration_event(
+    artifact_name: str,
+    artifact_type: str,
+    domain: str | None,
+    is_generic: bool,
+    *,
+    passed: bool,
+    error_msg: str | None = None,
+) -> None:
+    """Emit a registration event (Step 13.7 Batch C1).
+
+    Traces capability lineage: Chapter 5's §3.5f evolutionary-taxonomy
+    narrative + gap-detection search-quality analysis depend on knowing
+    which caps entered the registry with which domain / is_generic flags.
+    """
+    emit_langfuse_event(
+        None,
+        f"registry.register_{'ok' if passed else 'error'}",
+        "DEFAULT" if passed else "ERROR",
+        {
+            "capability_name": artifact_name,
+            "capability_type": artifact_type,
+            "domain": domain,
+            "is_generic": is_generic,
+            **({"error": error_msg} if error_msg else {}),
+        },
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +125,20 @@ def loading_node(
             loader.register_tool(artifact, registry)
             registered += 1
             logger.info("Registered tool '%s' in registry", artifact.capability_name)
+            _emit_registration_event(
+                artifact.capability_name, "mcp_tool",
+                artifact.domain, bool(artifact.is_generic),
+                passed=True,
+            )
         except Exception as exc:  # noqa: BLE001
             error_msg = f"Failed to register tool '{artifact.capability_name}': {exc}"
             logger.error(error_msg)
             errors.append(error_msg)
+            _emit_registration_event(
+                artifact.capability_name, "mcp_tool",
+                artifact.domain, bool(artifact.is_generic),
+                passed=False, error_msg=str(exc),
+            )
 
     # Register SKILL and AGENT artifacts in the registry for reuse.
     # They're already on disk (written during generation), but without
@@ -185,6 +225,12 @@ def loading_node(
                 artifact.capability_type.value,
                 artifact.capability_name,
             )
+            _emit_registration_event(
+                artifact.capability_name,
+                artifact.capability_type.value,
+                effective_domain, effective_is_generic,
+                passed=True,
+            )
         except Exception as exc:  # noqa: BLE001
             error_msg = (
                 f"Failed to register {artifact.capability_type.value} "
@@ -192,6 +238,13 @@ def loading_node(
             )
             logger.error(error_msg)
             errors.append(error_msg)
+            _emit_registration_event(
+                artifact.capability_name,
+                artifact.capability_type.value,
+                getattr(artifact, "domain", None),
+                bool(getattr(artifact, "is_generic", False)),
+                passed=False, error_msg=str(exc),
+            )
 
     # "deployed" = successfully registered in registry (MCP tools + SKILL/AGENT).
     deployed = registered

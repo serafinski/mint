@@ -1652,8 +1652,9 @@ def execute_task(
         _trace_tags.append("optimizer-on")
     if allow_network:
         _trace_tags.append("allow-network")
+    _lf_session_id = f"mint-run-{_run_id}"
     invoke_config = _langfuse_config(
-        session_id=f"mint-run-{_run_id}",
+        session_id=_lf_session_id,
         tags=_trace_tags,
         metadata={
             "task": task[:200],
@@ -1665,6 +1666,14 @@ def execute_task(
             "allow_network": allow_network,
         },
     )
+
+    # Step 13.7 tag-propagation fix (2026-04-19): set fallback trace
+    # context so events emitted from ThreadPool workers (verification,
+    # adversarial) + LangChain @tool callbacks (sandbox_execute) + any
+    # post-pipeline composition/execution emit sites still inherit
+    # tags/session/user. Primary path (langgraph.config.get_config()
+    # inside pipeline nodes) is unchanged.
+    from src.orchestrator.tracing import trace_context as _trace_context
 
     t_start = time.monotonic()
 
@@ -1682,7 +1691,12 @@ def execute_task(
     if json_output:
         # No live display for JSON mode
         try:
-            final_state = pipeline.invoke(initial_state, config=invoke_config)
+            with _trace_context(
+                tags=_trace_tags,
+                session_id=_lf_session_id,
+                user_id="mint-cli",
+            ):
+                final_state = pipeline.invoke(initial_state, config=invoke_config)
         except Exception as exc:
             err_console.print(f"[red]Pipeline failed: {exc}[/red]")
             return 1
@@ -1791,7 +1805,11 @@ def execute_task(
             with console.status(
                 f"[cyan]{current_label}[/cyan] [dim](0s)[/dim]",
                 spinner="dots",
-            ) as status:
+            ) as status, _trace_context(
+                tags=_trace_tags,
+                session_id=_lf_session_id,
+                user_id="mint-cli",
+            ):
                 timer_thread = threading.Thread(target=_timer_loop, args=(status,), daemon=True)
                 timer_thread.start()
 
@@ -2264,10 +2282,16 @@ def plan_task(
     plan_pipeline = plan_builder.compile()
 
     initial_state = TaskState(task_description=task_prompt)
+    _plan_tags = ["mint-cli", "plan"]
     invoke_config = _langfuse_config(
-        tags=["mint-cli", "plan"],
+        tags=_plan_tags,
         metadata={"task": task[:200], "files": [fp.name for fp in file_paths]},
     )
+    # Step 13.7 tag-propagation fix (2026-04-19): same rationale as
+    # execute_task — wrap the plan pipeline so downstream emit sites
+    # (classifier events, decomposition events, ThreadPool-born events)
+    # inherit tags even when get_config() can't reach them.
+    from src.orchestrator.tracing import trace_context as _trace_context
     t_start = time.monotonic()
 
     console.print(
@@ -2281,7 +2305,8 @@ def plan_task(
     )
 
     try:
-        final_state = plan_pipeline.invoke(initial_state, config=invoke_config)
+        with _trace_context(tags=_plan_tags, user_id="mint-cli"):
+            final_state = plan_pipeline.invoke(initial_state, config=invoke_config)
     except Exception as exc:
         err_console.print(f"[red]Planning pipeline failed: {exc}[/red]")
         return 1
