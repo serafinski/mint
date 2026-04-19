@@ -554,6 +554,53 @@ class TestCreateOptimizationLoop:
         assert result["split_results"] == {}
 
     @patch("src.optimizer.loop.prune", return_value=[])
+    @patch("src.optimizer.loop.split", return_value=["mcp-a-v1", "mcp-a-v2"])
+    @patch("src.optimizer.loop.merge")
+    @patch(
+        "src.optimizer.loop.compute_all_utilities",
+        return_value={"mcp-a": 0.5, "skill-a": 0.5, "agent-a": 0.5},
+    )
+    def test_identify_candidates_accepts_all_three_types_for_split(
+        self, mock_compute, mock_merge, mock_split, mock_prune
+    ):
+        """identify_candidates_node must accept MCP_TOOL, SKILL, and AGENT as
+        split candidates when the reuse/success thresholds fire.
+
+        Guards against regression of the Iteration-4 ``type != MCP_TOOL``
+        filter that blocked MCP_TOOL from autonomous split triggering. The
+        filter was removed to restore symmetry with merge (which was fixed
+        in B1 Step 3 commit ``6a8fc63``) and to match Step 8's per-type
+        split dispatch in ``operations.py``. Correctness on MCP_TOOL
+        variants is enforced downstream by ``verify_coverage`` + the
+        three-tier gate — the loop-level filter added no safety, only an
+        undisclosed scope hole in the auto-optimizer path.
+        """
+        caps = {
+            "mcp-a": _make_cap("mcp-a", CapabilityType.MCP_TOOL),
+            "skill-a": _make_cap("skill-a", CapabilityType.SKILL),
+            "agent-a": _make_cap("agent-a", CapabilityType.AGENT),
+        }
+
+        registry = MagicMock()
+        registry.list_all.return_value = list(caps.values())
+        registry.get.side_effect = lambda n: caps.get(n)
+        registry.count = len(caps)
+
+        store = MagicMock()
+        store.compute_granularity_metrics.side_effect = lambda cap_id, **kw: _make_metrics(
+            cap_id, reuse_rate=0.8, success_rate=0.5
+        )
+
+        graph = create_optimization_loop(
+            registry, store,
+            split_reuse_threshold=0.6,
+            split_success_threshold=0.7,
+        )
+        result = graph.invoke(OptimizerState())
+
+        assert set(result["split_candidates"]) == {"mcp-a", "skill-a", "agent-a"}
+
+    @patch("src.optimizer.loop.prune", return_value=[])
     @patch("src.optimizer.loop.split")
     @patch("src.optimizer.loop.merge")
     @patch("src.optimizer.loop.compute_all_utilities", return_value={"skill-a": 0.5})

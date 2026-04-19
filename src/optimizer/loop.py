@@ -19,7 +19,6 @@ from src.optimizer.operations import merge, prune, split
 from src.optimizer.utility import compute_all_utilities
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
-from src.schemas.capability import CapabilityType
 from src.schemas.metrics import GranularityMetrics
 from src.schemas.optimizer_config import OptimizerConfig
 
@@ -244,11 +243,13 @@ def create_optimization_loop(
                 if cap is None:
                     continue
 
-                # Split candidates: high reuse + mediocre success, non-MCP_TOOL
+                # Split candidates: high reuse + mediocre success. All three
+                # capability types eligible — per-type dispatch in operations.py
+                # split() + verify_coverage (MCP_TOOL) / three-tier gate per
+                # variant (SKILL/AGENT) enforce correctness downstream.
                 if (
                     m.reuse_rate > split_reuse_threshold
                     and m.success_rate < split_success_threshold
-                    and cap.capability_type != CapabilityType.MCP_TOOL
                 ):
                     split_cands.append(cap_id)
 
