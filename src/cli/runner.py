@@ -67,6 +67,7 @@ def _save_last_run(
         "allow_network": allow_network,
     }
     path = _data_dir() / "cli" / _LAST_RUN_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2))
 
 

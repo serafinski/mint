@@ -313,6 +313,7 @@ def main() -> None:
 
     # Save optimizer log
     log_path = DATA_DIR / "longitudinal_optimizer_log.json"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(json.dumps(optimizer_log, indent=2))
     print(f"\n  Optimizer log: {log_path}")
     print(f"  Results DB:    {args.db}")

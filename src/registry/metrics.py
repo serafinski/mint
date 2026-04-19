@@ -49,6 +49,9 @@ class MetricsStore:
 
     def __init__(self, *, db_path: str | None = None) -> None:
         """Initialize DuckDB connection. If *db_path* is ``None``, use in-memory."""
+        if db_path and db_path != ":memory:":
+            from pathlib import Path
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = duckdb.connect(db_path or ":memory:")
         self._conn.execute(_INIT_SQL)
         # Forward-migrate existing invocation tables (Step 4). Idempotent

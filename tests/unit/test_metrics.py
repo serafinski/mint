@@ -33,6 +33,24 @@ def store():
     s.close()
 
 
+# -- parent-directory autocreation (defensive init) ----------------------
+
+
+def test_init_creates_parent_directory_if_missing(tmp_path):
+    """``MetricsStore(db_path=...)`` mkdirs missing parent dirs.
+
+    Regression guard: ``duckdb.connect(db_path)`` raises FileNotFoundError
+    when the parent directory doesn't exist. CLI + eval harness relied on
+    upstream code (e.g., ``_create_infra``) to pre-mkdir; tests that bypass
+    that path crashed. Defensive init closes the class of bug.
+    """
+    nested = tmp_path / "nested" / "sub" / "dir" / "metrics.duckdb"
+    assert not nested.parent.exists()
+    with MetricsStore(db_path=str(nested)) as store:
+        store.record_invocation(_make_record())
+    assert nested.exists()
+
+
 # -- record & count -------------------------------------------------------
 
 

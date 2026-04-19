@@ -33,6 +33,24 @@ def store():
         yield s
 
 
+class TestInitParentDirAutocreation:
+    """Defensive mkdir: ``duckdb.connect(path)`` assumes parent exists."""
+
+    def test_init_creates_parent_directory_if_missing(self, tmp_path):
+        """``EvaluationStore(db_path=...)`` mkdirs missing parent dirs.
+
+        Regression guard: run_pilot.py / run_longitudinal*.py instantiate
+        ``EvaluationStore(db_path=args.db)`` on fresh data paths. If parent
+        dir doesn't exist, DuckDB raises FileNotFoundError. Defensive init
+        closes the class of bug.
+        """
+        nested = tmp_path / "nested" / "sub" / "dir" / "eval.duckdb"
+        assert not nested.parent.exists()
+        with EvaluationStore(db_path=str(nested)) as s:
+            s.record_run(_record())
+        assert nested.exists()
+
+
 class TestRecordAndRetrieve:
     def test_record_returns_id(self, store):
         row_id = store.record_run(_record())

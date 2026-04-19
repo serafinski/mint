@@ -161,6 +161,9 @@ class EvaluationStore:
     """DuckDB-backed store for evaluation run records."""
 
     def __init__(self, *, db_path: str | None = None) -> None:
+        if db_path and db_path != ":memory:":
+            from pathlib import Path
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = duckdb.connect(db_path or ":memory:")
         self._conn.execute(_INIT_SQL)
         # Idempotent ALTERs so existing DBs gain the Stage 1 compositional columns.
