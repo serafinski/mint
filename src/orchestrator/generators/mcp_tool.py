@@ -91,6 +91,15 @@ def _get_llm():
 # Validation
 # ---------------------------------------------------------------------------
 
+# NOTE: Intentional asymmetry with ``agent._SNAKE_CASE_RE`` (which is
+# ``r"^[a-z_][a-z0-9_]*$"`` — leading underscore allowed). MCP tool names are
+# used as Python module names by ``tool_loader.load_tool`` in the sandbox
+# runner script, so they must follow PyPI-/import-safe conventions and cannot
+# start with an underscore. Agent node names are LangGraph/DeepAgent
+# identifiers where ``_private_subagents``-style names are meaningful, hence
+# the looser rule there. Any future unifier should preserve this difference —
+# see ``tests/unit/test_mcp_tool_generator.py::TestValidateToolName::test_starts_with_underscore``
+# and ``tests/unit/test_agent_generator.py::test_node_name_with_leading_underscore_is_valid``.
 _SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 

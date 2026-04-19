@@ -410,21 +410,21 @@ def compute_sum(a: int, b: int) -> int:
         assert len(findings) == 0
 
     def test_missing_external_is_medium(self):
-        """MEDIUM findings should not block overall_passed."""
+        """Default (network disabled): severity is MEDIUM and overall_passed stays True.
+
+        Consolidates two earlier tests (one asserting overall_passed, one asserting
+        severity) — both fired the same underlying ``missing_external_calls`` path
+        with MEDIUM default severity.
+        """
         code = '''\
 def retrieve_items():
     return []
 '''
         report = scan(code, "retrieve-tool")
-        assert report.overall_passed is True
-
-    def test_missing_external_is_medium_offline(self):
-        """Default (network disabled): severity is MEDIUM."""
-        code = 'def fetch_data(): return []\n'
-        report = scan(code, "fetch-tool")
         findings = [f for f in report.findings if f.category == "missing_external_calls"]
         assert len(findings) == 1
         assert findings[0].severity == Severity.MEDIUM
+        assert report.overall_passed is True
 
     def test_missing_external_is_high_with_network(self):
         """When allow_network=True: severity is HIGH."""
@@ -640,8 +640,17 @@ class TestScanNonMcpTypes:
         assert report.tier_reached == 1
 
     def test_capability_name_in_report(self):
+        """Non-MCP scan preserves capability_name, tier_reached=1, and empty findings.
+
+        Complements ``TestReportStructure::test_report_has_capability_name`` which
+        covers the MCP_TOOL path — this one guards the SKILL/AGENT branch where
+        the scanner short-circuits before running AST+regex.
+        """
         report = scan("content", "cap-name", "agent")
         assert report.capability_name == "cap-name"
+        assert report.tier_reached == 1
+        assert report.findings == []
+        assert report.overall_passed is True
 
     def test_json_agent_config_with_mock_word_not_flagged(self):
         """JSON agent config containing the word 'mock' in the system_prompt

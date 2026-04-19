@@ -183,15 +183,36 @@ def _build_mock_registry_and_store(cap_names, cap_types=None, metrics_kwargs=Non
 
 class TestCreateOptimizationLoop:
     def test_compiles_without_error(self):
+        """Compiled graph exposes the three canonical nodes.
+
+        Guards against a refactor that silently drops a node (e.g.,
+        inlines ``identify_candidates`` into ``compute_metrics``) —
+        the three-stage shape is load-bearing for the prune/split/merge
+        ordering invariant the other tests depend on.
+        """
         registry = MagicMock()
         store = MagicMock()
         graph = create_optimization_loop(registry, store)
         assert graph is not None
 
+        node_names = set(graph.get_graph().nodes.keys())
+        # __start__ / __end__ plus our three nodes
+        assert {"compute_metrics", "identify_candidates", "apply_operations"}.issubset(
+            node_names
+        )
+
     @patch("src.optimizer.loop.prune", return_value=[])
     @patch("src.optimizer.loop.split")
     @patch("src.optimizer.loop.merge")
     def test_runs_to_completion(self, mock_merge, mock_split, mock_prune):
+        """End-to-end with two active caps: all three pipeline stages populate
+        their OptimizerState fields and terminate with no errors.
+
+        Tightens the earlier smoke assertion (`"errors" in result`) into a
+        functional check that each of the three stage nodes actually ran
+        and wrote output — otherwise a node that quietly short-circuited
+        on state would still satisfy the old shape assertion.
+        """
         registry, store = _build_mock_registry_and_store(
             ["cap-a", "cap-b"],
             metrics_kwargs={
@@ -204,7 +225,18 @@ class TestCreateOptimizationLoop:
         result = graph.invoke(OptimizerState())
 
         assert isinstance(result, dict)
-        assert "errors" in result
+        # compute_metrics_node populated the snapshot
+        assert set(result["capabilities_snapshot"]) == {"cap-a", "cap-b"}
+        # identify_candidates_node produced candidate lists (empty here because
+        # the mocked metrics don't trip either threshold, but the keys must exist)
+        assert result["split_candidates"] == []
+        assert result["merge_candidates"] == []
+        # apply_operations_node populated the result dicts
+        assert result["pruned"] == []
+        assert result["split_results"] == {}
+        assert result["merge_results"] == {}
+        # Clean run — no exceptions recorded
+        assert result["errors"] == []
 
     @patch("src.optimizer.loop.prune", return_value=[])
     @patch("src.optimizer.loop.split")
@@ -528,13 +560,18 @@ class TestCreateOptimizationLoop:
     def test_merge_candidate_metrics_failure_does_not_crash(
         self, mock_compute_all, mock_merge, mock_split, mock_prune
     ):
-        """If compute_granularity_metrics raises in the merge candidate loop,
-        identify_candidates_node must log a warning and continue — not crash.
+        """If compute_granularity_metrics raises in identify_candidates_node,
+        the node must log a warning and continue — not crash.
 
         We mock compute_all_utilities so that compute_metrics_node SUCCEEDS
-        and populates capabilities_snapshot.  Then store.compute_granularity_metrics
-        raises in identify_candidates_node, hitting both the split loop try/except
-        AND the merge loop try/except (the fix for the missing try/except bug).
+        and populates capabilities_snapshot. Then store.compute_granularity_metrics
+        raises: caught by the SPLIT loop's try/except (src/optimizer/loop.py
+        L240-256). That try/except skips the cap without populating
+        ``metrics_cache``. The subsequent MERGE loop reads `metrics_cache.get(cap_id)`,
+        finds None, and `continue`s (L273-275) — no try/except needed because
+        the cache miss is handled structurally. The merge loop's own try/except
+        (L290, L320) guards `registry.search()` failures, not metrics failures.
+        Either way: no crash, empty candidate lists, graceful exit.
         """
         caps = {"skill-a": _make_cap("skill-a", CapabilityType.SKILL)}
         registry = MagicMock()

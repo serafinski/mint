@@ -201,7 +201,24 @@ class TestBodyLengthWarning:
             assert "500" in msg
 
     def test_exactly_500_lines_no_warning(self):
-        """Exactly 500 lines should not trigger the warning."""
+        """Exactly 500 body lines should not trigger the warning.
+
+        Arithmetic walk-through (the 2026-04-19 audit flagged this test as
+        SUSPICIOUS; re-derivation below confirmed the test is correct — name
+        and behaviour agree):
+
+        ``validate_skill`` splits the file via regex ``^---\\n.*?\\n---\\n?(.*)$``
+        with ``DOTALL``. After the closing ``---\\n``, the optional ``\\n?`` is
+        consumed (not captured); the second ``\\n`` from the ``---\\n\\n`` prefix
+        lands at the *start* of the body capture group. Counts with
+        ``range(499)`` producing 499 ``"Line i"`` entries joined by ``\\n`` plus
+        a trailing ``\\n`` appended:
+
+        * body = "\\n" + "Line 0\\nLine 1\\n...\\nLine 498" + "\\n"
+        * newline count = 1 (leading) + 498 (between) + 1 (trailing) = 500
+        * body ends with ``\\n`` so the final ``+1`` branch does NOT apply
+        * body_lines = 500, threshold is ``> 500`` → no warning ✓
+        """
         with tempfile.TemporaryDirectory() as tmp:
             body_lines = "\n".join(f"Line {i}" for i in range(499))
             content = (

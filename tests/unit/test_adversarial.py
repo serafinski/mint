@@ -854,7 +854,7 @@ class TestPipPackagesPropagation:
 
 
 # ---------------------------------------------------------------------------
-# Integration test (requires DEEPSEEK_API_KEY + Docker)
+# Integration test (requires OPENAI_API_KEY + Docker)
 # ---------------------------------------------------------------------------
 
 
@@ -862,12 +862,15 @@ class TestPipPackagesPropagation:
 def test_adversarial_probe_integration():
     """Full adversarial probe against a simple tool.
 
-    Requires DEEPSEEK_API_KEY and the jit-sandbox Docker image.
+    Requires OPENAI_API_KEY and the jit-sandbox Docker image.
+    (Adversarial agent runs DEFAULT_LLM_MODEL = openai:gpt-5-mini; the
+    DEEPSEEK_API_KEY reference this test previously used was a pre-B1
+    artifact — updated 2026-04-19 via Step 13.5 audit.)
     """
     import os
 
-    if not os.environ.get("DEEPSEEK_API_KEY"):
-        pytest.skip("DEEPSEEK_API_KEY not set")
+    if not os.environ.get("OPENAI_API_KEY"):
+        pytest.skip("OPENAI_API_KEY not set")
 
     import subprocess
 

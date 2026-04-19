@@ -513,7 +513,10 @@ class TestClassifierNode:
             cmd = classifier_node(state)
 
         mock_classify.assert_not_called()
-        assert cmd.update["classified_gaps"] == [] if "classified_gaps" in cmd.update else True
+        # No-op early-return path in classifier_node: the Command update
+        # contains only `status` — classified_gaps is NOT emitted, so the
+        # pre-existing state.classified_gaps (empty by default) stays intact.
+        assert "classified_gaps" not in cmd.update
         assert cmd.update["status"] == TaskStatus.CLASSIFYING
         assert cmd.goto == "generate_mcp_tool"
 
@@ -629,7 +632,15 @@ class TestClassifierNode:
         assert cmd.update["classification_succeeded"] is False
 
     def test_preserves_existing_errors(self):
-        """classifier_node propagates pre-existing errors from state."""
+        """classifier_node does not clobber pre-existing errors.
+
+        When ``state.gaps`` is empty, the node takes the no-op early-return
+        branch (classifier.py lines 401-407) and emits only ``{"status": ...}``.
+        It does NOT include ``errors`` in the Command update, which means
+        LangGraph keeps whatever ``state.errors`` held before the node ran —
+        i.e. the decomposition error stays on the task. This test locks in
+        that exact non-overwrite contract.
+        """
         state = TaskState(
             task_description="Test",
             required_capabilities=[],
@@ -639,17 +650,24 @@ class TestClassifierNode:
 
         cmd = classifier_node(state)
 
-        # No-op path still propagates errors — when gaps is empty the node
-        # just sets status without touching errors, so they remain in state.
-        # We verify via the update dict having no overwrite of errors field.
-        assert "errors" not in cmd.update or "pre-existing error from decomposition" in cmd.update.get("errors", [])
+        # No-op branch does not touch errors — the key is absent from the
+        # Command update, so pre-existing errors on state survive untouched.
+        assert "errors" not in cmd.update
 
-    def test_classify_gap_unhandled_exception_propagates(self):
-        """Unexpected exceptions raised by classify_gap propagate from classifier_node.
+    def test_classify_gap_keyboard_interrupt_propagates(self):
+        """KeyboardInterrupt (BaseException, not Exception) escapes the retry loop.
 
-        classify_gap has comprehensive exception handling and should not
-        normally raise. This test documents the current behaviour for the
-        edge case where an exception does escape classify_gap.
+        ``classify_gap``'s retry loop catches ``Exception`` (see classifier.py
+        line 216) — every normal failure is swallowed and converted to ``None``
+        after ``MAX_CLASSIFICATION_ATTEMPTS`` per §12 finding #16. This is the
+        intentional fail-closed-without-raising contract.
+
+        However, ``BaseException`` subclasses like ``KeyboardInterrupt``,
+        ``SystemExit``, and ``GeneratorExit`` deliberately bypass that net so
+        Ctrl-C and process-level shutdown still work during a pipeline run.
+        This test locks in that design: a BaseException raised inside
+        ``classify_gap`` propagates up through ``classifier_node`` without
+        being masked.
         """
         state = TaskState(
             task_description="Test",
@@ -660,9 +678,9 @@ class TestClassifierNode:
         with (
             patch(
                 "src.orchestrator.classifier.classify_gap",
-                side_effect=RuntimeError("unexpected internal error"),
+                side_effect=KeyboardInterrupt("user pressed ctrl-c"),
             ),
-            pytest.raises(RuntimeError, match="unexpected internal error"),
+            pytest.raises(KeyboardInterrupt, match="user pressed ctrl-c"),
         ):
             classifier_node(state)
 

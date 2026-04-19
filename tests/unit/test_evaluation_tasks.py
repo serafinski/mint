@@ -25,6 +25,8 @@ from tests.evaluation.tasks import (
     T16,
     T17,
     T18,
+    T19,
+    T20,
     get_task,
 )
 
@@ -103,6 +105,32 @@ class TestT03Validator:
         from tests.evaluation.tasks import _EV
         wc = _EV["T03"]["word_count"]
         assert T03.validator({"word_count": wc + 1, "readability_score": 50.0})
+
+    def test_word_count_beyond_tolerance_fails(self):
+        """Pin the tolerance ceiling so the directional pass-test can't drift.
+
+        Tolerance is ``word_count_tolerance_pct`` (currently 2%) so for wc=154
+        the max-acceptable drift is ~3 words (|157-154|/154 = 1.95% ≤ 2%) and
+        +4 is the smallest integer strictly beyond (|158-154|/154 = 2.60% > 2%).
+        We compute the ceiling+1 from _EV so this stays correct if the fixture
+        word_count or tolerance changes — any value that pushes
+        |actual - expected| / expected strictly above the tol pct suffices.
+        """
+        import math
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T03"]
+        wc = ev["word_count"]
+        tol_pct = ev["word_count_tolerance_pct"]
+        # Smallest integer strictly beyond the ± tolerance window.
+        beyond = math.floor(wc * tol_pct / 100.0) + 1
+        # Sanity: the value just inside the ceiling still passes.
+        assert T03.validator(
+            {"word_count": wc + beyond - 1, "readability_score": 50.0}
+        ), "sanity: ceiling value should still pass"
+        # Load-bearing: the first value strictly beyond the ceiling must fail.
+        assert not T03.validator(
+            {"word_count": wc + beyond, "readability_score": 50.0}
+        ), "+(ceiling+1) must fail — the tolerance ceiling was unpinned otherwise"
 
     def test_readability_out_of_range(self):
         from tests.evaluation.tasks import _EV
@@ -545,3 +573,136 @@ class TestT18Validator:
 
     def test_empty_output(self):
         assert not T18.validator({})
+
+
+class TestT19Validator:
+    """Minimal coverage: happy path + one wrong-value rejection.
+
+    T19 validator checks n_rows + n_categories + categories set-equality
+    against _EV["T19"]. Added 2026-04-19 after batch_07 coverage audit
+    flagged T19/T20 as having zero validator tests.
+    """
+
+    def test_valid_eda_output(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T19"]
+        assert T19.validator({
+            "n_rows": ev["n_rows"],
+            "n_categories": ev["n_categories"],
+            "categories": list(ev["categories"]),
+        })
+
+    def test_wrong_n_rows(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T19"]
+        assert not T19.validator({
+            "n_rows": 999,
+            "n_categories": ev["n_categories"],
+            "categories": list(ev["categories"]),
+        })
+
+    def test_wrong_categories(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T19"]
+        assert not T19.validator({
+            "n_rows": ev["n_rows"],
+            "n_categories": ev["n_categories"],
+            "categories": ["Wrong", "Labels", "Here"],
+        })
+
+    def test_empty_output(self):
+        assert not T19.validator({})
+
+
+class TestT20Validator:
+    """Minimal coverage: happy path + wrong-value rejections.
+
+    T20 validator checks total_applications, eligible_count, ineligible_count,
+    rules_applied AND cross-invariant eligible + ineligible == total. Added
+    2026-04-19 after batch_07 coverage audit flagged T19/T20 as untested.
+    """
+
+    def test_valid_eligibility(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T20"]
+        assert T20.validator({
+            "total_applications": ev["total_applications"],
+            "eligible_count": ev["eligible_count"],
+            "ineligible_count": ev["ineligible_count"],
+            "rules_applied": ev["rules_applied"],
+        })
+
+    def test_wrong_eligible_count(self):
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T20"]
+        # Swap eligible↔ineligible — individually wrong AND cross-invariant
+        # (eligible + ineligible still sums to total here so the rejection
+        # is load-bearingly on the count field, not on the sum check).
+        assert not T20.validator({
+            "total_applications": ev["total_applications"],
+            "eligible_count": ev["ineligible_count"],
+            "ineligible_count": ev["eligible_count"],
+            "rules_applied": ev["rules_applied"],
+        })
+
+    def test_sum_mismatch(self):
+        """eligible + ineligible must equal total_applications."""
+        from tests.evaluation.tasks import _EV
+        ev = _EV["T20"]
+        assert not T20.validator({
+            "total_applications": ev["total_applications"],
+            "eligible_count": ev["eligible_count"],
+            "ineligible_count": ev["ineligible_count"] + 5,  # sum drifts
+            "rules_applied": ev["rules_applied"],
+        })
+
+    def test_empty_output(self):
+        assert not T20.validator({})
+
+
+# ---------------------------------------------------------------------------
+# Step 18.5 — TaskDefinition.expected_type invariants
+#
+# Added 2026-04-19 after Step 13.5 audit surfaced zero direct coverage for
+# the ``expected_type`` field (proposal Pillar 1 RQ #1 proxy input). These
+# tests pin the distribution claim in the §6.5 commit message ("8 mcp_tool
+# / 6 skill / 6 agent") and guard against silent drift when someone edits
+# a task definition.
+# ---------------------------------------------------------------------------
+
+
+class TestExpectedTypeInvariants:
+    """Every task has ``expected_type`` set + overall distribution matches."""
+
+    def test_every_task_has_expected_type_set(self):
+        """Zero ``None`` values — every one of the 20 tasks is labelled."""
+        unlabelled = [t.task_id for t in ALL_TASKS if t.expected_type is None]
+        assert unlabelled == [], f"Tasks missing expected_type: {unlabelled}"
+
+    def test_expected_type_values_are_valid(self):
+        """Only {mcp_tool, skill, agent} are valid primary-type labels."""
+        valid = {"mcp_tool", "skill", "agent"}
+        bad = [
+            (t.task_id, t.expected_type)
+            for t in ALL_TASKS
+            if t.expected_type not in valid
+        ]
+        assert bad == [], f"Invalid expected_type labels: {bad}"
+
+    def test_distribution_matches_step_18_5_claim(self):
+        """Step 18.5 commit (ad4908e) pinned the distribution at 8/6/6.
+
+        If someone adjusts a task's type without updating this count,
+        the Classification Accuracy Chapter 6 number silently shifts.
+        """
+        counts: dict[str, int] = {"mcp_tool": 0, "skill": 0, "agent": 0}
+        for t in ALL_TASKS:
+            if t.expected_type in counts:
+                counts[t.expected_type] += 1
+        assert counts == {"mcp_tool": 8, "skill": 6, "agent": 6}, (
+            f"Distribution drifted from the Step 18.5 claim (8/6/6): {counts}"
+        )
+
+    def test_total_task_count_is_20(self):
+        """Testbed is fixed at T01–T20 per CLAUDE.md + proposal §Testbed."""
+        assert len(ALL_TASKS) == 20

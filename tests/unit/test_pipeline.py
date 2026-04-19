@@ -125,15 +125,22 @@ def test_pipeline_no_gaps_path_completes(seeded_registry, mock_loader):
 # ---------------------------------------------------------------------------
 
 
-def test_create_pipeline_accepts_registry_and_loader(seeded_registry, mock_loader):
-    """create_pipeline must accept (registry, loader) as positional args."""
-    import inspect
+def test_create_pipeline_compiles_with_positional_args(seeded_registry, mock_loader):
+    """create_pipeline accepts (registry, loader) positionally and compiles.
 
-    sig = inspect.signature(create_pipeline)
-    params = list(sig.parameters.keys())
-    # registry and loader are required positional args; run_optimizer and
-    # metrics_store are optional keyword-only args added in Iteration 4.
-    assert params[:2] == ["registry", "loader"]
+    Exercises the public-API contract by calling ``create_pipeline`` with
+    exactly two positional arguments and compiling the result, instead of
+    introspecting the signature. A compiled ``CompiledStateGraph`` with an
+    ``invoke`` method is the real guarantee callers rely on.
+    """
+    from langgraph.graph.state import CompiledStateGraph
+
+    # Two positional args — the load-bearing contract other modules use
+    # (CLI runner, evaluation harness, scripts).
+    builder = create_pipeline(seeded_registry, mock_loader)
+    graph = builder.compile()
+    assert isinstance(graph, CompiledStateGraph)
+    assert callable(getattr(graph, "invoke", None))
 
 
 def test_create_pipeline_run_optimizer_flag(seeded_registry, mock_loader):

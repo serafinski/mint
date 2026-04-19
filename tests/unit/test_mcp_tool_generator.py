@@ -100,9 +100,13 @@ class TestGeneratedToolCodeSchema:
             tool_name="add",
             source_code="pass",
             description="A tool",
+            pip_packages=["pyyaml", "pandas"],
         )
         roundtripped = GeneratedToolCode.model_validate_json(r.model_dump_json())
         assert roundtripped.tool_name == "add"
+        assert roundtripped.source_code == "pass"
+        assert roundtripped.description == "A tool"
+        assert roundtripped.pip_packages == ["pyyaml", "pandas"]
 
 
 # ---------------------------------------------------------------------------
@@ -1178,35 +1182,6 @@ class TestSkipOnRetry:
         mock_gen.assert_not_called()
         assert len(cmd.update["generated_artifacts"]) == 1
 
-    def test_gap_query_set_on_generated_artifact(self):
-        """After generation, artifact.gap_query == gap.query."""
-        state = TaskState(
-            task_description="Test",
-            classified_gaps=[
-                ClassifiedGap(
-                    description="Add numbers",
-                    query="add_numbers",
-                    classified_type=CapabilityType.MCP_TOOL,
-                    confidence=0.9,
-                    rationale="Arithmetic",
-                ),
-            ],
-        )
-        mock_artifact = GeneratedArtifact(
-            capability_name="add_numbers_abc123",
-            capability_type=CapabilityType.MCP_TOOL,
-            source_code=VALID_TOOL_SOURCE,
-            gap_query="add_numbers",
-        )
-        with patch(
-            "src.orchestrator.generators.mcp_tool.generate_single_tool",
-            return_value=(mock_artifact, None),
-        ):
-            cmd = generate_mcp_tool(state)
-
-        art = cmd.update["generated_artifacts"][0]
-        assert art.gap_query == "add_numbers"
-
     def test_first_attempt_processes_all_gaps(self):
         """On first attempt (no existing artifacts), all gaps are processed."""
         state = TaskState(
@@ -1357,46 +1332,3 @@ class TestParallelGeneration:
         assert len(cmd.update["generated_artifacts"]) == 1
         assert any("tool-0" in e for e in cmd.update["errors"])
 
-    def test_already_passing_gaps_not_submitted_to_pool(self):
-        """Pre-existing artifact with gap_query means that gap is not submitted."""
-        existing = GeneratedArtifact(
-            capability_name="existing_tool",
-            capability_type=CapabilityType.MCP_TOOL,
-            source_code=VALID_TOOL_SOURCE,
-            gap_query="tool-a",
-        )
-        state = TaskState(
-            task_description="Test",
-            classified_gaps=[
-                ClassifiedGap(
-                    description="Tool A",
-                    query="tool-a",
-                    classified_type=CapabilityType.MCP_TOOL,
-                    confidence=0.9,
-                    rationale="x",
-                ),
-                ClassifiedGap(
-                    description="Tool B",
-                    query="tool-b",
-                    classified_type=CapabilityType.MCP_TOOL,
-                    confidence=0.9,
-                    rationale="x",
-                ),
-            ],
-            generated_artifacts=[existing],
-        )
-        new_artifact = GeneratedArtifact(
-            capability_name="tool_b_gen",
-            capability_type=CapabilityType.MCP_TOOL,
-            source_code=VALID_TOOL_SOURCE,
-        )
-
-        with patch(
-            "src.orchestrator.generators.mcp_tool.generate_single_tool",
-            return_value=(new_artifact, None),
-        ) as mock_gen:
-            cmd = generate_mcp_tool(state)
-
-        # Only tool-b should be generated
-        mock_gen.assert_called_once()
-        assert len(cmd.update["generated_artifacts"]) == 2

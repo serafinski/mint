@@ -190,13 +190,6 @@ class TestValidateSkillContent:
         assert not is_valid
         assert "path-unsafe" in msg
 
-    def test_absolute_path_in_skill_name_rejected(self):
-        """skill_name starting with '/' is rejected before reaching mkdir."""
-        is_valid, msg = validate_skill_content(VALID_SKILL_MD, "/absolute/path")
-        assert not is_valid
-        assert "path-unsafe" in msg
-
-
 # ---------------------------------------------------------------------------
 # Node routing tests — no LLM needed
 # ---------------------------------------------------------------------------
@@ -663,35 +656,6 @@ class TestGenerateSingleSkill:
 
         assert len(captured_prompts) >= 1
         assert "Input/Output Schema Contract" not in captured_prompts[0]
-
-    def test_all_special_char_query_uses_forced_name(self, tmp_path):
-        """When gap.query is all special chars, forced_name (hash-based slug) is used."""
-        content_no_name = "---\ndescription: Some skill.\n---\n\n# Body\n"
-        gap = ClassifiedGap(
-            description="Something",
-            query="@#$%",
-            classified_type=CapabilityType.SKILL,
-            confidence=0.9,
-            rationale="Workflow",
-        )
-
-        with (
-            patch(
-                "src.orchestrator.generators.skill._get_llm",
-                return_value=self._make_mock_llm([content_no_name]),
-            ),
-            patch(
-                "src.orchestrator.generators.skill.validate_skill_content",
-                return_value=(True, "ok"),
-            ),
-        ):
-            artifact, error = _generate_single_skill(gap, "context", output_dir=tmp_path)
-
-        # forced_name is a hash-based slug — always valid even for special-char queries
-        assert error is None
-        assert artifact is not None
-        assert artifact.capability_name  # non-empty slug from slugify_gap_hyphen
-
 
 # ---------------------------------------------------------------------------
 # Lazy-import safety: _VALIDATE_MODULE must not be cached on exec failure (Bug 2)

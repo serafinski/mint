@@ -162,6 +162,11 @@ class TestStrEnums:
         assert FailureReason.TIER3 == "tier3"
         assert FailureReason.OUTPUT_REJECTED == "output_rejected"
         assert FailureReason.NO_SOURCE_CODE == "no_source_code"
+        # Post-Step-13 additions (2026-04-15): chain-step / agent-execution failure reasons
+        # surfaced by the compositional executor's sticky failure meta.
+        assert FailureReason.CHAIN_STEP_FAILED == "chain_step_failed"
+        assert FailureReason.AGENT_EXECUTION_TIMEOUT == "agent_execution_timeout"
+        assert FailureReason.AGENT_EXECUTION_ERROR == "agent_execution_error"
 
     def test_human_label_values(self):
         assert HumanLabel.CORRECT == "correct"

@@ -65,12 +65,21 @@ def _extract_python_fences(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _check_mcp_tool(artifact: GeneratedArtifact) -> list[VerificationFinding]:
+def _check_mcp_tool(
+    artifact: GeneratedArtifact, *, allow_network: bool = False
+) -> list[VerificationFinding]:
     """Docker-import the generated MCP tool with its declared pip packages.
 
     Writes the source to ``/tmp/tool.py`` inside the container and runs
     ``import tool``. Matches ``tool_loader.py``'s runtime mechanism, so
     any import failure here will also fire at runtime.
+
+    ``allow_network`` (Step 14.12 / 2026-04-19 audit closure): when True,
+    the probe sandbox runs with ``--network bridge`` so import-time
+    network calls (e.g. ``from openai import OpenAI`` with eager API
+    initialization) don't spuriously fail Tier 1.5 under a task policy
+    that does permit network access. Default False preserves the offline
+    regime for the vast majority of tasks.
     """
     import base64
 
@@ -104,6 +113,7 @@ def _check_mcp_tool(artifact: GeneratedArtifact) -> list[VerificationFinding]:
         probe_code,
         timeout=30,
         extra_packages=artifact.pip_packages or None,
+        allow_network=allow_network,
     )
 
     if result.get("success", False):
@@ -225,7 +235,9 @@ def _check_agent(artifact: GeneratedArtifact) -> list[VerificationFinding]:
 # ---------------------------------------------------------------------------
 
 
-def run_import_check(artifact: GeneratedArtifact) -> VerificationReport:
+def run_import_check(
+    artifact: GeneratedArtifact, *, allow_network: bool = False
+) -> VerificationReport:
     """Run the Tier 1.5 import probe for *artifact*.
 
     Returns a ``VerificationReport`` summarising findings. Never raises —
@@ -237,11 +249,17 @@ def run_import_check(artifact: GeneratedArtifact) -> VerificationReport:
     replacement — so when the probe itself fails (Docker not available,
     internal bug), the gate proceeds to Tier 2 normally rather than
     blocking on a tooling failure.
+
+    ``allow_network`` (Step 14.12 / 2026-04-19 audit closure): forwarded
+    to the MCP_TOOL Docker-import sandbox so the probe runs in the same
+    network regime the artifact will execute under. SKILL / AGENT paths
+    are in-process compile-checks — ``allow_network`` has no effect on
+    those branches.
     """
     name = artifact.capability_name
     try:
         if artifact.capability_type == CapabilityType.MCP_TOOL:
-            findings = _check_mcp_tool(artifact)
+            findings = _check_mcp_tool(artifact, allow_network=allow_network)
         elif artifact.capability_type == CapabilityType.SKILL:
             findings = _check_skill(artifact)
         elif artifact.capability_type == CapabilityType.AGENT:

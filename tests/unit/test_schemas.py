@@ -12,6 +12,8 @@ from src.schemas.task import (
     GeneratedArtifact,
     GeneratorInput,
     MatchItem,
+    OutputContract,
+    StepTiming,
     SubTask,
     SubTaskItem,
     TaskState,
@@ -129,6 +131,84 @@ def test_capability_descriptor_roundtrip_with_new_fields():
     assert roundtripped.metadata == cap.metadata
 
 
+def test_capability_descriptor_is_generic_default_and_roundtrip():
+    """Step 3.5f: is_generic defaults False and survives roundtrip."""
+    default_cap = CapabilityDescriptor(
+        name="domain-thing",
+        description="Domain specific",
+        capability_type=CapabilityType.MCP_TOOL,
+    )
+    assert default_cap.is_generic is False
+
+    generic_cap = CapabilityDescriptor(
+        name="fibonacci",
+        description="Compute fibonacci",
+        capability_type=CapabilityType.MCP_TOOL,
+        is_generic=True,
+    )
+    assert generic_cap.is_generic is True
+    roundtripped = CapabilityDescriptor.model_validate_json(generic_cap.model_dump_json())
+    assert roundtripped.is_generic is True
+
+
+def test_capability_descriptor_definition_token_cost_default_and_bounds():
+    """Step 18.6: definition_token_cost defaults to 0, rejects negatives, roundtrips."""
+    default_cap = CapabilityDescriptor(
+        name="t",
+        description="t",
+        capability_type=CapabilityType.MCP_TOOL,
+    )
+    assert default_cap.definition_token_cost == 0
+
+    cap = CapabilityDescriptor(
+        name="t",
+        description="t",
+        capability_type=CapabilityType.MCP_TOOL,
+        definition_token_cost=1234,
+    )
+    assert cap.definition_token_cost == 1234
+    roundtripped = CapabilityDescriptor.model_validate_json(cap.model_dump_json())
+    assert roundtripped.definition_token_cost == 1234
+
+    with pytest.raises(ValueError):
+        CapabilityDescriptor(
+            name="t",
+            description="t",
+            capability_type=CapabilityType.MCP_TOOL,
+            definition_token_cost=-1,
+        )
+
+
+def test_capability_descriptor_all_fields_roundtrip():
+    """Full-field roundtrip guard against silent field removal."""
+    cap = CapabilityDescriptor(
+        name="full-roundtrip",
+        description="All fields set",
+        capability_type=CapabilityType.AGENT,
+        version=3,
+        input_schema={"a": {"type": "string"}},
+        output_schema={"b": {"type": "integer"}},
+        tags=["x", "y"],
+        domain="finance",
+        is_generic=True,
+        is_active=False,
+        definition_token_cost=555,
+        metadata={"k": "v"},
+    )
+    roundtripped = CapabilityDescriptor.model_validate_json(cap.model_dump_json())
+    assert roundtripped.name == "full-roundtrip"
+    assert roundtripped.capability_type == CapabilityType.AGENT
+    assert roundtripped.version == 3
+    assert roundtripped.input_schema == {"a": {"type": "string"}}
+    assert roundtripped.output_schema == {"b": {"type": "integer"}}
+    assert roundtripped.tags == ["x", "y"]
+    assert roundtripped.domain == "finance"
+    assert roundtripped.is_generic is True
+    assert roundtripped.is_active is False
+    assert roundtripped.definition_token_cost == 555
+    assert roundtripped.metadata == {"k": "v"}
+
+
 # --- TaskStatus ---
 
 
@@ -188,6 +268,28 @@ def test_subtask_roundtrip():
     roundtripped = SubTask.model_validate_json(st.model_dump_json())
     assert roundtripped.description == st.description
     assert roundtripped.required_capabilities == st.required_capabilities
+
+
+def test_subtask_b1_fields_default_and_roundtrip():
+    """B1 Step 3.5c: output_schema + requires_upstream_keys default empty and roundtrip."""
+    default_st = SubTask(description="root", required_capabilities=["a"])
+    assert default_st.output_schema == {}
+    assert default_st.requires_upstream_keys == []
+
+    st = SubTask(
+        description="aggregate",
+        required_capabilities=["aggregator"],
+        depends_on=[0, 1],
+        output_schema={"inventory": "list[dict]", "report_path": "str"},
+        requires_upstream_keys=["rules", "raw_data"],
+    )
+    assert st.output_schema == {"inventory": "list[dict]", "report_path": "str"}
+    assert st.requires_upstream_keys == ["rules", "raw_data"]
+
+    roundtripped = SubTask.model_validate_json(st.model_dump_json())
+    assert roundtripped.output_schema == st.output_schema
+    assert roundtripped.requires_upstream_keys == st.requires_upstream_keys
+    assert roundtripped.depends_on == [0, 1]
 
 
 # --- ClassifiedGap ---
@@ -326,6 +428,62 @@ def test_generated_artifact_description_field():
         description="Adds two integers",
     )
     assert art_with_desc.description == "Adds two integers"
+
+
+def test_generated_artifact_post_b1_fields_defaults():
+    """Post-B1 fields default to empty / None / False."""
+    art = GeneratedArtifact(
+        capability_name="t",
+        capability_type=CapabilityType.MCP_TOOL,
+        source_code="pass",
+    )
+    assert art.pip_packages == []
+    assert art.input_schema == {}
+    assert art.output_schema == {}
+    assert art.gap_query is None
+    assert art.domain is None
+    assert art.is_generic is False
+    assert art.needs_network is False
+
+
+def test_generated_artifact_all_fields_roundtrip():
+    """Full-field roundtrip covering pip_packages, input/output_schema,
+    gap_query, domain, is_generic, needs_network (Step 14.12)."""
+    art = GeneratedArtifact(
+        capability_name="csv-stats",
+        capability_type=CapabilityType.MCP_TOOL,
+        description="Parse CSV and compute stats",
+        source_code="def f(): ...",
+        gap_query="parse csv files",
+        pip_packages=["pandas", "pyyaml"],
+        input_schema={"path": "str"},
+        output_schema={"rows": "int", "cols": "int"},
+        domain="data-engineering",
+        is_generic=True,
+        needs_network=False,
+    )
+    roundtripped = GeneratedArtifact.model_validate_json(art.model_dump_json())
+    assert roundtripped.pip_packages == ["pandas", "pyyaml"]
+    assert roundtripped.input_schema == {"path": "str"}
+    assert roundtripped.output_schema == {"rows": "int", "cols": "int"}
+    assert roundtripped.gap_query == "parse csv files"
+    assert roundtripped.domain == "data-engineering"
+    assert roundtripped.is_generic is True
+    assert roundtripped.needs_network is False
+    assert roundtripped.description == "Parse CSV and compute stats"
+
+
+def test_generated_artifact_needs_network_populated():
+    """Step 14.12: needs_network True survives roundtrip."""
+    art = GeneratedArtifact(
+        capability_name="http-fetcher",
+        capability_type=CapabilityType.MCP_TOOL,
+        source_code="import requests",
+        needs_network=True,
+    )
+    assert art.needs_network is True
+    roundtripped = GeneratedArtifact.model_validate_json(art.model_dump_json())
+    assert roundtripped.needs_network is True
 
 
 # --- Severity ---
@@ -566,6 +724,32 @@ def test_invocation_record_roundtrip():
     assert roundtripped.token_cost == rec.token_cost
 
 
+def test_invocation_record_failure_replay_fields_default_and_roundtrip():
+    """Step 4: input_args + actual_output default None and roundtrip as JSON strings."""
+    default_rec = InvocationRecord(
+        capability_id="cap-123",
+        task_id="task-456",
+        success=True,
+        token_cost=10,
+        latency_ms=5.0,
+    )
+    assert default_rec.input_args is None
+    assert default_rec.actual_output is None
+
+    rec = InvocationRecord(
+        capability_id="cap-123",
+        task_id="task-456",
+        success=False,
+        token_cost=10,
+        latency_ms=5.0,
+        input_args='{"x": 1, "y": 2}',
+        actual_output='{"error": "bad input"}',
+    )
+    roundtripped = InvocationRecord.model_validate_json(rec.model_dump_json())
+    assert roundtripped.input_args == '{"x": 1, "y": 2}'
+    assert roundtripped.actual_output == '{"error": "bad input"}'
+
+
 # --- GranularityMetrics ---
 
 
@@ -795,6 +979,135 @@ def test_task_state_attempt_count_roundtrip():
     assert roundtripped.attempt_count == 3
 
 
+def test_task_state_sticky_flags_default_true():
+    """§12 findings #14/#15/#16: sticky success flags default True (never been tripped)."""
+    state = TaskState(task_description="test")
+    assert state.decomposition_succeeded is True
+    assert state.classification_succeeded is True
+    assert state.verification_succeeded is True
+
+
+def test_task_state_sticky_flags_false_roundtrip():
+    """Sticky False values survive serialization — they drive CLI exit codes."""
+    state = TaskState(
+        task_description="test",
+        decomposition_succeeded=False,
+        classification_succeeded=False,
+        verification_succeeded=False,
+    )
+    roundtripped = TaskState.model_validate_json(state.model_dump_json())
+    assert roundtripped.decomposition_succeeded is False
+    assert roundtripped.classification_succeeded is False
+    assert roundtripped.verification_succeeded is False
+
+
+def test_task_state_output_contract_default_none():
+    """Step 14.6: output_contract defaults to None (legacy fall-through)."""
+    state = TaskState(task_description="test")
+    assert state.output_contract is None
+
+
+def test_task_state_output_contract_populated_roundtrip():
+    """Step 14.6: OutputContract populated roundtrip preserves required_keys + required_files."""
+    contract = OutputContract(
+        required_keys=["report", "summary"],
+        required_files=["output.csv"],
+    )
+    state = TaskState(task_description="test", output_contract=contract)
+    roundtripped = TaskState.model_validate_json(state.model_dump_json())
+    assert roundtripped.output_contract is not None
+    assert roundtripped.output_contract.required_keys == ["report", "summary"]
+    assert roundtripped.output_contract.required_files == ["output.csv"]
+
+
+def test_task_state_allow_network_default_and_roundtrip():
+    """Step 14.12: allow_network defaults False and roundtrips."""
+    state = TaskState(task_description="test")
+    assert state.allow_network is False
+
+    state_on = TaskState(task_description="test", allow_network=True)
+    roundtripped = TaskState.model_validate_json(state_on.model_dump_json())
+    assert roundtripped.allow_network is True
+
+
+# --- OutputContract + ContractCheckResult ---
+
+
+def test_output_contract_empty_defaults():
+    contract = OutputContract()
+    assert contract.required_keys == []
+    assert contract.required_files == []
+    assert contract.is_empty() is True
+
+
+def test_output_contract_is_empty_when_fields_populated():
+    assert OutputContract(required_keys=["k"]).is_empty() is False
+    assert OutputContract(required_files=["f.csv"]).is_empty() is False
+
+
+def test_output_contract_check_satisfied():
+    contract = OutputContract(required_keys=["a"], required_files=["x.csv"])
+    result = contract.check({"a": 1, "b": 2}, {"x.csv": b"data"})
+    assert result.satisfied is True
+    assert result.missing_keys == []
+    assert result.missing_files == []
+    assert "a" in result.produced_keys
+    assert "x.csv" in result.produced_files
+
+
+def test_output_contract_check_missing():
+    contract = OutputContract(required_keys=["a", "c"], required_files=["x.csv"])
+    result = contract.check({"a": 1}, {})
+    assert result.satisfied is False
+    assert result.missing_keys == ["c"]
+    assert result.missing_files == ["x.csv"]
+
+
+def test_output_contract_rejects_extra():
+    with pytest.raises(ValueError):
+        OutputContract(required_keys=[], bogus="oops")
+
+
+def test_output_contract_roundtrip():
+    contract = OutputContract(required_keys=["x"], required_files=["a.csv", "b.xlsx"])
+    roundtripped = OutputContract.model_validate_json(contract.model_dump_json())
+    assert roundtripped.required_keys == ["x"]
+    assert roundtripped.required_files == ["a.csv", "b.xlsx"]
+
+
+# --- StepTiming ---
+
+
+def test_step_timing_valid_and_roundtrip():
+    t = StepTiming(
+        step_index=2,
+        capability_name="csv-parser",
+        capability_type="mcp_tool",
+        source="registry",
+        success=True,
+        latency_ms=12.5,
+    )
+    roundtripped = StepTiming.model_validate_json(t.model_dump_json())
+    assert roundtripped.step_index == 2
+    assert roundtripped.capability_name == "csv-parser"
+    assert roundtripped.source == "registry"
+    assert roundtripped.success is True
+    assert roundtripped.latency_ms == 12.5
+
+
+def test_step_timing_rejects_extra():
+    with pytest.raises(ValueError):
+        StepTiming(
+            step_index=0,
+            capability_name="x",
+            capability_type="skill",
+            source="generated",
+            success=False,
+            latency_ms=0.0,
+            bonus="bad",
+        )
+
+
 # --- GapItem / MatchItem ---
 
 
@@ -811,6 +1124,31 @@ def test_match_item_requires_capability():
 # --- SubTaskItem ---
 
 
+def test_subtask_item_valid_construction():
+    """Happy-path construction accepts all declared fields (B1 output_schema +
+    requires_upstream_keys)."""
+    item = SubTaskItem(
+        description="Aggregate sales data",
+        required_capabilities=["aggregator"],
+        depends_on=[0],
+        output_schema={"totals": "dict[str, float]"},
+        requires_upstream_keys=["rows"],
+    )
+    assert item.description == "Aggregate sales data"
+    assert item.required_capabilities == ["aggregator"]
+    assert item.depends_on == [0]
+    assert item.output_schema == {"totals": "dict[str, float]"}
+    assert item.requires_upstream_keys == ["rows"]
+
+
+def test_subtask_item_defaults():
+    """depends_on, output_schema, requires_upstream_keys default empty."""
+    item = SubTaskItem(description="root", required_capabilities=["a"])
+    assert item.depends_on == []
+    assert item.output_schema == {}
+    assert item.requires_upstream_keys == []
+
+
 def test_subtask_item_rejects_extra():
     with pytest.raises(ValueError):
         SubTaskItem(
@@ -821,6 +1159,31 @@ def test_subtask_item_rejects_extra():
 
 
 # --- DecompositionResult ---
+
+
+def test_decomposition_result_valid_construction():
+    """Happy-path construction with subtasks list + reasoning string."""
+    result = DecompositionResult(
+        subtasks=[
+            SubTaskItem(description="Step 1", required_capabilities=["a"]),
+            SubTaskItem(
+                description="Step 2",
+                required_capabilities=["b"],
+                depends_on=[0],
+            ),
+        ],
+        reasoning="Split into load + transform",
+    )
+    assert len(result.subtasks) == 2
+    assert result.subtasks[1].depends_on == [0]
+    assert result.reasoning == "Split into load + transform"
+
+
+def test_decomposition_result_reasoning_defaults_empty():
+    result = DecompositionResult(
+        subtasks=[SubTaskItem(description="only step", required_capabilities=["x"])],
+    )
+    assert result.reasoning == ""
 
 
 def test_decomposition_result_rejects_extra():
@@ -1008,3 +1371,39 @@ def test_chain_result_roundtrip():
     assert roundtripped.chain_length == 2
     assert roundtripped.chain_success is True
     assert len(roundtripped.step_results) == 2
+
+
+def test_chain_result_post_b1_fields_default():
+    """Step 13 + Step 14.12: failed_step_reason, step_timings, output_files default None/empty."""
+    cr = ChainResult(chain_length=1, chain_success=True)
+    assert cr.failed_step_reason is None
+    assert cr.step_timings == []
+    assert cr.output_files == {}
+
+
+def test_chain_result_all_fields_roundtrip():
+    """Full-field roundtrip including failed_step_reason (Step 13),
+    step_timings, and output_files."""
+    timing = StepTiming(
+        step_index=0,
+        capability_name="csv-parser",
+        capability_type="mcp_tool",
+        source="registry",
+        success=False,
+        latency_ms=100.0,
+    )
+    cr = ChainResult(
+        chain_length=2,
+        chain_success=False,
+        step_results=[{"name": "step-a", "ok": False}],
+        failed_step_index=0,
+        failed_step_name="step-a",
+        failed_step_reason="agent_execution_timeout",
+        step_timings=[timing],
+        output_files={"output.csv": b"col1,col2\n1,2\n"},
+    )
+    roundtripped = ChainResult.model_validate_json(cr.model_dump_json())
+    assert roundtripped.failed_step_reason == "agent_execution_timeout"
+    assert len(roundtripped.step_timings) == 1
+    assert roundtripped.step_timings[0].capability_name == "csv-parser"
+    assert roundtripped.output_files == {"output.csv": b"col1,col2\n1,2\n"}

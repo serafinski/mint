@@ -394,7 +394,13 @@ class TestSandboxExecuteWithPackages:
         assert captured[idx + 1] == "none"
 
     def test_extra_packages_triggers_install_phase(self):
-        """With extra_packages, runs multiple docker commands (install + commit + run)."""
+        """With extra_packages, runs the 5-command install→commit→rm→exec→rmi sequence.
+
+        Tightened 2026-04-19: previously only asserted ``len >= 3`` which would
+        pass even if commit/rm/rmi were silently dropped. The install path in
+        ``_sandbox_execute_with_install`` must perform all five docker operations
+        to commit the pip-installed layer and clean up the ephemeral image.
+        """
         calls = []
 
         def capture(*args, **kwargs):
@@ -404,9 +410,34 @@ class TestSandboxExecuteWithPackages:
         with patch("subprocess.run", side_effect=capture):
             sandbox_execute("pass", extra_packages=["scikit-learn"])
 
-        # Should have at least 3 docker calls: run (install), commit, rm, run (execute), rmi
         docker_cmds = [c for c in calls if c and c[0] == "docker"]
-        assert len(docker_cmds) >= 3
+
+        # Exact 5-command sequence (order-sensitive):
+        #   1. docker run <ephemeral>         (pip install phase)
+        #   2. docker commit <ephemeral>
+        #   3. docker rm -f <ephemeral>       (after commit)
+        #   4. docker run --rm <ephemeral>    (execution phase)
+        #   5. docker rmi -f <ephemeral>      (cleanup, via finally)
+        assert len(docker_cmds) == 5, (
+            f"expected 5 docker commands, got {len(docker_cmds)}: {docker_cmds}"
+        )
+
+        subcommands = [c[1] for c in docker_cmds]
+        assert subcommands == ["run", "commit", "rm", "run", "rmi"], (
+            f"unexpected docker subcommand sequence: {subcommands}"
+        )
+
+        # The install phase must run with network (bridge); exec phase without.
+        install_cmd = docker_cmds[0]
+        exec_cmd = docker_cmds[3]
+        assert (
+            "--network" in install_cmd
+            and install_cmd[install_cmd.index("--network") + 1] == "bridge"
+        )
+        assert (
+            "--network" in exec_cmd
+            and exec_cmd[exec_cmd.index("--network") + 1] == "none"
+        )
 
 
 # ---------------------------------------------------------------------------

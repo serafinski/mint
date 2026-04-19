@@ -425,3 +425,78 @@ class TestGateWiring:
         assert report.tier_reached == 3
         mock_behavioral.assert_called_once()
         mock_adversarial.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Step 14.12 / 2026-04-19 audit closure: allow_network forwarding
+#
+# Pre-2026-04-19, gate.py passed allow_network to behavioral + adversarial
+# but NOT to run_import_check — Tier 1.5's sandbox hardcoded offline mode.
+# Any MCP_TOOL whose import itself needs network (eager API init at import
+# time) would spuriously fail Tier 1.5 even under a task policy that does
+# permit network. The fix threads allow_network through.
+# ---------------------------------------------------------------------------
+
+
+class TestAllowNetworkForwarding:
+    """Tier 1.5 respects the task's allow_network policy."""
+
+    @patch("src.verification.sandbox_tool.sandbox_execute")
+    def test_default_offline_when_allow_network_unset(self, mock_sandbox):
+        """Default signature: allow_network defaults to False → sandbox offline."""
+        mock_sandbox.return_value = _sandbox_success()
+        run_import_check(_mcp_artifact())
+        mock_sandbox.assert_called_once()
+        assert mock_sandbox.call_args.kwargs.get("allow_network") is False
+
+    @patch("src.verification.sandbox_tool.sandbox_execute")
+    def test_explicit_offline_forwards_false(self, mock_sandbox):
+        """``allow_network=False`` is forwarded to sandbox_execute."""
+        mock_sandbox.return_value = _sandbox_success()
+        run_import_check(_mcp_artifact(), allow_network=False)
+        mock_sandbox.assert_called_once()
+        assert mock_sandbox.call_args.kwargs["allow_network"] is False
+
+    @patch("src.verification.sandbox_tool.sandbox_execute")
+    def test_explicit_online_forwards_true(self, mock_sandbox):
+        """``allow_network=True`` flows through so Docker runs ``--network bridge``."""
+        mock_sandbox.return_value = _sandbox_success()
+        run_import_check(_mcp_artifact(), allow_network=True)
+        mock_sandbox.assert_called_once()
+        assert mock_sandbox.call_args.kwargs["allow_network"] is True
+
+    @patch("src.verification.gate.adversarial.probe")
+    @patch("src.verification.gate.behavioral.run")
+    @patch("src.verification.sandbox_tool.sandbox_execute")
+    def test_gate_verify_threads_allow_network_to_tier_1_5(
+        self, mock_sandbox, mock_behavioral, mock_adversarial
+    ):
+        """End-to-end: ``gate.verify(allow_network=True)`` reaches the Tier 1.5 sandbox."""
+        from src.verification.gate import verify
+
+        mock_sandbox.return_value = _sandbox_success()
+        mock_behavioral.return_value = []
+        mock_adversarial.return_value = VerificationReport(
+            capability_name="test-tool",
+            findings=[],
+            overall_passed=True,
+            tier_reached=3,
+        )
+
+        verify(_mcp_artifact(), allow_network=True)
+
+        mock_sandbox.assert_called_once()
+        assert mock_sandbox.call_args.kwargs["allow_network"] is True
+
+    def test_skill_allow_network_no_op(self):
+        """SKILL path is in-process compile-check: allow_network is ignored, report still passes."""
+        report = run_import_check(_skill_artifact(), allow_network=True)
+        assert report.overall_passed is True
+
+    def test_agent_allow_network_no_op(self):
+        """AGENT path is in-process compile-check: allow_network is ignored, report still passes."""
+        report = run_import_check(
+            _agent_artifact(config={"system_prompt": "you are a helpful agent"}),
+            allow_network=True,
+        )
+        assert report.overall_passed is True

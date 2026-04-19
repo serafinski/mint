@@ -738,8 +738,23 @@ class TestAgentInvokeInput:
         assert "skills/test-agent/SKILL.md" in captured_invoke_input["files"]
 
     def test_fixture_does_not_clobber_skill_with_same_name(self, tmp_path):
-        """If a skill file and a fixture happen to share a filename, the
-        skill takes precedence (unlikely but safe)."""
+        """Skills win on filename collision with fixtures.
+
+        Semantic invariant (NOT a dict.update ordering side-effect):
+        ``_execute_agent_inner`` seeds ``workspace_files`` with the skill
+        files first, then iterates fixture entries and only inserts each
+        one when its key is NOT already present. Pinned to the
+        ``if filename not in workspace_files`` guard at
+        ``tests/evaluation/execution.py`` around line 1193 (the for-loop
+        below ``workspace_files = dict(skill_files)``).
+
+        The assertion below verifies the invariant by semantic intent:
+        when a skill and a fixture share the same absolute-virtual path
+        (``/SKILL.md``), the skill content survives. Refactoring the
+        merge from explicit-loop to any order-independent mechanism
+        (e.g. ``{**fixtures, **skills}``) is fine as long as this
+        assertion still holds.
+        """
         from tests.evaluation import execution as exec_mod
 
         artifact = self._make_agent_artifact()
@@ -804,11 +819,23 @@ class TestBuildDynamicResultModel:
     def test_model_allows_extra_keys(self):
         """extra='allow' tolerates additional keys beyond the declared ones.
 
+        This is an INTENTIONAL design decision — see CLAUDE.md
+        §12 finding #12 ("AGENT output_schema compliance") and
+        ``MEMORY.md`` topic file
+        ``project_agent_output_schema_compliance.md``. Do NOT tighten to
+        ``extra='forbid'`` without revisiting that finding.
+
         Important for lead+subagents AGENTs where the lead produces
         aggregated output covering multiple collapsed gaps plus task-level
         return keys. An earlier extra='forbid' design empirically failed
-        on the T16 third-run (2026-04-16): the lead produced task-level
-        keys as "extras", Pydantic rejected them, whole chain failed.
+        on the T16 third-run incident (2026-04-16): the lead produced
+        task-level keys as "extras", Pydantic rejected them, and the
+        whole compositional chain failed — that run is the reason this
+        test exists and the reason the decomposer's declared keys are
+        treated as a required floor with extras tolerated on top.
+
+        Required-key enforcement is NOT weakened — see
+        ``test_model_still_requires_declared_keys`` below.
         """
         from tests.evaluation.execution import _build_dynamic_result_model
 

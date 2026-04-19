@@ -192,16 +192,32 @@ class TestTypeDispatch:
         assert report.all_covered is True
         assert report.status == "vacuous"
 
-    def test_mixed_types_dispatches_on_first(self):
+    def test_mixed_types_dispatches_on_first(self, caplog):
         """Mixed-type variants are a caller bug but the verifier should
         still return a report, dispatching on the first variant's type
-        and logging a warning."""
-        report = verify_coverage(
-            [_skill_variant("skill-a"), _mcp_variant("tool-b")],
-            [_error_case()],
-        )
+        and logging a warning.
+
+        Tightened (2026-04-19): the warning log was previously assumed but
+        never asserted, so a silent refactor that dropped the log would
+        still pass. ``caplog`` now fixes both the status and the surfacing
+        of the mixed-types signal to operators.
+        """
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="src.verification.coverage"):
+            report = verify_coverage(
+                [_skill_variant("skill-a"), _mcp_variant("tool-b")],
+                [_error_case()],
+            )
         # Dispatch on SKILL (first variant) → unverifiable_type
         assert report.status == "unverifiable_type"
+        # Warning log surfaced for the mixed-types caller bug.
+        warning_messages = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any(
+            "mixed capability types" in msg for msg in warning_messages
+        ), f"Expected mixed-types warning in {warning_messages}"
 
 
 # ---------------------------------------------------------------------------

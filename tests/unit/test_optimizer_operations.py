@@ -130,9 +130,19 @@ class TestPrune:
         registry.deactivate.assert_not_called()
 
     def test_prune_deactivates_unpinned_zero_invocation(self):
-        """Unpinned capabilities with zero invocations are still pruned (regression)."""
+        """Unpinned capabilities with zero invocations are still pruned.
+
+        Regression fence for `test_prune_skips_pinned_capability`: the pinned
+        short-circuit must not accidentally apply to caps whose metadata
+        simply has no ``pinned`` key. Extends #1 with an explicit
+        ``record_event`` payload assertion to catch silent event-schema
+        drift when the prune helper is refactored.
+        """
         registry = MagicMock()
-        registry.list_all.return_value = [_make_cap("ephemeral")]
+        cap = _make_cap("ephemeral")
+        # Explicitly no "pinned" key in metadata (empty {})
+        assert cap.metadata == {}
+        registry.list_all.return_value = [cap]
         store = MagicMock()
         store.invocations_since.return_value = 0
 
@@ -140,6 +150,13 @@ class TestPrune:
 
         assert result == ["ephemeral"]
         registry.deactivate.assert_called_once_with("ephemeral")
+        # Event recorded with capability name AND the "pruned" event type —
+        # not just "some event was recorded".
+        assert store.record_event.call_count == 1
+        event_call = store.record_event.call_args
+        # Positional args: (capability_id, event_type, ...) per operations.py
+        assert event_call[0][0] == "ephemeral"
+        assert event_call[0][1] == "pruned"
 
     def test_prune_mixed_registry_only_deactivates_unpinned(self):
         """Mixed registry: pinned survives, active-with-invocations survives, idle-unpinned pruned."""

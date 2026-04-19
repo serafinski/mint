@@ -227,6 +227,17 @@ class TestBuildSandboxCode:
         is True.  Without neutralization, mcp.run() would start a server loop
         and asyncio.run(_run()) would never execute — all behavioral tests silently
         no-op.  The __name__ override MUST appear before the inlined source.
+
+        NOTE: This is a cheap LEXICAL guard (string-position check). It is
+        DELIBERATELY PAIRED with ``test_main_guard_neutralized_end_to_end_subprocess``
+        below, which runs the same generated payload through a real Python
+        interpreter and asserts the override works at RUNTIME (not just
+        lexically). Do NOT delete either without the other — they form the
+        Step 14 Gap A two-layer safety net (see CLAUDE.md + MEMORY.md commit
+        ``1bae0da``). The lexical test guards against override-position
+        regressions; the subprocess test guards against override-line
+        mutations. A future cleanup sweep that drops one in isolation would
+        reopen the silent-no-op regression surface for Pillar 2 Tier 2.
         """
         src = 'async def my_tool(n: int): return n\nif __name__ == "__main__": raise RuntimeError("main fired")'
         code = _build_sandbox_code(src, "my_tool", {"n": 1})
@@ -428,8 +439,24 @@ class TestRunSandboxFailure:
     def test_all_sandbox_failures_handled_gracefully(self, mock_sandbox):
         mock_sandbox.return_value = _sandbox_failure("Docker not found")
         findings = run(_make_artifact(CLEAN_TOOL))
-        # Should not raise; findings list may be empty or contain info-level items
+        # Should not raise, and must return a list (never-raises contract).
         assert isinstance(findings, list)
+        # With every sandbox call failing on a non-timeout, non-dep-install
+        # stderr, `_test_boundary` must surface one MEDIUM `boundary` finding
+        # per test case (zero/negative/large) via the else-branch at
+        # behavioral.py:439-451. The `dependency` branch specifically requires
+        # "pip install failed" / "No solution found" / "No matching
+        # distribution" in stderr, so generic "Docker not found" lands as
+        # `boundary`, not `dependency`. We assert on category presence rather
+        # than exact count to stay robust to future additions.
+        categories = {f.category for f in findings}
+        assert "boundary" in categories, (
+            f"Expected `boundary` category to surface on sandbox failure, "
+            f"got: {sorted(categories)}"
+        )
+        boundary_findings = [f for f in findings if f.category == "boundary"]
+        assert all(f.severity == Severity.MEDIUM for f in boundary_findings)
+        assert all(f.tier == 2 for f in boundary_findings)
 
 
 class TestRunNonexistentEntity:

@@ -4,7 +4,11 @@ Tests cover:
 - Stub gate always passes (default behaviour until Iteration 3)
 - Correct routing to loading_node vs generate_mcp_tool
 - Artifact replacement: failed artifacts removed from state on retry
-- Fail-open behaviour at MAX_ATTEMPTS
+- **Fail-closed behaviour at MAX_ATTEMPTS** (§12 finding #14, 2026-04-16):
+  flips ``verification_succeeded=False``, drops partially-produced artifacts,
+  emits ERROR-level LangFuse event, proceeds to terminal state via
+  the never-raises contract. Pre-fix behaviour (fail-OPEN) is preserved
+  in git history only — any test here asserts the fail-CLOSED outcome.
 - attempt_count incremented on every call
 - Errors accumulated from Critical/High findings
 - Existing verification_results preserved

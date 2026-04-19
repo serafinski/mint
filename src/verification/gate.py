@@ -276,7 +276,7 @@ def _verify_inner(
     # ------------------------------------------------------------------
     current_tier[0] = 1  # Tier 1.5 reports stay at tier=1 per schema constraint
     logger.debug("Running Tier 1.5 import probe on %s", name)
-    t15_report = import_check.run_import_check(artifact)
+    t15_report = import_check.run_import_check(artifact, allow_network=allow_network)
     all_findings.extend(t15_report.findings)
 
     if not import_check.should_proceed_to_tier2(t15_report):
