@@ -1255,17 +1255,40 @@ def _record_invocation(
     output: dict | None,
     elapsed_ms: int,
 ) -> None:
+    # Populate input_args / actual_output / error_message so the row survives
+    # MetricsStore.get_recent_failures (WHERE input_args IS NOT NULL) and
+    # reaches the Pillar 3 Split coverage verifier + failure-informed prompt.
+    # See docs/invocation_recording_gap_2026_04_19.md for the drift history.
     if artifact is None:
         return
     try:
+        from src.registry.metrics import (
+            extract_error_message,
+            looks_like_error,
+            serialize_for_invocation,
+        )
         from src.schemas.metrics import InvocationRecord
+
+        # CLI layer records the top-level task invocation. The task prompt
+        # is the closest replayable input at this granularity; structured
+        # kwargs (if any) live inside the compositional executor, which
+        # records its own per-step rows via composition._record_step_invocation.
+        input_args_json = serialize_for_invocation({"task_prompt": task_prompt})
+
+        is_error_shape = looks_like_error(output)
+        success = output is not None and bool(output) and not is_error_shape
+        actual_output_json = serialize_for_invocation(output)
+        error_message = extract_error_message(output) if is_error_shape else None
 
         record = InvocationRecord(
             capability_id=getattr(artifact, "capability_name", "unknown"),
             task_id=task_prompt[:64],
-            success=output is not None and bool(output),
+            success=success,
             token_cost=0,
             latency_ms=float(elapsed_ms),
+            input_args=input_args_json,
+            actual_output=actual_output_json,
+            error_message=error_message,
         )
         metrics_store.record_invocation(record)
     except Exception:

@@ -1426,3 +1426,117 @@ class TestAgentOutputSchemaRuntimeCheck:
         assert result.chain_success is False
         assert "summary" in (result.failed_step_reason or "")
         assert "counts" in (result.failed_step_reason or "")
+
+
+class TestRecordStepInvocationPopulatesFields:
+    """Regression guards for docs/invocation_recording_gap_2026_04_19.md.
+
+    The pre-fix writer left input_args and actual_output as None, which
+    silently excluded every production row from MetricsStore.get_recent_failures
+    (WHERE input_args IS NOT NULL), making the Pillar 3 Split coverage
+    verifier + failure-informed prompt structurally dead on real telemetry.
+    These tests assert the post-fix writer populates the fields that Split
+    depends on, and that error-shaped outputs are recorded as failures.
+    """
+
+    def _make_executor_with_metrics(self, metrics_store):
+        subtask = _make_subtask("do thing", ["x"])
+        ref = CapabilityReference(
+            source="generated",
+            capability_name="thing-doer",
+            capability_type=CapabilityType.MCP_TOOL,
+        )
+        ex = CompositionalExecutor(
+            subtasks=[subtask],
+            resolution={"x": ref},
+            artifacts=[],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+            metrics_store=metrics_store,
+        )
+        return ex, ref
+
+    def test_record_step_invocation_populates_input_args_and_output(self):
+        """Chain writer must serialize upstream_outputs + output into the
+        InvocationRecord so get_recent_failures returns the row."""
+        from src.registry.metrics import MetricsStore
+
+        metrics = MetricsStore(db_path=":memory:")
+        ex, ref = self._make_executor_with_metrics(metrics)
+
+        # Simulate a failed chain step: output is error-shaped.
+        upstream = {0: {"rows": [{"a": 1}, {"a": 2}]}}
+        output = {"error": "downstream function crashed on empty CSV"}
+
+        ex._record_step_invocation(
+            ref, output, latency_ms=12.5, task_id="T99",
+            upstream_outputs=upstream,
+        )
+
+        # Row must survive the get_recent_failures filter.
+        failures = metrics.get_recent_failures("thing-doer")
+        assert len(failures) == 1
+        rec = failures[0]
+        assert rec.input_args is not None
+        assert '"rows"' in rec.input_args  # upstream_outputs serialized
+        assert rec.actual_output is not None
+        assert '"error"' in rec.actual_output  # output serialized
+        assert rec.error_message is not None
+        assert "downstream function crashed" in rec.error_message
+        assert rec.success is False
+
+    def test_error_shaped_output_recorded_as_failure(self):
+        """{'error': '...'} must be recorded as success=False, not True —
+        pre-fix bool(output) treated non-empty error dicts as successes."""
+        from src.registry.metrics import MetricsStore
+
+        metrics = MetricsStore(db_path=":memory:")
+        ex, ref = self._make_executor_with_metrics(metrics)
+
+        output = {"error": "tool raised something"}
+        ex._record_step_invocation(
+            ref, output, latency_ms=1.0, task_id="T99",
+            upstream_outputs={0: {"x": 1}},
+        )
+
+        failures = metrics.get_recent_failures("thing-doer")
+        assert len(failures) == 1
+        assert failures[0].success is False
+
+    def test_successful_output_not_mistaken_for_error(self):
+        """Legitimate outputs with 'error_count' or similar keys must NOT
+        trigger the conservative error-shape check."""
+        from src.registry.metrics import MetricsStore
+
+        metrics = MetricsStore(db_path=":memory:")
+        ex, ref = self._make_executor_with_metrics(metrics)
+
+        # Real tool output: no 'error'/'exception'/'traceback'/'sandbox_error' key.
+        output = {"error_count": 0, "total_rows": 100}
+        ex._record_step_invocation(
+            ref, output, latency_ms=1.0, task_id="T99",
+            upstream_outputs={0: {"x": 1}},
+        )
+
+        # Row recorded as success — get_recent_failures returns nothing.
+        failures = metrics.get_recent_failures("thing-doer")
+        assert len(failures) == 0
+
+    def test_empty_upstream_serializes_to_none(self):
+        """Empty dict upstream (step 0 with no prior outputs) → input_args=None.
+        That's intentional — step-0 rows aren't usable as replay probes
+        because the kwargs came from fixtures, not upstream."""
+        from src.registry.metrics import MetricsStore
+
+        metrics = MetricsStore(db_path=":memory:")
+        ex, ref = self._make_executor_with_metrics(metrics)
+
+        ex._record_step_invocation(
+            ref, {"error": "step 0 blew up"}, latency_ms=1.0, task_id="T99",
+            upstream_outputs={},
+        )
+
+        # Row has NULL input_args → get_recent_failures filters it out.
+        failures = metrics.get_recent_failures("thing-doer")
+        assert len(failures) == 0

@@ -619,3 +619,140 @@ def test_fetch_preserves_invocation_order(store: MetricsStore):
 
     rows = store.fetch_invocations_for_task("T01")
     assert [r["capability_id"] for r in rows] == ["first", "second", "third"]
+
+
+# ---------------------------------------------------------------------------
+# Shared invocation-recording helpers (2026-04-19 fix for
+# docs/invocation_recording_gap_2026_04_19.md).
+# ---------------------------------------------------------------------------
+
+
+class TestSerializeForInvocation:
+    def test_none_returns_none(self):
+        from src.registry.metrics import serialize_for_invocation
+        assert serialize_for_invocation(None) is None
+
+    def test_empty_dict_returns_none(self):
+        """Empty dicts carry no information — treat as None so the row
+        fails the ``input_args IS NOT NULL`` filter and isn't used as
+        a no-op replay probe."""
+        from src.registry.metrics import serialize_for_invocation
+        assert serialize_for_invocation({}) is None
+
+    def test_populated_dict_round_trips(self):
+        import json
+
+        from src.registry.metrics import serialize_for_invocation
+
+        value = {"b": 2, "a": 1}
+        s = serialize_for_invocation(value)
+        assert s is not None
+        # sort_keys=True → deterministic ordering for byte-equality compare
+        assert s == '{"a": 1, "b": 2}'
+        assert json.loads(s) == value
+
+    def test_non_json_types_serialize_via_default_str(self):
+        from pathlib import Path
+
+        from src.registry.metrics import serialize_for_invocation
+
+        s = serialize_for_invocation({"p": Path("/tmp/x.csv")})
+        assert s is not None
+        assert "/tmp/x.csv" in s
+
+    def test_oversize_payload_truncates(self):
+        from src.registry.metrics import serialize_for_invocation
+
+        # 64 KiB + slack — force truncation path.
+        big = {"blob": "x" * 100_000}
+        s = serialize_for_invocation(big)
+        assert s is not None
+        assert len(s.encode("utf-8")) <= 64 * 1024
+        assert "__TRUNCATED__" in s
+
+    def test_unserializable_returns_none(self):
+        """Objects that json.dumps cannot encode even with default=str
+        (e.g., circular references) must return None rather than raise."""
+        from src.registry.metrics import serialize_for_invocation
+
+        a: dict = {}
+        a["self"] = a  # cyclic
+        assert serialize_for_invocation(a) is None
+
+
+class TestLooksLikeError:
+    def test_error_key_detected(self):
+        from src.registry.metrics import looks_like_error
+        assert looks_like_error({"error": "oops"}) is True
+
+    def test_exception_key_detected(self):
+        from src.registry.metrics import looks_like_error
+        assert looks_like_error({"exception": "RuntimeError"}) is True
+
+    def test_traceback_key_detected(self):
+        from src.registry.metrics import looks_like_error
+        assert looks_like_error({"traceback": "..."}) is True
+
+    def test_sandbox_error_key_detected(self):
+        from src.registry.metrics import looks_like_error
+        assert looks_like_error({"sandbox_error": "timeout"}) is True
+
+    def test_error_count_not_an_error(self):
+        """Legitimate keys containing ``error`` as substring (e.g.,
+        ``error_count``, ``error_rate``) must NOT trigger the heuristic.
+        Conservative keyset avoids this misfire."""
+        from src.registry.metrics import looks_like_error
+        assert looks_like_error({"error_count": 0}) is False
+        assert looks_like_error({"error_rate": 0.01}) is False
+
+    def test_success_dict_not_an_error(self):
+        from src.registry.metrics import looks_like_error
+        assert looks_like_error({"result": 42, "rows": 10}) is False
+
+    def test_non_mapping_returns_false(self):
+        from src.registry.metrics import looks_like_error
+        assert looks_like_error(None) is False
+        assert looks_like_error("error") is False
+        assert looks_like_error(42) is False
+        assert looks_like_error(["error"]) is False
+
+
+class TestExtractErrorMessage:
+    def test_error_key_extracted(self):
+        from src.registry.metrics import extract_error_message
+        assert extract_error_message({"error": "oops"}) == "oops"
+
+    def test_prefers_error_over_exception(self):
+        """When both ``error`` and ``exception`` keys are present, ``error``
+        is returned first (iteration order of the frozenset is stable but
+        not guaranteed; this test documents the extracted value must be
+        one of the valid error keys)."""
+        from src.registry.metrics import extract_error_message
+        out = extract_error_message({"error": "A", "exception": "B"})
+        assert out in ("A", "B")
+
+    def test_long_message_truncated_to_500_chars(self):
+        from src.registry.metrics import extract_error_message
+        out = extract_error_message({"error": "x" * 1000})
+        assert out is not None
+        assert len(out) == 500
+
+    def test_non_error_output_returns_none(self):
+        from src.registry.metrics import extract_error_message
+        assert extract_error_message({"result": 42}) is None
+        assert extract_error_message(None) is None
+
+    def test_none_error_value_returns_none(self):
+        """``{"error": None}`` — the key exists but carries no message."""
+        from src.registry.metrics import extract_error_message
+        assert extract_error_message({"error": None}) is None
+
+    def test_empty_string_error_returns_none(self):
+        from src.registry.metrics import extract_error_message
+        assert extract_error_message({"error": ""}) is None
+
+    def test_non_string_error_value_coerced(self):
+        from src.registry.metrics import extract_error_message
+        out = extract_error_message({"error": {"code": 500}})
+        assert out is not None
+        assert "500" in out

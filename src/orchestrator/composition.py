@@ -379,19 +379,48 @@ class CompositionalExecutor:
         output: dict,
         latency_ms: float,
         task_id: str,
+        *,
+        upstream_outputs: dict | None = None,
     ) -> None:
-        """Record a real invocation for this chain step in the metrics store."""
+        """Record a real invocation for this chain step in the metrics store.
+
+        Populates ``input_args`` / ``actual_output`` / ``error_message`` so the
+        row survives ``MetricsStore.get_recent_failures`` (WHERE input_args
+        IS NOT NULL) and reaches the Pillar 3 Split coverage verifier +
+        failure-informed prompt. See
+        ``docs/invocation_recording_gap_2026_04_19.md`` for the drift history.
+
+        ``input_args`` captures the upstream step outputs that feed this
+        step — the closest Python-side proxy for the literal kwargs the
+        capability consumed. Chain-step replay by the coverage verifier
+        requires matching the sandbox's kwargs-construction logic
+        (``tests/evaluation/execution.py::execute_mcp_tool_in_chain``);
+        direct-invocation replay on rows where ``input_args`` already
+        matches the function's parameter names works today.
+        """
         if self.metrics_store is None:
             return
         try:
+            from src.registry.metrics import (
+                extract_error_message,
+                looks_like_error,
+                serialize_for_invocation,
+            )
             from src.schemas.metrics import InvocationRecord
+
+            is_error_shape = looks_like_error(output)
+            success = bool(output) and not is_error_shape
+            error_message = extract_error_message(output) if is_error_shape else None
 
             record = InvocationRecord(
                 capability_id=ref.capability_name,
                 task_id=task_id[:64],
-                success=bool(output),
+                success=success,
                 token_cost=0,
                 latency_ms=latency_ms,
+                input_args=serialize_for_invocation(upstream_outputs),
+                actual_output=serialize_for_invocation(output),
+                error_message=error_message,
             )
             self.metrics_store.record_invocation(record)
         except Exception:  # noqa: BLE001
@@ -806,9 +835,13 @@ class CompositionalExecutor:
                             failed_step_reason=reason,
                         )
 
-                # Record real invocation in metrics store
+                # Record real invocation in metrics store. Pass the upstream
+                # outputs as input_args so the row survives get_recent_failures'
+                # WHERE input_args IS NOT NULL filter and feeds the Pillar 3
+                # Split coverage verifier + failure-informed prompt.
                 self._record_step_invocation(
                     ref, output, step_ms, task_id or "",
+                    upstream_outputs=executed_outputs,
                 )
 
                 if on_step_end:

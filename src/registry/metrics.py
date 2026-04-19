@@ -1,11 +1,90 @@
 from __future__ import annotations
 
+import json
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import duckdb
 
 from src.schemas.metrics import GranularityMetrics, InvocationRecord
+
+# Cap per-row JSON payload size so DuckDB rows don't bloat on large
+# tool outputs (e.g., a multi-MB CSV blob stuffed into a result dict).
+# 64 KiB is comfortably above typical kwargs + output shapes and well
+# below DuckDB's VARCHAR limits. Truncated payloads keep the row
+# queryable and partially replayable; the coverage verifier's
+# wrong-output-compare still fires as long as parent + variant
+# truncate identically.
+_INVOCATION_FIELD_MAX_BYTES = 64 * 1024
+
+# Conservative error-shape key list. A non-empty dict is truthy in
+# Python, so ``bool({"error": "..."})`` evaluates True — the old
+# ``success=bool(output)`` predicate mis-classified error-shaped
+# returns as successes, which then failed the ``success=FALSE``
+# filter in ``get_recent_failures`` and never reached the Pillar 3
+# Split coverage path. Key list is intentionally narrow (not a
+# generic "any key containing 'error'" heuristic) to avoid
+# misfiring on legitimate outputs like ``{"error_count": 0}``.
+_ERROR_KEY_CANDIDATES: frozenset[str] = frozenset(
+    {"error", "exception", "traceback", "sandbox_error"}
+)
+
+
+def serialize_for_invocation(value: Any) -> str | None:
+    """Serialize ``value`` to a JSON string for ``InvocationRecord`` fields.
+
+    Returns ``None`` when:
+    - ``value`` is ``None``
+    - ``value`` is a dict-like but empty (no information to record)
+    - JSON serialization raises (unserializable sentinel, cyclic ref)
+
+    Uses ``default=str`` to tolerate non-JSON-native types (``Path``,
+    ``datetime``, ``Decimal``, custom objects). Output is truncated to
+    ``_INVOCATION_FIELD_MAX_BYTES`` with an ellipsis marker — callers
+    should treat truncated JSON as lossy-but-usable for replay.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Mapping) and not value:
+        return None
+    try:
+        serialized = json.dumps(value, default=str, sort_keys=True)
+    except (TypeError, ValueError):
+        return None
+    if len(serialized.encode("utf-8")) > _INVOCATION_FIELD_MAX_BYTES:
+        head = serialized[: _INVOCATION_FIELD_MAX_BYTES // 2]
+        return f'{head}..."__TRUNCATED__"'
+    return serialized
+
+
+def looks_like_error(output: Any) -> bool:
+    """True iff ``output`` is a dict carrying one of the error-shape keys.
+
+    Used by the two production ``InvocationRecord`` writers to distinguish
+    genuinely-successful tool outputs from error-shaped returns that
+    ``bool(output)`` would otherwise accept as successes.
+    """
+    if not isinstance(output, Mapping):
+        return False
+    return any(k in output for k in _ERROR_KEY_CANDIDATES)
+
+
+def extract_error_message(output: Any) -> str | None:
+    """Pull a short error string from an error-shaped output for ``error_message``.
+
+    Returns the first error-key value as a string, truncated to 500
+    chars. ``None`` when the output has no error key.
+    """
+    if not isinstance(output, Mapping):
+        return None
+    for key in _ERROR_KEY_CANDIDATES:
+        if key in output:
+            raw = output[key]
+            text = str(raw) if raw is not None else ""
+            return text[:500] if text else None
+    return None
 
 _INIT_SQL = """
 CREATE TABLE IF NOT EXISTS invocations (

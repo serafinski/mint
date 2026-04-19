@@ -27,11 +27,13 @@ from src.optimizer.operations import (
     _split_agents,
     _split_skills,
     _split_tools,
+    _summarize_failures_for_prompt,
     merge,
     prune,
     split,
     verify_and_register_or_rollback,
 )
+from src.schemas.metrics import InvocationRecord
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import (
@@ -1419,3 +1421,64 @@ class TestSplitAgents:
         result = split(registry, store, "agent-parent")
         assert result is None
         mock_init.assert_not_called()
+
+
+class TestSummarizeFailuresForPrompt:
+    """Guards the Pillar 3 Split LLM-prompt summarizer against the 2026-04-19
+    invocation-recording regression. Pre-fix, both production writers left
+    ``input_args`` and ``actual_output`` as None, so ``get_recent_failures``
+    returned an empty list and this summarizer hit its degraded-mode fallback
+    on every real-telemetry split. This test asserts the summarizer produces
+    real LLM-ready context when fed rows in the shape the post-fix writers
+    now produce. See ``docs/invocation_recording_gap_2026_04_19.md``.
+    """
+
+    def test_empty_failures_returns_degraded_fallback(self):
+        summary = _summarize_failures_for_prompt([])
+        assert summary.startswith("No recorded failure cases.")
+
+    def test_populated_failures_produce_real_context(self):
+        """The critical post-fix invariant: when production writers populate
+        input_args + error_message, the summarizer must NOT return the
+        degraded fallback."""
+        failures = [
+            InvocationRecord(
+                capability_id="row-aggregator",
+                task_id="T99",
+                success=False,
+                token_cost=0,
+                latency_ms=7.5,
+                input_args='{"0": {"rows": [{"cat": "A", "val": 1}]}}',
+                actual_output='{"error": "schema mismatch"}',
+                error_message="schema mismatch",
+            ),
+        ]
+        summary = _summarize_failures_for_prompt(failures)
+
+        # Not the degraded fallback.
+        assert not summary.startswith("No recorded failure cases.")
+        # Carries input_args preview so the LLM can infer the input subspace.
+        assert '"rows"' in summary
+        # Carries the error mode.
+        assert "ERROR" in summary
+        assert "schema mismatch" in summary
+
+    def test_wrong_output_case_rendered_distinctly(self):
+        """Rows with actual_output but no error_message render as
+        WRONG OUTPUT, not ERROR — the summarizer must distinguish."""
+        failures = [
+            InvocationRecord(
+                capability_id="classifier",
+                task_id="T99",
+                success=False,
+                token_cost=0,
+                latency_ms=1.0,
+                input_args='{"x": 1}',
+                actual_output='{"label": "B"}',  # user flagged this as wrong
+                error_message=None,
+            ),
+        ]
+        summary = _summarize_failures_for_prompt(failures)
+        assert "WRONG OUTPUT" in summary
+        assert "ERROR" not in summary
+        assert '"label"' in summary
