@@ -50,6 +50,13 @@ from unittest.mock import patch
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
+# to ``environment=test`` so they don't pollute Phase 4 eval's
+# ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
+# ambient .env values can't override. Same pattern as ``tests/conftest.py``.
+import os  # noqa: E402
+os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
+
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")

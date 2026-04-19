@@ -45,6 +45,11 @@ def _load_env() -> None:
         from dotenv import load_dotenv
     except ImportError:
         return
+    # Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
+    # to ``environment=test`` so they don't pollute Phase 4 eval. Must be
+    # set BEFORE ``load_dotenv`` so ambient .env values can't override.
+    import os
+    os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
     root = Path(__file__).resolve().parent.parent
     load_dotenv(root / ".env")
 
