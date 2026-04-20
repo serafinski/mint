@@ -14,7 +14,17 @@ Run protocol (per advisor doc)
 ------------------------------
 1. Restore clean snapshot at the start of every run.
 2. Randomise task order within each run (different seed per run).
-3. Randomise condition order across runs.
+3. Condition order: deterministic (fixed list order ``full → no_verification
+   → no_optimization → static``) unless ``run_pilot.py --shuffle-conditions``
+   is passed. Security audit finding ext7 #48 (2026-04-20): the docstring
+   previously claimed "randomise condition order across runs" but the runner
+   never implemented it — the gap between docstring and behavior was itself
+   a finding. Resolution: document the determinism as the default (easier to
+   debug + reproduce) and add an opt-in ``--shuffle-conditions`` flag for the
+   randomization-pure path. Chapter 4.5 discloses determinism as a potential
+   confounder for time-dependent metrics (M5 latency drift, LangFuse write-
+   queue state); ``--shuffle-conditions`` is the mitigation for campaigns
+   that want the pure methodology.
 4. Registry persists within a run (tasks can reuse capabilities generated
    by earlier tasks in the same run — this is intentional for optimizer data).
 5. Reset between runs (each run starts from the same clean state).
@@ -416,6 +426,7 @@ class EvaluationHarness:
                     condition=condition,
                     task_id=task.task_id,
                     task_events_cutoff=task_events_cutoff,
+                    is_pilot=is_pilot,  # ext7 #50
                 )
 
         return records
@@ -650,10 +661,11 @@ class EvaluationHarness:
                 exc,
             )
 
-        initial_state = TaskState(
-            task_description=task.task_prompt,
-            output_contract=contract,
-            allow_network=self._config.allow_network,
+        # ext7 #53: use the shared builder so every pipeline entry point stays
+        # in sync on which TaskState fields get populated.
+        from src.orchestrator.task_state_builder import build_initial_state
+        initial_state = build_initial_state(
+            task, allow_network=self._config.allow_network,
         )
         try:
             final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)

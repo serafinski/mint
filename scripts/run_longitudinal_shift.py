@@ -237,6 +237,13 @@ def main() -> int:
         pass
     gc.collect()
 
+    # ext7 #51: acquire the advisory lock before mutating shared registry dirs.
+    # See run_pilot.py / run_longitudinal.py for the same pattern.
+    from scripts._eval_registry_lock import acquire_runner_lock
+    _eval_lock = acquire_runner_lock(
+        runner_name="run_longitudinal_shift", data_dir=DATA_DIR / "eval",
+    )
+
     # Security audit finding #31 (2026-04-20): clean registry directories
     # before snapshotting — see run_longitudinal.py for rationale.
     import shutil as _shutil
@@ -317,7 +324,11 @@ def main() -> int:
                 "registry_size": registry.count,
             }
 
-        initial_state = TaskState(task_description=task.task_prompt)
+        # ext7 #53 (2026-04-20): use shared builder so task.output_contract
+        # flows through and decomposition's writer-append validator fires
+        # identically with the harness path.
+        from src.orchestrator.task_state_builder import build_initial_state
+        initial_state = build_initial_state(task)
         # Step 13.7 tag-propagation fix (2026-04-19): wrap pipeline.invoke +
         # per-task flush + shift-boundary emit in trace_context so events
         # from ThreadPool workers (verification, adversarial), LangChain
@@ -383,6 +394,7 @@ def main() -> int:
                 condition="longitudinal",
                 task_id=task.task_id,
                 task_events_cutoff=task_events_cutoff,
+                is_pilot=False,  # ext7 #50 — longitudinal is always non-pilot
             )
 
             # --- Write shift marker at the cycle boundary (Step 18.8) ---

@@ -44,7 +44,12 @@ DATA_DIR = ROOT / "data"
 CHROMA_DIR = DATA_DIR / "eval" / "chroma"
 MCP_TOOLS_DIR = ROOT / "src" / "mcp_tools"
 SKILLS_DIR = DATA_DIR / "eval" / "skills"
-DB_PATH = str(DATA_DIR / "eval" / "metrics.duckdb")
+# ext7 #49 (2026-04-20): prior hardcoded ``data/eval/metrics.duckdb`` pooled
+# every invocation into the same file across sessions. Path is now a CLI
+# argument with a timestamped default; legacy hardcode is retained as a
+# canonical-location constant used only when the user explicitly asks for it
+# via ``--db auto``.
+_LEGACY_DB_PATH = str(DATA_DIR / "eval" / "metrics.duckdb")
 
 ALL_CONDITIONS = ["full", "no_verification", "no_optimization", "static"]
 
@@ -85,7 +90,79 @@ def main() -> None:
         default=None,
         help="Path to save log output. If 'auto', generates timestamped file in data/logs/.",
     )
+    # ext7 #49 (2026-04-20): campaign isolation. Prior to this fix the DB path
+    # was a hardcoded constant — every invocation pooled into the same file.
+    parser.add_argument(
+        "--db",
+        type=str,
+        default=None,
+        help="DuckDB path (default: data/eval/metrics_<timestamp>.duckdb — a fresh "
+             "campaign-scoped path). Use an explicit path to re-use or wipe an "
+             "existing DB (see --fresh-db / --append). Pass 'legacy' to use the "
+             "pre-fix shared path (NOT recommended). ext7 #49.",
+    )
+    parser.add_argument(
+        "--fresh-db",
+        action="store_true",
+        help="Wipe the DB before writing (deletes the file). Required when --db "
+             "points at an existing non-empty file, unless --append is also passed.",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append to an existing DB (mutually exclusive with --fresh-db). "
+             "Use when resuming a campaign with a different --condition.",
+    )
+    # ext7 #48 (2026-04-20): condition-order randomization. Default is fixed
+    # order (deterministic, easier to debug + reproduce); opt-in when the
+    # campaign wants order-randomization as a methodology-purity measure.
+    parser.add_argument(
+        "--shuffle-conditions",
+        action="store_true",
+        help="Shuffle the condition execution order with --base-seed. "
+             "Default: fixed order (full → no_verification → no_optimization "
+             "→ static). ext7 #48 methodology note: use this flag if Chapter "
+             "4.5 wants to eliminate time/order confounders (LangFuse latency "
+             "drift, Docker cache warmth) on M5 latency metrics.",
+    )
     args = parser.parse_args()
+
+    # ext7 #49: resolve the DB path + refuse silent pooling.
+    if args.fresh_db and args.append:
+        print("ERROR: --fresh-db and --append are mutually exclusive.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.db is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        db_path = DATA_DIR / "eval" / f"metrics_{ts}.duckdb"
+        # Fresh timestamped path — guaranteed empty.
+        print(f"ext7 #49: using fresh timestamped DB path: {db_path}")
+    elif args.db == "legacy":
+        db_path = Path(_LEGACY_DB_PATH)
+    else:
+        db_path = Path(args.db)
+
+    if db_path.exists() and db_path.stat().st_size > 0:
+        if args.fresh_db:
+            db_path.unlink()
+            print(f"ext7 #49: wiped existing DB at {db_path} per --fresh-db")
+        elif not args.append:
+            print(
+                f"ERROR: DB exists at {db_path} and is non-empty. Pass "
+                "--fresh-db to wipe it, --append to add to it, or choose a "
+                "different --db path.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    DB_PATH = str(db_path)
+
+    # ext7 #51: acquire the advisory lock on shared eval registry dirs. Retain
+    # the handle in a local so the OS releases on process exit.
+    from scripts._eval_registry_lock import acquire_runner_lock
+    _eval_lock = acquire_runner_lock(
+        runner_name="run_pilot", data_dir=DATA_DIR / "eval",
+    )
 
     from tests.evaluation.harness import EvaluationHarness, HarnessConfig
     from tests.evaluation.tasks import ALL_TASKS, PILOT_TASKS, get_task
@@ -137,6 +214,17 @@ def main() -> None:
     else:
         tasks = PILOT_TASKS
     conditions = ALL_CONDITIONS if args.all_conditions else [args.condition]
+    if args.shuffle_conditions and len(conditions) > 1:
+        # ext7 #48: deterministic shuffle keyed on base_seed so a given seed
+        # always produces the same condition sequence — reproducible +
+        # order-free.
+        import random
+        rng = random.Random(42)  # matches HarnessConfig.base_seed
+        rng.shuffle(conditions)
+        logger.info(
+            "ext7 #48: --shuffle-conditions active — condition order: %s",
+            conditions,
+        )
 
     with EvaluationHarness(config) as harness:
         logger.info("Taking clean snapshot...")

@@ -31,6 +31,7 @@ def flush_task_cycle_state(
     condition: str,
     task_id: str,
     task_events_cutoff: datetime,
+    is_pilot: bool = False,
 ) -> None:
     """Flush per-task cycle state to EvaluationStore.
 
@@ -78,6 +79,7 @@ def flush_task_cycle_state(
             condition=condition,
             task_id=task_id,
             events=task_invocations,
+            is_pilot=is_pilot,  # ext7 #50
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(

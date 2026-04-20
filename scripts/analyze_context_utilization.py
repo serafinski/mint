@@ -439,14 +439,28 @@ def main() -> int:
     # Security audit finding #39 (2026-04-20): scope to a single
     # environment / session-set to exclude smoke + dev + prior-campaign
     # traces.
+    #
+    # ext7 #47 (2026-04-20): default environment flipped from 'production' to
+    # 'default' — thesis-load-bearing runners (run_pilot, run_longitudinal,
+    # run_longitudinal_shift, CLI mint run) emit to environment='default' by
+    # design per docs/langfuse_audit/langfuse_redundancy_audit_2026_04_19.md.
+    # Pre-ext7-#47 default silently returned zero traces + exit 0 — T3 evidence
+    # was invisibly empty.
     parser.add_argument(
-        "--environment", default="production",
-        help="LangFuse environment tag to fetch (default: production).",
+        "--environment", default="default",
+        help="LangFuse environment tag to fetch (default: 'default' — matches runner "
+             "emission convention per docs/langfuse_audit/...).",
     )
     parser.add_argument(
         "--session-ids", nargs="+", default=None,
         help="Restrict to specific LangFuse session_ids (e.g. "
              "'eval_2026-04-20_full').",
+    )
+    parser.add_argument(
+        "--allow-empty", action="store_true",
+        help="ext7 #47: don't treat zero fetched traces as an error. Default: "
+             "exit 2 if total fetched traces across all agents is zero, so a "
+             "silently-empty Chapter 6 T3 section is loud instead of invisible.",
     )
     args = parser.parse_args()
 
@@ -496,6 +510,20 @@ def main() -> int:
 
             results[agent_name] = trace_results
             print("done.")
+
+    # ext7 #47: loud-fail when no traces found — converts invisible-empty T3
+    # section into an actionable error. Overridable via --allow-empty.
+    total_traces = sum(len(tlist) for tlist in results.values())
+    if total_traces == 0 and not args.allow_empty:
+        print(
+            f"\nERROR: zero traces found for any agent in environment={args.environment!r}, "
+            f"window={args.days}d"
+            + (f", session_ids={args.session_ids!r}" if args.session_ids else "")
+            + ". Check: (a) runner emission convention (runners use environment='default'), "
+            "(b) --session-ids filter, (c) --days window. Pass --allow-empty to suppress.",
+            file=sys.stderr,
+        )
+        return 2
 
     print_summary(results, detail=args.detail)
 

@@ -118,6 +118,15 @@ def main() -> None:
         pass
     gc.collect()
 
+    # ext7 #51: acquire the advisory lock before mutating shared registry dirs.
+    # Refuses (exit 2) if another runner already holds it — concurrent runs
+    # corrupt the shared chroma/skills/snapshot state. Retain in a local so the
+    # OS releases the lock on process exit.
+    from scripts._eval_registry_lock import acquire_runner_lock
+    _eval_lock = acquire_runner_lock(
+        runner_name="run_longitudinal", data_dir=DATA_DIR / "eval",
+    )
+
     # Security audit finding #31 (2026-04-20): clean the three registry
     # directories BEFORE snapshotting so the "clean baseline" captures
     # an actually-empty state, not whatever a prior run left behind.
@@ -208,7 +217,11 @@ def main() -> None:
                 "registry_size": registry.count,
             }
 
-        initial_state = TaskState(task_description=task.task_prompt)
+        # ext7 #53 (2026-04-20): use shared builder so task.output_contract
+        # flows through and decomposition's writer-append validator fires
+        # identically with the harness path.
+        from src.orchestrator.task_state_builder import build_initial_state
+        initial_state = build_initial_state(task)
         # Step 13.7 tag-propagation fix (2026-04-19): wrap the pipeline
         # invocation + post-task flush in trace_context so events from
         # ThreadPool workers (verification, adversarial), LangChain @tool
@@ -275,6 +288,7 @@ def main() -> None:
                 condition="longitudinal",
                 task_id=task.task_id,
                 task_events_cutoff=task_events_cutoff,
+                is_pilot=False,  # ext7 #50 — longitudinal is always non-pilot
             )
 
         cumulative_total += 1

@@ -123,11 +123,25 @@ def load_data(db_path: str) -> duckdb.DuckDBPyConnection:
 # ``_apply_scope`` below.
 _SCOPE_SQL: str = ""
 
+# ext7 #52 (2026-04-20): banner to mark Chapter-6 output tables as
+# [INCOMPLETE: ...] when --allow-incomplete was used. Populated at startup
+# from the completeness check; empty when the dataset matches the expected
+# campaign shape.
+_COMPLETENESS_BANNER: str = ""
+
+
+# ext7 #46: canonical eval shape is --n-runs 5 per condition × 4 conditions
+# = 20 distinct run_ids, not 4. Pre-fix auto-select of "4 most recent" silently
+# dropped 3 of 4 conditions on a canonical eval DB. Configurable via
+# --per-condition-cap.
+_DEFAULT_PER_CONDITION_CAP = 5
+
 
 def _resolve_scope(
     conn: duckdb.DuckDBPyConnection,
     run_ids: list[str] | None,
     since: str | None,
+    per_condition_cap: int = _DEFAULT_PER_CONDITION_CAP,
 ) -> str:
     """Return a SQL WHERE fragment that scopes queries to a single run-set.
 
@@ -139,8 +153,12 @@ def _resolve_scope(
     Resolution:
     - Explicit ``run_ids`` → filter on exactly those.
     - ``since`` → filter on timestamp.
-    - Neither: auto-select the 4 most recent run_ids (one per condition
-      is the canonical eval shape) and WARN on stderr.
+    - Neither: auto-select the ``per_condition_cap`` most recent run_ids
+      PER CONDITION (ext7 #46 — the canonical run-sheet eval shape is
+      ``--n-runs 5 × 4 conditions = 20 distinct run_ids``, so a fixed
+      4-total cap silently drops 3 of 4 conditions). Default: 5 per
+      condition. Fails loud with exit code 2 if the selected set doesn't
+      cover every condition present in the DB.
 
     Returns "" when no scoping is applied (legacy mode — unsafe on
     multi-run DBs).
@@ -157,22 +175,64 @@ def _resolve_scope(
         safe_since = since.replace("'", "''")
         return f" AND timestamp >= '{safe_since}'"
 
-    # Auto-select: resolve the 4 most recent non-pilot run_ids. If the DB
-    # has ≤4 distinct run_ids, no scoping needed (legacy single-run DBs).
-    available = conn.execute(
-        "SELECT run_id, MAX(timestamp) AS t FROM evaluation_runs "
-        "WHERE is_pilot = FALSE GROUP BY run_id ORDER BY t DESC LIMIT 64"
-    ).fetchall()
-    if len(available) <= 4:
+    # Auto-select: balanced per-condition. For each distinct condition, pick
+    # the N most recent run_ids; union across conditions. This preserves the
+    # canonical eval shape (5 per condition × 4 conditions = 20 run_ids) while
+    # tolerating DBs with fewer runs per condition.
+    total_available = conn.execute(
+        "SELECT COUNT(DISTINCT run_id) FROM evaluation_runs WHERE is_pilot = FALSE"
+    ).fetchone()[0]
+    if total_available == 0:
+        return ""  # Empty DB or all pilot — no scope needed.
+
+    # One run per condition × 4 conditions = 4 — don't warn, don't scope.
+    condition_count = conn.execute(
+        "SELECT COUNT(DISTINCT condition) FROM evaluation_runs WHERE is_pilot = FALSE"
+    ).fetchone()[0]
+    if total_available <= max(condition_count, 1):
         return ""
 
-    latest = [r[0] for r in available[:4]]
-    print(
-        f"WARNING: DB contains {len(available)} distinct non-pilot run_ids; "
-        f"auto-selecting the 4 most recent: {latest}. Pass --run-ids to "
-        f"override.",
-        file=_sys.stderr,
-    )
+    selected_rows = conn.execute(
+        """
+        WITH ranked AS (
+            SELECT run_id, condition, timestamp,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY condition ORDER BY timestamp DESC
+                   ) AS rn
+            FROM evaluation_runs
+            WHERE is_pilot = FALSE
+        )
+        SELECT DISTINCT run_id, condition
+        FROM ranked
+        WHERE rn <= ?
+        ORDER BY condition, run_id
+        """,
+        [per_condition_cap],
+    ).fetchall()
+    latest = [r[0] for r in selected_rows]
+    selected_conditions = {r[1] for r in selected_rows}
+
+    # Loud-fail if the auto-select dropped any condition. Under fixed
+    # condition-order (see #48), a 4-total auto-select could cover exactly
+    # one condition — worst-case bias is condition-dependent.
+    if len(selected_conditions) < condition_count:
+        print(
+            f"ERROR: auto-select covered {len(selected_conditions)}/{condition_count} "
+            f"conditions. Pass --run-ids explicitly to include all conditions, "
+            f"or --per-condition-cap to adjust.",
+            file=_sys.stderr,
+        )
+        _sys.exit(2)
+
+    if total_available > len(latest):
+        print(
+            f"WARNING: DB contains {total_available} distinct non-pilot run_ids; "
+            f"auto-selecting the {per_condition_cap} most recent per condition "
+            f"({len(latest)} total across {len(selected_conditions)} conditions). "
+            f"Pass --run-ids to override.",
+            file=_sys.stderr,
+        )
+
     safe_latest = [r.replace("'", "''") for r in latest]
     return " AND run_id IN ({})".format(
         ", ".join(f"'{r}'" for r in safe_latest)
@@ -275,7 +335,8 @@ def fmt_p(p: float) -> str:
 
 def print_condition_table(title: str, data: list[dict]) -> list[str]:
     """Print condition summary table with CIs. Returns CSV lines."""
-    lines = [f"\n{'='*80}", f"  {title}", f"{'='*80}"]
+    # ext7 #52: append the [INCOMPLETE: ...] banner (if any) to the title.
+    lines = [f"\n{'='*80}", f"  {title}{_COMPLETENESS_BANNER}", f"{'='*80}"]
     header = f"{'Condition':<22} {'Success':>14} {'95% CI':>18} {'Gate Pass':>14} {'Output OK':>14}"
     lines.append(header)
     lines.append("-" * len(header))
@@ -604,10 +665,16 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
         return
 
     # Per-condition, per-run Gini
+    # ext7 #44: filter by scope BEFORE grouping. invocation_events uses the same
+    # run_id column as evaluation_runs so _SCOPE_SQL applies verbatim.
+    # ext7 #50: exclude pilot invocations via the new is_pilot column. Pre-fix
+    # the table had no pilot marker; legacy rows are backfilled via JOIN on
+    # EvaluationStore init. COALESCE defends against any remaining NULL cases.
     per_run_rows = conn.execute(
-        """
+        f"""
         SELECT condition, run_id, capability_id, COUNT(*) AS invocations
         FROM invocation_events
+        WHERE NOT COALESCE(is_pilot, FALSE){_SCOPE_SQL}
         GROUP BY condition, run_id, capability_id
         ORDER BY condition, run_id, capability_id
         """
@@ -951,8 +1018,11 @@ def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
     populated yet: prints a single "audit not performed" line instead
     of empty tables.
     """
+    # ext7 #44: M2 must honor --run-ids / --since scope. Pre-fix, cross-campaign
+    # pooling silently consumed labels intended for prior campaigns into the
+    # current campaign's M2 aggregate.
     rows = conn.execute(
-        """
+        f"""
         SELECT condition,
                SUM(CASE WHEN human_label = 'correct'      THEN 1 ELSE 0 END) AS n_correct,
                SUM(CASE WHEN human_label = 'contaminated' THEN 1 ELSE 0 END) AS n_contaminated,
@@ -960,7 +1030,7 @@ def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
                COUNT(*)                                                      AS n_sampled
         FROM evaluation_runs
         WHERE human_label IS NOT NULL
-          AND NOT is_pilot
+          AND NOT is_pilot{_SCOPE_SQL}
         GROUP BY condition
         ORDER BY condition
         """
@@ -1029,14 +1099,42 @@ def main() -> None:
     parser.add_argument("--csv", action="store_true", help="Export tables to data/analysis/")
     parser.add_argument(
         "--run-ids", nargs="+", default=None,
-        help="Specific run_ids to include. Default: auto-select the 4 most "
-             "recent non-pilot run_ids with stderr WARNING. Security audit "
-             "finding #38 (2026-04-20).",
+        help="Specific run_ids to include. Default: auto-select the N most "
+             "recent run_ids PER CONDITION (ext7 #46) with stderr WARNING. "
+             "Security audit finding #38 (2026-04-20).",
     )
     parser.add_argument(
         "--since", default=None,
         help="Only include rows with timestamp >= SINCE (DB's native "
              "timestamp format). Mutually exclusive with --run-ids.",
+    )
+    parser.add_argument(
+        "--per-condition-cap", type=int, default=_DEFAULT_PER_CONDITION_CAP,
+        help=f"When auto-selecting (no --run-ids / --since), how many recent "
+             f"run_ids to pick per condition. Default matches run_sheet.md's "
+             f"--n-runs={_DEFAULT_PER_CONDITION_CAP}. ext7 #46.",
+    )
+    # ext7 #52: campaign completeness guard.
+    parser.add_argument(
+        "--expected-tasks", type=int, default=20,
+        help="Expected number of distinct task_ids per condition (default: 20, "
+             "matches run_sheet.md T01-T20). ext7 #52.",
+    )
+    parser.add_argument(
+        "--expected-runs-per-condition", type=int, default=5,
+        help="Expected number of runs per condition (default: 5, matches "
+             "run_sheet.md --n-runs). ext7 #52.",
+    )
+    parser.add_argument(
+        "--expected-conditions", type=int, default=4,
+        help="Expected number of distinct conditions (default: 4: full, "
+             "no_verification, no_optimization, static). ext7 #52.",
+    )
+    parser.add_argument(
+        "--allow-incomplete", action="store_true",
+        help="Proceed even if the scoped dataset doesn't match the expected "
+             "campaign shape. Every output table carries an [INCOMPLETE] banner. "
+             "ext7 #52.",
     )
     args = parser.parse_args()
 
@@ -1045,13 +1143,68 @@ def main() -> None:
     # Security audit finding #38 (2026-04-20): resolve the scope ONCE at
     # startup; every subsequent query reads module-level _SCOPE_SQL.
     global _SCOPE_SQL
-    _SCOPE_SQL = _resolve_scope(conn, args.run_ids, args.since)
+    _SCOPE_SQL = _resolve_scope(
+        conn, args.run_ids, args.since, args.per_condition_cap,
+    )
 
     # Record counts (scoped).
     total = conn.execute(
         f"SELECT COUNT(*) FROM evaluation_runs WHERE is_pilot = FALSE{_SCOPE_SQL}"
     ).fetchone()[0]
     print(f"\nTotal non-pilot records: {total}")
+
+    # ext7 #52: dataset-completeness guard. Refuse to produce Chapter-6 output
+    # on a partial campaign unless --allow-incomplete is passed. Partial
+    # datasets with the same visual shape as complete ones silently misrepresent
+    # incomplete data as headline numbers.
+    expected_conditions = args.expected_conditions
+    expected_tasks = args.expected_tasks
+    expected_runs = args.expected_runs_per_condition
+    expected_total = expected_conditions * expected_tasks * expected_runs
+    expected_per_condition = expected_tasks * expected_runs
+
+    per_condition_counts = conn.execute(
+        f"SELECT condition, COUNT(*) FROM evaluation_runs "
+        f"WHERE is_pilot = FALSE{_SCOPE_SQL} GROUP BY condition"
+    ).fetchall()
+    condition_map = {row[0]: row[1] for row in per_condition_counts}
+
+    issues: list[str] = []
+    if total != expected_total:
+        issues.append(f"total non-pilot rows={total}, expected {expected_total}")
+    for condition, count in condition_map.items():
+        if count != expected_per_condition:
+            issues.append(
+                f"condition '{condition}': {count} rows, expected {expected_per_condition}"
+            )
+    if len(condition_map) < expected_conditions:
+        missing = (
+            {"full", "no_verification", "no_optimization", "static"}
+            - set(condition_map)
+        )
+        for c in sorted(missing):
+            issues.append(f"condition '{c}' missing entirely (0 rows)")
+
+    if issues and not args.allow_incomplete:
+        print(
+            "\nERROR: dataset appears incomplete — refusing to produce Chapter-6 output.\n"
+            "Issues:\n  - " + "\n  - ".join(issues) + "\n"
+            "Pass --allow-incomplete to override (output will be marked "
+            "INCOMPLETE in every table header). ext7 #52.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Stash the banner on the module so table printers can render it when
+    # --allow-incomplete forces a partial-data run. Empty string = complete.
+    global _COMPLETENESS_BANNER
+    _COMPLETENESS_BANNER = (
+        f" [INCOMPLETE: {'; '.join(issues)}]"
+        if args.allow_incomplete and issues
+        else ""
+    )
+    if _COMPLETENESS_BANNER:
+        print(f"\nWARNING: proceeding with partial data:{_COMPLETENESS_BANNER}", file=sys.stderr)
 
     # ── Table 1: All tasks ───────────────────────────────────────────────
     all_data = query_condition_summary(conn)

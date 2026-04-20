@@ -74,6 +74,12 @@ CREATE TABLE IF NOT EXISTS invocation_events (
     success                   BOOLEAN NOT NULL,
     token_cost                INTEGER NOT NULL DEFAULT 0,
     latency_ms                INTEGER NOT NULL DEFAULT 0,
+    -- ext7 #50 (2026-04-20): mirror evaluation_runs.is_pilot so M3 Gini can
+    -- exclude pilot invocations. DuckDB doesn't support ADD COLUMN with NOT NULL
+    -- DEFAULT via ALTER, so this column is nullable when migrated in and every
+    -- writer must supply an explicit value. Legacy rows (pre-migration) are
+    -- backfilled via JOIN to evaluation_runs (see MIGRATION_BACKFILL_SQL).
+    is_pilot                  BOOLEAN,
     occurred_at               TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_invocation_events_condition
@@ -154,7 +160,22 @@ _MIGRATIONS = [
     # Enables jump-navigation from DuckDB eval row → LangFuse trace UI
     # without a timestamp/session join.
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS langfuse_trace_id VARCHAR",
+    # ext7 #50 (2026-04-20) — mirror is_pilot onto invocation_events so M3 Gini
+    # can exclude pilot rows. Nullable on migrate; backfilled below.
+    "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS is_pilot BOOLEAN",
 ]
+
+# ext7 #50: backfill is_pilot on legacy invocation_events rows by joining to
+# the evaluation_runs row that produced them. Safe on fresh DBs (zero rows
+# means zero updates). Idempotent — only touches rows where is_pilot IS NULL.
+_INVOCATION_IS_PILOT_BACKFILL_SQL = """
+UPDATE invocation_events AS ie
+SET is_pilot = COALESCE(er.is_pilot, FALSE)
+FROM evaluation_runs AS er
+WHERE ie.run_id = er.run_id
+  AND ie.task_id = er.task_id
+  AND ie.is_pilot IS NULL
+"""
 
 
 class EvaluationStore:
@@ -169,6 +190,9 @@ class EvaluationStore:
         # Idempotent ALTERs so existing DBs gain the Stage 1 compositional columns.
         for stmt in _MIGRATIONS:
             self._conn.execute(stmt)
+        # ext7 #50 (2026-04-20): backfill invocation_events.is_pilot from
+        # evaluation_runs for legacy rows. No-op on fresh DBs.
+        self._conn.execute(_INVOCATION_IS_PILOT_BACKFILL_SQL)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -289,6 +313,7 @@ class EvaluationStore:
         condition: str,
         task_id: str,
         events: list[dict],
+        is_pilot: bool = False,
     ) -> int:
         """Persist a batch of capability invocation events for one task-run.
 
@@ -296,8 +321,15 @@ class EvaluationStore:
         ``capability_type`` (optional str), ``success`` (required bool),
         ``token_cost`` (optional int), ``latency_ms`` (optional int).
         All rows share the same ``run_id`` / ``condition`` / ``task_id``
-        context — that's the unit the harness flushes after each task's
-        chain execution completes.
+        / ``is_pilot`` context — that's the unit the harness flushes after
+        each task's chain execution completes.
+
+        ext7 #50 (2026-04-20): ``is_pilot`` threads through from the harness
+        so the M3 Gini analyzer can exclude pilot rows via a direct
+        ``WHERE NOT is_pilot`` clause (symmetric with evaluation_runs). Default
+        False preserves backward compatibility for any caller that pre-dates
+        the fix (e.g., unit-test helpers) — but the harness always supplies
+        the real flag, so Phase-4/5 writers set it correctly.
 
         Returns the number of rows inserted. Zero on empty ``events``.
 
@@ -323,14 +355,16 @@ class EvaluationStore:
                 bool(ev["success"]),
                 int(ev.get("token_cost", 0) or 0),
                 int(ev.get("latency_ms", 0) or 0),
+                bool(is_pilot),
                 now,
             ])
         self._conn.executemany(
             """
             INSERT INTO invocation_events (
                 id, run_id, condition, task_id, capability_id,
-                capability_type, success, token_cost, latency_ms, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                capability_type, success, token_cost, latency_ms,
+                is_pilot, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

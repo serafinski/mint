@@ -36,13 +36,23 @@ Run sequentially; each gate must pass before the next. If any fails, **stop** an
 
 ---
 
-## Phase 4 — Data generation (unattended, parallelizable)
+## Phase 4 — Data generation (unattended, SERIAL per ext7 #51)
 
-Each row writes to a **different** DuckDB; all three can run concurrently in separate terminals. Wall-clock lower bound if parallel: **~18 h** (dominated by row 8).
+Rows 8/9/10 share the `data/eval/chroma`, `src/mcp_tools`, `data/eval/skills`, and `tests/evaluation/snapshots` directories. Running them concurrently **will** corrupt one or more of the runs (via registry `rmtree` or snapshot-hash mismatch). Run them **strictly in sequence**: row 8 → row 9 → row 10. Wall-clock sum: **~30–38 h** (18 h row 8 + 6–10 h row 9 + 6–10 h row 10).
+
+### Campaign DB isolation (ext7 #49)
+
+Every Phase-4 run MUST write to its own DuckDB. `run_pilot.py --db` now defaults to a fresh timestamped path (`data/eval/metrics_<timestamp>.duckdb`); passing an existing DB without `--fresh-db` or `--append` exits with code 2. Set this at session start so every row references the same campaign DB:
+
+```bash
+export CAMPAIGN_DB="data/eval/metrics_$(date +%Y-%m-%d_%H%M%S)_full.duckdb"
+```
+
+Then pass `--db $CAMPAIGN_DB` to row 8 below and to every analyzer row (11, 17). Legacy `data/eval/metrics.duckdb` is retained only when `--db legacy` is passed explicitly.
 
 | # | Command | Why | Time / $ |
 |---|---|---|---:|
-| 8 | `uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5` | **THE eval.** 20 tasks × 4 conditions × 5 runs = 400 records → `data/eval/metrics.duckdb` | ~18 h / ~$6 |
+| 8 | `uv run scripts/run_pilot.py --db $CAMPAIGN_DB --all-tasks --all-conditions --n-runs 5` | **THE eval.** 20 tasks × 4 conditions × 5 runs = 400 records → `$CAMPAIGN_DB` | ~18 h / ~$6 |
 | 9 | `uv run scripts/run_longitudinal.py` | **Pillar 3 RQ #2** — 40 sequential tasks, shared registry, no per-run reset → `data/eval/longitudinal.duckdb` | ~6–10 h |
 | 10 | `uv run scripts/run_longitudinal_shift.py --phase-a-tasks T01,T02,T03,T04,T05 --phase-b-tasks T11,T12,T13,T14,T15 --shift-at 20 --total 40` | **Pillar 3 RQ #3** — two-phase with distribution shift → `data/eval/longitudinal_shifted.duckdb` | ~6–10 h |
 
@@ -52,17 +62,36 @@ Each row writes to a **different** DuckDB; all three can run concurrently in sep
 
 Row 11 backfills M4 `token_cost` → consumed by row 17. Row 16 populates `human_label` → consumed by row 17 for M2. Both are blocking. Rows 12, 13, 14, 15 produce standalone reports and can run any time post-eval — in parallel with row 16's human audit if you want to save wall-clock.
 
+### Scoping convention (ext6 #38/#40/#41 + ext7 #45)
+
+Every Row below that reads `data/eval/metrics.duckdb` or a longitudinal DB MUST scope by the campaign's `run_id`(s). The DBs are append-only across sessions — unscoped queries pool prior campaigns into the current Chapter-6 aggregate. Set these variables at the top of the run-sheet session:
+
+```bash
+# 4 run_ids from this campaign (one per condition). Source of truth:
+#   SELECT DISTINCT run_id FROM evaluation_runs WHERE NOT is_pilot ORDER BY run_id DESC LIMIT 4;
+export CAMPAIGN_RUN_IDS="full_00_abc123 no_verification_00_def456 no_optimization_00_ghi789 static_00_jkl012"
+
+# Row-8 LangFuse session id (one per campaign). Used by rows 13 + 15.
+export CAMPAIGN_SESSION_IDS="eval_2026_04_20_full_final"
+
+# Row-9 + Row-10 longitudinal run_ids (one per DB).
+export LONGITUDINAL_RUN_ID="long_2026_04_20_abc"
+export SHIFT_RUN_ID="shift_2026_04_20_xyz"
+```
+
+Every analyzer row below passes the appropriate scope flag. Forgetting the flag is not safe: `analyze_results.py` will auto-select with a WARN (ext6 #38), but the other analyzers will silently pool cross-campaign data.
+
 | # | Command | Why (proposal metric) | Time |
 |---|---|---|---:|
-| 11 | `uv run scripts/backfill_token_costs.py --write` | **M4** — populates `evaluation_runs.token_cost` from LangFuse GENERATION observations | ~5 min |
+| 11 | `uv run scripts/backfill_token_costs.py --db $CAMPAIGN_DB --write` | **M4** — populates `evaluation_runs.token_cost` from LangFuse GENERATION observations | ~5 min |
 | 12 | `uv run scripts/backfill_definition_token_costs.py --write` | **Pillar 3 U(c) token-cost input** — per-capability definition-string tokens (proposal §Pillar 3 four-metric table, line 170). Distinct from row 11's M4 (total per-task). Idempotent. | ~1 min |
-| 13 | `uv run scripts/analyze_context_utilization.py` | **T3 naive-verbose half** — peak input-token % of 128k context window per agent type | ~1 min |
-| 14 | `uv run scripts/analyze_compression_loss.py` | **T3 aggressive-compression half** — 9-bucket failure taxonomy + most-dropped-keys table | ~1 min |
-| 15 | `uv run scripts/analyze_tier2_probes.py --environment default` | **Chapter 4.3 methodology evidence** — per-Tier-2-probe-type detection breakdown. Reads `verification.tier_2.{pass,reject}` LangFuse events, groups by `metadata.categories`, reports per-category hit counts + per-capability-type distribution. Answers "of the N Tier 2 rejections, which probe types caught them?" — proposal §Pillar 2 line 133 grounding. | ~10 s |
-| 16 | `uv run scripts/audit_contamination.py` | **M2** — manual contamination audit, stratified random sample (default 90). **Interactive — human labels each sampled capability as clean / contaminated / partial.** Resumable. | **~2–4 h HUMAN** |
-| 17 | `uv run scripts/analyze_results.py` | **THE Chapter 6 analyzer** — M1 (Fisher + Holm + Clopper-Pearson CI) + M3 Gini of invocations + M4 total token cost + M5 latency + M2 contamination + Core-Work Classification Accuracy *(Pillar 1 RQ #1 proxy — task-level primary-type match; see Step 18.5 disclosure)* + failure breakdown | ~2 min |
-| 18 | `uv run scripts/analyze_longitudinal.py` | **M6 + Pillar 3 RQ #1/#2** — utility-score KL convergence + cycles-to-converge + seeded-vs-evolved Gini | ~1 min |
-| 19 | `uv run scripts/analyze_longitudinal.py --db data/eval/longitudinal_shifted.duckdb` | **Pillar 3 RQ #3** — three-tier adaptation verdict (graceful / sluggish / collapse) | ~1 min |
+| 13 | `uv run scripts/analyze_context_utilization.py --session-ids $CAMPAIGN_SESSION_IDS` | **T3 naive-verbose half** — peak input-token % of 128k context window per agent type | ~1 min |
+| 14 | `uv run scripts/analyze_compression_loss.py --db $CAMPAIGN_DB --run-ids $CAMPAIGN_RUN_IDS` | **T3 aggressive-compression half** — 9-bucket failure taxonomy + most-dropped-keys table | ~1 min |
+| 15 | `uv run scripts/analyze_tier2_probes.py --environment default --session-ids $CAMPAIGN_SESSION_IDS` | **Chapter 4.3 methodology evidence** — per-Tier-2-probe-type detection breakdown. Reads `verification.tier_2.{pass,reject}` LangFuse events, groups by `metadata.categories`, reports per-category hit counts + per-capability-type distribution. Answers "of the N Tier 2 rejections, which probe types caught them?" — proposal §Pillar 2 line 133 grounding. | ~10 s |
+| 16 | `uv run scripts/audit_contamination.py --db $CAMPAIGN_DB --run-ids $CAMPAIGN_RUN_IDS` | **M2** — manual contamination audit, stratified random sample (default 90). **Interactive — human labels each sampled capability as clean / contaminated / partial.** Resumable. | **~2–4 h HUMAN** |
+| 17 | `uv run scripts/analyze_results.py --db $CAMPAIGN_DB --run-ids $CAMPAIGN_RUN_IDS` | **THE Chapter 6 analyzer** — M1 (Fisher + Holm + Clopper-Pearson CI) + M3 Gini of invocations + M4 total token cost + M5 latency + M2 contamination + Core-Work Classification Accuracy *(Pillar 1 RQ #1 proxy — task-level primary-type match; see Step 18.5 disclosure)* + failure breakdown | ~2 min |
+| 18 | `uv run scripts/analyze_longitudinal.py --run-id $LONGITUDINAL_RUN_ID` | **M6 + Pillar 3 RQ #1/#2** — utility-score KL convergence + cycles-to-converge + seeded-vs-evolved Gini | ~1 min |
+| 19 | `uv run scripts/analyze_longitudinal.py --db data/eval/longitudinal_shifted.duckdb --run-id $SHIFT_RUN_ID` | **Pillar 3 RQ #3** — three-tier adaptation verdict (graceful / sluggish / collapse) | ~1 min |
 
 **Tip:** Row 17 (`analyze_results.py`) can be run earlier for a headline preview — the M2 section falls back to *"audit not performed"* when `human_label` is empty. The FINAL Chapter-6-ready pass must come after rows 11 + 16.
 
