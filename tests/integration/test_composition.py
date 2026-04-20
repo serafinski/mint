@@ -65,26 +65,40 @@ def test_two_step_mcp_tool_chain_with_docker(tmp_path):
     fixture = tmp_path / "data.csv"
     fixture.write_text("name,value\nalpha,10\nbeta,20\ngamma,30\n")
 
-    # Step 0: parse CSV, return rows as list of dicts
+    # Step 0: parse CSV, return rows under a stable upstream key.
+    # The pre-fix step0 returned a bare list which the executor wraps as
+    # ``{"result": [...]}``; that key name then leaked into step 1's
+    # parameter contract. Using a named key (``rows``) keeps the
+    # upstream payload self-describing and matches what generated
+    # MCP tools are instructed to emit.
     step0_code = '''\
 import csv
 
-async def parse_csv(file_path: str) -> list:
-    """Parse a CSV file and return rows as list of dicts."""
+async def parse_csv(file_path: str) -> dict:
+    """Parse a CSV file and return rows under the 'rows' key."""
     rows = []
     with open(file_path) as f:
         reader = csv.DictReader(f)
         for row in reader:
             rows.append(dict(row))
-    return rows
+    return {"rows": rows}
 '''
 
-    # Step 1: sum the "value" column from upstream parsed data
+    # Step 1: sum the "value" column from upstream parsed data.
+    # Modern chain convention (commit 1283f68 "chain schema contracts,
+    # upstream_data parameter"): every downstream step takes a single
+    # ``upstream_data: dict`` parameter that contains the merged dict
+    # from all predecessors. Pre-fix this test used per-key matching
+    # (``parsed_data: list``) which the sandbox stopped supporting
+    # when generated tools standardized on ``upstream_data``. Security
+    # audit ext9 verification re-run (2026-04-20) flagged the old shape
+    # as a stale test asserting deprecated behavior.
     step1_code = '''\
-async def aggregate_values(parsed_data: list) -> dict:
-    """Sum the value column from parsed CSV rows."""
-    total = sum(int(row["value"]) for row in parsed_data)
-    return {"total": total, "count": len(parsed_data)}
+async def aggregate_values(upstream_data: dict) -> dict:
+    """Sum the value column from parsed CSV rows in upstream_data."""
+    rows = upstream_data["rows"]
+    total = sum(int(row["value"]) for row in rows)
+    return {"total": total, "count": len(rows)}
 '''
 
     subtasks = [
@@ -123,12 +137,13 @@ async def aggregate_values(parsed_data: list) -> dict:
     assert result.chain_length == 2
     assert len(result.step_results) == 2
 
-    # Step 0 should return parsed CSV rows
+    # Step 0 should return parsed CSV rows under the 'rows' key.
     step0_output = result.step_results[0]
-    assert isinstance(step0_output, list)
-    assert len(step0_output) == 3
+    assert isinstance(step0_output, dict)
+    assert isinstance(step0_output["rows"], list)
+    assert len(step0_output["rows"]) == 3
 
-    # Step 1 should aggregate the values
+    # Step 1 should aggregate the values via upstream_data["rows"].
     step1_output = result.step_results[1]
     assert step1_output["total"] == 60
     assert step1_output["count"] == 3

@@ -359,6 +359,11 @@ def _register_artifact_directly(
                 output_schema=dict(artifact.output_schema or {}),
                 tags=list(tags or []),
                 definition_token_cost=count_definition_tokens(artifact),
+                # Security audit finding #83 (2026-04-19, ext9): preserve
+                # generator-declared pip_packages through Pillar 3 Merge /
+                # Split registration so optimised MCP tools retain their
+                # runtime dependencies.
+                pip_packages=list(getattr(artifact, "pip_packages", []) or []),
                 metadata=metadata,
             )
             registry.add(descriptor)

@@ -77,10 +77,10 @@ def run_pipeline_and_verify(
         True if all checks pass.
     """
     from src.orchestrator.pipeline import create_pipeline
+    from src.orchestrator.task_state_builder import build_initial_state_from_prompt
     from src.orchestrator.tool_loader import ToolLoader
     from src.registry.store import SkillRegistry, seed_registry
     from src.schemas.capability import CapabilityType
-    from src.schemas.task import TaskState
 
     type_map = {
         "mcp_tool": CapabilityType.MCP_TOOL,
@@ -103,8 +103,14 @@ def run_pipeline_and_verify(
         print(f"  Task: {task_prompt[:100]}...")
 
         # --- Run pipeline ---
+        # Security audit finding #88 (2026-04-19, ext9): use the canonical
+        # builder so Phase 3 smoke tests exercise the same entry-point
+        # shape (contract-as-object) as Phase 4 production. Pre-fix
+        # ``TaskState(task_description=...)`` bypassed contract injection
+        # and the downstream writer-synthesis guard, so the smoke gate
+        # tested a simpler path than production.
         pipeline = create_pipeline(registry, loader).compile()
-        initial_state = TaskState(task_description=task_prompt)
+        initial_state = build_initial_state_from_prompt(task_prompt)
 
         print("\n  Running pipeline...", flush=True)
         try:
@@ -263,9 +269,25 @@ pathlib.Path("/tmp/fixture.csv").write_text({fixture_content!r})
 async def _run():
     try:
         _sig = inspect.signature({func_name})
-        _valid = set(_sig.parameters.keys())
+        _valid = list(_sig.parameters.keys())
+        # First try named exact matches for the common shapes.
         _inputs = {{"file_path": "/tmp/fixture.csv", "filepath": "/tmp/fixture.csv"}}
         _kwargs = {{k: v for k, v in _inputs.items() if k in _valid}}
+        # Path-keyword fallback so the validator doesn't FAIL just because the
+        # LLM named the param `csv_path` / `input_csv` / `data_path` / etc.
+        # Mirrors the path-keyword heuristic used by the chain executor in
+        # tests/evaluation/execution.py::execute_mcp_tool_in_chain.
+        if not _kwargs:
+            _PATH_KEYWORDS = ("path", "file", "csv", "input", "src", "source")
+            _required = [
+                name for name, p in _sig.parameters.items()
+                if p.default is inspect.Parameter.empty
+            ]
+            for _p in _required:
+                _pl = _p.lower()
+                if any(kw in _pl for kw in _PATH_KEYWORDS):
+                    _kwargs[_p] = "/tmp/fixture.csv"
+                    break
         result = await {func_name}(**_kwargs)
         print(json.dumps({{"result": result}}))
     except Exception as e:

@@ -409,6 +409,12 @@ class CompositionalExecutor:
         from src.schemas.task import decode_agent_config_metadata
 
         meta = getattr(match.capability, "metadata", {}) or {}
+        # Security audit finding #83 (2026-04-19, ext9): restore pip_packages
+        # from the descriptor so registry-matched MCP tools install their
+        # declared dependencies in the sandbox. Pre-fix this hardcoded `[]`,
+        # causing every registry-matched tool that needed non-base packages
+        # to crash on ImportError at execution time.
+        pip_packages = list(getattr(match.capability, "pip_packages", []) or [])
         return GeneratedArtifact(
             capability_name=ref.capability_name,
             capability_type=ref.capability_type,
@@ -416,6 +422,7 @@ class CompositionalExecutor:
             skill_content=meta.get("skill_content"),
             agent_config=decode_agent_config_metadata(meta.get("agent_config")),
             description=getattr(match.capability, "description", None),
+            pip_packages=pip_packages,
             generated_at=datetime.now(UTC),
         )
 
@@ -488,6 +495,7 @@ class CompositionalExecutor:
         ref: CapabilityReference,
         step_index: int,
         workspace: Path,
+        subtask: SubTask | None = None,
     ) -> dict:
         from tests.evaluation.execution import execute_mcp_tool_in_chain
 
@@ -497,13 +505,24 @@ class CompositionalExecutor:
         else:
             meta = getattr(artifact_or_match.capability, "metadata", {}) or {}
             source_code = meta.get("source_code")
-            pip_packages = []
+            # Security audit finding #83 (2026-04-19, ext9): pip_packages
+            # is now a first-class CapabilityDescriptor field persisted by
+            # SkillRegistry; pull it back from the descriptor instead of
+            # silently using `[]` and crashing on ImportError.
+            pip_packages = list(
+                getattr(artifact_or_match.capability, "pip_packages", []) or []
+            )
 
         if not source_code:
             logger.warning(
                 "No source code for MCP_TOOL step %d (%s)", step_index, ref.capability_name
             )
             return {}
+
+        # Security audit finding #91 (2026-04-19, ext9): pass the
+        # subtask's depends_on so the sandbox only merges state from
+        # declared predecessors, not every prior step's output.
+        depends_on = list(subtask.depends_on) if subtask is not None else None
 
         return execute_mcp_tool_in_chain(
             source_code=source_code,
@@ -512,6 +531,7 @@ class CompositionalExecutor:
             pip_packages=pip_packages,
             capability_name=ref.capability_name,
             allow_network=self.allow_network,
+            depends_on=depends_on,
         )
 
     def _execute_skill_step(
@@ -649,7 +669,8 @@ class CompositionalExecutor:
 
         if cap_type == CapabilityType.MCP_TOOL:
             output = self._execute_mcp_tool_step(
-                artifact_or_match, ref, step_index, workspace
+                artifact_or_match, ref, step_index, workspace,
+                subtask=subtask,
             )
         elif cap_type == CapabilityType.SKILL:
             output = self._execute_skill_step(
@@ -958,26 +979,37 @@ class CompositionalExecutor:
 
             # SKILL/AGENT steps can't write to the Docker workspace, so they
             # embed file content in the output dict using special keys.
-            if step_results:
-                last_output = step_results[-1]
-                file_name = last_output.get("_output_file_name")
-                file_content = last_output.get("_output_file_content")
-                if file_name and file_content and file_name not in collected_files:
-                    if isinstance(file_content, str):
-                        # Use base64 only for binary file extensions
-                        _binary_exts = {".xlsx", ".xls", ".parquet", ".pkl", ".zip", ".gz"}
-                        _, ext = os.path.splitext(file_name)
-                        if ext.lower() in _binary_exts:
-                            try:
-                                collected_files[file_name] = base64.b64decode(
-                                    file_content, validate=True,
-                                )
-                            except Exception:  # noqa: BLE001
-                                collected_files[file_name] = file_content.encode("utf-8")
-                        else:
+            #
+            # Security audit finding #93 (2026-04-19, ext9): scan EVERY
+            # step's output, not just the terminal step. Pre-fix
+            # intermediate SKILL/AGENT steps that emitted
+            # ``_output_file_name`` / ``_output_file_content`` had their
+            # files silently discarded, restricting file-output
+            # capability to the last step only.
+            _binary_exts = {".xlsx", ".xls", ".parquet", ".pkl", ".zip", ".gz"}
+            for step_output in step_results:
+                if not isinstance(step_output, dict):
+                    continue
+                file_name = step_output.get("_output_file_name")
+                file_content = step_output.get("_output_file_content")
+                if not (file_name and file_content):
+                    continue
+                if file_name in collected_files:
+                    # MCP_TOOL path (workspace mount) already captured it.
+                    continue
+                if isinstance(file_content, str):
+                    _, ext = os.path.splitext(file_name)
+                    if ext.lower() in _binary_exts:
+                        try:
+                            collected_files[file_name] = base64.b64decode(
+                                file_content, validate=True,
+                            )
+                        except Exception:  # noqa: BLE001
                             collected_files[file_name] = file_content.encode("utf-8")
-                    elif isinstance(file_content, bytes):
-                        collected_files[file_name] = file_content
+                    else:
+                        collected_files[file_name] = file_content.encode("utf-8")
+                elif isinstance(file_content, bytes):
+                    collected_files[file_name] = file_content
 
             self._end_langfuse_chain_trace(lf, chain_trace, True, step_results)
             return ChainResult(

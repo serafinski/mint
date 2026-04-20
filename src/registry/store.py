@@ -127,6 +127,9 @@ class SkillRegistry:
             "tags": ",".join(getattr(capability, "tags", [])),
             "input_schema": json.dumps(getattr(capability, "input_schema", {})),
             "output_schema": json.dumps(getattr(capability, "output_schema", {})),
+            "pip_packages": json.dumps(
+                list(getattr(capability, "pip_packages", []) or [])
+            ),
             "extra_metadata": json.dumps(
                 getattr(capability, "metadata", {}), default=str
             ),
@@ -176,6 +179,12 @@ class SkillRegistry:
             kwargs["input_schema"] = json.loads(meta["input_schema"])
         if "output_schema" in model_fields and "output_schema" in meta:
             kwargs["output_schema"] = json.loads(meta["output_schema"])
+        if "pip_packages" in model_fields and "pip_packages" in meta:
+            try:
+                raw_pp = json.loads(meta["pip_packages"])
+                kwargs["pip_packages"] = [str(p) for p in raw_pp] if isinstance(raw_pp, list) else []
+            except (ValueError, TypeError):
+                kwargs["pip_packages"] = []
         if "metadata" in model_fields and "extra_metadata" in meta:
             kwargs["metadata"] = json.loads(meta["extra_metadata"])
 
@@ -507,6 +516,7 @@ def seed_registry(registry: SkillRegistry) -> None:
         agent_config: str | None = None,
         input_schema: dict | None = None,
         output_schema: dict | None = None,
+        pip_packages: list[str] | None = None,
     ) -> CapabilityDescriptor:
         metadata: dict = {"pinned": "true"}  # all seeded caps are pinned
         if source_code is not None:
@@ -560,6 +570,8 @@ def seed_registry(registry: SkillRegistry) -> None:
             kwargs["input_schema"] = input_schema
         if output_schema:
             kwargs["output_schema"] = output_schema
+        if pip_packages:
+            kwargs["pip_packages"] = list(pip_packages)
         return CapabilityDescriptor(**kwargs)
 
     seeds = [
@@ -664,6 +676,10 @@ def seed_registry(registry: SkillRegistry) -> None:
             domain="data-processing",
             input_schema={"config_path": "str", "schema_path": "str"},
             output_schema={"errors": "list[str]"},
+            # Security audit finding #83 (2026-04-19, ext9): declare the
+            # jsonschema runtime dependency explicitly so registry-matched
+            # uses of this seed install it in the sandbox.
+            pip_packages=["jsonschema"],
             source_code=(
                 "from typing import Annotated\n"
                 "from mcp.server.fastmcp import FastMCP\n"

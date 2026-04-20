@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src.schemas.task import TaskState
+from src.schemas.task import OutputContract, TaskState
 
 if TYPE_CHECKING:
     from tests.evaluation.tasks import TaskDefinition
@@ -47,6 +47,33 @@ def build_initial_state(
     contract = getattr(task, "output_contract", None)
     return TaskState(
         task_description=task.task_prompt,
+        output_contract=contract,
+        allow_network=allow_network,
+    )
+
+
+def build_initial_state_from_prompt(
+    task_prompt: str,
+    *,
+    output_contract: OutputContract | None = None,
+    allow_network: bool = False,
+) -> TaskState:
+    """Construct an initial TaskState from a bare task prompt.
+
+    Security audit finding #88 (2026-04-19, ext9): smoke scripts
+    (e.g. ``scripts/test_pipeline.py``) do not have a
+    ``TaskDefinition`` but must still thread the canonical entry-point
+    shape — ``output_contract`` as an object, not ``None`` — so their
+    pipeline path mirrors Phase 4 production. Callers that don't
+    declare any required keys/files can pass ``output_contract=None``
+    and this helper substitutes an empty ``OutputContract()``,
+    matching ``build_initial_state``'s contract-always-an-object
+    promise. Any inline-prompt script in ``scripts/`` should prefer
+    this helper over raw ``TaskState(task_description=...)``.
+    """
+    contract = output_contract if output_contract is not None else OutputContract()
+    return TaskState(
+        task_description=task_prompt,
         output_contract=contract,
         allow_network=allow_network,
     )

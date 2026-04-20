@@ -106,7 +106,13 @@ def main() -> None:
     task_sequence = task_sequence[: args.n_tasks]
 
     run_id = f"longitudinal_{uuid.uuid4().hex[:8]}"
-    logger.info("Run ID: %s", run_id)
+    # Security audit finding #87 (2026-04-19, ext9): per-invocation
+    # timestamp threaded into the LangFuse session_id so two runs with
+    # the same ``--seed`` don't pool their traces into one session in
+    # the LangFuse UI. Campaign-scoped (one value per invocation) so
+    # every task in the sequence shares the same session.
+    _campaign_start = datetime.now().strftime("%Y%m%d-%H%M%S")
+    logger.info("Run ID: %s (campaign %s)", run_id, _campaign_start)
     logger.info("Task sequence (%d tasks): %s", len(task_sequence), [t.task_id for t in task_sequence])
 
     # --- ONE snapshot restore ---
@@ -127,14 +133,39 @@ def main() -> None:
         runner_name="run_longitudinal", data_dir=DATA_DIR / "eval",
     )
 
-    # Security audit finding #31 (2026-04-20): clean the three registry
+    # Security audit finding #31 (2026-04-20): clean the two registry
     # directories BEFORE snapshotting so the "clean baseline" captures
     # an actually-empty state, not whatever a prior run left behind.
     # Seed AFTER the clean to produce a known (seeded-only) baseline;
     # re-snapshot over the seeded state so downstream restores hit
     # that same known baseline.
+    #
+    # Security audit finding #86 (2026-04-19, ext9): MCP_TOOLS_DIR
+    # (``src/mcp_tools``) is PROJECT SOURCE — it contains hand-written
+    # reference tools (e.g., ``fibonacci.py``) tracked in git. The
+    # pre-fix rmtree deleted the reference tools on every longitudinal
+    # run. Generated MCP tools are persisted as ``source_code`` metadata
+    # in ChromaDB (per CLAUDE.md "MCP Tool Loading Strategy"), not on
+    # disk under ``src/mcp_tools``, so there is no runtime-accumulating
+    # state in that directory to clean. Clean ChromaDB + skills only.
     import shutil as _shutil
-    for _d in (CHROMA_DIR, MCP_TOOLS_DIR, SKILLS_DIR):
+    # Safety net for security audit finding #86: refuse to rmtree any
+    # directory that lives inside project source.
+    _project_source_roots = (
+        (ROOT / "src").resolve(),
+        (ROOT / "scripts").resolve(),
+        (ROOT / "tests").resolve(),
+    )
+    for _d in (CHROMA_DIR, SKILLS_DIR):
+        _resolved = Path(_d).resolve()
+        for _root in _project_source_roots:
+            if _resolved == _root or _root in _resolved.parents:
+                raise RuntimeError(
+                    f"Refusing to rmtree {_resolved!s} — inside project "
+                    f"source {_root!s}. Security audit finding #86 "
+                    f"(ext9). Use a path under data/eval/ for runtime "
+                    f"state."
+                )
         if _d.exists():
             _shutil.rmtree(_d)
         _d.mkdir(parents=True, exist_ok=True)
@@ -204,7 +235,13 @@ def main() -> None:
             f"static_coverage:{str(task.has_static_coverage).lower()}",
             *(f"format:{fmt}" for fmt in sorted(_file_fmts)),
         ]
-        _lf_session = f"longitudinal-{args.seed}"
+        # Security audit finding #87 (2026-04-19, ext9): derive the
+        # LangFuse session_id from ``--seed`` AND the campaign start
+        # time so two back-to-back invocations with the same seed don't
+        # pool their traces into one LangFuse session. ``_campaign_start``
+        # is computed once below at the top of main() so every task in
+        # a single invocation shares the same session_id.
+        _lf_session = f"longitudinal-{args.seed}-{_campaign_start}"
 
         invoke_config: dict = {}
         if langfuse_handler is not None:

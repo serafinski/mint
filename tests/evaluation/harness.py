@@ -1089,8 +1089,17 @@ def _extract_result(
     # Compositional execution path (Phase 3): when the task was
     # decomposed into multiple subtasks, run all resolved artifacts
     # in dependency order via the CompositionalExecutor.
+    #
+    # Security audit finding #95 (2026-04-19, ext9): require only >=1
+    # artifact OR match (not >1). A lead-with-subagents pattern can
+    # produce a SINGLE AGENT artifact that covers N subtasks via
+    # ``agent_config.subagent_gap_queries`` — pre-fix this fell
+    # through to the single-artifact path and executed only 1/N
+    # subtasks. CompositionalExecutor's lead-cache dedup (ext6 #29)
+    # handles one-artifact-resolves-many-subtasks correctly; widening
+    # the precondition lets it fire for the lead pattern.
     # ---------------------------------------------------------------
-    if len(subtasks) > 1 and (len(artifacts) + len(matches) > 1):
+    if len(subtasks) > 1 and (len(artifacts) + len(matches) >= 1):
         return _extract_result_compositional(
             subtasks=subtasks,
             artifacts=artifacts,
@@ -1644,18 +1653,39 @@ def _build_fixture_inputs(task: TaskDefinition, source_code: str | None = None) 
 
 
 def _run_static_implementation(task_id: str, fixture_paths: list[Path]) -> dict:
-    """Execute a hand-written static implementation for seeded tasks."""
+    """Execute a hand-written static implementation for seeded tasks.
+
+    Security audit finding #97 (2026-04-19, ext9): the dispatch table
+    must align 1:1 with ``has_static_coverage=True`` in
+    ``tests/evaluation/tasks.py``. A drift in either direction is a
+    silent correctness bug — a missing branch causes ``ValueError`` to
+    surface as a generic ``generation_failed`` row in the static
+    condition (depressing M1 with a misattributed reason); a dead
+    branch wastes reader attention. The module-load-time assertion
+    below (``_assert_static_implementation_coverage``) loud-fails on
+    drift so the table cannot regress.
+    """
     if task_id == "T01":
         return _static_t01(fixture_paths[0])
     if task_id == "T02":
         return _static_t02(fixture_paths[0], fixture_paths[1])
-    if task_id == "T03":
-        return _static_t03(fixture_paths[0])
     if task_id == "T05":
         return _static_t05(fixture_paths[0])
     if task_id == "T09":
         return _static_t09(fixture_paths[0])
+    if task_id == "T19":
+        return _static_t19(fixture_paths[0])
     raise ValueError(f"No static implementation for {task_id}")
+
+
+# Tasks for which a hand-written static implementation exists in this
+# module. KEEP IN SYNC with the dispatch above and with
+# ``has_static_coverage=True`` in tests/evaluation/tasks.py — the
+# startup assertion at the bottom of this module enforces the
+# bidirectional invariant.
+_STATIC_IMPLEMENTATION_TASKS: frozenset[str] = frozenset(
+    {"T01", "T02", "T05", "T09", "T19"}
+)
 
 
 def _static_t01(csv_path: Path) -> dict:
@@ -1700,33 +1730,6 @@ def _static_t02(config_path: Path, schema_path: Path) -> dict:
         for e in validator.iter_errors(config)
     ]
     return {"errors": errors}
-
-
-def _static_t03(doc_path: Path) -> dict:
-    """Compute word count and Flesch readability score."""
-    import re
-
-    text = doc_path.read_text()
-    words = re.findall(r"\b\w+\b", text)
-    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
-
-    def syllables(word: str) -> int:
-        return max(len(re.findall(r"[aeiouAEIOU]+", word)), 1)
-
-    n_words = len(words)
-    n_sentences = max(len(sentences), 1)
-    n_syllables = sum(syllables(w) for w in words)
-    score = round(
-        max(
-            0.0,
-            min(
-                100.0,
-                206.835 - 1.015 * (n_words / n_sentences) - 84.6 * (n_syllables / max(n_words, 1)),
-            ),
-        ),
-        2,
-    )
-    return {"word_count": n_words, "readability_score": score}
 
 
 def _static_t05(csv_path: Path) -> dict:
@@ -1792,6 +1795,66 @@ def _static_t09(data_path: Path) -> dict:
     )
 
     return {"summary": summary, "stats_table": stats_table, "anomalies": anomalies}
+
+
+def _static_t19(csv_path: Path) -> dict:
+    """Exploratory data analysis on product sales CSV.
+
+    Security audit finding #97 (2026-04-19, ext9): T19 declares
+    ``has_static_coverage=True`` but pre-fix had no dispatch branch,
+    so every static-condition run of T19 raised ``ValueError`` which
+    the caller mis-attributed as ``generation_failed``. This reference
+    implementation profiles the dataset and returns the three keys the
+    ``_validate_t19`` contract checks (``n_rows``, ``n_categories``,
+    ``categories``). Any extra analysis (revenue stats, best category
+    by satisfaction) is the AGENT-level value-add that the static
+    baseline is NOT expected to provide — the baseline answers the
+    proposal's contract keys deterministically.
+    """
+    import csv as _csv
+
+    with csv_path.open() as f:
+        reader = _csv.DictReader(f)
+        rows = list(reader)
+
+    categories = sorted({r.get("category", "").strip() for r in rows if r.get("category")})
+    return {
+        "n_rows": len(rows),
+        "n_categories": len(categories),
+        "categories": categories,
+    }
+
+
+def _assert_static_implementation_coverage() -> None:
+    """Module-load-time guard for security audit finding #97 (2026-04-19, ext9).
+
+    Asserts the ``_STATIC_IMPLEMENTATION_TASKS`` whitelist exactly
+    matches the set of tasks in ``tests/evaluation/tasks.py`` with
+    ``has_static_coverage=True``. Loud-fails on drift in either
+    direction so future edits to ``tasks.py`` or the dispatch table
+    can't silently regress.
+    """
+    try:
+        from tests.evaluation.tasks import ALL_TASKS
+    except Exception:  # noqa: BLE001
+        # During bootstrap (e.g., sphinx build or partial import) tasks
+        # may not be importable; skip the assertion then.
+        return
+    coverage_tasks = {t.task_id for t in ALL_TASKS if t.has_static_coverage}
+    if coverage_tasks != _STATIC_IMPLEMENTATION_TASKS:
+        missing_impl = coverage_tasks - _STATIC_IMPLEMENTATION_TASKS
+        missing_coverage = _STATIC_IMPLEMENTATION_TASKS - coverage_tasks
+        raise AssertionError(
+            "Static implementation whitelist drift (security audit "
+            "finding #97, ext9). has_static_coverage=True tasks: "
+            f"{sorted(coverage_tasks)}; _STATIC_IMPLEMENTATION_TASKS: "
+            f"{sorted(_STATIC_IMPLEMENTATION_TASKS)}. "
+            f"Missing implementation for: {sorted(missing_impl)}. "
+            f"Missing coverage flag for: {sorted(missing_coverage)}."
+        )
+
+
+_assert_static_implementation_coverage()
 
 
 # Late import to avoid circular at module level

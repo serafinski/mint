@@ -10,7 +10,7 @@ If any of these fail, the static baseline is broken before we ever run the pilot
 from __future__ import annotations
 
 from tests.evaluation.harness import _run_static_implementation
-from tests.evaluation.tasks import FIXTURES_DIR, T01, T02, T03, T05, T09
+from tests.evaluation.tasks import FIXTURES_DIR, T01, T02, T05, T09, T19
 
 
 class TestStaticT01:
@@ -67,20 +67,32 @@ class TestStaticT02:
         assert any("level" in e or "VERBOSE" in e for e in output["errors"])
 
 
-class TestStaticT03:
+class TestStaticT19:
+    """Security audit finding #97 (2026-04-19, ext9).
+
+    T19 declares ``has_static_coverage=True`` so it MUST have a
+    dispatch branch in ``_run_static_implementation``. Pre-fix the
+    branch was missing, so every static-condition run of T19 raised
+    ``ValueError`` mis-attributed downstream as ``generation_failed``.
+    Replaces the prior ``TestStaticT03`` block, which exercised a
+    DEAD branch (T03 has ``has_static_coverage=False`` and never
+    reaches ``_run_static_implementation`` from production paths).
+    """
+
     def test_output_passes_validator(self):
-        output = _run_static_implementation("T03", [FIXTURES_DIR / "t03_document.txt"])
-        assert "word_count" in output
-        assert "readability_score" in output
-        assert T03.validator(output), f"T03 validator failed on: {output}"
+        output = _run_static_implementation("T19", [FIXTURES_DIR / "t19_product_sales.csv"])
+        assert "n_rows" in output
+        assert "n_categories" in output
+        assert "categories" in output
+        assert T19.validator(output), f"T19 validator failed on: {output}"
 
-    def test_word_count_positive(self):
-        output = _run_static_implementation("T03", [FIXTURES_DIR / "t03_document.txt"])
-        assert output["word_count"] > 0
+    def test_row_count_positive(self):
+        output = _run_static_implementation("T19", [FIXTURES_DIR / "t19_product_sales.csv"])
+        assert output["n_rows"] > 0
 
-    def test_readability_in_range(self):
-        output = _run_static_implementation("T03", [FIXTURES_DIR / "t03_document.txt"])
-        assert 0 <= output["readability_score"] <= 100
+    def test_categories_match_n(self):
+        output = _run_static_implementation("T19", [FIXTURES_DIR / "t19_product_sales.csv"])
+        assert len(output["categories"]) == output["n_categories"]
 
 
 class TestStaticT05:

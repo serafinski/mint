@@ -206,15 +206,28 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
             "step_count": 0,
             "peak_input_tokens": 0,
             "peak_output_tokens": 0,
+            "total_chain_input_tokens": 0,
+            "total_chain_output_tokens": 0,
             "total_tokens_consumed": 0,
             "total_reasoning_tokens": 0,
             "total_cache_read_tokens": 0,
             "context_utilization_pct": 0.0,
+            "context_utilization_chain_pct": 0.0,
             "steps": [],
         }
 
     peak_input = max(s["input_tokens"] for s in steps)
     peak_output = max(s["output_tokens"] for s in steps)
+    # Security audit finding #94 (2026-04-19, ext9): Pillar 3's Context
+    # Economy tension is about TOTAL prompt-token cost across the whole
+    # MAS per task, not any single agent's peak window utilisation. A
+    # chain of 5 agents at 20K tokens each consumes 100K chain-tokens;
+    # per-agent peak alone reports 20K, a 5x under-report for the
+    # proposal's "reduce prompt bloat" claim. Report BOTH — per-agent
+    # peak (for "does any agent exceed the context window?") AND the
+    # chain cumulative (for "total MAS cost per task").
+    total_chain_input = sum(s["input_tokens"] for s in steps)
+    total_chain_output = sum(s["output_tokens"] for s in steps)
     total_consumed = sum(s["total_tokens"] for s in steps)
     total_reasoning = sum(s["reasoning_tokens"] for s in steps)
     total_cache = sum(s["cache_read_tokens"] for s in steps)
@@ -223,10 +236,15 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
         "step_count": len(steps),
         "peak_input_tokens": peak_input,
         "peak_output_tokens": peak_output,
+        "total_chain_input_tokens": total_chain_input,
+        "total_chain_output_tokens": total_chain_output,
         "total_tokens_consumed": total_consumed,
         "total_reasoning_tokens": total_reasoning,
         "total_cache_read_tokens": total_cache,
         "context_utilization_pct": round(peak_input / MODEL_CONTEXT_WINDOW * 100, 1),
+        "context_utilization_chain_pct": round(
+            total_chain_input / MODEL_CONTEXT_WINDOW * 100, 1
+        ),
         "steps": steps,
     }
 

@@ -237,11 +237,26 @@ reader — the data is already parsed JSON. Output a JSON-serializable dict.
 - **Last step (nothing depends on it):** same as middle steps — receives \
 ``upstream_data: dict`` as its only required parameter. Output a JSON \
 dict by default. If the task EXPLICITLY asks for a file output (CSV, \
-Excel, Markdown, etc.), write the file to ``/workspace/output.<ext>`` \
-(e.g. ``/workspace/output.csv``, ``/workspace/output.xlsx``) AND return \
-a JSON dict with metadata about the file \
-(e.g. ``{{"output_file": "output.csv", "row_count": 42}}``). \
+Excel, Markdown, etc.), write the file to ``/workspace/<filename>`` \
+where ``<filename>`` is whatever the task or subtask description names \
+(e.g. ``/workspace/output.csv``, ``/workspace/output.xlsx``, \
+``/workspace/report.md``, ``/workspace/metrics.csv``) AND return a JSON \
+dict with metadata about the file \
+(e.g. ``{{"output_file": "report.md", "row_count": 42}}``). \
 The pipeline will collect the file from the workspace automatically.
+
+**CRITICAL — file path placement (security audit finding #98 / ext9, \
+2026-04-20).** The Docker sandbox ONLY mounts ``/workspace/``. Writing \
+to any other absolute path (``/report.md``, ``/output.csv``, \
+``/tmp/report.md``, ``/metrics.csv``) will either raise \
+``PermissionError: [Errno 13]`` (root paths) or land in a directory \
+``_collect_output_files`` does not scan, in which case the file is \
+silently lost and the task fails the output_contract check downstream. \
+If the subtask description references a bare filename like ``report.md`` \
+or ``metrics.csv`` (no leading ``/``), you MUST treat it as a workspace \
+path: ``open("/workspace/report.md", "w")`` — NEVER \
+``open("/report.md", "w")`` and NEVER ``open("report.md", "w")`` \
+(cwd-relative paths are also unreliable in the sandbox).
 
 All inter-step communication uses JSON. This is the pipeline's "world \
 state at each handoff point."

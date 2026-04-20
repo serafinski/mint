@@ -242,7 +242,17 @@ def _resolve_scope(
 def query_condition_summary(
     conn: duckdb.DuckDBPyConnection, task_filter: str = "TRUE"
 ) -> list[dict]:
-    """Per-condition summary: success, gate_pass, output_in_range counts."""
+    """Per-condition summary: success, gate_pass, output_in_range counts.
+
+    Security audit finding #79 (2026-04-19, ext9): every correctness
+    column now applies the SAME shape-mismatch tightening — pre-fix
+    ``successes`` tightened by ``NOT output_shape_mismatch`` but the
+    sibling ``output_in_range`` column did not, so Table 1 readers saw
+    contradictory headline numbers ("90% Output OK but only 50%
+    Success") with no column explaining the gap. A new
+    ``shape_mismatch`` count is also reported so the gap is visible
+    directly instead of inferred.
+    """
     rows = conn.execute(
         f"""
         SELECT
@@ -250,7 +260,8 @@ def query_condition_summary(
             COUNT(*) AS n,
             SUM(CASE WHEN gate_passed AND output_in_range AND NOT COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS successes,
             SUM(CASE WHEN gate_passed THEN 1 ELSE 0 END) AS gate_passed,
-            SUM(CASE WHEN output_in_range THEN 1 ELSE 0 END) AS output_in_range
+            SUM(CASE WHEN output_in_range AND NOT COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS output_in_range,
+            SUM(CASE WHEN COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS shape_mismatch
         FROM evaluation_runs
         WHERE is_pilot = FALSE AND ({task_filter}){_SCOPE_SQL}
         GROUP BY condition
@@ -264,13 +275,20 @@ def query_condition_summary(
             "successes": r[2],
             "gate_passed": r[3],
             "output_in_range": r[4],
+            "shape_mismatch": r[5],
         }
         for r in rows
     ]
 
 
 def query_per_task(conn: duckdb.DuckDBPyConnection) -> list[dict]:
-    """Per-task, per-condition success counts."""
+    """Per-task, per-condition success counts.
+
+    Security audit finding #79 (2026-04-19, ext9): ``output_in_range``
+    applies the shape-mismatch tightening consistently with
+    ``successes`` so per-task rows stay internally coherent. See
+    ``query_condition_summary`` for the root rationale.
+    """
     rows = conn.execute(
         f"""
         SELECT
@@ -278,7 +296,7 @@ def query_per_task(conn: duckdb.DuckDBPyConnection) -> list[dict]:
             COUNT(*) AS n,
             SUM(CASE WHEN gate_passed AND output_in_range AND NOT COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS successes,
             SUM(CASE WHEN gate_passed THEN 1 ELSE 0 END) AS gate_passed,
-            SUM(CASE WHEN output_in_range THEN 1 ELSE 0 END) AS output_in_range
+            SUM(CASE WHEN output_in_range AND NOT COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS output_in_range
         FROM evaluation_runs
         WHERE is_pilot = FALSE{_SCOPE_SQL}
         GROUP BY task_id, condition
@@ -334,25 +352,39 @@ def fmt_p(p: float) -> str:
 
 
 def print_condition_table(title: str, data: list[dict]) -> list[str]:
-    """Print condition summary table with CIs. Returns CSV lines."""
+    """Print condition summary table with CIs. Returns CSV lines.
+
+    Security audit finding #79 (2026-04-19, ext9): adds a Shape
+    Mismatch column so readers can see the gap between ``Output OK``
+    (shape-checked) and ``Gate Pass`` (raw validator) directly.
+    """
     # ext7 #52: append the [INCOMPLETE: ...] banner (if any) to the title.
     lines = [f"\n{'='*80}", f"  {title}{_COMPLETENESS_BANNER}", f"{'='*80}"]
-    header = f"{'Condition':<22} {'Success':>14} {'95% CI':>18} {'Gate Pass':>14} {'Output OK':>14}"
+    header = (
+        f"{'Condition':<22} {'Success':>14} {'95% CI':>18} "
+        f"{'Gate Pass':>14} {'Output OK':>14} {'ShapeMismatch':>14}"
+    )
     lines.append(header)
     lines.append("-" * len(header))
 
-    csv_lines = ["condition,n,successes,success_rate,ci_lo,ci_hi,gate_passed,output_in_range"]
+    csv_lines = [
+        "condition,n,successes,success_rate,ci_lo,ci_hi,gate_passed,"
+        "output_in_range,shape_mismatch"
+    ]
     for d in data:
         label = CONDITION_LABELS.get(d["condition"], d["condition"])
         lo, hi = binom_ci(d["successes"], d["n"])
+        shape_mismatch = d.get("shape_mismatch", 0)
         lines.append(
             f"{label:<22} {fmt_pct(d['successes'], d['n']):>14} {fmt_ci(lo, hi):>18} "
-            f"{fmt_pct(d['gate_passed'], d['n']):>14} {fmt_pct(d['output_in_range'], d['n']):>14}"
+            f"{fmt_pct(d['gate_passed'], d['n']):>14} "
+            f"{fmt_pct(d['output_in_range'], d['n']):>14} "
+            f"{fmt_pct(shape_mismatch, d['n']):>14}"
         )
         csv_lines.append(
             f"{d['condition']},{d['n']},{d['successes']},"
             f"{d['successes']/d['n']:.4f},{lo:.4f},{hi:.4f},"
-            f"{d['gate_passed']},{d['output_in_range']}"
+            f"{d['gate_passed']},{d['output_in_range']},{shape_mismatch}"
         )
     for line in lines:
         print(line)
@@ -493,18 +525,50 @@ def print_gate_vs_output_table(per_task: list[dict]) -> None:
         print(line)
 
 
-def print_failure_breakdown(failures: list[dict]) -> None:
+def print_failure_breakdown(
+    failures: list[dict],
+    condition_totals: dict[str, int] | None = None,
+) -> None:
+    """Print per-condition failure breakdown.
+
+    Security audit finding #85 (2026-04-19, ext9): include a
+    denominator (N) and a rate column so identical failure counts
+    across conditions with different N aren't read as equivalent
+    outcomes. Pre-fix a JIT condition with N=100 and 5 failures
+    looked "as bad as" a static condition with N=20 and 5 failures —
+    5% vs 25%, a 5x invisible gap. ``condition_totals`` is optional
+    for back-compat; absent totals fall back to count-only rendering
+    with an explicit banner.
+    """
     lines = [
         f"\n{'='*80}",
         "  Failure Breakdown by Condition",
         f"{'='*80}",
     ]
-    header = f"{'Condition':<22} {'Reason':<22} {'Count':>6}"
+    if condition_totals:
+        header = (
+            f"{'Condition':<22} {'Reason':<22} "
+            f"{'Count':>6} {'N':>6} {'Rate':>8}"
+        )
+    else:
+        header = f"{'Condition':<22} {'Reason':<22} {'Count':>6}"
+        lines.append(
+            "  [WARN] no condition totals provided — counts only. "
+            "Pass condition_totals to see rates."
+        )
     lines.append(header)
     lines.append("-" * len(header))
     for d in failures:
         label = CONDITION_LABELS.get(d["condition"], d["condition"])
-        lines.append(f"{label:<22} {d['reason']:<22} {d['n']:>6}")
+        if condition_totals:
+            total = condition_totals.get(d["condition"], 0)
+            rate = f"{100.0 * d['n'] / total:.1f}%" if total else "—"
+            lines.append(
+                f"{label:<22} {d['reason']:<22} "
+                f"{d['n']:>6} {total:>6} {rate:>8}"
+            )
+        else:
+            lines.append(f"{label:<22} {d['reason']:<22} {d['n']:>6}")
     for line in lines:
         print(line)
 
@@ -534,7 +598,26 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
     lines.append("  Synthesis tasks only (T04-T13):")
     lines.append(f"    JIT cluster:  {jit_min:.1f}% – {jit_max:.1f}%")
     lines.append(f"    Static:       {static_rate:.1f}%")
-    lines.append(f"    Gap:          {jit_min - static_rate:.1f} – {jit_max - static_rate:.1f} pp")
+    lines.append(
+        f"    Gap (cluster): {jit_min - static_rate:.1f} – "
+        f"{jit_max - static_rate:.1f} pp"
+    )
+
+    # Security audit finding #80 (2026-04-19, ext9): report the full-
+    # system gap separately so readers see the headline "full vs
+    # static" number alongside the cluster spread. Pre-fix the cluster
+    # range alone buried the full-system gap at the upper bound and
+    # anchored the lower bound to the weakest ablation — systematically
+    # under-selling the full-system benefit for a hurried reader.
+    full_cond = next(
+        (d for d in jit_conds if d["condition"] == "full"), None
+    )
+    if full_cond and full_cond["n"] > 0:
+        full_rate = full_cond["successes"] / full_cond["n"] * 100
+        lines.append(
+            f"    Gap (full vs static): {full_rate - static_rate:.1f} pp "
+            f"(full = {full_rate:.1f}%)"
+        )
     lines.append("")
 
     # Pairwise Fisher's exact between JIT conditions (with Holm-Bonferroni)
@@ -557,19 +640,39 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
 
     lines.append("")
 
-    # Overall JIT vs static (pooled) — single test, no correction needed
+    # Security audit finding #81 (2026-04-19, ext9): the pooled-JIT
+    # Fisher test is a statistical fallacy — pooling non-exchangeable
+    # ablation conditions (`full`, `no_verification`, `no_optimization`)
+    # into a single bucket treats three different interventions as
+    # samples of one population and inflates N by 3x, shrinking the
+    # p-value artificially. Pre-fix the number was printed alongside
+    # the legitimate per-condition tests with a one-line disclaimer —
+    # a hurried reader could still misquote it as "p_pooled < 0.01
+    # supports JIT". Downgraded here to a DIAGNOSTIC ONLY block,
+    # clearly labeled DO NOT CITE so it can still be inspected during
+    # development without masquerading as a thesis-quotable result.
+    # The per-condition Fisher + Holm-Bonferroni tests above remain the
+    # proposal-correct methodology.
     jit_total_k = sum(d["successes"] for d in jit_conds)
     jit_total_n = sum(d["n"] for d in jit_conds)
     _, p_pooled = fisher_exact_2x2(
         jit_total_k, jit_total_n, static["successes"], static["n"]
     )
+    lines.append("")
+    lines.append("  ===== DIAGNOSTIC ONLY — DO NOT CITE (Chapter 4.5) =====")
     lines.append(
-        f"  Pooled JIT vs Static (NOTE: pooling inflates significance): "
-        f"{jit_total_k}/{jit_total_n} "
+        "  Pooled JIT vs Static — statistically fallacious (non-exchangeable"
+    )
+    lines.append(
+        "  ablations pooled into one bucket; inflates N by ~3x, shrinks p):"
+    )
+    lines.append(
+        f"    {jit_total_k}/{jit_total_n} "
         f"({jit_total_k/jit_total_n*100:.1f}%) vs "
         f"{static['successes']}/{static['n']} ({static_rate:.1f}%), "
         f"p={fmt_p(p_pooled)}"
     )
+    lines.append("  ===== END DIAGNOSTIC =====")
 
     for line in lines:
         print(line)
@@ -713,18 +816,36 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
         print("  (skipped: invocation_events table is empty)")
         return
 
-    # Group by (condition, run_id) → list of counts
+    # Group by (condition, run_id) → counts keyed by capability, so we
+    # can zero-pad against the per-condition active-registry proxy
+    # below. Also collect the per-condition union of capability ids.
     from collections import defaultdict
-    by_run: dict[tuple[str, str], list[int]] = defaultdict(list)
+    by_run: dict[tuple[str, str], dict[str, int]] = defaultdict(dict)
     by_condition: dict[str, list[int]] = defaultdict(list)
-    for cond, run_id, _cap_id, inv_count in per_run_rows:
-        by_run[(cond, run_id)].append(int(inv_count))
+    condition_caps: dict[str, set[str]] = defaultdict(set)
+    for cond, run_id, cap_id, inv_count in per_run_rows:
+        by_run[(cond, run_id)][cap_id] = int(inv_count)
         by_condition[cond].append(int(inv_count))
+        condition_caps[cond].add(cap_id)
 
-    # Compute per-run Ginis
+    # Security audit finding #96 (2026-04-19, ext9): zero-pad the
+    # per-run counts with all capabilities that were EVER invoked
+    # within this condition. Pre-fix the Gini was computed only over
+    # caps actually invoked in that specific run, so a run that used
+    # one cap 100 times reported Gini=0.0 (perfect equality of a
+    # single-element list) when the proposal-correct measure — "how
+    # concentrated are invocations across the registry?" — demanded
+    # ~0.95 (extreme concentration). Using the per-condition
+    # cap-union as the denominator is an approximation of the active
+    # registry size (legacy DBs don't carry cap-registry size per run)
+    # and correctly registers unused active caps as zeros.
     condition_ginis: dict[str, list[float]] = defaultdict(list)
-    for (cond, _run_id), counts in by_run.items():
-        condition_ginis[cond].append(_gini_coefficient(counts))
+    for (cond, _run_id), run_counts in by_run.items():
+        all_caps_for_condition = condition_caps[cond]
+        padded = [
+            run_counts.get(cap_id, 0) for cap_id in all_caps_for_condition
+        ]
+        condition_ginis[cond].append(_gini_coefficient(padded))
 
     print(f"\n{'='*80}")
     print("  Gini Coefficient of Capability Invocation Counts (proposal §Metrics)")
@@ -1076,9 +1197,21 @@ def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
         )
         return
 
+    # Security audit finding #84 (2026-04-19, ext9): M2's
+    # proposal-literal definition is *"fraction containing fabricated
+    # elements"*. A ``partial`` label means the tool IS partially
+    # contaminated (it contains SOME fabricated elements), so per the
+    # proposal it MUST appear in the numerator. Pre-fix the rate used
+    # ``n_contam / n_sampled`` (strict) and reported ``n_partial``
+    # side-by-side without summing — under-reporting M2 by up to ~50
+    # percentage points depending on partial-label frequency. We now
+    # report BOTH the strict and proposal-literal rates. Chapter 6
+    # cites the proposal-literal column as the headline; the strict
+    # column is a diagnostic refinement.
     header = (
         f"{'Condition':<22} {'n':>4} {'Correct':>9} {'Contam.':>9} "
-        f"{'Partial':>9} {'Contam.%':>10} {'95% CI':>22}"
+        f"{'Partial':>9} {'Strict%':>9} {'Proposal%':>10} "
+        f"{'95% CI (proposal)':>22}"
     )
     print(header)
     print("-" * len(header))
@@ -1086,12 +1219,15 @@ def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
     total_c, total_x, total_p, total_n = 0, 0, 0, 0
     for condition, n_correct, n_contam, n_partial, n_sampled in rows:
         label = CONDITION_LABELS.get(condition, condition)
-        rate = 100.0 * n_contam / n_sampled if n_sampled else 0.0
-        lo, hi = _clopper_pearson_ci(int(n_contam), int(n_sampled))
+        strict_rate = 100.0 * n_contam / n_sampled if n_sampled else 0.0
+        proposal_num = int(n_contam) + int(n_partial)
+        proposal_rate = 100.0 * proposal_num / n_sampled if n_sampled else 0.0
+        lo, hi = _clopper_pearson_ci(proposal_num, int(n_sampled))
         ci_str = f"[{lo * 100:.1f}%, {hi * 100:.1f}%]"
         print(
             f"{label:<22} {n_sampled:>4d} {n_correct:>9d} {n_contam:>9d} "
-            f"{n_partial:>9d} {rate:>9.1f}% {ci_str:>22}"
+            f"{n_partial:>9d} {strict_rate:>8.1f}% {proposal_rate:>9.1f}% "
+            f"{ci_str:>22}"
         )
         total_c += int(n_correct)
         total_x += int(n_contam)
@@ -1101,13 +1237,21 @@ def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
     # Pool across conditions only when there are multiple — a single-condition
     # "pooled" row would just be a duplicate of the per-condition row.
     if len(rows) > 1 and total_n > 0:
-        rate = 100.0 * total_x / total_n
-        lo, hi = _clopper_pearson_ci(total_x, total_n)
+        strict_rate = 100.0 * total_x / total_n
+        proposal_num = total_x + total_p
+        proposal_rate = 100.0 * proposal_num / total_n
+        lo, hi = _clopper_pearson_ci(proposal_num, total_n)
         print("-" * len(header))
         print(
             f"{'Pooled':<22} {total_n:>4d} {total_c:>9d} {total_x:>9d} "
-            f"{total_p:>9d} {rate:>9.1f}% [{lo * 100:.1f}%, {hi * 100:.1f}%]"
+            f"{total_p:>9d} {strict_rate:>8.1f}% {proposal_rate:>9.1f}% "
+            f"[{lo * 100:.1f}%, {hi * 100:.1f}%]"
         )
+    print(
+        "\n  Strict% = n_contam / n_sampled (fully-contaminated only). "
+        "\n  Proposal% = (n_contam + n_partial) / n_sampled — per "
+        "proposal §M2 \"fraction containing fabricated elements\"."
+    )
 
     print(
         "\n  Methodology: manual audit of stratified random sample (Step 18.10). "
@@ -1259,8 +1403,12 @@ def main() -> None:
     print_cluster_analysis(all_data, synth_data)
 
     # ── Failure breakdown ────────────────────────────────────────────────
+    # Security audit finding #85 (2026-04-19, ext9): pass condition
+    # totals so the table prints rates alongside counts. ``all_data``
+    # carries the per-condition ``n`` from ``query_condition_summary``.
     failures = query_failure_breakdown(conn)
-    print_failure_breakdown(failures)
+    condition_totals = {d["condition"]: d["n"] for d in all_data}
+    print_failure_breakdown(failures, condition_totals)
 
     # ── Token costs ──────────────────────────────────────────────────────
     print_token_cost_summary(conn)

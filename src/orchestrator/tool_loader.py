@@ -401,6 +401,11 @@ class ToolLoader:
             input_schema=input_schema,
             output_schema=output_schema,
             definition_token_cost=definition_token_cost,
+            # Security audit finding #83 (2026-04-19, ext9): thread
+            # pip_packages from the artifact onto the descriptor so the
+            # registry persists it and registry-matched MCP tools install
+            # their declared runtime dependencies at sandbox execution.
+            pip_packages=list(getattr(artifact, "pip_packages", []) or []),
             metadata={
                 "generated": "true",
                 "source": "jit_pipeline",

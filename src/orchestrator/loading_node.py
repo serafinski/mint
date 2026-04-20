@@ -207,6 +207,11 @@ def loading_node(
                 input_schema=input_schema,
                 output_schema=output_schema,
                 definition_token_cost=definition_token_cost,
+                # Security audit finding #83 (2026-04-19, ext9): forward
+                # the generator-declared pip_packages onto the descriptor
+                # so they survive ChromaDB persistence + registry-match
+                # reconstruction. Empty for SKILL/AGENT.
+                pip_packages=list(getattr(artifact, "pip_packages", []) or []),
                 metadata=metadata,
             )
             registry.add(descriptor)

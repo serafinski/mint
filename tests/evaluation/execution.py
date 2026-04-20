@@ -727,11 +727,21 @@ def execute_mcp_tool_in_chain(
     capability_name: str = "tool",
     *,
     allow_network: bool = False,
+    depends_on: list[int] | None = None,
 ) -> dict:
     """Execute an MCP_TOOL as one step of a chain with workspace state passing.
 
     Reads inputs from ``/workspace/fixtures/`` and ``/workspace/step_*_output.json``,
     runs the tool function, writes output to ``/workspace/step_<N>_output.json``.
+
+    Security audit finding #91 (2026-04-19, ext9): when ``depends_on``
+    is provided, the sandbox code only loads ``step_*_output.json``
+    files whose step index is in the dependency set. Pre-fix every
+    prior step's output was globbed and merged unconditionally, so
+    parallel branches saw each other's state (T11-shape chains had
+    cross-branch corruption depending on alphabetical glob order).
+    ``depends_on=None`` preserves the pre-fix broad-load behaviour for
+    callers (unit tests) that have no dependency information.
 
     Never raises — returns ``{}`` on any failure.
     """
@@ -743,8 +753,17 @@ def execute_mcp_tool_in_chain(
 
     func_name = _extract_function_name(source_code) or capability_name.replace("-", "_")
 
+    # Security audit finding #91 (2026-04-19, ext9): encode the
+    # depends_on filter so the sandbox only merges state from direct
+    # predecessors. Empty list = read nothing; None = read everything
+    # (back-compat).
+    if depends_on is None:
+        _deps_filter_expr = "None"  # marker: sentinel meaning "load all"
+    else:
+        _deps_filter_expr = json.dumps(sorted({int(d) for d in depends_on}))
+
     sandbox_code = f"""\
-import asyncio, json, inspect, os, glob
+import asyncio, json, inspect, os, glob, re
 
 __name__ = "not_main"
 
@@ -755,10 +774,27 @@ async def _run():
         _all_inputs = {{}}
         _fixture_paths = []
 
+        # Security audit finding #91 (2026-04-19, ext9): only merge
+        # state from direct predecessors declared in depends_on. None
+        # = load all prior step outputs (back-compat for callers with
+        # no dependency info).
+        _deps_filter = {_deps_filter_expr}
+
+        def _step_idx_from_path(_sf_path):
+            _m = re.match(r"step_(\\d+)_output\\.json$", os.path.basename(_sf_path))
+            return int(_m.group(1)) if _m else -1
+
+        def _is_allowed(_sf_path):
+            if _deps_filter is None:
+                return True
+            return _step_idx_from_path(_sf_path) in _deps_filter
+
         # Read upstream step outputs FIRST (higher priority for later steps).
         # These are the structured JSON handoffs from previous chain steps —
         # the proposal's "world state at each handoff point".
         for _sf in sorted(glob.glob("/workspace/step_*_output.json")):
+            if not _is_allowed(_sf):
+                continue
             _step_name = os.path.basename(_sf).replace("_output.json", "")
             try:
                 with open(_sf) as _f:
@@ -792,9 +828,13 @@ async def _run():
         _valid = set(_sig.parameters.keys())
 
         if {step_index} > 0 and "upstream_data" in _valid:
-            # Collect only upstream step outputs (not fixtures) into one dict
+            # Collect only upstream step outputs (not fixtures) into one dict.
+            # Security audit finding #91: filter by depends_on so parallel
+            # branches don't see each other's state.
             _upstream = {{}}
             for _sf in sorted(glob.glob("/workspace/step_*_output.json")):
+                if not _is_allowed(_sf):
+                    continue
                 try:
                     with open(_sf) as _uf:
                         _ud = json.load(_uf)

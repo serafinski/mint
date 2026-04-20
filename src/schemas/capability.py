@@ -58,6 +58,21 @@ class CapabilityDescriptor(BaseModel):
             "formula. Step 18.6."
         ),
     )
+    pip_packages: list[str] = Field(
+        default_factory=list,
+        description=(
+            "PyPI package names required by MCP_TOOL execution at runtime. "
+            "Populated at generation time by the MCP tool generator from "
+            "the LLM's GeneratedToolCode.pip_packages and persisted via "
+            "ChromaDB metadata (JSON-encoded), so that registry-matched "
+            "tools restore their dependency list at retrieval time. "
+            "Empty for SKILL/AGENT capabilities. Security audit finding "
+            "#83 (2026-04-19, ext9): pre-fix this field did not exist on "
+            "the descriptor, causing CompositionalExecutor._match_to_artifact "
+            "to hardcode pip_packages=[] for registry hits and crash on "
+            "ImportError at sandbox execution."
+        ),
+    )
     metadata: dict[str, str] = Field(
         default_factory=dict, description="Additional key-value metadata"
     )

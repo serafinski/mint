@@ -218,7 +218,12 @@ def main() -> int:
     )
 
     run_id = f"longitudinal_shift_{uuid.uuid4().hex[:8]}"
-    logger.info("Run ID: %s", run_id)
+    # Security audit finding #87 (2026-04-19, ext9): add a per-invocation
+    # timestamp suffix to the LangFuse session_id so two runs with the
+    # same ``--seed`` don't pool their traces into one session.
+    from datetime import datetime as _dt
+    _campaign_start = _dt.now().strftime("%Y%m%d-%H%M%S")
+    logger.info("Run ID: %s (campaign %s)", run_id, _campaign_start)
     logger.info("Phase A tasks: %s", [t.task_id for t in phase_a_tasks])
     logger.info("Phase B tasks: %s", [t.task_id for t in phase_b_tasks])
     logger.info("Shift at cycle: %d (total: %d)", args.shift_at, args.total)
@@ -246,8 +251,31 @@ def main() -> int:
 
     # Security audit finding #31 (2026-04-20): clean registry directories
     # before snapshotting — see run_longitudinal.py for rationale.
+    #
+    # Security audit finding #86 (2026-04-19, ext9): MCP_TOOLS_DIR is
+    # project source (``src/mcp_tools``) and MUST NOT be rmtree'd —
+    # it holds git-tracked reference tools (e.g., ``fibonacci.py``).
+    # Clean ChromaDB + skills only. See ``run_longitudinal.py`` for the
+    # full rationale and the "MCP Tool Loading Strategy" note in
+    # CLAUDE.md that explains why generated tools are ChromaDB-only.
     import shutil as _shutil
-    for _d in (CHROMA_DIR, MCP_TOOLS_DIR, SKILLS_DIR):
+    # Safety net for security audit finding #86: refuse to rmtree any
+    # directory that lives inside project source.
+    _project_source_roots = (
+        (ROOT / "src").resolve(),
+        (ROOT / "scripts").resolve(),
+        (ROOT / "tests").resolve(),
+    )
+    for _d in (CHROMA_DIR, SKILLS_DIR):
+        _resolved = Path(_d).resolve()
+        for _root in _project_source_roots:
+            if _resolved == _root or _root in _resolved.parents:
+                raise RuntimeError(
+                    f"Refusing to rmtree {_resolved!s} — inside project "
+                    f"source {_root!s}. Security audit finding #86 "
+                    f"(ext9). Use a path under data/eval/ for runtime "
+                    f"state."
+                )
         if _d.exists():
             _shutil.rmtree(_d)
         _d.mkdir(parents=True, exist_ok=True)
@@ -309,7 +337,9 @@ def main() -> int:
             f"static_coverage:{str(task.has_static_coverage).lower()}",
             *(f"format:{fmt}" for fmt in sorted(_file_fmts)),
         ]
-        _lf_session = f"longitudinal-shift-{args.seed}"
+        # Security audit finding #87 (2026-04-19, ext9): session_id is
+        # {seed}-{campaign_start} so same-seed re-runs are distinct.
+        _lf_session = f"longitudinal-shift-{args.seed}-{_campaign_start}"
 
         invoke_config: dict = {}
         if langfuse_handler is not None:
@@ -404,10 +434,18 @@ def main() -> int:
 
             # --- Write shift marker at the cycle boundary (Step 18.8) ---
             # The marker is a synthetic cycle_events row with event_type
-            # "distribution_shift". Written AFTER the last Phase A task
-            # finishes + its per-task flush completes, so the marker's
-            # occurred_at is strictly after all Phase A events but before
-            # the first Phase B task's events.
+            # "distribution_shift".
+            #
+            # Security audit finding #82 (2026-04-19, ext9): explicitly
+            # anchor the marker to the LAST Phase A task's
+            # ``evaluation_runs.timestamp`` (via ``record.timestamp``).
+            # Pre-fix the default-now() timestamp landed strictly AFTER
+            # all Phase A rows and BEFORE the first Phase B row, which
+            # under ext8 #56's half-open-interval cycle bucketing placed
+            # the marker in cycle N+1 instead of cycle N — the analyzer's
+            # adaptation verdict was systematically biased toward
+            # "sluggish" by one cycle. Anchoring to the Phase A task's
+            # own timestamp places the marker inside Phase A's bucket.
             if cycle == args.shift_at and not shift_marked:
                 try:
                     details = (
@@ -424,6 +462,7 @@ def main() -> int:
                             "event_type": "distribution_shift",
                             "details": details,
                         }],
+                        occurred_at=record.timestamp,
                     )
                     shift_marked = True
                     logger.info("=== DISTRIBUTION SHIFT at cycle %d ===", cycle)

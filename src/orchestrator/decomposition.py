@@ -205,6 +205,32 @@ def _validate_depends_on_indices(subtasks: list[SubTask]) -> list[str]:
     return violations
 
 
+def _validate_single_capability_per_subtask(subtasks: list[SubTask]) -> list[str]:
+    """Return a list of subtasks that declare more than one required capability.
+
+    Security audit finding #92 (2026-04-19, ext9): the executor's
+    ``CompositionalExecutor._resolve_step`` returns only the FIRST
+    capability that resolves, so multi-capability subtasks silently
+    drop capabilities 2..N. The design intent (and the decomposer
+    prompt) is one-cap-per-subtask; the LLM occasionally deviates and
+    the silent drop causes downstream chain incompleteness. Flagging
+    multi-cap subtasks as a decomposition-layer violation surfaces
+    the deviation (and routes it through the §12 finding #15 retry
+    loop on bad-shape attempts).
+    """
+    violations: list[str] = []
+    for i, st in enumerate(subtasks):
+        if len(st.required_capabilities) > 1:
+            violations.append(
+                f"Subtask {i} declares {len(st.required_capabilities)} "
+                f"required_capabilities ({st.required_capabilities!r}); "
+                f"decomposer contract expects exactly one per subtask "
+                f"— multi-cap subtasks would silently drop caps 2..N "
+                f"at execution time."
+            )
+    return violations
+
+
 def _validate_chain_coherence(subtasks: list[SubTask]) -> list[str]:
     """Return a list of coherence violation messages for the subtask DAG.
 
@@ -387,11 +413,28 @@ def _ensure_file_writer_last_step(
         ext = "".join(Path(filename).suffixes[-1:]).lower() or ""
         ext_slug = ext.lstrip(".") or "file"
         fmt_label = _EXT_TO_FORMAT.get(ext, ext_slug.upper())
+        # Security audit finding #98 (2026-04-20, ext9 follow-up):
+        # explicitly include the ``/workspace/`` prefix in the writer
+        # description so the downstream MCP_TOOL generator emits an
+        # ``open("/workspace/<filename>", ...)`` call rather than
+        # ``open("/<filename>", ...)``. Pre-fix the bare filename in the
+        # description coupled with the generator-prompt example
+        # ``/workspace/output.<ext>`` led the LLM to occasionally
+        # produce ``open("/report.md", ...)`` (filesystem root) — the
+        # Docker sandbox correctly rejected the privileged-path write
+        # with ``PermissionError`` and the chain failed at the writer
+        # step. The MCP-tool prompt is now reinforced at the call site
+        # so generators don't have to guess where the workspace lives.
         writer = SubTask(
             description=(
-                f"Write the upstream result to {filename} as {fmt_label}, "
-                "serializing the per-key upstream data into the requested "
-                "file format and returning the output file path."
+                f"Write the upstream result to /workspace/{filename} as "
+                f"{fmt_label}, serializing the per-key upstream data into "
+                "the requested file format and returning the output file "
+                f"path. The file MUST be written to /workspace/{filename} "
+                "(NOT /{filename} or any other absolute path) so the "
+                "compositional executor can collect it from the sandbox "
+                "and ship it to the host's data/<env>/mint_output/<run>/ "
+                "directory."
             ),
             required_capabilities=[f"write-{ext_slug}-file"],
             depends_on=[original_predecessor_index],
@@ -563,8 +606,15 @@ def decomposition_node(
             structured: DecompositionResult | None = result.get("structured_response")
 
             if structured is not None and structured.subtasks:
+                # Build candidate subtasks and required_caps from the
+                # current attempt. We stage them in locals first so a
+                # failed DAG validation can discard the attempt and
+                # trigger a retry without contaminating the accumulated
+                # state from prior attempts.
+                attempt_subtasks: list[SubTask] = []
+                attempt_caps: list[str] = []
                 for item in structured.subtasks:
-                    subtasks.append(
+                    attempt_subtasks.append(
                         SubTask(
                             description=item.description,
                             required_capabilities=item.required_capabilities,
@@ -573,7 +623,51 @@ def decomposition_node(
                             requires_upstream_keys=item.requires_upstream_keys,
                         )
                     )
-                    required_caps.extend(item.required_capabilities)
+                    attempt_caps.extend(item.required_capabilities)
+
+                # Security audit finding #90 (2026-04-19, ext9): validate
+                # the DAG structure inside the retry loop so malformed
+                # DAGs (cycles, out-of-range indices, self-loops) get
+                # the full ``MAX_DECOMPOSITION_ATTEMPTS`` retry budget.
+                # Pre-fix the validator only ran AFTER the loop, so a
+                # malformed DAG on attempt 1 immediately flipped the
+                # sticky flag without any retry. Any genuine LLM
+                # nondeterminism (forgetting the DAG constraint once)
+                # now self-corrects within the budget.
+                attempt_dag_violations = _validate_depends_on_indices(
+                    attempt_subtasks
+                )
+                if attempt_dag_violations and attempt < MAX_DECOMPOSITION_ATTEMPTS:
+                    logger.warning(
+                        "DecompositionAgent attempt %d/%d: DAG violations "
+                        "%s — discarding attempt and retrying.",
+                        attempt, MAX_DECOMPOSITION_ATTEMPTS,
+                        attempt_dag_violations,
+                    )
+                    errors.append(
+                        f"Decomposition attempt {attempt}/"
+                        f"{MAX_DECOMPOSITION_ATTEMPTS}: invalid DAG "
+                        f"({len(attempt_dag_violations)} violations)"
+                    )
+                    emit_langfuse_event(
+                        langfuse_handler,
+                        "decomposition.invalid_dag_retry",
+                        "WARNING",
+                        {
+                            "attempt": attempt,
+                            "violation_count": len(attempt_dag_violations),
+                            "violations": attempt_dag_violations,
+                        },
+                    )
+                    # Discard attempt — leave subtasks/required_caps empty
+                    # so the next iteration re-attempts cleanly.
+                    continue
+
+                # Accept the attempt (DAG either valid, or this is the
+                # final attempt and the post-loop validator will surface
+                # the violation via the sticky flag).
+                subtasks.extend(attempt_subtasks)
+                required_caps.extend(attempt_caps)
                 # Success — break out of retry loop.
                 break
 
@@ -669,22 +763,66 @@ def decomposition_node(
         )
 
     if len(required_caps) > MAX_CAPS_HARD:
+        # Security audit finding #89 (2026-04-19, ext9): pre-fix the
+        # truncation dropped entries from ``required_caps`` but left
+        # ``subtasks`` untouched, so any subtask referencing a dropped
+        # cap reached ``CompositionalExecutor._resolve_step`` and crashed
+        # the chain with "Step N has no resolved capability". The
+        # circuit-breaker intent (cap LLM cap-list inflation) is
+        # preserved, but now the subtask list is pruned consistently and
+        # ``depends_on`` is remapped so survivors keep their DAG indices
+        # valid for the post-truncation validators below.
+        dropped_caps = set(required_caps[MAX_CAPS_HARD:])
+        original_cap_count = len(required_caps)
+        required_caps = required_caps[:MAX_CAPS_HARD]
+
+        kept_subtasks: list[SubTask] = []
+        index_remap: dict[int, int] = {}
+        for old_idx, st in enumerate(subtasks):
+            references_dropped = any(
+                cap in dropped_caps for cap in st.required_capabilities
+            )
+            if references_dropped:
+                continue
+            index_remap[old_idx] = len(kept_subtasks)
+            kept_subtasks.append(st)
+
+        # Remap depends_on for surviving subtasks: drop indices that
+        # pointed at removed subtasks, rewrite the rest to their new
+        # positions. Order-preserving so the topological structure of
+        # the surviving DAG is unchanged.
+        remapped_subtasks: list[SubTask] = []
+        for st in kept_subtasks:
+            new_deps = [
+                index_remap[d]
+                for d in st.depends_on
+                if d in index_remap
+            ]
+            remapped_subtasks.append(st.model_copy(update={"depends_on": new_deps}))
+
+        dropped_subtask_count = len(subtasks) - len(remapped_subtasks)
+        subtasks = remapped_subtasks
+
         logger.error(
-            "Decomposition produced %d capabilities — truncating to %d (hard limit). "
-            "This is a pathological decomposition; the prompt may not be working.",
-            len(required_caps), MAX_CAPS_HARD,
+            "Decomposition produced %d capabilities — truncating to %d "
+            "(hard limit) and dropping %d subtask(s) referencing the "
+            "%d truncated cap(s). This is a pathological decomposition; "
+            "the prompt may not be working.",
+            original_cap_count, MAX_CAPS_HARD,
+            dropped_subtask_count, len(dropped_caps),
         )
         emit_langfuse_event(
             langfuse_handler,
             "decomposition.hard_truncation",
             "CRITICAL",
             {
-                "original_count": len(required_caps),
+                "original_count": original_cap_count,
                 "truncated_to": MAX_CAPS_HARD,
-                "dropped": required_caps[MAX_CAPS_HARD:],
+                "dropped": sorted(dropped_caps),
+                "dropped_subtask_count": dropped_subtask_count,
+                "surviving_subtask_count": len(subtasks),
             },
         )
-        required_caps = required_caps[:MAX_CAPS_HARD]
 
     # §12 finding #15 (2026-04-16): if no subtasks were produced after
     # MAX_DECOMPOSITION_ATTEMPTS retries, FAIL CLOSED per the proposal's
@@ -769,6 +907,42 @@ def decomposition_node(
                 {
                     "violation_count": len(dag_violations),
                     "violations": dag_violations,
+                    "subtask_count": len(subtasks),
+                },
+            )
+
+        # Security audit finding #92 (2026-04-19, ext9): flag
+        # multi-capability subtasks as a SOFT warning. Pre-fix the
+        # executor's ``_resolve_step`` silently used cap[0] only and
+        # dropped caps 2..N. The audit recommended hard rejection
+        # ("Option A1") for design-intent enforcement; in practice the
+        # decomposer legitimately emits multi-cap subtasks for
+        # parallel multi-file-output tasks (e.g., ``['write-markdown-
+        # report', 'write-csv-file']`` on a "write report.md AND
+        # metrics.csv" task). Hard-rejecting these regressed test_mint
+        # AGENT-YAML-incident with a loud "DECOMPOSITION FAILED"
+        # whereas the chain previously executed the first cap and
+        # produced partial output. Soft-warning preserves the loud
+        # signal (errors list + LangFuse WARNING event) so we can
+        # tighten later via Option A2 (auto-split into parallel
+        # single-cap subtasks) once the depends_on-remap edge cases
+        # are covered, without blocking legitimate multi-file chains
+        # in the meantime. Mirrors the
+        # ``_detect_upstream_key_collisions`` soft-warning pattern
+        # below: visible but doesn't trip ``decomposition_succeeded=
+        # False``.
+        multi_cap_violations = _validate_single_capability_per_subtask(subtasks)
+        if multi_cap_violations:
+            for violation in multi_cap_violations:
+                errors.append(f"Multi-cap subtask warning: {violation}")
+                logger.warning("DecompositionAgent: %s", violation)
+            emit_langfuse_event(
+                langfuse_handler,
+                "decomposition.multi_cap_subtask",
+                "WARNING",
+                {
+                    "violation_count": len(multi_cap_violations),
+                    "violations": multi_cap_violations,
                     "subtask_count": len(subtasks),
                 },
             )
