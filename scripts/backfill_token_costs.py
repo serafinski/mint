@@ -249,6 +249,12 @@ def compute_run_costs(
             if rw["n_distinct_tasks"] >= 13:
                 n_jit_tasks = rw["n_distinct_tasks"] - 3
 
+        # Security audit finding #28 Bug A (2026-04-20): use total-record
+        # count (``n_tasks``) for the per-record divisor, NOT distinct
+        # count. Pre-fix a 40-cycle longitudinal run over 20 unique
+        # tasks divided total_tokens by 20 then assigned per-record to
+        # all 40 rows → 2x overcount. ``n_records`` is the cycle count
+        # and is the correct divisor for per-record apportionment.
         summaries[rid] = {
             "condition": rw["condition"],
             "total_tokens": total_tokens,
@@ -256,7 +262,8 @@ def compute_run_costs(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "n_generations": len(gens),
-            "n_tasks": rw["n_distinct_tasks"],
+            "n_tasks": rw["n_tasks"],  # total records (cycles) — for divisor
+            "n_distinct_tasks": rw["n_distinct_tasks"],  # preserved for per-JIT rollup
             "n_jit_tasks": n_jit_tasks,
             "tokens_per_jit_task": total_tokens // n_jit_tasks if n_jit_tasks > 0 else 0,
             "by_model": dict(by_model),
@@ -482,53 +489,75 @@ def compute_per_task_costs(
     auth: httpx.Auth,
     records: list[dict],
     run_windows: list[dict],
+    run_summaries: dict[str, dict] | None = None,
 ) -> list[tuple[str, int]] | None:
     """Try per-task attribution via tagged LangFuse traces.
 
-    Returns (record_id, token_cost) pairs if tagged traces are found,
-    or None if no tagged data exists (fall back to run-level averaging).
+    Security audit findings #30 + #37 (2026-04-20): probes tagged
+    traces **per-run** instead of "first non-static run only". Pre-fix
+    a single untagged run at the front of the iteration disabled
+    per-task mode for every run in the DB (including newer, tagged
+    runs whose data would have attributed cleanly).
+
+    Returns (record_id, token_cost) pairs, or ``None`` when NO run in
+    the DB has any tagged traces (caller falls back to pure run-level
+    mode). Mixed-era DBs use per-task for tagged runs and fall back
+    to run-level-divided-by-cycle-count for untagged runs — no records
+    silently receive 0.
     """
-    # Group records by run_id
     runs_by_id = {rw["run_id"]: rw for rw in run_windows}
 
-    # Try the first non-static run to see if it has tagged traces
-    test_run = None
-    for rw in run_windows:
-        if rw["condition"] != "static":
-            test_run = rw
-            break
-    if test_run is None:
+    # Per-run tag detection: fetch traces for each non-static run and
+    # record which ones carry task_id tags.
+    run_ids = {r["run_id"] for r in records if r["condition"] != "static"}
+    if not run_ids:
         return None
 
-    test_traces = fetch_traces_by_session(base_url, auth, test_run["run_id"])
-    has_tags = any(t.get("task_id") for t in test_traces)
-    if not has_tags:
-        return None  # No tagged data — fall back to run-level mode
-
-    print("  Per-task trace tags detected — using per-task attribution mode.")
-
-    # Build a mapping: (run_id, task_id) → total_tokens
     run_task_tokens: dict[tuple[str, str], int] = {}
+    tagged_run_ids: set[str] = set()
 
-    # Get unique non-static run_ids from records
-    run_ids = {r["run_id"] for r in records if r["condition"] != "static"}
     for i, rid in enumerate(sorted(run_ids)):
         if (i + 1) % 5 == 0 or i == len(run_ids) - 1:
             print(f"    Fetching traces for run {i + 1}/{len(run_ids)}...", flush=True)
 
         traces = fetch_traces_by_session(base_url, auth, rid)
-        # Group traces by task_id, sum tokens via observations
         task_traces: dict[str, list[dict]] = defaultdict(list)
         for t in traces:
             tid = t.get("task_id")
             if tid:
                 task_traces[tid].append(t)
 
+        if not task_traces:
+            # Untagged run — caller will fall back to run-level mode.
+            continue
+        tagged_run_ids.add(rid)
+
         for task_id, t_list in task_traces.items():
             total = 0
             for t in t_list:
                 total += fetch_observations_for_trace(base_url, auth, t["id"])
             run_task_tokens[(rid, task_id)] = total
+
+    if not tagged_run_ids:
+        # No run in the entire DB has tagged traces — pure fallback.
+        return None
+
+    print(
+        f"  Per-task trace tags detected on {len(tagged_run_ids)}/"
+        f"{len(run_ids)} non-static run(s); mixed-mode attribution."
+    )
+
+    # Security audit finding #28 Bug B (2026-04-20): count cycles per
+    # (run_id, task_id) so the aggregated per-task total splits evenly
+    # across repeated cycles of the same task. Pre-fix every cycle
+    # received the SUMMED total → 2x overcount for 2-cycle tasks.
+    from collections import Counter as _Counter
+    cycle_counts: _Counter[tuple[str, str]] = _Counter()
+    run_record_counts: _Counter[str] = _Counter()
+    for rec in records:
+        if rec["condition"] != "static":
+            cycle_counts[(rec["run_id"], rec["task_id"])] += 1
+            run_record_counts[rec["run_id"]] += 1
 
     # Build updates
     updates: list[tuple[str, int]] = []
@@ -537,8 +566,20 @@ def compute_per_task_costs(
             updates.append((rec["id"], 0))
             continue
 
-        key = (rec["run_id"], rec["task_id"])
-        tokens = run_task_tokens.get(key, 0)
+        rid = rec["run_id"]
+        if rid in tagged_run_ids:
+            key = (rid, rec["task_id"])
+            total_for_task = run_task_tokens.get(key, 0)
+            n_cycles = cycle_counts.get(key, 1) or 1
+            tokens = total_for_task // n_cycles
+        else:
+            # Security audit finding #37 (2026-04-20): untagged run in a
+            # mixed-era DB falls back to run-level-divided-by-cycle-count
+            # instead of silently writing 0.
+            summary = (run_summaries or {}).get(rid)
+            run_total = (summary or {}).get("total_tokens", 0)
+            n_records = run_record_counts.get(rid, 1) or 1
+            tokens = run_total // n_records
         updates.append((rec["id"], tokens))
 
     return updates
@@ -584,10 +625,25 @@ def main() -> None:
     print(f"  Found {len(generations)} generations in evaluation window.")
 
     if not generations:
-        print("WARNING: No generation observations found. LangFuse data may have been purged.")
-        print("         Token costs will remain at 0.")
+        # Security audit finding #36 (2026-04-20): flipped from
+        # silent-exit-0 to loud-fail-exit-2. Pre-fix a purged-LangFuse
+        # window silently left every record's token_cost at 0, and the
+        # caller had no way to distinguish "backfill ran cleanly" from
+        # "backfill found nothing". M4 Chapter 6 tables then showed
+        # uniformly-zero costs as legitimate data. Exit code 2 is
+        # distinct from the generic error exit 1.
+        print(
+            "ERROR: No generation observations found. LangFuse data may have "
+            "been purged.",
+            file=sys.stderr,
+        )
+        print(
+            "       Token costs NOT backfilled. Rerun after restoring "
+            "LangFuse data.",
+            file=sys.stderr,
+        )
         conn.close()
-        return
+        sys.exit(2)
 
     # Map generations to runs
     print("Mapping generations to evaluation runs...")
@@ -605,7 +661,10 @@ def main() -> None:
     records = get_per_record_info(conn)
 
     print("\nChecking for per-task trace tags...")
-    per_task_updates = compute_per_task_costs(base_url, auth, records, run_windows)
+    per_task_updates = compute_per_task_costs(
+        base_url, auth, records, run_windows,
+        run_summaries=run_summaries,
+    )
     if per_task_updates is not None:
         updates = per_task_updates
         print("  Using per-task attribution (traces tagged with task_id).")

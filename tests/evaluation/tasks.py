@@ -20,6 +20,7 @@ Pilot tasks: T01 (seeded retrieval), T07 (moderate JIT), T05 (moderate JIT, stat
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,8 +28,46 @@ from typing import Literal
 
 from src.schemas.task import OutputContract
 
+logger = logging.getLogger(__name__)
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 _EV_PATH = FIXTURES_DIR / "expected_values.json"
+
+# ext6 #35 disclosure: tasks whose validators check metadata/shape only and do
+# NOT cross-check output content against the fixture ground truth. The
+# uniform-inflation defense (all conditions equally permissive) is preserved in
+# Chapter 4.5; this list is the audit-trail of which tasks rely on that defense.
+# T05, T09, T10, T13 were tightened in the pragmatic subset — the rest remain
+# permissive by design (cost-of-tightening vs. marginal eval-integrity payoff).
+_PERMISSIVE_VALIDATOR_TASK_IDS: frozenset[str] = frozenset({
+    "T02",  # errors list length only
+    "T08",  # n_rows/n_columns shape + quality_issues_found > 0 (trivially met)
+    "T12",  # clean_row_count exact + violations > 0 (count-based)
+    "T15",  # n_days/metrics_aggregated/alert_days exact (but metadata only)
+    "T16",  # root_cause_metric exact + cascade_chain length >= 2 (structural)
+})
+
+_PERMISSIVE_WARN_EMITTED = False
+
+
+def warn_permissive_validators_once() -> None:
+    """Emit a one-time WARN at harness startup naming permissive validators.
+
+    Called by ``EvaluationHarness.__init__`` (ext6 #35 recommendation D). Idempotent.
+    """
+    global _PERMISSIVE_WARN_EMITTED
+    if _PERMISSIVE_WARN_EMITTED:
+        return
+    _PERMISSIVE_WARN_EMITTED = True
+    if not _PERMISSIVE_VALIDATOR_TASK_IDS:
+        return
+    ids = ", ".join(sorted(_PERMISSIVE_VALIDATOR_TASK_IDS))
+    logger.warning(
+        "ext6 #35: the following testbed tasks rely on metadata-only validators "
+        "(no fixture-content cross-check); success rates are permissive and the "
+        "uniform-inflation defense is the Chapter 4.5 disclosure: %s",
+        ids,
+    )
 
 # Load expected values at import time — generate.py must have been run first.
 if not _EV_PATH.exists():
@@ -262,13 +301,25 @@ _t05_ev = _EV["T05"]
 
 
 def _validate_t05(output: dict) -> bool:
-    """output_row_count < input_row_count AND null_count == 0."""
+    """output_row_count in a plausible cleaned-range AND null_count == 0.
+
+    ext6 #35: prior predicate ``out_count < input_row_count AND null_count == 0``
+    accepts a hallucinated ``{output_row_count: 1, null_count: 0}``. Tightened to
+    require the output count to fall inside a plausible range:
+    ``expected_max_output_row_count * 0.5 <= out_count <= expected_max_output_row_count``.
+    The max is the upper-bound ground-truth (dedup + null drop) from the fixture
+    generator; the 50% floor rejects severely-truncated hallucinations while
+    tolerating validator variance in interpretation of "null or empty".
+    """
     try:
         out_count = int(output.get("output_row_count", -1))
         null_count = int(output.get("null_count", -1))
+        max_expected = int(_t05_ev["expected_max_output_row_count"])
+        min_expected = max_expected // 2  # 50% floor — ext6 #35 fail-closed
         ok_reduced = out_count < _t05_ev["input_row_count"]
+        ok_range = min_expected <= out_count <= max_expected
         ok_nulls = null_count == 0
-        return ok_reduced and ok_nulls
+        return ok_reduced and ok_range and ok_nulls
     except (TypeError, ValueError):
         return False
 
@@ -361,16 +412,27 @@ def _validate_t07(output: dict) -> bool:
 
 
 def _file_validate_t07(output: dict, output_files: dict[str, bytes]) -> bool:
-    """CSV file has expected_join_count data rows AND row_count in metadata."""
+    """CSV file has expected_join_count data rows AND row_count in metadata.
+
+    Security audit finding #33 (2026-04-20): T07's file validator is
+    only reached when ``output_contract.required_files`` is non-empty,
+    so a missing ``output.csv`` is a contract violation, not a
+    "graceful degradation" case. Fail-closed on missing / undecodable
+    file. Narrow the exception handler to (TypeError, ValueError) — the
+    original catch-all masked csv.Error and other file-level failures.
+    """
     import csv
     import io
     try:
         # Check metadata dict
         ok_count = int(output.get("row_count", -1)) == _t07_ev["expected_join_count"]
-        # Check CSV file content
+        # Check CSV file content — required by T07's output_contract.
         csv_bytes = output_files.get("output.csv")
         if csv_bytes is None:
-            return ok_count  # fall back to dict-only validation
+            # Pre-fix fell back to dict-only; this is a contract
+            # violation and the pipeline never produced the required
+            # file. Fail closed.
+            return False
         text = csv_bytes.decode("utf-8")
         reader = csv.reader(io.StringIO(text))
         rows = list(reader)
@@ -378,7 +440,7 @@ def _file_validate_t07(output: dict, output_files: dict[str, bytes]) -> bool:
         data_rows = len(rows) - 1 if len(rows) > 1 else 0
         ok_file_rows = data_rows == _t07_ev["expected_join_count"]
         return ok_count and ok_file_rows
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, UnicodeDecodeError, csv.Error):
         return False
 
 
@@ -474,11 +536,36 @@ _t09_ev = _EV["T09"]
 
 
 def _validate_t09(output: dict) -> bool:
-    """output has required keys AND anomalies list has exactly 5 items."""
+    """output has required keys AND anomalies list shape + content checks.
+
+    ext6 #35: prior predicate only counted ``len(anomalies) == N``; a list of
+    ``["fake", "fake", "fake", "fake", "fake"]`` passed. Tightened to reject
+    fabricated stand-in strings: each anomaly must be a dict OR a string that
+    contains at least one digit (real anomalies reference revenue/unit numbers
+    from the XML) and unique across the list.
+    """
     try:
         if not _check_keys_present(output, _t09_ev["required_keys"]):
             return False
-        return len(output.get("anomalies", [])) == _t09_ev["expected_anomaly_count"]
+        anomalies = output.get("anomalies", [])
+        if len(anomalies) != _t09_ev["expected_anomaly_count"]:
+            return False
+        seen: set[str] = set()
+        for item in anomalies:
+            if isinstance(item, dict):
+                # Real structured anomaly — accept.
+                key = json.dumps(item, sort_keys=True, default=str)
+            elif isinstance(item, str):
+                # String anomaly must reference a number (revenue/units/returns).
+                if not any(ch.isdigit() for ch in item):
+                    return False
+                key = item
+            else:
+                return False
+            if key in seen:
+                return False
+            seen.add(key)
+        return True
     except (TypeError, ValueError):
         return False
 
@@ -513,13 +600,35 @@ _t10_ev = _EV["T10"]
 
 
 def _validate_t10(output: dict) -> bool:
-    """trend_direction == 'upward' AND n_weeks matches AND forecast provided."""
+    """trend_direction upward AND n_weeks matches AND forecast is numeric + plausible.
+
+    ext6 #35: prior predicate accepted ``forecast=[0, 0, 0]``. Tightened to:
+    (a) require forecast to have exactly ``n_forecast_weeks`` numeric entries,
+    (b) reject all-zero / constant forecasts, (c) require the forecast mean to
+    sit within ``[avg_last_4_weeks * 0.3, avg_last_4_weeks * 3.0]`` — a 3x band
+    around the observed recent level. An upward trend with forecast mean at 0
+    or at 6000 is a hallucination.
+    """
     try:
         ok_trend = output.get("trend_direction", "").lower() in ("upward", "up", "increasing", "positive")
         ok_weeks = int(output.get("n_weeks", -1)) == _t10_ev["n_weeks"]
-        # Agent should provide some forecast (list of numbers or a summary)
         forecast = output.get("forecast")
-        ok_forecast = forecast is not None and isinstance(forecast, list)
+        if not isinstance(forecast, list):
+            return False
+        n_expected = int(_t10_ev["n_forecast_weeks"])
+        if len(forecast) != n_expected:
+            return False
+        try:
+            values = [float(v) for v in forecast]
+        except (TypeError, ValueError):
+            return False
+        if len(set(values)) == 1:
+            # All-constant forecast (includes the [0, 0, 0] hallucination case).
+            return False
+        mean_forecast = sum(values) / len(values)
+        recent_avg = float(_t10_ev["avg_last_4_weeks"])
+        low, high = recent_avg * 0.3, recent_avg * 3.0
+        ok_forecast = low <= mean_forecast <= high
         return ok_trend and ok_weeks and ok_forecast
     except (TypeError, ValueError):
         return False
@@ -588,17 +697,39 @@ def _validate_t11(output: dict) -> bool:
 
 
 def _file_validate_t11(output: dict, output_files: dict[str, bytes]) -> bool:
-    """Excel file exists with a 'Summary' sheet containing region revenue rows."""
+    """Excel file exists with a 'Summary' sheet containing region revenue rows.
+
+    Security audit finding #33 (2026-04-20): T11's file validator had
+    two fail-open branches — missing file returned True, and the
+    catch-all ``except Exception`` caught parse errors (BadZipFile,
+    InvalidFileException) as well as the intended ImportError. Both
+    let contract-violating outputs pass M1. Now fail-closed on missing
+    file + narrow the except to ImportError only (graceful degradation
+    for the environment-lacks-openpyxl case), letting parse failures
+    surface as invalid.
+    """
+    # Dict validation still required for metadata
+    if not _validate_t11(output):
+        return False
+    # Check Excel file — required by T11's output_contract.
+    xlsx_bytes = output_files.get("output.xlsx")
+    if xlsx_bytes is None:
+        # Pre-fix returned True; the file is contract-required.
+        return False
     try:
-        # Dict validation still required for metadata
-        if not _validate_t11(output):
-            return False
-        # Check Excel file
-        xlsx_bytes = output_files.get("output.xlsx")
-        if xlsx_bytes is None:
-            return True  # dict passed, no file — still valid
         import io
+
         import openpyxl
+    except ImportError:
+        # Graceful degradation only when openpyxl is unavailable in this
+        # dev env. openpyxl is a hard eval dependency in pyproject so
+        # this branch fires only in narrow developer setups.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "openpyxl unavailable; T11 falling back to dict-only validation."
+        )
+        return True
+    try:
         wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), read_only=True)
         # Should have at least one sheet
         if len(wb.sheetnames) == 0:
@@ -608,7 +739,9 @@ def _file_validate_t11(output: dict, output_files: dict[str, bytes]) -> bool:
         row_count = sum(1 for _ in ws.iter_rows(min_row=1))
         return row_count >= 5  # header + 4 regions
     except Exception:  # noqa: BLE001
-        return True  # fall back to dict-only if openpyxl not available
+        # Parse failures (BadZipFile, InvalidFileException, etc.) on a
+        # file that WAS produced but is corrupt → contract violation.
+        return False
 
 
 T11 = TaskDefinition(
@@ -708,12 +841,31 @@ _t13_ev = _EV["T13"]
 
 
 def _validate_t13(output: dict) -> bool:
-    """anomaly_count >= 3 (tolerant) AND anomalies list non-empty AND metrics_analyzed > 0."""
+    """anomaly_count >= 3 AND anomalies reference real metric names from the fixture.
+
+    ext6 #35: prior predicate accepted any non-empty anomalies list with
+    ``anomaly_count >= 3``; a fabricated ``[{"metric": "banana"}, ...]`` passed.
+    Tightened to require each anomaly entry to be a dict with a ``metric`` key
+    whose value is one of the four real metric names the task prompt enumerates
+    (``cpu_usage, memory_mb, request_latency_ms, error_rate``). A ``timestamp``
+    key is also required so count-only hallucinations can't pass.
+    """
+    valid_metrics = {"cpu_usage", "memory_mb", "request_latency_ms", "error_rate"}
     try:
         anomaly_count = int(output.get("anomaly_count", 0))
         anomalies = output.get("anomalies", [])
         metrics_analyzed = int(output.get("metrics_analyzed", 0))
-        return anomaly_count >= 3 and len(anomalies) > 0 and metrics_analyzed > 0
+        if anomaly_count < 3 or metrics_analyzed <= 0 or len(anomalies) == 0:
+            return False
+        for item in anomalies:
+            if not isinstance(item, dict):
+                return False
+            metric = item.get("metric")
+            if metric not in valid_metrics:
+                return False
+            if "timestamp" not in item:
+                return False
+        return True
     except (TypeError, ValueError):
         return False
 

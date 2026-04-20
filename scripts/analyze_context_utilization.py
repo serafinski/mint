@@ -85,15 +85,23 @@ def fetch_traces(
     name: str,
     start: datetime,
     end: datetime,
+    environment: str | None = None,
+    session_ids: list[str] | None = None,
 ) -> list[dict]:
-    """Fetch all traces with a given name within the time window."""
+    """Fetch all traces with a given name within the time window.
+
+    Security audit finding #39 (2026-04-20): accepts ``environment`` and
+    ``session_ids`` to scope fetches to a single campaign. Pre-fix, any
+    trace in the time window with a matching name was returned,
+    including smoke-test / dev runs and prior campaigns.
+    """
     traces = []
     page = 1
     while True:
-        resp = client.get(
-            "/api/public/traces",
-            params={"name": name, "limit": 100, "page": page},
-        )
+        params = {"name": name, "limit": 100, "page": page}
+        if environment:
+            params["environment"] = environment
+        resp = client.get("/api/public/traces", params=params)
         resp.raise_for_status()
         data = resp.json().get("data", [])
         if not data:
@@ -102,10 +110,13 @@ def fetch_traces(
         for t in data:
             ts = _parse_dt(t.get("timestamp"))
             if ts and start <= ts <= end:
+                if session_ids and t.get("sessionId") not in session_ids:
+                    continue
                 traces.append({
                     "id": t["id"],
                     "name": t.get("name", ""),
                     "timestamp": ts,
+                    "session_id": t.get("sessionId"),
                     "latency": t.get("latency", 0) or 0,
                     "total_cost": t.get("totalCost", 0) or 0,
                     "observation_ids": t.get("observations", []),
@@ -425,6 +436,18 @@ def main() -> int:
         metavar="PATH",
         help="Write results to CSV (default: data/context_utilization.csv)",
     )
+    # Security audit finding #39 (2026-04-20): scope to a single
+    # environment / session-set to exclude smoke + dev + prior-campaign
+    # traces.
+    parser.add_argument(
+        "--environment", default="production",
+        help="LangFuse environment tag to fetch (default: production).",
+    )
+    parser.add_argument(
+        "--session-ids", nargs="+", default=None,
+        help="Restrict to specific LangFuse session_ids (e.g. "
+             "'eval_2026-04-20_full').",
+    )
     args = parser.parse_args()
 
     base_url, auth = _langfuse_client()
@@ -448,7 +471,11 @@ def main() -> int:
     with httpx.Client(base_url=base_url, auth=auth, timeout=30.0) as client:
         for agent_name, label in AGENT_TRACE_NAMES.items():
             print(f"\nFetching '{agent_name}' traces...", end=" ", flush=True)
-            traces = fetch_traces(client, agent_name, start, end)
+            traces = fetch_traces(
+                client, agent_name, start, end,
+                environment=args.environment,
+                session_ids=args.session_ids,
+            )
             print(f"{len(traces)} found.", end=" ", flush=True)
 
             if not traces:

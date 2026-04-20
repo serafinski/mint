@@ -63,8 +63,16 @@ def flush_task_cycle_state(
             used to filter capability_events to just this task's events.
     """
     # --- Invocation events (Step 18.5) ---
+    # Security audit finding #23 (2026-04-20): pass ``since=task_events_cutoff``
+    # so fetch returns only THIS cycle's invocations. Pre-fix the fetch
+    # returned all rows for the task_id, duplicating cycle-1 invocations
+    # into every subsequent flush when tasks repeated in the sequence
+    # (default `--n-tasks=40` over 20 testbed tasks). Gini + invocation-
+    # count KL were inflated.
     try:
-        task_invocations = metrics_store.fetch_invocations_for_task(task_id)
+        task_invocations = metrics_store.fetch_invocations_for_task(
+            task_id, since=task_events_cutoff,
+        )
         eval_store.record_invocation_events(
             run_id=run_id,
             condition=condition,

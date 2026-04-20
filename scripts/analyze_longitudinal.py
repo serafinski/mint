@@ -144,7 +144,62 @@ def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
         return False
 
 
-def _load_cycle_data(conn: duckdb.DuckDBPyConnection) -> list[dict]:
+def _resolve_longitudinal_run_id(
+    conn: duckdb.DuckDBPyConnection,
+    run_id: str | None,
+) -> str | None:
+    """Pick the run_id to analyze.
+
+    Security audit finding #24 (2026-04-20): when the DB contains
+    multiple longitudinal runs (re-run with different config, two shift
+    schedules, etc.), pre-fix merged all of them into one interleaved
+    timeline. Now the analyzer picks a single run_id — the caller's
+    ``--run-id`` value if provided, otherwise the most-recent
+    longitudinal run, with a warning on the stderr if multiple exist.
+
+    Returns ``None`` if the DB has no longitudinal runs at all.
+    """
+    # Enumerate available longitudinal runs (newest first).
+    available = conn.execute(
+        """
+        SELECT run_id, MAX(timestamp) AS last_ts
+        FROM evaluation_runs
+        WHERE condition = 'longitudinal'
+        GROUP BY run_id
+        ORDER BY last_ts DESC
+        """
+    ).fetchall()
+
+    if not available:
+        return None
+
+    run_ids_in_db = [r[0] for r in available]
+
+    if run_id is not None:
+        if run_id not in run_ids_in_db:
+            raise ValueError(
+                f"run_id {run_id!r} not found in evaluation_runs. "
+                f"Available longitudinal run_ids: {run_ids_in_db}"
+            )
+        return run_id
+
+    # Auto-select the most recent; warn loudly if multiple exist.
+    latest = run_ids_in_db[0]
+    if len(run_ids_in_db) > 1:
+        import sys as _sys
+        print(
+            f"WARNING: multiple longitudinal runs present ({len(run_ids_in_db)}); "
+            f"auto-selecting latest {latest!r}. Pass --run-id to pick a "
+            f"specific run. Available: {run_ids_in_db}",
+            file=_sys.stderr,
+        )
+    return latest
+
+
+def _load_cycle_data(
+    conn: duckdb.DuckDBPyConnection,
+    run_id: str | None = None,
+) -> list[dict]:
     """Read evaluation_runs + invocation_events + cycle_utility_scores +
     cycle_events; group into per-cycle records.
 
@@ -164,36 +219,43 @@ def _load_cycle_data(conn: duckdb.DuckDBPyConnection) -> list[dict]:
 
     Returns an empty list if either ``evaluation_runs`` is empty or has
     no longitudinal rows.
+
+    Security audit finding #24 (2026-04-20): ``run_id`` is now required
+    to disambiguate across multiple longitudinal runs in the same DB.
+    ``None`` auto-selects the most recent run with a stderr warning if
+    multiple exist. Pre-fix the analyzer merged all run_ids into one
+    timeline, corrupting KL / shift-detection / adaptation verdicts
+    whenever the DB had more than one longitudinal run.
     """
-    # Is this a longitudinal DB?
-    has_longitudinal = conn.execute(
-        "SELECT COUNT(*) FROM evaluation_runs WHERE condition = 'longitudinal'"
-    ).fetchone()[0]
-    if has_longitudinal == 0:
+    # Resolve the run_id (may warn / raise on ambiguity).
+    selected_run_id = _resolve_longitudinal_run_id(conn, run_id)
+    if selected_run_id is None:
         return []
 
-    # Ordered task sequence from evaluation_runs
+    # Ordered task sequence from evaluation_runs (scoped to run_id).
     task_rows = conn.execute(
         """
         SELECT run_id, task_id, timestamp
         FROM evaluation_runs
-        WHERE condition = 'longitudinal'
+        WHERE condition = 'longitudinal' AND run_id = ?
         ORDER BY timestamp
-        """
+        """,
+        [selected_run_id],
     ).fetchall()
 
     if not task_rows:
         return []
 
-    # Invocation events with timestamps, grouped by task_id context
+    # Invocation events with timestamps, grouped by task_id context.
     try:
         inv_rows = conn.execute(
             """
             SELECT task_id, capability_id, occurred_at
             FROM invocation_events
-            WHERE condition = 'longitudinal'
+            WHERE condition = 'longitudinal' AND run_id = ?
             ORDER BY occurred_at
-            """
+            """,
+            [selected_run_id],
         ).fetchall()
     except Exception:  # noqa: BLE001
         # invocation_events table may not exist on old DBs (pre-Step-18.5).
@@ -253,9 +315,10 @@ def _load_cycle_data(conn: duckdb.DuckDBPyConnection) -> list[dict]:
             """
             SELECT task_id, capability_id, utility_score, occurred_at
             FROM cycle_utility_scores
-            WHERE condition = 'longitudinal'
+            WHERE condition = 'longitudinal' AND run_id = ?
             ORDER BY occurred_at
-            """
+            """,
+            [selected_run_id],
         ).fetchall()
         c_idx = 0
         for _util_task_id, cap_id, score, util_ts in util_rows:
@@ -276,9 +339,10 @@ def _load_cycle_data(conn: duckdb.DuckDBPyConnection) -> list[dict]:
             """
             SELECT task_id, capability_id, event_type, details, occurred_at
             FROM cycle_events
-            WHERE condition = 'longitudinal'
+            WHERE condition = 'longitudinal' AND run_id = ?
             ORDER BY occurred_at
-            """
+            """,
+            [selected_run_id],
         ).fetchall()
         c_idx = 0
         for _evt_task_id, cap_id, event_type, details, evt_ts in event_rows:
@@ -485,6 +549,10 @@ def main() -> int:
                         help="Emit convergence PNG via matplotlib (if installed)")
     parser.add_argument("--tail", type=int, default=0,
                         help="Print only the last N cycles in the per-cycle table (0 = all, default)")
+    parser.add_argument("--run-id", default=None,
+                        help="Specific longitudinal run_id to analyze. Default: latest "
+                             "longitudinal run, with a WARNING on stderr if multiple are "
+                             "present. Security audit finding #24 (2026-04-20).")
     args = parser.parse_args()
 
     db_path = Path(args.db)
@@ -495,7 +563,12 @@ def main() -> int:
 
     conn = duckdb.connect(str(db_path), read_only=True)
 
-    cycles = _load_cycle_data(conn)
+    try:
+        cycles = _load_cycle_data(conn, run_id=args.run_id)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        conn.close()
+        return 1
     if not cycles:
         print(f"ERROR: no longitudinal rows in {db_path}")
         print(f"       (evaluation_runs has no rows with condition='longitudinal')")

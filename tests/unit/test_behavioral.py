@@ -152,6 +152,53 @@ class TestExtractParameterSchema:
         schema = extract_parameter_schema(code)
         assert schema["x"]["type"] == "unknown"
 
+    def test_respects_mcp_tool_decorator_over_source_order(self):
+        """Security audit finding #20 (2026-04-20) regression guard.
+
+        Pre-fix used ``ast.walk`` and returned the schema of the first
+        public async function — for a module with a helper defined
+        before the ``@mcp.tool`` entrypoint, returned the helper's
+        schema. Post-fix delegates to ``_extract_function_name`` so the
+        decorator wins regardless of source order. This is the same
+        fix class as Issue #8 for the function-name resolver.
+        """
+        source = '''
+async def helper_format_rows(a: int) -> str:
+    return f"{a}"
+
+@mcp.tool
+async def real_tool(df: dict, window: int = 7) -> dict:
+    return {}
+'''
+        schema = extract_parameter_schema(source)
+        # Must be the decorated tool's schema, not the helper's.
+        assert set(schema.keys()) == {"df", "window"}, (
+            f"Pre-fix returned the helper's {{'a': ...}} schema. "
+            f"Got: {schema}"
+        )
+        assert schema["df"]["type"] == "dict"
+        assert schema["window"]["type"] == "int"
+
+    def test_explicit_func_name_overrides_resolution(self):
+        """Callers that already resolved the function name can pass it
+        explicitly — belt-and-braces against any resolver drift."""
+        source = '''
+async def first_fn(a: int) -> str:
+    return str(a)
+
+async def second_fn(b: float) -> str:
+    return str(b)
+'''
+        # No decorator → _extract_function_name returns None (ambiguous).
+        # Explicit func_name lets the caller pick.
+        assert extract_parameter_schema(source, func_name="first_fn") == {"a": {"type": "int"}}
+        assert extract_parameter_schema(source, func_name="second_fn") == {"b": {"type": "float"}}
+
+    def test_nonexistent_func_name_returns_empty(self):
+        """Explicit func_name pointing to a missing function → empty schema."""
+        source = "async def real_fn(x: int) -> int: return x\n"
+        assert extract_parameter_schema(source, func_name="nonexistent") == {}
+
 
 # ---------------------------------------------------------------------------
 # _extract_function_name
@@ -1038,3 +1085,54 @@ class TestNetworkDisconnectDifferential:
             )
         ]
         assert diffs == []
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_differential_fires_critical_on_real_sandbox_payload_shape(
+        self, mock_sandbox,
+    ):
+        """Security audit finding #19 (2026-04-20) regression guard.
+
+        The sandbox payload at ``behavioral.py:246`` always emits
+        ``"error": None`` on success. Pre-fix, ``_parse`` used
+        ``if "error" in parsed:`` (key presence) which returned
+        ``(False, None)`` on every successful run, making the CRITICAL
+        ``network_silent_fallback`` branch dead code.
+
+        This test uses the EXACT shape the real sandbox emits — with
+        ``"error": None`` explicitly present — and asserts CRITICAL
+        fires when both online + offline produce plausible output.
+        Pre-fix would silently fall through to the "both failed"
+        MEDIUM branch instead.
+        """
+        # Real sandbox payload contract: both on/off succeed, both emit
+        # "error": None → silent fallback (hardcoded data).
+        real_payload = {
+            "stdout": json.dumps({
+                "result": "42",
+                "elapsed": 0.01,
+                "error": None,
+            }) + "\n",
+            "stderr": "",
+            "exit_code": 0,
+            "success": True,
+        }
+        mock_sandbox.return_value = real_payload
+        artifact = GeneratedArtifact(
+            capability_name="hardcoded-api-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            needs_network=True,
+        )
+
+        findings = run(artifact, allow_network=True)
+
+        silent_fallback = [
+            f for f in findings if f.category == "network_silent_fallback"
+        ]
+        assert len(silent_fallback) == 1, (
+            f"CRITICAL network_silent_fallback must fire on real sandbox "
+            f"payload shape (with 'error': None). Got findings: "
+            f"{[f.category for f in findings]}. Pre-fix parser used key "
+            f"presence, making this branch dead code."
+        )
+        assert silent_fallback[0].severity == Severity.CRITICAL

@@ -211,14 +211,32 @@ def _parse_first_bracketed_list(reason: str) -> list[str]:
 
 
 def load_failures(
-    conn: duckdb.DuckDBPyConnection, *, condition: str | None = None
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    condition: str | None = None,
+    run_ids: list[str] | None = None,
+    since: str | None = None,
 ) -> list[FailureRow]:
-    """Fetch every non-pilot failure row."""
+    """Fetch every non-pilot failure row.
+
+    Security audit finding #40 (2026-04-20): pre-fix pooled failures
+    across every run_id in the DB; Row 14 compression-loss numbers
+    mixed campaigns. Now accepts ``run_ids`` / ``since`` to scope to
+    a single run-set.
+    """
     clauses = ["NOT is_pilot", "(NOT gate_passed OR NOT output_in_range)"]
     params: list[object] = []
     if condition is not None:
         clauses.append("condition = ?")
         params.append(condition)
+    if run_ids:
+        clauses.append(
+            "run_id IN ({})".format(", ".join("?" * len(run_ids)))
+        )
+        params.extend(run_ids)
+    if since is not None:
+        clauses.append("timestamp >= ?")
+        params.append(since)
     where = " AND ".join(clauses)
     rows = conn.execute(
         f"""
@@ -441,6 +459,16 @@ def main() -> int:
         "--output-dir", default=str(ROOT / "data" / "analysis"),
         help="CSV output directory.",
     )
+    # Security audit finding #40 (2026-04-20): run-id scoping.
+    parser.add_argument(
+        "--run-ids", nargs="+", default=None,
+        help="Specific run_ids to include (default: all rows in the DB — "
+             "unsafe on multi-run DBs; pass explicitly for Chapter 6).",
+    )
+    parser.add_argument(
+        "--since", default=None,
+        help="Include only rows with timestamp >= SINCE.",
+    )
     args = parser.parse_args()
 
     db_path = Path(args.db)
@@ -464,7 +492,12 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        rows = load_failures(conn, condition=args.condition)
+        rows = load_failures(
+            conn,
+            condition=args.condition,
+            run_ids=args.run_ids,
+            since=args.since,
+        )
     finally:
         conn.close()
 

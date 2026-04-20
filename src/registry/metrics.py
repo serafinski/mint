@@ -352,26 +352,42 @@ class MetricsStore:
             for row in rows
         ]
 
-    def fetch_invocations_for_task(self, task_id: str) -> list[dict]:
-        """Return all invocations recorded against a given task_id.
+    def fetch_invocations_for_task(
+        self,
+        task_id: str,
+        *,
+        since: datetime | None = None,
+    ) -> list[dict]:
+        """Return invocations recorded against a given task_id.
 
-        Used by the evaluation harness to flush per-task invocations to
-        the persistent EvaluationStore's ``invocation_events`` table
-        after each task's chain execution completes (Step 18.5 Gini
-        analysis pipeline). Each returned dict matches the shape
-        ``EvaluationStore.record_invocation_events`` expects.
+        Security audit finding #23 (2026-04-20): when ``since`` is
+        provided, only rows with ``invoked_at >= since`` are returned.
+        Pre-fix, every call returned all rows for the task_id — on the
+        second cycle of a repeating task in a longitudinal run, the
+        fetch returned cycle-1 invocations alongside cycle-2 invocations,
+        and ``record_invocation_events`` duplicated cycle 1 into
+        ``invocation_events``. Step 18.5 Gini + Step 18.7 KL both read
+        the duplicated distribution and reported inflated counts.
 
-        Returns an empty list if no invocations exist for the task.
+        Callers (the per-task flush helper) capture a timestamp BEFORE
+        the task's pipeline invocation and pass it as ``since`` so only
+        this cycle's invocations are returned.
+
+        Each returned dict matches the shape
+        ``EvaluationStore.record_invocation_events`` expects. Returns an
+        empty list if no matching invocations exist.
         """
-        rows = self._conn.execute(
-            """
-            SELECT capability_id, success, token_cost, latency_ms
-            FROM invocations
-            WHERE task_id = ?
-            ORDER BY invoked_at
-            """,
-            [task_id],
-        ).fetchall()
+        query = (
+            "SELECT capability_id, success, token_cost, latency_ms "
+            "FROM invocations WHERE task_id = ?"
+        )
+        params: list = [task_id]
+        if since is not None:
+            query += " AND invoked_at >= ?"
+            params.append(since)
+        query += " ORDER BY invoked_at"
+
+        rows = self._conn.execute(query, params).fetchall()
         return [
             {
                 "capability_id": row[0],

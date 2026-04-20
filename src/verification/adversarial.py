@@ -436,18 +436,27 @@ def _timeout_report(capability_name: str) -> VerificationReport:
 
 
 def _error_report(capability_name: str, error: str) -> VerificationReport:
-    """Return a partial report when the adversarial agent hits an error."""
+    """Return a FAIL report when the adversarial agent hits an error.
+
+    Security audit finding #25 (2026-04-20): flipped from fail-open to
+    fail-closed. §12 finding #14 committed Pillar 2 verification to
+    fail-closed semantics — infrastructure errors during Tier 3 (OpenAI
+    rate limit, sandbox image missing, agent-creation crash) must not
+    manufacture PASS verdicts. The node-level retry loop regenerates
+    the artifact and re-runs Tier 3 on fresh code (matches Step 14.11
+    timeout semantics).
+    """
     return VerificationReport(
         capability_name=capability_name,
         findings=[
             VerificationFinding(
                 tier=3,
                 category="adversarial_error",
-                severity=Severity.MEDIUM,
+                severity=Severity.CRITICAL,
                 message=f"Adversarial probing error: {error}",
             )
         ],
-        overall_passed=True,  # fail open on error
+        overall_passed=False,
         tier_reached=3,
     )
 

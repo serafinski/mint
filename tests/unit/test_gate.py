@@ -750,7 +750,15 @@ def test_agent_no_fence_prose_passes(mock_behavioral, mock_adversarial):
 
 @patch("src.verification.gate._static_scan")
 def test_verify_never_raises_on_unexpected_exception(mock_static_scan):
-    """verify() must catch all exceptions and return a report, never raise."""
+    """verify() must catch all exceptions and return a report, never raise.
+
+    Security audit finding #25 (2026-04-20): flipped from fail-open to
+    fail-closed. §12 finding #14 committed Pillar 2 to fail-closed and
+    the gate's exception handler now emits a CRITICAL gate_error
+    finding with ``overall_passed=False``. The retry loop regenerates
+    the artifact on fresh code — infrastructure errors no longer
+    manufacture PASSES.
+    """
     mock_static_scan.side_effect = OSError("Simulated filesystem failure in _run_skill_precheck")
     artifact = _make_artifact(
         cap_type=CapabilityType.SKILL,
@@ -758,16 +766,17 @@ def test_verify_never_raises_on_unexpected_exception(mock_static_scan):
         skill_content=_VALID_SKILL_MD,
     )
 
-    # Must not raise even when internal scan raises
+    # Must not raise even when internal scan raises (never-raises contract
+    # preserved).
     report = verify(artifact)
 
     assert isinstance(report, VerificationReport)
     assert report.capability_name == "test-cap"
-    # Fails open (MEDIUM, not CRITICAL) so the pipeline can continue
+    # Fails closed (CRITICAL) — the node's retry loop will regenerate.
     assert any(f.category == "gate_error" for f in report.findings)
     gate_finding = next(f for f in report.findings if f.category == "gate_error")
-    assert gate_finding.severity == Severity.MEDIUM
-    assert report.overall_passed is True  # fail open
+    assert gate_finding.severity == Severity.CRITICAL
+    assert report.overall_passed is False  # fail closed per §12 #14 + #25
 
 
 # ---------------------------------------------------------------------------

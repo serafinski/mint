@@ -497,3 +497,108 @@ def test_synthesis_task_ids_include_t19_and_t20():
     assert "T01" not in SYNTHESIS_TASK_IDS
     for t in RETRIEVAL_TASKS:
         assert t not in SYNTHESIS_TASK_IDS
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #32 — success predicate excludes shape mismatch
+# ---------------------------------------------------------------------------
+
+
+def test_success_predicate_excludes_shape_mismatched_rows():
+    """Pre-fix, a row with gate_passed=True + output_in_range=True +
+    output_shape_mismatch=True counted as a success. Post-fix, the SUM
+    expression also requires NOT output_shape_mismatch. Regression
+    guard for finding #32."""
+    from scripts.analyze_results import query_condition_summary
+
+    store, conn = _open_in_memory_store()
+
+    # Row A — genuine success (gate + range + no shape mismatch).
+    rec_a = _record(
+        condition="full",
+        gate_passed=True,
+        output_in_range=True,
+        latency_ms=1000,
+        task_id="T04",
+    )
+    # Row B — shape mismatch despite gate + range both True.
+    rec_b = _record(
+        condition="full",
+        gate_passed=True,
+        output_in_range=True,
+        latency_ms=2000,
+        task_id="T07",
+    )
+    # Manually set the shape-mismatch flag on row B by writing the row
+    # then patching the column. EvaluationStore doesn't accept the field
+    # in the record shape, so use a direct update.
+    store.record_run(rec_a)
+    store.record_run(rec_b)
+    conn.execute(
+        "UPDATE evaluation_runs SET output_shape_mismatch = TRUE WHERE task_id = 'T07'"
+    )
+
+    summary = query_condition_summary(conn)
+    full_row = [r for r in summary if r["condition"] == "full"][0]
+    assert full_row["n"] == 2
+    assert full_row["successes"] == 1, (
+        f"Pre-fix, both rows counted as success (n=2, successes=2). "
+        f"Post-fix, row B (shape mismatch) excluded. Got successes={full_row['successes']}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #38 — run-id scoping (2026-04-20)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_scope_single_run_returns_empty_filter():
+    """DB with <=4 distinct run_ids → no scoping needed, empty filter."""
+    import scripts.analyze_results as ar
+
+    store, conn = _open_in_memory_store()
+    store.record_run(_record(
+        condition="full", gate_passed=True, output_in_range=True, latency_ms=1,
+    ))
+
+    assert ar._resolve_scope(conn, run_ids=None, since=None) == ""
+
+
+def test_resolve_scope_explicit_run_ids_filters_sql(capsys):
+    """Explicit --run-ids injects IN clause; queries filtered to that set."""
+    import scripts.analyze_results as ar
+
+    store, conn = _open_in_memory_store()
+    rec_a = _record(condition="full", gate_passed=True, output_in_range=True,
+                    latency_ms=1, task_id="T04")
+    rec_b = _record(condition="full", gate_passed=True, output_in_range=True,
+                    latency_ms=2, task_id="T04")
+    store.record_run(rec_a)
+    store.record_run(rec_b)
+    # Compare the produced SQL fragment.
+    fragment = ar._resolve_scope(conn, run_ids=[rec_a.run_id], since=None)
+    assert " AND run_id IN ('" in fragment
+    assert rec_a.run_id in fragment
+    assert rec_b.run_id not in fragment
+
+
+def test_resolve_scope_auto_selects_latest_when_many_runs_with_warning(capsys):
+    """5+ distinct run_ids → stderr WARNING + auto-select the 4 most recent."""
+    import scripts.analyze_results as ar
+
+    store, conn = _open_in_memory_store()
+    # 6 runs with different condition values to make them distinct run_ids.
+    for i in range(6):
+        rec = _record(
+            condition="full", gate_passed=True, output_in_range=True,
+            latency_ms=(i + 1) * 10,
+        )
+        store.record_run(rec)
+
+    fragment = ar._resolve_scope(conn, run_ids=None, since=None)
+    captured = capsys.readouterr()
+    # WARNING emitted to stderr.
+    assert "WARNING" in captured.err
+    assert "auto-selecting the 4 most recent" in captured.err
+    # 4 run_ids picked (out of 6).
+    assert fragment.count("'") == 8  # 4 run_ids × 2 quotes each

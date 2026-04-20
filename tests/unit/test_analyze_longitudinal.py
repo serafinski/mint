@@ -414,22 +414,31 @@ class TestPerCycleIsolationAcrossTaskRepetitions:
         """Two cycles with the same task_id carry distinct utility values."""
         from datetime import UTC, datetime, timedelta
 
+        # One longitudinal run = one run_id (security audit finding #24).
+        # Repeating task_ids within that run must still isolate per-cycle
+        # (ext5 #18 fix) — this test verifies per-cycle isolation WITHIN
+        # a single run_id.
+        run_id = "longitudinal-run"
         base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
         with EvaluationStore() as store:
             # Cycle 1 — T01 @ t=1 min; utility cap-x = 0.1
             ts_1 = base + timedelta(minutes=1)
-            store.record_run(_base_record(task_id="T01", timestamp=ts_1))
+            store.record_run(_base_record(
+                task_id="T01", timestamp=ts_1, run_id=run_id,
+            ))
             store.record_cycle_utility_scores(
-                run_id="run-1", condition="longitudinal", task_id="T01",
+                run_id=run_id, condition="longitudinal", task_id="T01",
                 scores={"cap-x": 0.1},
                 occurred_at=ts_1 + timedelta(seconds=10),
             )
 
             # Cycle 2 — T01 AGAIN @ t=2 min; utility cap-x = 0.9
             ts_2 = base + timedelta(minutes=2)
-            store.record_run(_base_record(task_id="T01", timestamp=ts_2))
+            store.record_run(_base_record(
+                task_id="T01", timestamp=ts_2, run_id=run_id,
+            ))
             store.record_cycle_utility_scores(
-                run_id="run-2", condition="longitudinal", task_id="T01",
+                run_id=run_id, condition="longitudinal", task_id="T01",
                 scores={"cap-x": 0.9},
                 occurred_at=ts_2 + timedelta(seconds=10),
             )
@@ -449,20 +458,26 @@ class TestPerCycleIsolationAcrossTaskRepetitions:
         """Events from different cycles of the same task_id must not merge."""
         from datetime import UTC, datetime, timedelta
 
+        # One longitudinal run = one run_id (security audit finding #24).
+        run_id = "longitudinal-run"
         base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
         with EvaluationStore() as store:
             ts_1 = base + timedelta(minutes=1)
-            store.record_run(_base_record(task_id="T01", timestamp=ts_1))
+            store.record_run(_base_record(
+                task_id="T01", timestamp=ts_1, run_id=run_id,
+            ))
             store.record_cycle_events(
-                run_id="run-1", condition="longitudinal", task_id="T01",
+                run_id=run_id, condition="longitudinal", task_id="T01",
                 events=[{"capability_id": "cap-a", "event_type": "split", "details": "cycle 1"}],
                 occurred_at=ts_1 + timedelta(seconds=10),
             )
 
             ts_2 = base + timedelta(minutes=2)
-            store.record_run(_base_record(task_id="T01", timestamp=ts_2))
+            store.record_run(_base_record(
+                task_id="T01", timestamp=ts_2, run_id=run_id,
+            ))
             store.record_cycle_events(
-                run_id="run-2", condition="longitudinal", task_id="T01",
+                run_id=run_id, condition="longitudinal", task_id="T01",
                 events=[{"capability_id": "cap-b", "event_type": "merged", "details": "cycle 2"}],
                 occurred_at=ts_2 + timedelta(seconds=10),
             )
@@ -479,3 +494,73 @@ class TestPerCycleIsolationAcrossTaskRepetitions:
             assert len(cycles[1]["events"]) == 1
             assert cycles[1]["events"][0]["event_type"] == "merged"
             assert cycles[1]["events"][0]["details"] == "cycle 2"
+
+
+class TestRunIdIsolation:
+    """Security audit finding #24 (2026-04-20) regression guard.
+
+    Pre-fix, `_load_cycle_data` queried `WHERE condition = 'longitudinal'`
+    without a run_id filter — when the DB contained multiple runs, the
+    analyzer merged them into one interleaved timeline, corrupting
+    KL convergence / shift detection / adaptation verdicts.
+    """
+
+    def test_two_runs_each_analyzed_independently(self):
+        """Two runs in one DB → analyzer scoped to a single run_id
+        returns only that run's cycles."""
+        from datetime import UTC, datetime, timedelta
+
+        base = datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC)
+        with EvaluationStore() as store:
+            # Run r1 — 2 cycles at t=1min, t=2min
+            for i in range(1, 3):
+                ts = base + timedelta(minutes=i)
+                store.record_run(_base_record(
+                    task_id=f"T{i:02d}", timestamp=ts, run_id="r1",
+                    condition="longitudinal",
+                ))
+
+            # Run r2 — 2 cycles at t=10min, t=11min (later)
+            for i in range(1, 3):
+                ts = base + timedelta(minutes=10 + i)
+                store.record_run(_base_record(
+                    task_id=f"T{i:02d}", timestamp=ts, run_id="r2",
+                    condition="longitudinal",
+                ))
+
+            # Passing run_id="r1" returns only r1's 2 cycles.
+            cycles_r1 = _load_cycle_data(store._conn, run_id="r1")
+            assert len(cycles_r1) == 2
+            assert all(c["run_id"] == "r1" for c in cycles_r1)
+
+            # Passing run_id="r2" returns only r2's 2 cycles.
+            cycles_r2 = _load_cycle_data(store._conn, run_id="r2")
+            assert len(cycles_r2) == 2
+            assert all(c["run_id"] == "r2" for c in cycles_r2)
+
+            # Default (None) auto-selects the latest — r2 has the newer
+            # timestamps so it wins.
+            cycles_default = _load_cycle_data(store._conn)
+            assert len(cycles_default) == 2
+            assert all(c["run_id"] == "r2" for c in cycles_default)
+
+    def test_nonexistent_run_id_raises(self):
+        """Explicit run_id that doesn't exist → ValueError (loud fail,
+        not silent empty result)."""
+        import pytest as _pytest
+        from datetime import UTC, datetime
+
+        with EvaluationStore() as store:
+            store.record_run(_base_record(
+                task_id="T01", timestamp=datetime.now(UTC), run_id="r1",
+                condition="longitudinal",
+            ))
+
+            with _pytest.raises(ValueError, match="not found"):
+                _load_cycle_data(store._conn, run_id="nonexistent")
+
+    def test_empty_db_returns_empty(self):
+        """No longitudinal runs → empty list, no error."""
+        with EvaluationStore() as store:
+            assert _load_cycle_data(store._conn) == []
+            assert _load_cycle_data(store._conn, run_id=None) == []

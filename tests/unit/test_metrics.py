@@ -621,6 +621,44 @@ def test_fetch_preserves_invocation_order(store: MetricsStore):
     assert [r["capability_id"] for r in rows] == ["first", "second", "third"]
 
 
+def test_fetch_with_since_filter_excludes_prior_rows(store: MetricsStore):
+    """Security audit finding #23 (2026-04-20) regression guard.
+
+    Pre-fix, a repeating task_id in a longitudinal sequence caused each
+    flush to re-read all prior cycles' invocations, duplicating them in
+    ``invocation_events``. Post-fix, the ``since`` filter uses the
+    cutoff captured BEFORE the cycle's pipeline invocation — only this
+    cycle's rows are returned.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    # Cycle 1: record 2 invocations at t=1min
+    t_cycle1 = datetime.now(UTC) - timedelta(minutes=10)
+    for cap in ("cap-a", "cap-b"):
+        r = _make_record(capability_id=cap, task_id="T01")
+        object.__setattr__(r, "invoked_at", t_cycle1)
+        store.record_invocation(r)
+
+    # Cycle 2: record 1 more invocation at t=5min
+    t_cycle2_start = datetime.now(UTC) - timedelta(minutes=5)
+    r = _make_record(capability_id="cap-c", task_id="T01")
+    object.__setattr__(r, "invoked_at", t_cycle2_start + timedelta(seconds=30))
+    store.record_invocation(r)
+
+    # Without since: returns all 3 (pre-fix behavior on repeat).
+    all_rows = store.fetch_invocations_for_task("T01")
+    assert len(all_rows) == 3
+
+    # With since=t_cycle2_start: returns only cycle 2's row.
+    cycle2_rows = store.fetch_invocations_for_task("T01", since=t_cycle2_start)
+    assert len(cycle2_rows) == 1, (
+        f"Pre-fix, flush would re-read all 3 rows on cycle 2 and "
+        f"duplicate cycle 1 into invocation_events. Got {len(cycle2_rows)} "
+        f"rows; expected 1 (cycle-2 only)."
+    )
+    assert cycle2_rows[0]["capability_id"] == "cap-c"
+
+
 # ---------------------------------------------------------------------------
 # Shared invocation-recording helpers (2026-04-19 fix for
 # docs/invocation_recording_gap_2026_04_19.md).

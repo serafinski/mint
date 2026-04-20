@@ -357,7 +357,8 @@ class TestT12Validator:
 
 class TestT13Validator:
     def test_valid_investigation(self):
-        anomalies = [{"timestamp": "2024-06-01", "metric": "cpu", "value": 99.0}] * 5
+        # ext6 #35: metric names must be real fixture columns.
+        anomalies = [{"timestamp": "2024-06-01", "metric": "cpu_usage", "value": 99.0}] * 5
         assert T13.validator({
             "anomaly_count": 5,
             "anomalies": anomalies,
@@ -366,7 +367,8 @@ class TestT13Validator:
 
     def test_tolerant_anomaly_count(self):
         """Agent finding 3-7 anomalies should pass (threshold is >= 3)."""
-        anomalies = [{"timestamp": "t", "metric": "m", "value": 1.0}] * 3
+        # ext6 #35: each entry must reference a real fixture metric name.
+        anomalies = [{"timestamp": "t", "metric": "memory_mb", "value": 1.0}] * 3
         assert T13.validator({
             "anomaly_count": 3,
             "anomalies": anomalies,
@@ -706,3 +708,256 @@ class TestExpectedTypeInvariants:
     def test_total_task_count_is_20(self):
         """Testbed is fixed at T01–T20 per CLAUDE.md + proposal §Testbed."""
         assert len(ALL_TASKS) == 20
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #33 — T07 + T11 file validators (2026-04-20)
+# ---------------------------------------------------------------------------
+
+
+class TestT07FileValidatorFailsClosed:
+    """Pre-fix, ``_file_validate_t07`` fell back to dict-only validation
+    when ``output.csv`` was missing. Post-fix fails closed — the file
+    is contract-required."""
+
+    def test_missing_csv_fails_closed(self):
+        from tests.evaluation.tasks import _file_validate_t07, _t07_ev
+
+        output = {"row_count": _t07_ev["expected_join_count"]}
+        assert _file_validate_t07(output, output_files={}) is False
+
+    def test_undecodable_csv_fails_closed(self):
+        from tests.evaluation.tasks import _file_validate_t07, _t07_ev
+
+        output = {"row_count": _t07_ev["expected_join_count"]}
+        assert _file_validate_t07(
+            output, output_files={"output.csv": b"\xff\xfe\x00\x00"},
+        ) is False
+
+    def test_wrong_row_count_fails(self):
+        from tests.evaluation.tasks import _file_validate_t07
+
+        output = {"row_count": 9999}
+        csv = b"a,b,c\n1,2,3\n"
+        assert _file_validate_t07(
+            output, output_files={"output.csv": csv},
+        ) is False
+
+
+class TestT11FileValidatorFailsClosed:
+    """Pre-fix had two fail-open branches: missing-file returned True,
+    catch-all Exception returned True (masking BadZipFile /
+    InvalidFileException). Post-fix fails closed on both, with graceful
+    degradation only for the ImportError (openpyxl-missing) case."""
+
+    def _t11_good_output(self):
+        from tests.evaluation.tasks import _t11_ev
+        return {
+            "summary_row_count": _t11_ev["summary_row_count"],
+            "region_revenues": dict(_t11_ev["region_revenues"]),
+            "regions_meeting_target": _t11_ev["regions_meeting_target"],
+        }
+
+    def test_missing_xlsx_fails_closed(self):
+        from tests.evaluation.tasks import _file_validate_t11
+
+        assert _file_validate_t11(
+            self._t11_good_output(), output_files={},
+        ) is False
+
+    def test_corrupt_xlsx_fails_closed(self):
+        from tests.evaluation.tasks import _file_validate_t11
+
+        bad = b"this is not an xlsx file"
+        assert _file_validate_t11(
+            self._t11_good_output(), output_files={"output.xlsx": bad},
+        ) is False
+
+
+class TestExt6Finding35TightenedValidators:
+    """ext6 #35: validators tightened on the 4 highest-risk tasks reject
+    hallucinated/minimal outputs that passed the pre-fix metadata predicates.
+    """
+
+    # -- T05 -----------------------------------------------------------------
+
+    @pytest.mark.parametrize("output", [
+        {"output_row_count": 1, "null_count": 0},
+        {"output_row_count": 5, "null_count": 0},
+    ])
+    def test_t05_rejects_hallucinated_minimal_output(self, output):
+        from tests.evaluation.tasks import _validate_t05
+
+        assert _validate_t05(output) is False
+
+    def test_t05_rejects_no_reduction(self):
+        from tests.evaluation.tasks import _t05_ev, _validate_t05
+
+        # Equal to input_row_count — implies no dedup/null drop happened.
+        assert _validate_t05({
+            "output_row_count": _t05_ev["input_row_count"],
+            "null_count": 0,
+        }) is False
+
+    def test_t05_accepts_plausible_output(self):
+        from tests.evaluation.tasks import _t05_ev, _validate_t05
+
+        assert _validate_t05({
+            "output_row_count": _t05_ev["expected_max_output_row_count"],
+            "null_count": 0,
+        }) is True
+
+    # -- T09 -----------------------------------------------------------------
+
+    def test_t09_rejects_fabricated_anomaly_strings(self):
+        from tests.evaluation.tasks import _t09_ev, _validate_t09
+
+        output = {
+            **{k: "fake" for k in _t09_ev["required_keys"]},
+            "anomalies": ["fake"] * _t09_ev["expected_anomaly_count"],
+        }
+        assert _validate_t09(output) is False
+
+    def test_t09_rejects_duplicate_anomalies(self):
+        from tests.evaluation.tasks import _t09_ev, _validate_t09
+
+        # Non-digit strings are rejected; even if they had digits, duplicates fail.
+        output = {
+            **{k: "x" for k in _t09_ev["required_keys"]},
+            "anomalies": ["rev=100"] * _t09_ev["expected_anomaly_count"],
+        }
+        assert _validate_t09(output) is False
+
+    def test_t09_accepts_structured_anomalies(self):
+        from tests.evaluation.tasks import _t09_ev, _validate_t09
+
+        anomalies = [
+            {"region": "R1", "product": "P1", "revenue": 1000.0 + i}
+            for i in range(_t09_ev["expected_anomaly_count"])
+        ]
+        output = {
+            **{k: "x" for k in _t09_ev["required_keys"]},
+            "anomalies": anomalies,
+        }
+        assert _validate_t09(output) is True
+
+    # -- T10 -----------------------------------------------------------------
+
+    def test_t10_rejects_zero_forecast(self):
+        from tests.evaluation.tasks import _t10_ev, _validate_t10
+
+        assert _validate_t10({
+            "n_weeks": _t10_ev["n_weeks"],
+            "trend_direction": "upward",
+            "forecast": [0, 0, 0, 0],
+        }) is False
+
+    def test_t10_rejects_constant_forecast(self):
+        from tests.evaluation.tasks import _t10_ev, _validate_t10
+
+        assert _validate_t10({
+            "n_weeks": _t10_ev["n_weeks"],
+            "trend_direction": "upward",
+            "forecast": [500, 500, 500, 500],
+        }) is False
+
+    def test_t10_rejects_wrong_forecast_length(self):
+        from tests.evaluation.tasks import _t10_ev, _validate_t10
+
+        # n_forecast_weeks is 4 — a 3-element forecast is rejected.
+        assert _validate_t10({
+            "n_weeks": _t10_ev["n_weeks"],
+            "trend_direction": "upward",
+            "forecast": [1800, 1900, 2000],
+        }) is False
+
+    def test_t10_accepts_plausible_forecast(self):
+        from tests.evaluation.tasks import _t10_ev, _validate_t10
+
+        recent = float(_t10_ev["avg_last_4_weeks"])
+        assert _validate_t10({
+            "n_weeks": _t10_ev["n_weeks"],
+            "trend_direction": "upward",
+            "forecast": [recent, recent * 1.05, recent * 1.10, recent * 1.15],
+        }) is True
+
+    # -- T13 -----------------------------------------------------------------
+
+    def test_t13_rejects_fabricated_metric_names(self):
+        from tests.evaluation.tasks import _validate_t13
+
+        output = {
+            "anomaly_count": 5,
+            "anomalies": [{"metric": "banana", "timestamp": "2024-06-01"}] * 5,
+            "metrics_analyzed": 4,
+        }
+        assert _validate_t13(output) is False
+
+    def test_t13_rejects_string_anomaly_entries(self):
+        from tests.evaluation.tasks import _validate_t13
+
+        output = {
+            "anomaly_count": 5,
+            "anomalies": ["anomaly"] * 5,
+            "metrics_analyzed": 4,
+        }
+        assert _validate_t13(output) is False
+
+    def test_t13_rejects_missing_timestamp(self):
+        from tests.evaluation.tasks import _validate_t13
+
+        output = {
+            "anomaly_count": 5,
+            "anomalies": [{"metric": "cpu_usage", "value": 244.0}] * 5,
+            "metrics_analyzed": 4,
+        }
+        assert _validate_t13(output) is False
+
+    def test_t13_accepts_real_metric_names(self):
+        from tests.evaluation.tasks import _validate_t13
+
+        output = {
+            "anomaly_count": 5,
+            "anomalies": [
+                {"metric": "memory_mb", "timestamp": "2024-06-01 00:45:00", "value": 15134.607},
+                {"metric": "memory_mb", "timestamp": "2024-06-01 11:15:00", "value": 18518.638},
+                {"metric": "cpu_usage", "timestamp": "2024-06-01 18:45:00", "value": 244.754},
+                {"metric": "memory_mb", "timestamp": "2024-06-01 22:15:00", "value": 19215.307},
+                {"metric": "error_rate", "timestamp": "2024-06-01 23:30:00", "value": 0.203},
+            ],
+            "metrics_analyzed": 4,
+        }
+        assert _validate_t13(output) is True
+
+
+class TestExt6Finding35PermissiveDisclosure:
+    """ext6 #35: the permissive-validator set and one-time WARN log are
+    audit-trail artifacts backing the Chapter 4.5 disclosure.
+    """
+
+    def test_permissive_set_contents(self):
+        from tests.evaluation.tasks import _PERMISSIVE_VALIDATOR_TASK_IDS
+
+        # The 5 tasks that remain metadata-only after the pragmatic subset fix.
+        assert _PERMISSIVE_VALIDATOR_TASK_IDS == frozenset({
+            "T02", "T08", "T12", "T15", "T16",
+        })
+
+    def test_permissive_warn_emits_once(self, caplog):
+        import logging as _logging
+
+        from tests.evaluation import tasks as _tasks_module
+
+        _tasks_module._PERMISSIVE_WARN_EMITTED = False
+        with caplog.at_level(_logging.WARNING, logger="tests.evaluation.tasks"):
+            _tasks_module.warn_permissive_validators_once()
+            _tasks_module.warn_permissive_validators_once()
+
+        warnings = [
+            r for r in caplog.records
+            if "metadata-only validators" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        for tid in ("T02", "T08", "T12", "T15", "T16"):
+            assert tid in msg

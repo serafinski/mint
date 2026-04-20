@@ -32,37 +32,56 @@ TIMEOUT_THRESHOLD_S = 5.0
 # ---------------------------------------------------------------------------
 
 
-def extract_parameter_schema(source_code: str) -> dict[str, dict]:
-    """Extract {param_name: {"type": type_str}} from the async function signature.
+def _schema_from_async_def(node: ast.AsyncFunctionDef) -> dict[str, dict]:
+    """Return ``{param_name: {"type": type_str}}`` for an async def node."""
+    schema: dict[str, dict] = {}
+    for arg in (*node.args.args, *node.args.kwonlyargs):
+        annotation = arg.annotation
+        if isinstance(annotation, ast.Subscript):
+            # Annotated[X, ...] -> extract the first type argument
+            if isinstance(annotation.slice, ast.Tuple):
+                type_node = annotation.slice.elts[0]
+                schema[arg.arg] = {"type": ast.unparse(type_node)}
+            else:
+                schema[arg.arg] = {"type": ast.unparse(annotation.slice)}
+        elif annotation:
+            schema[arg.arg] = {"type": ast.unparse(annotation)}
+        else:
+            schema[arg.arg] = {"type": "unknown"}
+    return schema
 
-    Skips private functions (names starting with ``_``). Returns the schema
-    for the first public async function found.
+
+def extract_parameter_schema(
+    source_code: str,
+    func_name: str | None = None,
+) -> dict[str, dict]:
+    """Extract {param_name: {"type": type_str}} from the target function signature.
+
+    Security audit finding #20 (2026-04-20): pre-fix used ``ast.walk`` and
+    returned the schema for the FIRST public async function — out of
+    agreement with the decorator-first ``_extract_function_name`` used to
+    resolve the entrypoint for sandbox execution. When an LLM generator
+    emits ``async def helper(a: int)`` before ``@mcp.tool async def
+    tool(df, window)``, the sandbox called ``tool(**kwargs)`` but the
+    probe kwargs were built from the helper's schema. Tier 2 either
+    crashed on TypeError or probed nothing realistic.
+
+    Post-fix: accepts an optional ``func_name``; when omitted, resolves
+    via the decorator-first ``_extract_function_name`` so both sides
+    agree.
     """
     try:
         tree = ast.parse(source_code)
     except SyntaxError:
         return {}
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.AsyncFunctionDef):
-            continue
-        if node.name.startswith("_"):
-            continue
-        schema: dict[str, dict] = {}
-        for arg in (*node.args.args, *node.args.kwonlyargs):
-            annotation = arg.annotation
-            if isinstance(annotation, ast.Subscript):
-                # Annotated[X, ...] -> extract the first type argument
-                if isinstance(annotation.slice, ast.Tuple):
-                    type_node = annotation.slice.elts[0]
-                    schema[arg.arg] = {"type": ast.unparse(type_node)}
-                else:
-                    schema[arg.arg] = {"type": ast.unparse(annotation.slice)}
-            elif annotation:
-                schema[arg.arg] = {"type": ast.unparse(annotation)}
-            else:
-                schema[arg.arg] = {"type": "unknown"}
-        return schema
+    target_name = func_name or _extract_function_name(source_code)
+    if target_name is None:
+        return {}
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == target_name:
+            return _schema_from_async_def(node)
     return {}
 
 
@@ -253,16 +272,16 @@ def _build_sandbox_code(source_code: str, func_name: str, inputs: dict[str, Any]
 
 
 def _parse_sandbox_output(result: dict) -> dict | None:
-    """Parse the JSON output from a sandbox execution. Returns None on failure."""
-    if not result.get("success"):
-        return None
-    stdout = result.get("stdout", "").strip()
-    if not stdout:
-        return None
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
-        return None
+    """Parse the JSON output from a sandbox execution. Returns None on failure.
+
+    Security audit finding #21 (2026-04-20): delegates to the shared
+    ``parse_sandbox_last_json_line`` helper which tolerates debug-print
+    prefixes before the final JSON line. Pre-fix used full-stdout
+    ``json.loads`` which failed on any non-JSON prefix (import warnings,
+    LLM-generated debug prints) and marked the probe inconclusive.
+    """
+    from src.verification.sandbox_parse import parse_sandbox_last_json_line
+    return parse_sandbox_last_json_line(result)
 
 
 # ---------------------------------------------------------------------------
@@ -775,7 +794,18 @@ def _test_network_disconnect_differential(
     )
 
     def _parse(payload: dict) -> tuple[bool, dict | str]:
-        """Return (produced_plausible_dict, parsed_value)."""
+        """Return (produced_plausible_dict, parsed_value).
+
+        Security audit finding #19 (2026-04-20): pre-fix used
+        ``if "error" in parsed`` (key presence) to detect a failed
+        run. The sandbox contract at line ~246 above always emits
+        ``"error": None`` on success, so the key was always present
+        and the function always returned ``(False, ...)`` — making
+        the CRITICAL ``network_silent_fallback`` branch dead code.
+        Fixed to check the value: ``"error": None`` = success,
+        ``"error": "<string>"`` = failure. Closes the proposal
+        §Pillar 2 F2 detection gap.
+        """
         if not payload.get("success"):
             return False, payload.get("stderr", "")[:300]
         stdout = (payload.get("stdout") or "").strip()
@@ -788,8 +818,9 @@ def _test_network_disconnect_differential(
             return False, stdout[:300]
         if not isinstance(parsed, dict):
             return False, parsed
-        if "error" in parsed:
-            return False, parsed["error"]
+        err = parsed.get("error")
+        if err is not None:
+            return False, err
         return True, parsed.get("result", parsed)
 
     on_ok, on_value = _parse(on_result)

@@ -492,3 +492,54 @@ class TestRunCondition:
         seeds = {r.seed for r in records}
         # With 2 runs the seeds should differ (extremely unlikely to collide)
         assert len(seeds) == 2
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #34 — deterministic seed derivation (2026-04-20)
+# ---------------------------------------------------------------------------
+
+
+class TestConditionSeedIsDeterministic:
+    """Pre-fix used Python's ``hash((condition, base_seed))`` which
+    randomizes across processes unless PYTHONHASHSEED is pinned. Post-
+    fix uses SHA-256 — same value on every process / Python version."""
+
+    def test_derive_condition_seed_stable_across_calls(self):
+        from tests.evaluation.harness import _derive_condition_seed
+
+        s1 = _derive_condition_seed("full", 42)
+        s2 = _derive_condition_seed("full", 42)
+        assert s1 == s2
+
+    def test_derive_condition_seed_differs_by_condition(self):
+        from tests.evaluation.harness import _derive_condition_seed
+
+        assert _derive_condition_seed("full", 42) != _derive_condition_seed(
+            "static", 42,
+        )
+
+    def test_derive_condition_seed_differs_by_base(self):
+        from tests.evaluation.harness import _derive_condition_seed
+
+        assert _derive_condition_seed("full", 42) != _derive_condition_seed(
+            "full", 43,
+        )
+
+    def test_derive_condition_seed_matches_known_value(self):
+        """Pin the expected SHA-256-derived seed for the canonical
+        (full, 42) pair so a future change to the hashing scheme is
+        caught explicitly."""
+        import hashlib
+
+        from tests.evaluation.harness import _derive_condition_seed
+
+        expected = int.from_bytes(
+            hashlib.sha256(b"full|42").digest()[:4], "big",
+        ) % (2**31)
+        assert _derive_condition_seed("full", 42) == expected
+
+    def test_derive_condition_seed_in_expected_range(self):
+        from tests.evaluation.harness import _derive_condition_seed
+
+        s = _derive_condition_seed("full", 42)
+        assert 0 <= s < 2**31

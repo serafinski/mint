@@ -101,6 +101,20 @@ class HarnessConfig:
 # ---------------------------------------------------------------------------
 
 
+def _derive_condition_seed(condition: str, base_seed: int) -> int:
+    """Deterministic seed derivation for EvaluationHarness.
+
+    Security audit finding #34 (2026-04-20): replaces Python's
+    per-process-randomized ``hash((condition, base_seed))`` with a
+    SHA-256-based derivation that returns the same value across every
+    Python process / version / PYTHONHASHSEED setting. Restores the
+    reproducibility contract documented in CLAUDE.md and run_sheet.md.
+    """
+    import hashlib
+    key = f"{condition}|{int(base_seed)}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(key).digest()[:4], "big") % (2**31)
+
+
 def _snapshot_artifacts(
     artifacts: list[GeneratedArtifact] | None,
 ) -> list[GeneratedArtifactSnapshot]:
@@ -161,6 +175,10 @@ class EvaluationHarness:
         self._config = config
         self._store = EvaluationStore(db_path=config.db_path)
         self._snap_id: str | None = None
+        # ext6 #35: emit a one-time WARN listing permissive metadata-only
+        # validators so the uniform-inflation disclosure is unmissable in logs.
+        from tests.evaluation.tasks import warn_permissive_validators_once
+        warn_permissive_validators_once()
 
     # -- public API ----------------------------------------------------------
 
@@ -240,8 +258,14 @@ class EvaluationHarness:
         The registry is restored to the clean snapshot before each run.
         """
         all_records: list[EvaluationRecord] = []
-        # Use condition name in seed to ensure independent orderings per condition
-        condition_seed = hash((condition, self._config.base_seed)) % (2**31)
+        # Use condition name in seed to ensure independent orderings per condition.
+        # Security audit finding #34 (2026-04-20): use a deterministic
+        # SHA-256-based derivation, NOT Python's ``hash()``, which
+        # randomizes ``str.__hash__`` per process unless PYTHONHASHSEED
+        # is pinned. The pre-fix seed differed across processes,
+        # silently violating the "same base_seed → same ordering"
+        # reproducibility contract documented in CLAUDE.md / run_sheet.
+        condition_seed = _derive_condition_seed(condition, self._config.base_seed)
         rng = random.Random(condition_seed)
         condition_seeds = [rng.randint(0, 2**31) for _ in range(self._config.n_runs)]
 
@@ -861,6 +885,21 @@ def _extract_result_compositional(
     shape_check = task.output_contract.check(
         final_output, chain_result.output_files,
     ) if task.output_contract else None
+
+    # Security audit finding #32 (2026-04-20): promote
+    # output_shape_mismatch into the failure_reason when the validator
+    # was happy but the contract wasn't. Pre-fix, a task missing its
+    # declared required_files with a happy dict-only validator recorded
+    # failure_reason="none" AND output_in_range=True — counted as
+    # success in Chapter 6 tables. Now the reason surfaces explicitly,
+    # matching the CLI's exit-code-3 semantics, and the analyzer's
+    # success predicate excludes shape-mismatched rows.
+    if (
+        failure_reason == "none"
+        and shape_check is not None
+        and not shape_check.satisfied
+    ):
+        failure_reason = "output_shape_mismatch"
 
     # Count how many registry matches vs generated artifacts were executed
     matched_count = sum(

@@ -85,6 +85,18 @@ LIVE_ENDPOINTS = [
 ]
 
 
+class NetworkUnavailableError(RuntimeError):
+    """Raised by smoke tests when the host has no network and plumbing
+    cannot be validated.
+
+    Security audit finding #43 (2026-04-20): pre-fix the helpers
+    returned ``True`` (pass-by-skip), masking plumbing regressions on
+    offline CI. Now raised so ``main()`` can emit exit code 2
+    (UNABLE-TO-VALIDATE), distinguishable from 0 (VALIDATED) and 1
+    (FAILED).
+    """
+
+
 def _host_has_network() -> bool:
     """Quick host-level reachability probe — decides SKIP vs FAIL."""
     for host in ("api.github.com", "httpbin.org", "worldtimeapi.org"):
@@ -193,11 +205,15 @@ def test_allow_network_flag_changes_docker_behavior() -> bool:
     on_ok = "RESOLVED" in (on.get("stdout") or "")
     if not on_ok:
         # Likely the host itself is offline. Distinguish via host probe.
+        # Security audit finding #43 (2026-04-20): returning a plain
+        # pass-by-skip masked plumbing regressions on offline CI. Now
+        # raises ``NetworkUnavailableError`` so ``main()`` can exit
+        # with a distinct code 2 (UNABLE-TO-VALIDATE), differentiated
+        # from 0 (VALIDATED) and 1 (FAILED VALIDATION).
         if not _host_has_network():
-            print(
-                "⚠ Skipping — host has no network (cannot verify bridge mode)."
+            raise NetworkUnavailableError(
+                "host has no network — cannot verify bridge mode"
             )
-            return True
         print("✗ Bridge sandbox failed to resolve a hostname — plumbing broken.")
         return False
 
@@ -223,8 +239,9 @@ def test_network_allowed_succeeds() -> bool:
     print("=" * 70)
 
     if not _host_has_network():
-        print("⚠ Skipping — host has no network.")
-        return True
+        # Security audit finding #43 (2026-04-20): raise instead of
+        # pass-by-skip so the smoke runner can exit with code 2.
+        raise NetworkUnavailableError("host has no network — cannot run live API test")
 
     from src.cli.runner import _execute_mcp_tool
 
@@ -357,24 +374,35 @@ def main() -> int:
             ("test_fake_network_tool_rejected", test_fake_network_tool_rejected),
         ]
 
-    results: list[tuple[str, bool]] = []
+    results: list[tuple[str, str]] = []  # (name, status: "pass"|"fail"|"skip")
     for name, fn in selected:
         try:
             ok = fn()
+            status = "pass" if ok else "fail"
+        except NetworkUnavailableError as exc:
+            # Security audit finding #43 (2026-04-20): tri-state result.
+            # SKIP is NOT the same as PASS — main() exits with code 2.
+            print(f"⚠ {name} skipped: {exc}")
+            status = "skip"
         except Exception as exc:  # noqa: BLE001
             logger.exception("%s raised", name)
             print(f"✗ {name} raised: {exc}")
-            ok = False
-        results.append((name, ok))
+            status = "fail"
+        results.append((name, status))
 
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    for name, ok in results:
-        mark = "✓" if ok else "✗"
-        print(f"  {mark} {name}")
+    mark_map = {"pass": "✓", "fail": "✗", "skip": "⚠"}
+    for name, status in results:
+        print(f"  {mark_map[status]} {name} ({status})")
 
-    return 0 if all(ok for _, ok in results) else 1
+    if any(status == "fail" for _, status in results):
+        return 1
+    if any(status == "skip" for _, status in results):
+        # Exit 2 = UNABLE-TO-VALIDATE (host offline). Different from pass.
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

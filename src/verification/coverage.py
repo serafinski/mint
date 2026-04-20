@@ -243,16 +243,19 @@ def _build_replay_code(
 
 
 def _parse_replay_output(sandbox_result: dict) -> dict | None:
-    """Parse the JSON output from a replay run. Returns None on failure."""
-    if not sandbox_result.get("success"):
-        return None
-    stdout = sandbox_result.get("stdout", "").strip()
-    if not stdout:
-        return None
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
-        return None
+    """Parse the JSON output from a replay run. Returns None on failure.
+
+    Security audit finding #22 (2026-04-20): delegates to the shared
+    ``parse_sandbox_last_json_line`` helper so coverage replay tolerates
+    the same debug-print prefixes ``behavioral._parse_sandbox_output``
+    now tolerates post-#21. Pre-fix used full-stdout ``json.loads``
+    which silently failed the replay on any non-JSON prefix, manifesting
+    as false "variant didn't handle case" verdicts. Compounds with
+    (fixed) #16 truncation: both narrow the replay-reproduction surface
+    and bias split coverage anti-optimizer.
+    """
+    from src.verification.sandbox_parse import parse_sandbox_last_json_line
+    return parse_sandbox_last_json_line(sandbox_result)
 
 
 def _variant_handles_case(

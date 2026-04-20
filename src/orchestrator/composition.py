@@ -822,8 +822,14 @@ class CompositionalExecutor:
 
                 # Lead dedup: if this artifact was already executed (lead-with-
                 # subagents covering multiple subtasks), reuse cached output.
+                # Security audit finding #29 (2026-04-20): track cache-hit
+                # so invocation recording can skip cache-hit subtasks —
+                # pre-fix, every subtask recorded an invocation regardless
+                # of whether the artifact actually ran, inflating Gini /
+                # per-cap invocation counts / M4 token cost.
                 t_step = time.monotonic()
-                if ref.capability_name in _lead_cache:
+                cache_hit = ref.capability_name in _lead_cache
+                if cache_hit:
                     output = _lead_cache[ref.capability_name]
                     logger.info(
                         "Step %d reusing cached lead output from %s",
@@ -907,10 +913,15 @@ class CompositionalExecutor:
                 # outputs as input_args so the row survives get_recent_failures'
                 # WHERE input_args IS NOT NULL filter and feeds the Pillar 3
                 # Split coverage verifier + failure-informed prompt.
-                self._record_step_invocation(
-                    ref, output, step_ms, task_id or "",
-                    upstream_outputs=executed_outputs,
-                )
+                # Security audit finding #29 (2026-04-20): skip recording on
+                # cache-hit subtasks — the artifact didn't actually run;
+                # recording a phantom row inflates per-cap counts by the
+                # lead-reuse factor.
+                if not cache_hit:
+                    self._record_step_invocation(
+                        ref, output, step_ms, task_id or "",
+                        upstream_outputs=executed_outputs,
+                    )
 
                 if on_step_end:
                     try:

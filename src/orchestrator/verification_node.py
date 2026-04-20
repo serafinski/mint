@@ -199,19 +199,34 @@ def verification_node(
         pass
 
     # On retry, skip artifacts that already have a passing verification
-    # report — they haven't changed and re-verifying them wastes Tier 2/3 cost.
-    already_passed: set[str] = set()
+    # report — they haven't changed and re-verifying them wastes Tier 2/3
+    # cost. Security audit finding #26 (2026-04-20): skip is keyed by
+    # (capability_name, artifact_hash) not name alone, so a regenerated
+    # artifact with the same name but modified content does NOT inherit
+    # the old PASS report. Pre-fix the skip was name-only, creating a
+    # silent-bypass path for Pillar 2.
+    from src.verification.gate import compute_artifact_hash
+
+    already_passed_hash: dict[str, str] = {}
     for report in state.verification_results:
         if report.overall_passed:
-            already_passed.add(report.capability_name)
+            # Empty hash on legacy rows forces re-verification (safe default).
+            already_passed_hash[report.capability_name] = report.artifact_hash or ""
+
+    def _is_already_passed(art: GeneratedArtifact) -> bool:
+        prior_hash = already_passed_hash.get(art.capability_name)
+        if not prior_hash:
+            return False
+        return compute_artifact_hash(art) == prior_hash
 
     artifacts_to_verify = [
         a for a in state.generated_artifacts
-        if a.capability_name not in already_passed
+        if not _is_already_passed(a)
     ]
-    # Artifacts with existing passing reports go straight to passed list.
+    # Artifacts with existing passing reports AND matching hash go straight
+    # to passed list.
     for a in state.generated_artifacts:
-        if a.capability_name in already_passed:
+        if _is_already_passed(a):
             passed_artifacts.append(a)
 
     logger.info(

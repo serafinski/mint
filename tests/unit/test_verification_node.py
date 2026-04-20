@@ -463,3 +463,133 @@ def test_parallel_preserves_prior_verification_results():
     results = cmd.update["verification_results"]
     assert results[0].capability_name == "prior_tool"
     assert any(r.capability_name == "new_tool" for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #26 — artifact_hash-aware skip (2026-04-20)
+# ---------------------------------------------------------------------------
+
+
+class TestAlreadyPassedSkipHashMatch:
+    """The retry-loop skip previously used ``capability_name`` only,
+    creating a silent-bypass path for Pillar 2: any regenerated artifact
+    with the same name but modified content inherited the old PASS
+    report and was registered without the gate seeing it. Post-fix the
+    skip compares content hashes.
+    """
+
+    def test_skip_when_hash_matches(self):
+        """Same artifact as before → skipped (preserves perf optimization)."""
+        from src.verification.gate import compute_artifact_hash
+
+        art = _artifact("stable_tool")
+        prior = VerificationReport(
+            capability_name="stable_tool",
+            findings=[],
+            overall_passed=True,
+            tier_reached=3,
+            artifact_hash=compute_artifact_hash(art),
+        )
+
+        calls: list[str] = []
+
+        def _gate_fn(a):
+            calls.append(a.capability_name)
+            return VerificationReport(
+                capability_name=a.capability_name, findings=[],
+                overall_passed=True, tier_reached=3,
+            )
+
+        state = TaskState(
+            task_description="t",
+            generated_artifacts=[art],
+            verification_results=[prior],
+            attempt_count=1,
+        )
+        verification_node(state, gate_fn=_gate_fn)
+
+        # Gate was skipped — prior PASS hash matched.
+        assert calls == [], (
+            f"Stable artifact should have been skipped on retry; gate called "
+            f"with {calls}"
+        )
+
+    def test_re_verify_when_hash_mismatches(self):
+        """Regenerated artifact with same name but modified content →
+        gate must re-run (no silent bypass). Security audit #26 fix."""
+        art_v1 = GeneratedArtifact(
+            capability_name="tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code="async def tool(): return 1",
+        )
+        art_v2 = GeneratedArtifact(
+            capability_name="tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code="async def tool(): return 2",  # content changed
+        )
+        from src.verification.gate import compute_artifact_hash
+
+        prior_pass = VerificationReport(
+            capability_name="tool",
+            findings=[],
+            overall_passed=True,
+            tier_reached=3,
+            artifact_hash=compute_artifact_hash(art_v1),  # v1's hash
+        )
+
+        calls: list[str] = []
+
+        def _gate_fn(a):
+            calls.append(a.capability_name)
+            return VerificationReport(
+                capability_name=a.capability_name, findings=[],
+                overall_passed=True, tier_reached=3,
+            )
+
+        state = TaskState(
+            task_description="t",
+            generated_artifacts=[art_v2],              # v2 — content changed
+            verification_results=[prior_pass],         # but old report present
+            attempt_count=1,
+        )
+        verification_node(state, gate_fn=_gate_fn)
+
+        # Gate MUST re-run because v2's hash differs from v1's hash.
+        assert calls == ["tool"], (
+            f"v2 differs from v1 — gate must re-verify. Got calls={calls}"
+        )
+
+    def test_legacy_empty_hash_forces_reverification(self):
+        """Legacy VerificationReport rows with empty artifact_hash (pre-fix
+        rows, or reports serialized before this schema field landed) must
+        trigger re-verification rather than being silently trusted."""
+        art = _artifact("legacy")
+        prior = VerificationReport(
+            capability_name="legacy",
+            findings=[],
+            overall_passed=True,
+            tier_reached=3,
+            artifact_hash="",  # legacy row
+        )
+
+        calls: list[str] = []
+
+        def _gate_fn(a):
+            calls.append(a.capability_name)
+            return VerificationReport(
+                capability_name=a.capability_name, findings=[],
+                overall_passed=True, tier_reached=3,
+            )
+
+        state = TaskState(
+            task_description="t",
+            generated_artifacts=[art],
+            verification_results=[prior],
+            attempt_count=1,
+        )
+        verification_node(state, gate_fn=_gate_fn)
+
+        assert calls == ["legacy"], (
+            "Empty artifact_hash on the prior report must force re-verification "
+            "(safe default for legacy rows)."
+        )

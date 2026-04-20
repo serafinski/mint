@@ -994,6 +994,66 @@ class TestLeadDedup:
         assert len(result.step_results) == 2
         assert result.step_results[0] == result.step_results[1]
 
+    def test_lead_cache_hit_does_not_record_phantom_invocation(self):
+        """Security audit finding #29 (2026-04-20) regression guard.
+
+        When a lead AGENT covers 2 subtasks, the optimizer's _execute_step
+        runs once and the second subtask uses the cached output. Pre-fix,
+        ``_record_step_invocation`` ran for BOTH subtasks, inflating
+        per-cap invocation counts by the lead-reuse factor. Post-fix
+        the cache-hit subtask skips recording.
+        """
+        from src.registry.metrics import MetricsStore
+
+        metrics = MetricsStore(db_path=":memory:")
+        lead = _make_artifact(
+            "lead-agent-29",
+            CapabilityType.AGENT,
+            gap_query="step-a",
+            agent_config={
+                "system_prompt": "lead",
+                "is_deep_agent": True,
+                "subagents": [
+                    {"name": "sub-1", "description": "d", "system_prompt": "s", "tools": []},
+                ],
+                "subagent_gap_queries": ["step-a", "step-b"],
+            },
+        )
+        subtasks = [
+            _make_subtask("Step A", ["step-a"]),
+            _make_subtask("Step B", ["step-b"], depends_on=[0]),
+        ]
+        resolution = build_resolution_map(
+            required_capabilities=["step-a", "step-b"],
+            matches=[],
+            artifacts=[lead],
+        )
+        executor = CompositionalExecutor(
+            subtasks=subtasks,
+            resolution=resolution,
+            artifacts=[lead],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+            metrics_store=metrics,
+        )
+
+        with patch.object(
+            executor, "_execute_step",
+            return_value={"result": "ok", "output_data": "something"},
+        ):
+            executor.run(task_id="T29")
+
+        # Exactly ONE invocation row — the cache-hit subtask didn't
+        # phantom-record. Pre-fix would have been 2.
+        invocations = metrics._conn.execute(
+            "SELECT COUNT(*) FROM invocations WHERE capability_id = 'lead-agent-29'"
+        ).fetchone()[0]
+        assert invocations == 1, (
+            f"Expected 1 invocation (cache-hit subtask must skip recording). "
+            f"Got {invocations} — pre-fix phantom-row bug."
+        )
+
 
 # ---------------------------------------------------------------------------
 # File output support (B3)

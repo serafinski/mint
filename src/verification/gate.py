@@ -26,6 +26,7 @@ verify(artifact: GeneratedArtifact) -> VerificationReport
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -39,6 +40,27 @@ from src.schemas.verification import Severity, VerificationFinding, Verification
 from src.verification import adversarial, behavioral, import_check, static_scanner
 
 logger = logging.getLogger(__name__)
+
+
+def compute_artifact_hash(artifact: GeneratedArtifact) -> str:
+    """Return a SHA-256 hash of the artifact's verification-relevant content.
+
+    Security audit finding #26 (2026-04-20): the retry-loop skip in
+    ``verification_node`` uses this hash to detect regenerated artifacts
+    with the same ``capability_name`` but modified content. Any change
+    to ``source_code`` / ``skill_content`` / ``agent_config`` produces
+    a different hash and forces re-verification.
+    """
+    payload = json.dumps(
+        {
+            "source_code": artifact.source_code or "",
+            "skill_content": artifact.skill_content or "",
+            "agent_config": artifact.agent_config or None,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _emit_tier_event(
@@ -206,17 +228,35 @@ def verify(
     name = artifact.capability_name
     all_findings: list[VerificationFinding] = []
 
+    # Security audit finding #26 (2026-04-20): stamp the artifact's
+    # content hash so the retry loop's ``already_passed`` skip can
+    # detect regenerated-but-same-name artifacts. Computed BEFORE
+    # verification so the hash on the report matches the exact content
+    # that was verified.
+    artifact_hash = compute_artifact_hash(artifact)
+
     # Track the current tier so the error handler can report accurately.
     current_tier = [1]  # mutable container for closure access
     try:
-        return _verify_inner(
+        report = _verify_inner(
             artifact, name, all_findings, current_tier,
             allow_network=allow_network,
         )
+        report.artifact_hash = artifact_hash
+        return report
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Verification gate error for '%s' at tier %d: %s — PASSING (fail-open policy). "
-            "Artifact was NOT verified; it passed by default due to a gate error.",
+        # Security audit finding #25 (2026-04-20): flipped from fail-open
+        # to fail-closed. §12 finding #14 committed Pillar 2 verification
+        # to fail-closed semantics, but the gate's own exception handler
+        # was left with ``overall_passed=True`` — silently overriding the
+        # verification_node's fail-safe path. Under the retry + sticky-
+        # flag contract, fail-closed is strictly safer: gate errors
+        # surface as a visible retry (the node regenerates on fresh
+        # code), not an invisible PASS that promotes unverified
+        # artifacts.
+        logger.error(
+            "Verification gate error for '%s' at tier %d: %s — REJECTING "
+            "(fail-closed per §12 finding #14 + audit #25).",
             name, current_tier[0], exc,
         )
         return VerificationReport(
@@ -225,12 +265,16 @@ def verify(
                 VerificationFinding(
                     tier=current_tier[0],
                     category="gate_error",
-                    severity=Severity.MEDIUM,
-                    message=f"Verification gate raised an unexpected exception at tier {current_tier[0]}: {exc}",
+                    severity=Severity.CRITICAL,
+                    message=(
+                        f"Verification gate raised an unexpected exception "
+                        f"at tier {current_tier[0]}: {exc}"
+                    ),
                 )
             ],
-            overall_passed=True,  # fail open — don't block on gate bugs
+            overall_passed=False,
             tier_reached=current_tier[0],
+            artifact_hash=artifact_hash,
         )
 
 

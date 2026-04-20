@@ -147,8 +147,14 @@ def fetch_tier2_events(
     *,
     event_names: tuple[str, ...],
     environment: str | None,
+    session_ids: list[str] | None = None,
 ) -> list[dict]:
     """Fetch LangFuse EVENT-type observations matching our Tier 2 names.
+
+    Security audit finding #42 (2026-04-20): accepts ``session_ids`` to
+    client-side-filter observations after the environment-scoped fetch.
+    Concurrent production runs landing in the same time window would
+    otherwise cross-contaminate.
 
     The REST API's ``/api/public/observations`` endpoint supports ``name`` +
     ``type`` filters; we iterate over event_names and paginate.
@@ -173,6 +179,15 @@ def fetch_tier2_events(
             for obs in data:
                 ts = _parse_dt(obs.get("startTime") or obs.get("timestamp"))
                 if ts and start <= ts <= end:
+                    if session_ids:
+                        # Session id may live on the observation or its
+                        # parent trace; LangFuse puts it under "trace".
+                        sid = (
+                            (obs.get("trace") or {}).get("sessionId")
+                            or obs.get("sessionId")
+                        )
+                        if sid not in session_ids:
+                            continue
                     events.append(obs)
             if len(data) < 100:
                 break
@@ -360,6 +375,12 @@ def main() -> int:
             "dev-script output."
         ),
     )
+    # Security audit finding #42 (2026-04-20): session-id scoping to
+    # avoid concurrent-run contamination in the same environment.
+    parser.add_argument(
+        "--session-ids", nargs="+", default=None,
+        help="Restrict to specific LangFuse session_ids.",
+    )
     args = parser.parse_args()
 
     try:
@@ -388,6 +409,7 @@ def main() -> int:
             end,
             event_names=event_names,
             environment=args.environment,
+            session_ids=args.session_ids,
         )
 
     print(f"Fetched {len(events)} events.\n")

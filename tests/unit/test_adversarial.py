@@ -168,19 +168,19 @@ class TestPartialReports:
         assert report.findings[0].severity == Severity.HIGH
         assert "fail-closed" in report.findings[0].message.lower()
 
-    def test_error_report_still_fail_open(self):
-        """Error branch deliberately left fail-open by Step 14.11.
-        Provider errors (rate limits, transient 500s) would trigger
-        expensive regenerations for reasons the LLM can't fix. If
-        Phase 5 surfaces a silent-error fail-open pattern, revisit in
-        §12 or Chapter 7."""
+    def test_error_report_fails_closed(self):
+        """Security audit finding #25 (2026-04-20): flipped from fail-
+        open to fail-closed. Adversarial error paths no longer
+        manufacture PASS verdicts; infrastructure errors surface as a
+        CRITICAL adversarial_error finding with overall_passed=False.
+        The retry loop regenerates the artifact on fresh code."""
         report = _error_report("my-tool", "Something broke")
         assert report.capability_name == "my-tool"
-        assert report.overall_passed is True  # deliberately fail-open
+        assert report.overall_passed is False  # §12 #14 + #25 fail-closed
         assert report.tier_reached == 3
         assert len(report.findings) == 1
         assert "Something broke" in report.findings[0].message
-        assert report.findings[0].severity == Severity.MEDIUM
+        assert report.findings[0].severity == Severity.CRITICAL
 
     def test_adversarial_timeout_ceiling_is_480s(self):
         """Regression guard for the Step 14.11 bump 300 → 480. Any
@@ -245,23 +245,25 @@ class TestProbe:
 
     @patch("src.verification.adversarial._create_adversarial_agent")
     def test_agent_error_returns_error_report(self, mock_create):
+        """Security audit finding #25 (2026-04-20): now fails closed."""
         mock_agent = MagicMock()
         mock_agent.invoke.side_effect = RuntimeError("LLM exploded")
         mock_create.return_value = mock_agent
 
         report = probe(_artifact())
-        assert report.overall_passed is True  # fail open
+        assert report.overall_passed is False  # #25 fail-closed
         assert report.tier_reached == 3
         assert any("LLM exploded" in f.message for f in report.findings)
 
     @patch("src.verification.adversarial._create_adversarial_agent")
     def test_no_structured_response(self, mock_create):
+        """Security audit finding #25 (2026-04-20): now fails closed."""
         mock_agent = MagicMock()
         mock_agent.invoke.return_value = {"structured_response": None}
         mock_create.return_value = mock_agent
 
         report = probe(_artifact())
-        assert report.overall_passed is True  # fail open
+        assert report.overall_passed is False  # #25 fail-closed
         assert any("no structured response" in f.message.lower() for f in report.findings)
 
     def test_empty_source_code_skips(self):
@@ -417,9 +419,10 @@ class TestProbe:
 
     @patch("src.verification.adversarial._create_adversarial_agent")
     def test_agent_creation_failure(self, mock_create):
+        """Security audit finding #25 (2026-04-20): fails closed."""
         mock_create.side_effect = ImportError("deepagents not installed")
         report = probe(_artifact())
-        assert report.overall_passed is True  # fail open
+        assert report.overall_passed is False  # #25 fail-closed
         assert any("Agent creation failed" in f.message for f in report.findings)
 
     @patch("src.verification.adversarial._create_adversarial_agent")
@@ -544,12 +547,13 @@ class TestTimeoutTriggersRetry:
         assert cmd_2.goto == "loading_node"
         assert cmd_2.update["attempt_count"] == 2
 
-    def test_non_timeout_exception_still_fail_open(self):
-        """Step 14.11 deliberately does NOT fail-close the error branch.
-        A RuntimeError in the adversarial agent (e.g., provider 500 or
-        DeepAgents invocation crash) still returns a fail-open MEDIUM
-        report, preserving the never-raises contract. If this changes,
-        Phase 5 will see silent retries on transient provider errors."""
+    def test_non_timeout_exception_fails_closed(self):
+        """Security audit finding #25 (2026-04-20): flipped from
+        fail-open to fail-closed. A RuntimeError in the adversarial
+        agent (provider 500, DeepAgents crash, rate limit) now emits a
+        CRITICAL adversarial_error finding with overall_passed=False.
+        The verification_node retry loop regenerates the artifact on
+        fresh code — same pattern as Step 14.11's timeout branch."""
         with patch(
             "src.verification.adversarial._create_adversarial_agent"
         ) as mock_create:
@@ -559,13 +563,13 @@ class TestTimeoutTriggersRetry:
 
             report = probe(_artifact())
 
-        assert report.overall_passed is True  # deliberately fail-open
+        assert report.overall_passed is False  # §12 #14 + #25 fail-closed
         assert report.tier_reached == 3
         error_findings = [
             f for f in report.findings if f.category == "adversarial_error"
         ]
         assert len(error_findings) == 1
-        assert error_findings[0].severity == Severity.MEDIUM
+        assert error_findings[0].severity == Severity.CRITICAL
         assert "LLM 500" in error_findings[0].message
 
 

@@ -116,6 +116,69 @@ def load_data(db_path: str) -> duckdb.DuckDBPyConnection:
     return duckdb.connect(db_path, read_only=True)
 
 
+# Security audit finding #38 (2026-04-20): module-level scope filter
+# resolved at ``main()`` startup. Every SQL query appends this fragment
+# to its WHERE clause so analyzers operate on a single run-set. Empty
+# string when no scoping is requested (legacy behavior). Populated by
+# ``_apply_scope`` below.
+_SCOPE_SQL: str = ""
+
+
+def _resolve_scope(
+    conn: duckdb.DuckDBPyConnection,
+    run_ids: list[str] | None,
+    since: str | None,
+) -> str:
+    """Return a SQL WHERE fragment that scopes queries to a single run-set.
+
+    Security audit finding #38 (2026-04-20): pre-fix, ``analyze_results.py``
+    pooled every non-pilot row in the DB. When the DB contains multiple
+    runs (re-runs after code changes, different configs, etc.), every
+    table mixes populations.
+
+    Resolution:
+    - Explicit ``run_ids`` → filter on exactly those.
+    - ``since`` → filter on timestamp.
+    - Neither: auto-select the 4 most recent run_ids (one per condition
+      is the canonical eval shape) and WARN on stderr.
+
+    Returns "" when no scoping is applied (legacy mode — unsafe on
+    multi-run DBs).
+    """
+    import sys as _sys
+
+    if run_ids:
+        safe_ids = [r.replace("'", "''") for r in run_ids]
+        return " AND run_id IN ({})".format(
+            ", ".join(f"'{r}'" for r in safe_ids)
+        )
+
+    if since is not None:
+        safe_since = since.replace("'", "''")
+        return f" AND timestamp >= '{safe_since}'"
+
+    # Auto-select: resolve the 4 most recent non-pilot run_ids. If the DB
+    # has ≤4 distinct run_ids, no scoping needed (legacy single-run DBs).
+    available = conn.execute(
+        "SELECT run_id, MAX(timestamp) AS t FROM evaluation_runs "
+        "WHERE is_pilot = FALSE GROUP BY run_id ORDER BY t DESC LIMIT 64"
+    ).fetchall()
+    if len(available) <= 4:
+        return ""
+
+    latest = [r[0] for r in available[:4]]
+    print(
+        f"WARNING: DB contains {len(available)} distinct non-pilot run_ids; "
+        f"auto-selecting the 4 most recent: {latest}. Pass --run-ids to "
+        f"override.",
+        file=_sys.stderr,
+    )
+    safe_latest = [r.replace("'", "''") for r in latest]
+    return " AND run_id IN ({})".format(
+        ", ".join(f"'{r}'" for r in safe_latest)
+    )
+
+
 def query_condition_summary(
     conn: duckdb.DuckDBPyConnection, task_filter: str = "TRUE"
 ) -> list[dict]:
@@ -125,11 +188,11 @@ def query_condition_summary(
         SELECT
             condition,
             COUNT(*) AS n,
-            SUM(CASE WHEN gate_passed AND output_in_range THEN 1 ELSE 0 END) AS successes,
+            SUM(CASE WHEN gate_passed AND output_in_range AND NOT COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS successes,
             SUM(CASE WHEN gate_passed THEN 1 ELSE 0 END) AS gate_passed,
             SUM(CASE WHEN output_in_range THEN 1 ELSE 0 END) AS output_in_range
         FROM evaluation_runs
-        WHERE is_pilot = FALSE AND ({task_filter})
+        WHERE is_pilot = FALSE AND ({task_filter}){_SCOPE_SQL}
         GROUP BY condition
         ORDER BY condition
         """
@@ -149,15 +212,15 @@ def query_condition_summary(
 def query_per_task(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """Per-task, per-condition success counts."""
     rows = conn.execute(
-        """
+        f"""
         SELECT
             task_id, condition,
             COUNT(*) AS n,
-            SUM(CASE WHEN gate_passed AND output_in_range THEN 1 ELSE 0 END) AS successes,
+            SUM(CASE WHEN gate_passed AND output_in_range AND NOT COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS successes,
             SUM(CASE WHEN gate_passed THEN 1 ELSE 0 END) AS gate_passed,
             SUM(CASE WHEN output_in_range THEN 1 ELSE 0 END) AS output_in_range
         FROM evaluation_runs
-        WHERE is_pilot = FALSE
+        WHERE is_pilot = FALSE{_SCOPE_SQL}
         GROUP BY task_id, condition
         ORDER BY task_id, condition
         """
@@ -177,10 +240,10 @@ def query_per_task(conn: duckdb.DuckDBPyConnection) -> list[dict]:
 
 def query_failure_breakdown(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     rows = conn.execute(
-        """
+        f"""
         SELECT condition, failure_reason, COUNT(*) AS n
         FROM evaluation_runs
-        WHERE is_pilot = FALSE AND failure_reason != 'none'
+        WHERE is_pilot = FALSE AND failure_reason != 'none'{_SCOPE_SQL}
         GROUP BY condition, failure_reason
         ORDER BY condition, n DESC
         """
@@ -454,14 +517,14 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
 def print_token_cost_summary(conn: duckdb.DuckDBPyConnection) -> None:
     """Token cost per condition (from backfilled LangFuse data)."""
     rows = conn.execute(
-        """
+        f"""
         SELECT condition,
                SUM(token_cost) AS total_tokens,
                AVG(CASE WHEN token_cost > 0 THEN token_cost ELSE NULL END) AS avg_per_jit_task,
                COUNT(CASE WHEN token_cost > 0 THEN 1 END) AS n_with_cost,
                COUNT(*) AS n_total
         FROM evaluation_runs
-        WHERE is_pilot = FALSE
+        WHERE is_pilot = FALSE{_SCOPE_SQL}
         GROUP BY condition
         ORDER BY condition
         """
@@ -691,10 +754,10 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> None:
         return
 
     rows = conn.execute(
-        """
+        f"""
         SELECT task_id, condition, capability_type
         FROM evaluation_runs
-        WHERE is_pilot = FALSE AND condition != 'static'
+        WHERE is_pilot = FALSE AND condition != 'static'{_SCOPE_SQL}
         """
     ).fetchall()
 
@@ -783,7 +846,7 @@ def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> None:
     plus the count of excluded rows with the exclusion rationale.
     """
     rows = conn.execute(
-        """
+        f"""
         SELECT condition,
                COUNT(*) AS n_included,
                AVG(attempt_latency_ms) / 1000.0 AS avg_sec,
@@ -793,18 +856,21 @@ def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> None:
         FROM evaluation_runs
         WHERE gate_passed
           AND output_in_range
-          AND NOT is_pilot
+          AND NOT COALESCE(output_shape_mismatch, FALSE)
+          AND NOT is_pilot{_SCOPE_SQL}
         GROUP BY condition
         ORDER BY condition
         """
     ).fetchall()
 
     excluded_counts = conn.execute(
-        """
+        f"""
         SELECT condition, COUNT(*)
         FROM evaluation_runs
-        WHERE (NOT gate_passed OR NOT output_in_range)
-          AND NOT is_pilot
+        WHERE (NOT gate_passed
+               OR NOT output_in_range
+               OR COALESCE(output_shape_mismatch, FALSE))
+          AND NOT is_pilot{_SCOPE_SQL}
         GROUP BY condition
         ORDER BY condition
         """
@@ -961,13 +1027,29 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Statistical analysis of evaluation results")
     parser.add_argument("--db", default=str(ROOT / "data" / "eval" / "metrics.duckdb"))
     parser.add_argument("--csv", action="store_true", help="Export tables to data/analysis/")
+    parser.add_argument(
+        "--run-ids", nargs="+", default=None,
+        help="Specific run_ids to include. Default: auto-select the 4 most "
+             "recent non-pilot run_ids with stderr WARNING. Security audit "
+             "finding #38 (2026-04-20).",
+    )
+    parser.add_argument(
+        "--since", default=None,
+        help="Only include rows with timestamp >= SINCE (DB's native "
+             "timestamp format). Mutually exclusive with --run-ids.",
+    )
     args = parser.parse_args()
 
     conn = load_data(args.db)
 
-    # Record counts
+    # Security audit finding #38 (2026-04-20): resolve the scope ONCE at
+    # startup; every subsequent query reads module-level _SCOPE_SQL.
+    global _SCOPE_SQL
+    _SCOPE_SQL = _resolve_scope(conn, args.run_ids, args.since)
+
+    # Record counts (scoped).
     total = conn.execute(
-        "SELECT COUNT(*) FROM evaluation_runs WHERE is_pilot = FALSE"
+        f"SELECT COUNT(*) FROM evaluation_runs WHERE is_pilot = FALSE{_SCOPE_SQL}"
     ).fetchone()[0]
     print(f"\nTotal non-pilot records: {total}")
 

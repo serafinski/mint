@@ -237,6 +237,14 @@ def main() -> int:
         pass
     gc.collect()
 
+    # Security audit finding #31 (2026-04-20): clean registry directories
+    # before snapshotting — see run_longitudinal.py for rationale.
+    import shutil as _shutil
+    for _d in (CHROMA_DIR, MCP_TOOLS_DIR, SKILLS_DIR):
+        if _d.exists():
+            _shutil.rmtree(_d)
+        _d.mkdir(parents=True, exist_ok=True)
+
     snap_id = take_clean_snapshot(CHROMA_DIR, MCP_TOOLS_DIR, SKILLS_DIR)
     restore_snap = restore_clean_snapshot(CHROMA_DIR, MCP_TOOLS_DIR, SKILLS_DIR)
     logger.info("Snapshot: %s (restored: %s)", snap_id, restore_snap)
@@ -324,7 +332,12 @@ def main() -> int:
         ):
             try:
                 final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
-                result = _extract_result(final_state, task, loader)
+                # Security audit finding #27 (2026-04-20): pass metrics_store
+                # so compositional execution records invocations.
+                result = _extract_result(
+                    final_state, task, loader,
+                    metrics_store=metrics_store,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Pipeline raised for task %s: %s", task.task_id, exc)
                 result = {

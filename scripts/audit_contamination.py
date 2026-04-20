@@ -110,11 +110,18 @@ def fetch_unlabeled_rows(
     *,
     conditions: list[str],
     types: list[str],
+    run_ids: list[str] | None = None,
+    since: str | None = None,
 ) -> list[AuditRow]:
     """All eval_runs matching the sampling pool (human_label IS NULL).
 
     Excludes pilot rows. Excludes runs with zero generated artifacts
     (no JIT output to audit — e.g. registry-matched T01-T03).
+
+    Security audit finding #41 (2026-04-20): accepts ``run_ids`` /
+    ``since`` so M2 labeling samples from a single campaign instead of
+    pooling every historical run. Cross-campaign sampling wastes
+    expert-labeling human time.
 
     Reads ``generated_artifact_sources`` (Step 18.10 Option B) so audit can
     work off DB snapshots rather than registry state. Gracefully degrades
@@ -125,14 +132,23 @@ def fetch_unlabeled_rows(
 
     placeholders_c = ", ".join("?" for _ in conditions)
     placeholders_t = ", ".join("?" for _ in types)
-    where = (
-        f"WHERE human_label IS NULL "
-        f"  AND NOT is_pilot "
-        f"  AND condition IN ({placeholders_c}) "
-        f"  AND capability_type IN ({placeholders_t}) "
-        f"  AND COALESCE(generated_artifact_count, 0) > 0"
-    )
-    params = [*conditions, *types]
+    where_parts = [
+        "human_label IS NULL",
+        "NOT is_pilot",
+        f"condition IN ({placeholders_c})",
+        f"capability_type IN ({placeholders_t})",
+        "COALESCE(generated_artifact_count, 0) > 0",
+    ]
+    params: list = [*conditions, *types]
+    if run_ids:
+        where_parts.append(
+            "run_id IN ({})".format(", ".join("?" * len(run_ids)))
+        )
+        params.extend(run_ids)
+    if since is not None:
+        where_parts.append("timestamp >= ?")
+        params.append(since)
+    where = "WHERE " + " AND ".join(where_parts)
     try:
         rows = conn.execute(
             f"""
@@ -391,6 +407,8 @@ def run_audit(
     per_stratum: int,
     seed: int,
     dry_run: bool,
+    run_ids: list[str] | None = None,
+    since: str | None = None,
 ) -> int:
     if not db_path.exists():
         print(f"ERROR: eval DB not found at {db_path}", file=sys.stderr)
@@ -402,6 +420,8 @@ def run_audit(
             store._conn,  # noqa: SLF001 — internal for direct query
             conditions=conditions,
             types=types,
+            run_ids=run_ids,
+            since=since,
         )
         sample = stratified_sample(
             pool,
@@ -538,6 +558,17 @@ def main() -> int:
                         help="Print sample breakdown and exit without prompting")
     parser.add_argument("--help-labels", action="store_true",
                         help="Print labelling criteria and exit")
+    # Security audit finding #41 (2026-04-20): run-id scoping for M2 labeling.
+    parser.add_argument(
+        "--run-ids", nargs="+", default=None,
+        help="Specific run_ids to sample from (default: all unlabeled non-pilot "
+             "rows across every campaign in the DB — cross-campaign pooling "
+             "wastes expert labeling time; pass explicitly for Chapter 6 M2).",
+    )
+    parser.add_argument(
+        "--since", default=None,
+        help="Include only rows with timestamp >= SINCE.",
+    )
     args = parser.parse_args()
 
     if args.help_labels:
@@ -564,6 +595,8 @@ def main() -> int:
         per_stratum=args.per_stratum,
         seed=args.base_seed,
         dry_run=args.dry_run,
+        run_ids=args.run_ids,
+        since=args.since,
     )
 
 
