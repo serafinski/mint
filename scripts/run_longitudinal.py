@@ -149,7 +149,12 @@ def main() -> None:
         collection_name="capabilities",
     )
     seed_registry(registry)
-    metrics_store = MetricsStore()
+    # ext8 #71 (2026-04-20): persist MetricsStore across runs so
+    # maintenance_burden (and any other cross-run state consumed by the
+    # Pillar 3 optimizer) accumulates. The path is co-located with the
+    # longitudinal DB for per-campaign isolation.
+    _metrics_store_path = str(DATA_DIR / "eval" / "longitudinal_metrics_store.duckdb")
+    metrics_store = MetricsStore(db_path=_metrics_store_path)
     loader = ToolLoader()
 
     # --- Evaluation store ---

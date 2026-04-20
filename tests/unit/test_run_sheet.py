@@ -138,3 +138,105 @@ def test_campaign_session_ids_convention_present():
         "run_sheet.md is missing the ext7 #54 CAMPAIGN_SESSION_IDS convention. "
         "Document it alongside CAMPAIGN_RUN_IDS in the Phase 4/5 scoping block."
     )
+
+
+# ---------------------------------------------------------------------------
+# ext7 post-remediation fixes (discovered during thesis-alignment audit
+# 2026-04-20): scoping convention examples + Chapter 3 evidence elevation.
+# ---------------------------------------------------------------------------
+
+
+def test_scoping_convention_uses_dynamic_discovery_not_fixed_literal():
+    """The scoping block MUST populate CAMPAIGN_RUN_IDS dynamically from the
+    DB, not with a literal 4-element example.
+
+    Original ext7 #45 doc carried a literal 4-run-id example. A user who
+    literally followed it on the canonical ``--n-runs 5 --all-conditions``
+    Phase-4 campaign (20 distinct run_ids) would silently scope analyses to
+    20% of the campaign — ``--run-ids`` bypasses ext7 #46's per-condition
+    auto-select so the safety net doesn't fire.
+
+    Post-fix the block uses a ``$(duckdb ... SELECT DISTINCT run_id ...)``
+    subshell that reads every non-pilot run_id from ``$CAMPAIGN_DB``,
+    adapting automatically to any ``--n-runs`` value.
+    """
+    text = RUN_SHEET.read_text()
+    # Must have the dynamic-discovery subshell.
+    assert 'SELECT DISTINCT run_id FROM evaluation_runs' in text, (
+        "run_sheet.md scoping convention must populate CAMPAIGN_RUN_IDS via a "
+        "dynamic DB query, not a literal example — see thesis-alignment audit "
+        "2026-04-20 for the 4-vs-20 silent-scope-to-20%-of-campaign hazard."
+    )
+    assert "NOT is_pilot" in text, (
+        "The CAMPAIGN_RUN_IDS discovery query must filter `WHERE NOT is_pilot` "
+        "so Row 7 smoke-pilot rows don't contaminate the Phase-4 campaign scope."
+    )
+    # MUST NOT carry the original 4-id fixed-literal example.
+    assert '"full_00_abc123 no_verification_00_def456' not in text, (
+        "run_sheet.md still carries the pre-fix 4-run-id literal example. "
+        "This is a documented hazard (see test docstring). Replace with the "
+        "dynamic-discovery subshell pattern."
+    )
+
+
+def test_campaign_session_ids_mirrors_run_ids_not_single_value():
+    """ext7 post-audit: LangFuse session_id == DuckDB run_id (harness.py:396).
+
+    Canonical Phase-4 run has 20 run_ids → 20 session_ids, not 1. The run
+    sheet's scoping block must reflect this — either by reusing
+    ``$CAMPAIGN_RUN_IDS`` as ``$CAMPAIGN_SESSION_IDS`` or by populating
+    session_ids via its own dynamic query. A single-literal example would
+    mis-scope rows 13 + 15 to zero traces.
+    """
+    text = RUN_SHEET.read_text()
+    # Must indicate session_id == run_id at the doc level, or explicitly
+    # derive CAMPAIGN_SESSION_IDS from CAMPAIGN_RUN_IDS.
+    assert (
+        'CAMPAIGN_SESSION_IDS="$CAMPAIGN_RUN_IDS"' in text
+        or "session_id == DuckDB run_id" in text
+        or "session_id=run_id" in text
+    ), (
+        "run_sheet.md scoping convention must document that LangFuse "
+        "session_id == run_id (harness.py:396) and populate "
+        "CAMPAIGN_SESSION_IDS accordingly (e.g., $CAMPAIGN_SESSION_IDS="
+        '"$CAMPAIGN_RUN_IDS"). A single-literal example mis-scopes rows '
+        "13 + 15 to zero traces."
+    )
+    # MUST NOT carry the pre-fix single-literal example.
+    assert 'CAMPAIGN_SESSION_IDS="eval_2026_04_20_full_final"' not in text, (
+        "Pre-fix single-literal CAMPAIGN_SESSION_IDS example still present. "
+        "Replace with the dynamic-reuse pattern."
+    )
+
+
+def test_chapter_3_fp_fn_evidence_on_main_path():
+    """Chapter 3's §Pillar 1 line 77 claim (hierarchical embeddings prevent
+    FP + FN) needs numbered-row evidence, not diagnostic-only placement.
+
+    Pre-audit, ``test_registry_matching.py`` + ``test_registry_fn.py`` were
+    listed only in the Diagnostic Scripts section. Thesis writer following
+    numbered rows would reach Chapter 6 without the Chapter 3 evidence.
+    Post-fix these are Phase-3 rows 6a + 6b.
+    """
+    text = RUN_SHEET.read_text()
+    # Each script appears in a numbered row of the Phase 3 table.
+    rows = _parse_command_rows(text)
+    scripts_in_numbered_rows = set()
+    for _, cmd in rows:
+        m = re.search(r"scripts/(\w+\.py)", cmd)
+        if m:
+            scripts_in_numbered_rows.add(m.group(1))
+
+    # Also pick up "6a"/"6b" rows which have non-numeric row numbers.
+    for line in text.splitlines():
+        if re.match(r"\|\s*6[ab]\s*\|", line):
+            m = re.search(r"scripts/(\w+\.py)", line)
+            if m:
+                scripts_in_numbered_rows.add(m.group(1))
+
+    for script in ("test_registry_matching.py", "test_registry_fn.py"):
+        assert script in scripts_in_numbered_rows, (
+            f"Chapter 3 evidence script `{script}` must be on the numbered "
+            "main path (row 6a or 6b), not diagnostic-only. Proposal §Pillar 1 "
+            "line 77 claim needs produced-by evidence in Chapter 3."
+        )

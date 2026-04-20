@@ -103,6 +103,16 @@ class HarnessConfig:
     # this flag.
     allow_network: bool = False
 
+    # ext8 #71 (2026-04-20): MetricsStore persistence path. Pre-fix the
+    # harness instantiated ``MetricsStore()`` with default ``:memory:``;
+    # every run got a fresh in-memory DuckDB, wiping ``maintenance_burden``
+    # + any other cross-run state the optimizer needs for "learning over
+    # time" claims. Pass a filesystem path (e.g.
+    # ``data/eval/metrics_store.duckdb``) to persist across runs, or
+    # leave ``None`` for the legacy in-memory behavior (test helpers do
+    # this intentionally).
+    metrics_store_path: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Step 18.10 Option B — capture generated artifact sources at record-write
@@ -358,10 +368,16 @@ class EvaluationHarness:
         loader = ToolLoader()
 
         # Step 3: create a single MetricsStore for this run (shared across tasks
-        # so the optimizer accumulates data from all tasks in the same run)
+        # so the optimizer accumulates data from all tasks in the same run).
+        #
+        # ext8 #71 (2026-04-20): when HarnessConfig.metrics_store_path is set,
+        # the store persists to disk. `maintenance_burden` + other cross-run
+        # state accumulate across every run of the campaign, backing the
+        # Pillar 3 "learning over time" claim. `:memory:` remains the
+        # default for legacy callers (unit tests).
         from src.registry.metrics import MetricsStore
 
-        metrics_store = MetricsStore()
+        metrics_store = MetricsStore(db_path=self._config.metrics_store_path)
 
         # Step 4: randomise task order
         rng = random.Random(seed)
@@ -476,7 +492,8 @@ class EvaluationHarness:
         t_start = time.monotonic()
 
         if condition == "static":
-            result = self._run_static(task, registry)
+            # ext8 #65: thread metrics_store so static runs record invocations.
+            result = self._run_static(task, registry, metrics_store)
         else:
             result = self._run_jit(
                 task,
@@ -530,13 +547,29 @@ class EvaluationHarness:
         self,
         task: TaskDefinition,
         registry: SkillRegistry,
+        metrics_store: Any = None,
     ) -> dict:
-        """Static baseline: registry lookup + execute pre-written implementation."""
+        """Static baseline: registry lookup + execute pre-written implementation.
+
+        ext8 #65 (2026-04-20): records one ``InvocationRecord`` per static run
+        so the ``static`` condition has invocation rows in the Chapter-6
+        Gini aggregate. Pre-fix the static condition was invisible in M3 →
+        JIT-vs-static Gini comparison had no baseline.
+
+        ext8 #68 (2026-04-20): applies ``task.output_contract.check`` the
+        same way JIT paths do so static can't silently ship dict-valid /
+        file-invalid outputs as successes while JIT would correctly fail.
+        Symmetric validation between conditions is load-bearing for the
+        Pillar 1 JIT-vs-static comparison claim.
+        """
         if not task.has_static_coverage:
             return {
                 "gate_passed": False,
                 "output_in_range": False,
                 "failure_reason": "generation_failed",
+                "output_shape_mismatch": False,
+                "output_shape_missing_keys": [],
+                "output_shape_missing_files": [],
             }
 
         # Check registry has the expected capability by exact name lookup
@@ -550,19 +583,66 @@ class EvaluationHarness:
                 "gate_passed": False,
                 "output_in_range": False,
                 "failure_reason": "generation_failed",
+                "output_shape_mismatch": False,
+                "output_shape_missing_keys": [],
+                "output_shape_missing_files": [],
             }
 
         # Execute the pre-written static implementation
         try:
             output = _run_static_implementation(task.task_id, task.fixture_paths)
             in_range = task.validator(output)
+            # ext8 #68: apply the same output-contract check JIT paths use.
+            # Single-artifact static path has no output_files (file writers
+            # live in compositional JIT chains only) so pass an empty dict.
+            shape_check = (
+                task.output_contract.check(output, {})
+                if task.output_contract
+                else None
+            )
+            shape_mismatch = (
+                shape_check is not None and not shape_check.satisfied
+            )
+
+            failure_reason = "none" if in_range else "output_rejected"
+            # Promote shape mismatch + flip output_in_range (ext8 #64 pattern).
+            if in_range and shape_mismatch:
+                failure_reason = "output_shape_mismatch"
+                in_range = False
+
+            # ext8 #65: record one invocation so the static condition is
+            # visible in M3 Gini. Best-effort — never let the record call
+            # break the surrounding eval loop.
+            if metrics_store is not None:
+                try:
+                    from src.schemas.metrics import InvocationRecord
+                    metrics_store.record_invocation(InvocationRecord(
+                        capability_id=task.static_capability_name,
+                        task_id=task.task_id,
+                        success=bool(in_range),
+                        token_cost=0,
+                        latency_ms=0,
+                    ))
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "ext8 #65: failed to record static invocation for %s",
+                        task.task_id, exc_info=True,
+                    )
+
             return {
                 "gate_passed": True,  # static implementations don't go through the gate
                 "output_in_range": in_range,
-                "failure_reason": "none" if in_range else "output_rejected",
+                "failure_reason": failure_reason,
                 "capability_type": cap.capability_type,
                 "attempt_count": 0,
                 "verification_tier_reached": None,  # bypassed for static
+                "output_shape_mismatch": shape_mismatch,
+                "output_shape_missing_keys": (
+                    shape_check.missing_keys if shape_check is not None else []
+                ),
+                "output_shape_missing_files": (
+                    shape_check.missing_files if shape_check is not None else []
+                ),
             }
         except Exception as exc:  # noqa: BLE001
             logger.warning("Static implementation for %s failed: %s", task.task_id, exc)
@@ -570,6 +650,9 @@ class EvaluationHarness:
                 "gate_passed": False,
                 "output_in_range": False,
                 "failure_reason": "generation_failed",
+                "output_shape_mismatch": False,
+                "output_shape_missing_keys": [],
+                "output_shape_missing_files": [],
             }
 
     def _run_jit(
@@ -667,6 +750,11 @@ class EvaluationHarness:
         initial_state = build_initial_state(
             task, allow_network=self._config.allow_network,
         )
+        # ext8 #67: measure pipeline latency in _run_jit's own scope so the
+        # LangFuse `m5.latency_ms` score below has a value to read. Pre-fix
+        # that score reached into the result dict for a never-populated
+        # chain-result latency key → every M5 score landed as 0.
+        _t_start_jit = time.monotonic()
         try:
             final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
         except Exception as exc:  # noqa: BLE001
@@ -677,6 +765,7 @@ class EvaluationHarness:
                 "failure_reason": "generation_failed",
                 "attempt_count": 0,
             }
+        jit_elapsed_ms = int((time.monotonic() - _t_start_jit) * 1000)
 
         # Step 13.7 Batch B6 — capture LangFuse root trace ID for
         # DuckDB↔LangFuse cross-reference. Read after pipeline.invoke
@@ -712,10 +801,19 @@ class EvaluationHarness:
             try:
                 from langfuse import get_client
                 lf = get_client()
-                success_val = (
-                    float(result.get("gate_passed", False))
-                    * float(result.get("output_in_range", False))
-                )
+                # ext8 #59/#64: use the canonical M1 predicate so LangFuse
+                # `m1.success` agrees with DuckDB success (including the
+                # ext6 #32 `NOT output_shape_mismatch` tightening).
+                success_val = 1.0 if EvaluationRecord.is_success(
+                    gate_passed=bool(result.get("gate_passed", False)),
+                    output_in_range=bool(result.get("output_in_range", False)),
+                    output_shape_mismatch=bool(result.get("output_shape_mismatch", False)),
+                ) else 0.0
+                # ext8 #67: pre-fix read a chain-result latency key that was
+                # never populated in the result dict → always 0.
+                # ``jit_elapsed_ms`` is measured around pipeline.invoke
+                # above; use it directly.
+                latency_val = float(jit_elapsed_ms or 0)
                 for method_name in ("create_score", "score"):
                     _create = getattr(lf, method_name, None)
                     if _create is None:
@@ -733,10 +831,7 @@ class EvaluationHarness:
                             _create(
                                 trace_id=_lf_trace_id,
                                 name="m5.latency_ms",
-                                value=float(
-                                    result.get("chain_result_attempt_latency_ms", 0)
-                                    or 0
-                                ),
+                                value=latency_val,
                                 data_type="NUMERIC",
                             )
                         break
@@ -906,12 +1001,21 @@ def _extract_result_compositional(
     # success in Chapter 6 tables. Now the reason surfaces explicitly,
     # matching the CLI's exit-code-3 semantics, and the analyzer's
     # success predicate excludes shape-mismatched rows.
+    #
+    # ext8 #64 (2026-04-20): also flip output_in_range=False so the
+    # LangFuse `m1.success` score (which reads from the result dict via
+    # EvaluationRecord.is_success) agrees with the DuckDB SQL predicate.
+    # Pre-ext8 fix, a shape-mismatched row had failure_reason set BUT
+    # output_in_range=True — LangFuse scored success=1.0 while DuckDB
+    # excluded the row. Same-store parity now holds; cross-store parity
+    # via is_success().
     if (
         failure_reason == "none"
         and shape_check is not None
         and not shape_check.satisfied
     ):
         failure_reason = "output_shape_mismatch"
+        output_in_range = False  # ext8 #64
 
     # Count how many registry matches vs generated artifacts were executed
     matched_count = sum(
@@ -1206,6 +1310,18 @@ def _extract_result(
     # so the file-presence check uses an empty dict here. T07/T11 — the
     # only file-producing tasks — go through the compositional path.
     shape_check = task.output_contract.check(output, {}) if task.output_contract else None
+
+    # ext8 #64 (2026-04-20): promote output_shape_mismatch + flip
+    # output_in_range=False on the single-artifact path too (symmetric
+    # with the compositional branch at line 922). Keeps LangFuse
+    # `m1.success` in agreement with the DuckDB SQL predicate.
+    if (
+        failure_reason == "none"
+        and shape_check is not None
+        and not shape_check.satisfied
+    ):
+        failure_reason = "output_shape_mismatch"
+        output_in_range = False
 
     return {
         "gate_passed": gate_passed,

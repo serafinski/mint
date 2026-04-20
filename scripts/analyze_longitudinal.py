@@ -286,12 +286,25 @@ def _load_cycle_data(
         (task_ts, (run_id, task_id))
         for run_id, task_id, task_ts in task_rows
     ]
-    # Map each invocation to its containing cycle (index into task_rows)
+    # Map each invocation to its containing cycle (index into task_rows).
+    #
+    # ext8 #56 investigation (2026-04-20): the audit claimed this loop
+    # off-by-ones cycle attribution because ``task_boundaries[N]`` is an END
+    # timestamp and invocations "during task N" have ``occurred_at <
+    # task_boundaries[N]``. Empirical trace through the code shows the
+    # premise is wrong: ``EvaluationStore.record_invocation_events`` sets
+    # ``occurred_at = datetime.now(UTC)`` at FLUSH time, inside
+    # ``flush_task_cycle_state`` which runs AFTER ``record_run`` persists
+    # the EvaluationRecord (harness.py:410 → :421). Production occurred_at
+    # is therefore > evaluation_runs.timestamp, and the pre-fix loop
+    # correctly attributes invocations via "advance to the next cycle when
+    # its END timestamp is <= inv_ts". Verified by the pre-existing
+    # ``tests/unit/test_analyze_longitudinal.py::TestLoadCycleData`` suite
+    # (invocations with occurred_at > task timestamp bucket into the
+    # correct cycles). Audit #56 logged as false positive.
     cycle_increment: list[dict[str, int]] = [defaultdict(int) for _ in task_rows]
-    # Binary-search-ish: walk invocations chronologically, track current cycle
     cycle_idx = 0
     for inv_task_id, cap_id, inv_ts in inv_rows:
-        # Advance cycle_idx to the last task whose timestamp <= inv_ts
         while (
             cycle_idx + 1 < len(task_boundaries)
             and task_boundaries[cycle_idx + 1][0] <= inv_ts
@@ -320,6 +333,8 @@ def _load_cycle_data(
             """,
             [selected_run_id],
         ).fetchall()
+        # ext8 #56 investigation: see inv_rows loop above — audit claim
+        # logged as false positive after empirical trace.
         c_idx = 0
         for _util_task_id, cap_id, score, util_ts in util_rows:
             while (
@@ -344,6 +359,8 @@ def _load_cycle_data(
             """,
             [selected_run_id],
         ).fetchall()
+        # ext8 #56 investigation: see inv_rows loop above — audit claim
+        # logged as false positive after empirical trace.
         c_idx = 0
         for _evt_task_id, cap_id, event_type, details, evt_ts in event_rows:
             while (
@@ -385,6 +402,15 @@ def _detect_convergence(
 ) -> int | None:
     """Return the first cycle N (1-indexed) where the KL stays < threshold
     for ``min_consecutive`` consecutive cycles. None if never converged.
+
+    ext8 #77 (2026-04-20): this is the LOCAL-STABILITY convergence
+    detector — it measures "consecutive-snapshot KL stayed below threshold
+    for N cycles", which is close to but not the same as the proposal's
+    "registry reaches a stable state where further cycles no longer
+    meaningfully change its contents." For the proposal-aligned
+    "distance-to-final-distribution" detector see
+    ``_detect_stable_convergence`` below. Callers can use either; Chapter
+    6 should cite both for defensibility.
     """
     if len(kls) < min_consecutive:
         return None
@@ -394,6 +420,67 @@ def _detect_convergence(
             run_len += 1
             if run_len >= min_consecutive:
                 # First cycle of the converged window is (i + 1) - (min_consecutive - 1)
+                return (i + 1) - (min_consecutive - 1)
+        else:
+            run_len = 0
+    return None
+
+
+def _average_distributions(snapshots: list[dict[str, float]]) -> dict[str, float]:
+    """Return the element-wise average of a list of distribution dicts.
+
+    Missing keys in a snapshot are treated as 0. ext8 #77 helper used by
+    ``_detect_stable_convergence`` to smooth the final-window average so
+    noise at any single cycle doesn't set the reference point.
+    """
+    if not snapshots:
+        return {}
+    all_keys: set[str] = set()
+    for s in snapshots:
+        all_keys.update(s.keys())
+    n = len(snapshots)
+    return {
+        k: sum(float(s.get(k, 0.0)) for s in snapshots) / n
+        for k in all_keys
+    }
+
+
+def _detect_stable_convergence(
+    snapshots: list[dict[str, float]],
+    threshold: float,
+    min_consecutive: int,
+    *,
+    window_size: int = 5,
+    kl_fn=None,
+) -> int | None:
+    """Return the earliest cycle where each cycle's distance to the final
+    windowed-average distribution stays below ``threshold`` for
+    ``min_consecutive`` consecutive cycles.
+
+    ext8 #77 (2026-04-20): proposal-aligned convergence detector. Unlike
+    ``_detect_convergence`` (local-stability: per-step KL < threshold),
+    this compares each cycle to the FINAL-WINDOW-AVERAGED distribution,
+    catching oscillations (each step small but cycle-N distribution far
+    from the attractor) and slow drifts. Returns None when no stable
+    window exists.
+
+    ``kl_fn(reference, snapshot) -> float`` is injectable so tests can
+    verify the behavior without depending on the analyzer's specific
+    KL implementation; defaults to ``_kl_divergence_between_snapshots``.
+    """
+    if kl_fn is None:
+        kl_fn = _kl_divergence_between_snapshots
+    if len(snapshots) < max(window_size, min_consecutive):
+        return None
+
+    final_ref = _average_distributions(snapshots[-window_size:])
+
+    run_len = 0
+    for i, snap in enumerate(snapshots):
+        kl = kl_fn(final_ref, snap)
+        if kl < threshold:
+            run_len += 1
+            if run_len >= min_consecutive:
                 return (i + 1) - (min_consecutive - 1)
         else:
             run_len = 0

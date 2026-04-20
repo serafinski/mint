@@ -20,7 +20,7 @@ At-a-glance command sequence for the thesis evaluation pipeline (Phase 3 smoke �
 
 ---
 
-## Phase 3 — Smoke (~55 min hands-on, ~$0.50–1)
+## Phase 3 — Smoke (~57 min hands-on, ~$0.50–1)
 
 Run sequentially; each gate must pass before the next. If any fails, **stop** and diagnose.
 
@@ -32,6 +32,8 @@ Run sequentially; each gate must pass before the next. If any fails, **stop** an
 | 4 | `uv run scripts/test_allow_network.py` | Pillar 2 Tier 2 network-disconnect differential; `--network bridge` vs `--network none` Docker plumbing (Step 14.12) | ~2 min |
 | 5 | `uv run scripts/test_auto_optimizer.py` | Pillar 3 (prune/split/merge) wired through pipeline; atomic-rollback invariant | ~90 s |
 | 6 | `uv run scripts/test_mint.py` | Full CLI e2e across all three backends + all supported file formats | ~10 min |
+| 6a | `uv run scripts/test_registry_matching.py` | **Chapter 3 hierarchical-embeddings FP evidence** — proposal §Pillar 1 line 77 "prevent false positives (superficial keyword matches)". Diagnostic-only prior to ext7; elevated to the main path so a Chapter 3 writer doesn't miss the claim's evidence. | ~1 min |
+| 6b | `uv run scripts/test_registry_fn.py` | **Chapter 3 hierarchical-embeddings FN evidence** — proposal §Pillar 1 line 77 "prevent ... false negatives (semantically equivalent but differently named skills)". Symmetric to 6a. | ~1 min |
 | 7 | `uv run scripts/run_pilot.py --all-tasks --condition full --n-runs 1` | 20-task pilot (1 run each). Last gate before committing ~$6 / 18 h to the 400-record run | ~30 min |
 
 ---
@@ -64,22 +66,46 @@ Row 11 backfills M4 `token_cost` → consumed by row 17. Row 16 populates `human
 
 ### Scoping convention (ext6 #38/#40/#41 + ext7 #45)
 
-Every Row below that reads `data/eval/metrics.duckdb` or a longitudinal DB MUST scope by the campaign's `run_id`(s). The DBs are append-only across sessions — unscoped queries pool prior campaigns into the current Chapter-6 aggregate. Set these variables at the top of the run-sheet session:
+Every Row below that reads `data/eval/metrics.duckdb` or a longitudinal DB MUST scope by the campaign's `run_id`(s). The DBs are append-only across sessions — unscoped queries pool prior campaigns into the current Chapter-6 aggregate.
+
+**The canonical Phase-4 run (`--all-tasks --all-conditions --n-runs 5`) produces 20 distinct `run_id`s** (4 conditions × 5 runs). Each of those 20 run_ids is also a LangFuse session_id (`tests/evaluation/harness.py:396` — the harness sets `session_id=run_id` on every trace). So `CAMPAIGN_RUN_IDS` and `CAMPAIGN_SESSION_IDS` both need 20 values. A fixed literal example would go stale on every campaign — populate them dynamically from the DB + LangFuse after Row 8 finishes:
 
 ```bash
-# 4 run_ids from this campaign (one per condition). Source of truth:
-#   SELECT DISTINCT run_id FROM evaluation_runs WHERE NOT is_pilot ORDER BY run_id DESC LIMIT 4;
-export CAMPAIGN_RUN_IDS="full_00_abc123 no_verification_00_def456 no_optimization_00_ghi789 static_00_jkl012"
+# 20 run_ids from this Phase-4 campaign (4 conditions × 5 runs).
+# Runs AFTER Row 8 completes; reads $CAMPAIGN_DB set in the isolation block above.
+export CAMPAIGN_RUN_IDS="$(uv run python -c "
+import duckdb
+conn = duckdb.connect('$CAMPAIGN_DB')
+ids = [r[0] for r in conn.execute(
+    'SELECT DISTINCT run_id FROM evaluation_runs '
+    'WHERE NOT is_pilot ORDER BY run_id'
+).fetchall()]
+print(' '.join(ids))
+")"
 
-# Row-8 LangFuse session id (one per campaign). Used by rows 13 + 15.
-export CAMPAIGN_SESSION_IDS="eval_2026_04_20_full_final"
+# LangFuse session_id == DuckDB run_id (harness.py:396) — reuse the run_ids.
+# Rows 13 + 15 take these as --session-ids; rows 14, 16, 17 take the run_ids
+# themselves as --run-ids against $CAMPAIGN_DB.
+export CAMPAIGN_SESSION_IDS="$CAMPAIGN_RUN_IDS"
 
-# Row-9 + Row-10 longitudinal run_ids (one per DB).
-export LONGITUDINAL_RUN_ID="long_2026_04_20_abc"
-export SHIFT_RUN_ID="shift_2026_04_20_xyz"
+# Longitudinal runs emit ONE run_id per invocation (uuid-based). Capture
+# after Rows 9 / 10 complete by tailing the runner log or querying the DB:
+#   SELECT DISTINCT run_id FROM evaluation_runs ORDER BY timestamp DESC LIMIT 1;
+export LONGITUDINAL_RUN_ID="$(uv run python -c "
+import duckdb
+conn = duckdb.connect('data/eval/longitudinal.duckdb')
+print(conn.execute('SELECT DISTINCT run_id FROM evaluation_runs ORDER BY timestamp DESC LIMIT 1').fetchone()[0])
+")"
+export SHIFT_RUN_ID="$(uv run python -c "
+import duckdb
+conn = duckdb.connect('data/eval/longitudinal_shifted.duckdb')
+print(conn.execute('SELECT DISTINCT run_id FROM evaluation_runs ORDER BY timestamp DESC LIMIT 1').fetchone()[0])
+")"
 ```
 
-Every analyzer row below passes the appropriate scope flag. Forgetting the flag is not safe: `analyze_results.py` will auto-select with a WARN (ext6 #38), but the other analyzers will silently pool cross-campaign data.
+**Why dynamic discovery, not a literal example:** every campaign generates fresh uuid-hash suffixes, and `--n-runs` is configurable — a literal list in the doc goes stale on every invocation. An earlier doc draft (pre-fix) carried a 4-value literal list that, if followed verbatim on the canonical 20-run campaign, would silently scope analyses to 20% of the data — the exact bug ext7 #46 was meant to prevent, re-opened through a doc mismatch.
+
+Every analyzer row below passes the appropriate scope flag. Forgetting the flag is not safe: `analyze_results.py` will auto-select with a WARN (ext6 #38 + ext7 #46 balanced per-condition), but the other analyzers will silently pool cross-campaign data.
 
 | # | Command | Why (proposal metric) | Time |
 |---|---|---|---:|
@@ -107,9 +133,9 @@ Not on the main path. Call these to debug a specific regression.
 | Prune misbehaving | `uv run scripts/test_prune.py` | 2-second real-ChromaDB prune mechanics smoke |
 | Pillar 3 split/merge regression | `uv run scripts/test_split_merge.py` | 9/9 matrix (MCP_TOOL × SKILL × AGENT × {split, merge}) with real LLM (~5–10 min) |
 | `mint feedback --wrong` flow broken | `uv run scripts/test_feedback_split.py` | In-memory demo of §12 finding #6b: feedback → `get_recent_failures` → split consumer |
-| Chapter 3 needs hierarchical-embeddings FP evidence | `uv run scripts/test_registry_matching.py` | **False-positive** audit + description/implementation self-consistency (cite in §3.1/§3.2) |
-| Chapter 3 needs hierarchical-embeddings FN evidence | `uv run scripts/test_registry_fn.py` | **False-negative** audit — symmetric to the above; paraphrased-query recall. ✅ shipped 2026-04-19 (closes proposal §Pillar 1 line 77 gap) |
 | Writing Chapter 4 §14.6 appendix | `uv run scripts/validate_contract_extractor.py` | 20/20 extractor agreement check against authored T-task contracts |
+
+**Note (ext7 remediation 2026-04-20):** `test_registry_matching.py` (Chapter 3 FP) + `test_registry_fn.py` (Chapter 3 FN) were previously in this diagnostic list. They are now elevated to main-path rows 6a + 6b because the proposal's §Pillar 1 line 77 claim ("hierarchical embeddings prevent both false positives and false negatives") needs numbered evidence in Chapter 3.
 
 ---
 
@@ -117,10 +143,10 @@ Not on the main path. Call these to debug a specific regression.
 
 | Phase | Hands-on | Unattended | $ |
 |---|---:|---:|---:|
-| Phase 3 smoke | ~55 min | — | ~$0.50–1 |
-| Phase 4 data gen | kickoff only | ~18 h (parallel) | ~$6 |
-| Phase 4/5 analysis | ~2–4 h (row 15 human audit) | trivial | $0 |
-| **Total** | **~4–6 h** | **~18 h** | **~$7** |
+| Phase 3 smoke | ~57 min | — | ~$0.50–1 |
+| Phase 4 data gen | kickoff only | ~30–38 h (SERIAL per ext7 #51) | ~$6 |
+| Phase 4/5 analysis | ~2–4 h (row 16 human audit) | trivial | $0 |
+| **Total** | **~4–6 h** | **~30–38 h** | **~$7** |
 
 ---
 
@@ -164,8 +190,8 @@ Cross-reference against `docs/thesis_proposal.md`. Every proposal-asked delivera
 | Pillar 1 RQ #1 — classification accuracy | line 96 | Row 17 Core-Work Classification Accuracy *(proxy, task-level match)* |
 | Pillar 1 RQ #2 — JIT vs human-designed success | line 97 | Row 17 Fisher test: each JIT condition vs `static` baseline |
 | Pillar 1 RQ #3 — latency of generation + verification | line 98 | Row 17 M5 latency |
-| Pillar 1 line 77 — hierarchical embeddings prevent **FP** | line 77 | `test_registry_matching.py` (diagnostic) |
-| Pillar 1 line 77 — hierarchical embeddings prevent **FN** | line 77 | `test_registry_fn.py` (diagnostic, ✅ shipped 2026-04-19) |
+| Pillar 1 line 77 — hierarchical embeddings prevent **FP** | line 77 | Row 6a (`test_registry_matching.py`) |
+| Pillar 1 line 77 — hierarchical embeddings prevent **FN** | line 77 | Row 6b (`test_registry_fn.py`) |
 | Pillar 3 RQ #1 — evolutionary vs human distribution | line 195 | Row 18 seeded-vs-evolved Gini comparison |
 | Pillar 3 RQ #2 — cycles to converge | line 196 | Row 18 cycles-to-convergence on utility-score KL |
 | Pillar 3 RQ #3 — stability under distribution shift | line 197 | Row 19 three-tier adaptation verdict |
@@ -175,7 +201,7 @@ Cross-reference against `docs/thesis_proposal.md`. Every proposal-asked delivera
 | Tension | Row |
 |---|---|
 | T1 — Autonomy vs correctness | Implicit via entire Pillar 2 pipeline — defensibility at row 3 (`test_verification.py`) + row 4 (`test_allow_network.py`) + row 15 (`analyze_tier2_probes.py`) + M2 at row 16 |
-| T2 — Specificity vs generality | Pillar 3 at rows 5 + 18 + 19; hierarchical-embeddings FP+FN claims via `test_registry_matching.py` + `test_registry_fn.py` (diagnostic, both shipped) |
+| T2 — Specificity vs generality | Pillar 3 at rows 5 + 18 + 19; hierarchical-embeddings FP+FN claims at rows 6a + 6b |
 | T3 — Context economy (two failure modes) | Row 13 naive-verbose half + row 14 aggressive-compression half |
 
 ### §Pillar 2 failure-mode taxonomy (lines 106–111)

@@ -14,6 +14,7 @@ Six test categories:
 
 import ast
 import json
+import re
 import statistics
 import textwrap
 import time
@@ -370,16 +371,23 @@ def _test_output_variation(
         elif (
             err_a is None
             and err_b is None
-            and parsed_a.get("result") == parsed_b.get("result")
+            and _normalize_for_variation(parsed_a.get("result"))
+            == _normalize_for_variation(parsed_b.get("result"))
             and parsed_a.get("result") not in _TRIVIAL_RESULTS
         ):
+            # ext8 #72 (2026-04-20): compare NORMALIZED outputs (timestamps
+            # / UUIDs / counters stripped) so a contaminated tool that
+            # embeds a varying timestamp per-call doesn't bypass the probe.
+            # The raw outputs may differ by a timestamp but their canned
+            # core is identical.
             findings.append(
                 VerificationFinding(
                     tier=2,
                     category="output_variation",
                     severity=Severity.MEDIUM,
                     message=(
-                        f"Tool returned identical output for very different inputs: "
+                        f"Tool returned near-identical output for very different "
+                        f"inputs (timestamps/UUIDs normalized): "
                         f"{parsed_a.get('result')!r} — may be ignoring parameters"
                     ),
                     location="output_variation",
@@ -387,6 +395,59 @@ def _test_output_variation(
             )
 
     return findings
+
+
+# ext8 #72 (2026-04-20): regex-based normalization. Strips embedded
+# timestamps, UUIDs, and counter-like fields before equality comparison in
+# the output-variation probe. A contaminated tool whose only inter-call
+# variation is an embedded ``datetime.now()`` / ``uuid.uuid4()`` / ``counter
+# += 1`` pattern gets flagged. False positives are tolerable (the probe is
+# MEDIUM severity + one of several detection signals) — better to false-
+# positive than false-negative on contamination.
+_NORMALIZATION_PATTERNS = [
+    # ISO-8601 timestamps: 2026-04-20T14:32:17.123456+00:00 or Z.
+    (
+        re.compile(
+            r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+            r"(?:Z|[+-]\d{2}:?\d{2})?"
+        ),
+        "<TS>",
+    ),
+    # Epoch timestamps (10 or 13 digits standing alone or in quotes).
+    (re.compile(r"\b1[67]\d{8}(?:\d{3})?\b"), "<EPOCH>"),
+    # UUIDs.
+    (
+        re.compile(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}",
+            re.IGNORECASE,
+        ),
+        "<UUID>",
+    ),
+    # Counter/id/nonce fields with numeric values.
+    (
+        re.compile(
+            r"(?P<key>(?:count|counter|id|nonce|request_id|trace_id)"
+            r"\"?'?)\s*[:=]\s*\d+",
+            re.IGNORECASE,
+        ),
+        r"\g<key>: <N>",
+    ),
+]
+
+
+def _normalize_for_variation(result: Any) -> str:
+    """Normalize a probe result string by stripping timestamps/UUIDs/counters.
+
+    Called by ``_test_output_variation`` (ext8 #72) before equality
+    comparison. Accepts any type — stringifies then applies the patterns.
+    Returns the normalized string; identical output (modulo the masked
+    fields) compares equal.
+    """
+    s = result if isinstance(result, str) else repr(result)
+    for pattern, replacement in _NORMALIZATION_PATTERNS:
+        s = pattern.sub(replacement, s)
+    return s
 
 
 def _test_nonexistent_entity(
@@ -633,8 +694,14 @@ def _test_latency(
     stdev = statistics.stdev(elapsed_samples)
     cv = (stdev / mean) if mean > 0 else 0.0
 
-    # Two-condition gate: very fast AND very uniform.
-    if mean < 0.001 and cv < 0.10:
+    # ext8 #73 (2026-04-20): pre-fix gate required mean < 1ms AND cv < 0.10.
+    # For sub-millisecond means, natural Python GC/allocation jitter across
+    # a small (3-5) sample inflates cv to 0.2-0.5 routinely, so the probe
+    # under-fires on real mocks. Loosen to "very fast AND absolute stdev is
+    # small" — any tool with ≥ 10×mean variability is real computation,
+    # sub-10×mean variability at sub-millisecond is canned output.
+    absolute_stdev_threshold = max(2e-4, 0.5 * mean)  # 200µs or half the mean
+    if mean < 0.001 and stdev < absolute_stdev_threshold:
         findings.append(
             VerificationFinding(
                 tier=2,

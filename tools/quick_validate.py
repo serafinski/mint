@@ -43,6 +43,24 @@ def validate_skill(skill_path):
 
     frontmatter_text = match.group(1)
 
+    # ext8 #75 (2026-04-20): reject bodies containing bare-line '---'
+    # delimiters beyond the 2 frontmatter markers. DeepAgents' skill loader
+    # (or any downstream tool using ``yaml.safe_load_all``) splits on
+    # ``\n---\n`` → body content after the 3rd delimiter can be silently
+    # dropped. Count bare-line '---' occurrences; expect exactly 2 (open
+    # + close of frontmatter).
+    bare_delim_count = sum(
+        1 for line in content.splitlines() if line.strip() == "---"
+    )
+    if bare_delim_count > 2:
+        return False, (
+            f"SKILL body contains {bare_delim_count - 2} extra bare-line "
+            "'---' delimiter(s) beyond the frontmatter markers. DeepAgents "
+            "may interpret body content after these as separate YAML "
+            "documents and drop it silently. Use '***' or "
+            "indented '---' for horizontal rules."
+        )
+
     # Parse YAML frontmatter
     try:
         frontmatter = yaml.safe_load(frontmatter_text)

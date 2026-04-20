@@ -262,7 +262,12 @@ def main() -> int:
         collection_name="capabilities",
     )
     seed_registry(registry)
-    metrics_store = MetricsStore()
+    # ext8 #71 (2026-04-20): persist MetricsStore — see run_longitudinal.py
+    # for rationale.
+    _metrics_store_path = str(
+        DATA_DIR / "eval" / "longitudinal_shift_metrics_store.duckdb"
+    )
+    metrics_store = MetricsStore(db_path=_metrics_store_path)
     loader = ToolLoader()
 
     # --- Evaluation store ---

@@ -153,16 +153,25 @@ def create_pipeline(
         _opt_loop = create_optimization_loop(
             registry, metrics_store, optimizer_config=optimizer_config,
         )
-        _prev_optimizer_scores: dict[str, float] = {}
 
         def _optimizer_node(state: TaskState) -> Command:
-            nonlocal _prev_optimizer_scores
             try:
+                # ext8 #62 (2026-04-20): load previous-utility scores from
+                # MetricsStore instead of a closure-local nonlocal. Pre-fix
+                # every per-task pipeline recompile wiped the nonlocal to
+                # {} so KL divergence always compared against an empty
+                # baseline. MetricsStore persists across recompiles within
+                # a run AND (post-#71) across runs — so "cycles-to-converge"
+                # now measures the actual convergence signal.
+                try:
+                    _prev_scores = metrics_store.load_previous_utility_scores()
+                except Exception:  # noqa: BLE001
+                    _prev_scores = {}
                 # Step 14.12: carry the task's network policy into the
                 # optimizer subgraph so merge/split variant verification
                 # runs under the same policy the triggering task uses.
                 init_state = OptimizerState(
-                    previous_utility_scores=_prev_optimizer_scores,
+                    previous_utility_scores=_prev_scores,
                     allow_network=bool(getattr(state, "allow_network", False)),
                 )
                 # Fix #4 (2026-04-19): wrap the optimizer sub-graph in
@@ -203,9 +212,17 @@ def create_pipeline(
 
                 with _trace_context(trace_id=_opt_trace_id):
                     result = _opt_loop.invoke(init_state)
-                # Carry current utility scores forward for the next pipeline run.
+                # ext8 #62: persist the current utility scores to MetricsStore
+                # so the next task's optimizer reads them as `previous_*`.
                 if isinstance(result, dict):
-                    _prev_optimizer_scores = result.get("utility_scores", {})
+                    try:
+                        metrics_store.persist_utility_scores(
+                            result.get("utility_scores", {}) or {}
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "ext8 #62 persist_utility_scores failed: %s", exc,
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Granularity optimizer failed (non-fatal): %s", exc)
             return Command(update={}, goto=END)

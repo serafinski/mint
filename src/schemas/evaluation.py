@@ -312,12 +312,50 @@ class EvaluationRecord(BaseModel):
 
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
-        description="When this record was written",
+        description=(
+            "When this record was written. Set at task-END time by the "
+            "default_factory; the EvaluationRecord(...) constructor is "
+            "called AFTER _run_jit / _run_static returns. ext8 #56 flagged "
+            "that analyze_longitudinal's per-cycle attribution uses this as "
+            "an END timestamp (not a start), so the bucketing loop uses "
+            "half-open intervals with the current-cycle boundary as the "
+            "upper bound."
+        ),
     )
 
     model_config = {"extra": "forbid"}
 
+    @classmethod
+    def is_success(
+        cls,
+        *,
+        gate_passed: bool,
+        output_in_range: bool,
+        output_shape_mismatch: bool = False,
+    ) -> bool:
+        """Canonical M1 success predicate — ext8 #59/#64 single source of truth.
+
+        Every site that reports M1 (DuckDB SQL predicate, LangFuse
+        ``m1.success`` score, this class's ``success`` property) MUST route
+        through this predicate so the two stores never diverge.
+
+        Pre-ext8-#59/#64, the LangFuse score used ``gate_passed * output_in_range``
+        (pre-ext6-#32 formula) while DuckDB SQL had been tightened to also
+        exclude ``output_shape_mismatch`` — the two stores disagreed on
+        every shape-mismatched row. A single classmethod + one-line call
+        at each consumer closes the gap.
+        """
+        return gate_passed and output_in_range and not output_shape_mismatch
+
     @property
     def success(self) -> bool:
-        """Composite success: gate accepted AND output is correct."""
-        return self.gate_passed and self.output_in_range
+        """Composite success: gate accepted AND output in range AND shape ok.
+
+        Delegates to ``is_success`` (ext8 #59/#64) so this property and every
+        other M1 consumer share one predicate.
+        """
+        return self.__class__.is_success(
+            gate_passed=self.gate_passed,
+            output_in_range=self.output_in_range,
+            output_shape_mismatch=self.output_shape_mismatch,
+        )

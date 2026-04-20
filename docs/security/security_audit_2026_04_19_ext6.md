@@ -7,7 +7,9 @@
 
 **All seven re-verified still-open 2026-04-20** against the current tip after ext4/ext5 content was folded into the parent audit. None have been incidentally fixed by the #1-#18 sweep.
 
-**Status at time of write (2026-04-20):** all twenty-five **open**. Severities:
+**Status (verified 2026-04-20 post-remediation sweep): ALL TWENTY-FIVE ✅ FIXED.** Every finding was remediated in the 2026-04-20 batch; verified against current `iter/6-execution-backends` tip via direct code inspection. See ext8 (`security_audit_2026_04_19_ext8.md`) for the next open set (#56-#60).
+
+**Original status at time of write:** all twenty-five **open**. Severities (preserved for audit trail):
 
 | # | Severity | Layer | Direction of bias |
 |---|---|---|---|

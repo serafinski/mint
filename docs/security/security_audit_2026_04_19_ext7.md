@@ -13,7 +13,9 @@
 
 These are logged as a separate extension (rather than appended to ext6) because they are regression findings against ext6's own remediations — they describe gaps in the fix, not new bugs in pre-fix code. Future audits of this shape (post-remediation verification) should land in their own files so the audit history cleanly separates "bugs we found" from "bugs our fixes missed."
 
-**Status at time of write (2026-04-20):** all twelve **open**.
+**Status (verified 2026-04-20 post-remediation sweep): ALL TWELVE ✅ FIXED.** Every finding was remediated in the 2026-04-20 batch; verified against current `iter/6-execution-backends` tip via direct code inspection (`analyze_results.py::_resolve_scope` per-condition cap, `--environment` default "default", `run_pilot.py::--db/--fresh-db/--append`, `invocation_events.is_pilot` column, file-locked shared dirs + SERIAL run_sheet, `EXPECTED_TOTAL` completeness guard, `build_initial_state` shared helper, run-sheet `$CAMPAIGN_*` env vars, `analyze_longitudinal.py` run-id enforcement). See ext8 (`security_audit_2026_04_19_ext8.md`) for the next open set (#56-#60).
+
+**Original status at time of write:** all twelve **open**.
 
 | # | Severity | Scope | Impact |
 |---|---|---|---|

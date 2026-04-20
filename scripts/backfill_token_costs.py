@@ -113,7 +113,13 @@ def fetch_all_generations(
 
 
 def get_run_windows(conn: duckdb.DuckDBPyConnection) -> list[dict]:
-    """Get per-run_id time windows from the evaluation DB."""
+    """Get per-run_id time windows from the evaluation DB.
+
+    ext8 #58 Bug B (2026-04-20): also fetches the set of distinct task_ids
+    actually present in each run. ``n_jit_tasks`` needs the real set, not
+    blind ``n_distinct_tasks - 3`` (which collapses partial runs without
+    the 3 retrieval tasks to 0).
+    """
     rows = conn.execute(
         """
         SELECT run_id, condition,
@@ -127,6 +133,16 @@ def get_run_windows(conn: duckdb.DuckDBPyConnection) -> list[dict]:
         ORDER BY MIN(timestamp)
         """
     ).fetchall()
+
+    # ext8 #58 Bug B: per-run task_id sets (one query, then bucket by run_id).
+    task_rows = conn.execute(
+        "SELECT DISTINCT run_id, task_id FROM evaluation_runs "
+        "WHERE is_pilot = FALSE"
+    ).fetchall()
+    actual_task_ids_by_run: dict[str, set[str]] = {}
+    for rid, tid in task_rows:
+        actual_task_ids_by_run.setdefault(rid, set()).add(tid)
+
     return [
         {
             "run_id": r[0],
@@ -135,6 +151,7 @@ def get_run_windows(conn: duckdb.DuckDBPyConnection) -> list[dict]:
             "end_ts": r[3].replace(tzinfo=UTC) if r[3].tzinfo is None else r[3],
             "n_tasks": r[4],
             "n_distinct_tasks": r[5],
+            "actual_task_ids": actual_task_ids_by_run.get(r[0], set()),
         }
         for r in rows
     ]
@@ -242,12 +259,25 @@ def compute_run_costs(
         if rw["condition"] == "longitudinal":
             n_jit_tasks = rw["n_distinct_tasks"]
         else:
-            n_jit_tasks = rw["n_distinct_tasks"] - len(
-                RETRIEVAL_TASKS  # Exclude retrieval tasks from per-JIT-task estimate
-            )
-            # Rough: subtract 3 for T01-T03 if this is a full-task run
-            if rw["n_distinct_tasks"] >= 13:
-                n_jit_tasks = rw["n_distinct_tasks"] - 3
+            # ext8 #58 Bug B (2026-04-20): compute n_jit_tasks from the
+            # ACTUAL distinct task_ids this run covered, not by blind
+            # subtraction. Pre-fix ``n_distinct_tasks - 3`` collapsed to
+            # 0 on partial runs (e.g. ``--tasks T11,T12,T13`` → 3 JIT
+            # tasks reported as n_jit_tasks=0, per-task cost=0) and
+            # miscounted any partial set without exactly 3 retrieval
+            # tasks present. The ``actual_task_ids`` set is populated by
+            # ``get_run_windows`` via a per-run distinct-task_id query.
+            actual_task_ids = rw.get("actual_task_ids", set())
+            if actual_task_ids:
+                n_jit_tasks = len(actual_task_ids - RETRIEVAL_TASKS)
+            else:
+                # Legacy caller that didn't populate actual_task_ids
+                # (e.g., a unit test with a hand-built rw). Fall back to
+                # the n_distinct_tasks - 3 heuristic but clamp at 0.
+                n_jit_tasks = max(
+                    rw["n_distinct_tasks"] - len(RETRIEVAL_TASKS),
+                    0,
+                )
 
         # Security audit finding #28 Bug A (2026-04-20): use total-record
         # count (``n_tasks``) for the per-record divisor, NOT distinct
@@ -554,15 +584,36 @@ def compute_per_task_costs(
     from collections import Counter as _Counter
     cycle_counts: _Counter[tuple[str, str]] = _Counter()
     run_record_counts: _Counter[str] = _Counter()
+    # ext8 #58 Bug A: track retrieval-task record counts per-run so the
+    # untagged-run fallback divisor reflects JIT-only rows.
+    run_retrieval_record_counts: _Counter[str] = _Counter()
     for rec in records:
         if rec["condition"] != "static":
             cycle_counts[(rec["run_id"], rec["task_id"])] += 1
             run_record_counts[rec["run_id"]] += 1
+            if (
+                rec["condition"] != "longitudinal"
+                and rec["task_id"] in RETRIEVAL_TASKS
+            ):
+                run_retrieval_record_counts[rec["run_id"]] += 1
 
     # Build updates
     updates: list[tuple[str, int]] = []
     for rec in records:
         if rec["condition"] == "static":
+            updates.append((rec["id"], 0))
+            continue
+
+        # ext8 #58 Bug A (2026-04-20): zero retrieval tasks regardless of
+        # whether this run is tagged or falls through to the untagged
+        # fallback. Pre-fix the fallback at line 575 skipped the
+        # retrieval-zero check that ``compute_backfill_values`` applies,
+        # inflating T01/T02/T03 cost with a share of JIT tokens those
+        # tasks never incurred.
+        if (
+            rec["condition"] != "longitudinal"
+            and rec["task_id"] in RETRIEVAL_TASKS
+        ):
             updates.append((rec["id"], 0))
             continue
 
@@ -576,10 +627,18 @@ def compute_per_task_costs(
             # Security audit finding #37 (2026-04-20): untagged run in a
             # mixed-era DB falls back to run-level-divided-by-cycle-count
             # instead of silently writing 0.
+            #
+            # ext8 #58 Bug A: the fallback divisor must reflect JIT-only
+            # record count (retrieval tasks are zeroed above) so the
+            # JIT share isn't diluted by retrieval-zeros in the run.
             summary = (run_summaries or {}).get(rid)
             run_total = (summary or {}).get("total_tokens", 0)
-            n_records = run_record_counts.get(rid, 1) or 1
-            tokens = run_total // n_records
+            jit_records_in_run = max(
+                run_record_counts.get(rid, 1)
+                - run_retrieval_record_counts.get(rid, 0),
+                1,
+            )
+            tokens = run_total // jit_records_in_run
         updates.append((rec["id"], tokens))
 
     return updates

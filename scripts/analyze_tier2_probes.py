@@ -109,9 +109,25 @@ class ProbeBreakdown:
     capability_types_by_category: dict[str, Counter] = field(
         default_factory=lambda: defaultdict(Counter)
     )
+    # ext8 #60 (2026-04-20): this counter records SEVERITY HITS per
+    # category, not per-category severity counts. A single event with N
+    # categories and K findings at severity S contributes K to each of
+    # the N categories, so summing across categories exceeds the true
+    # per-severity event count. Use ``severity_by_event`` (below) for
+    # the sum-across-severities view that matches the actual finding
+    # count. Renders are labelled "severity hits by category (multi-
+    # category events contribute to each category)" to make the
+    # overcounting explicit — pre-fix the label was "severity by
+    # category" which was misleading.
     severity_by_category: dict[str, Counter] = field(
         default_factory=lambda: defaultdict(Counter)
     )
+    # ext8 #60: per-event severity distribution (each event contributes
+    # its severity_distribution ONCE regardless of how many categories
+    # it flagged). This is the coherent "how many findings at each
+    # severity level" count that Chapter 6 Row 15 should cite for total
+    # volume; severity_by_category is the distributional view.
+    severity_by_event: Counter = field(default_factory=Counter)
     events_total: int = 0
     events_pass: int = 0
     events_reject: int = 0
@@ -229,6 +245,17 @@ def aggregate(events: list[dict]) -> ProbeBreakdown:
         if not isinstance(categories, list):
             continue
 
+        # ext8 #60: record each event's severity distribution ONCE
+        # regardless of category count. This is the coherent "how many
+        # findings at each severity level" view. The ``severity_by_
+        # category`` counter below records severity HITS with multi-
+        # category overcounting — distributional view only.
+        if isinstance(severity_dist, dict):
+            for sev, count in severity_dist.items():
+                bd.severity_by_event[sev] += (
+                    int(count) if isinstance(count, (int, float)) else 1
+                )
+
         for cat in categories:
             if not isinstance(cat, str):
                 continue
@@ -238,8 +265,9 @@ def aggregate(events: list[dict]) -> ProbeBreakdown:
             # Attribute the severity distribution to each category in the
             # event. (LangFuse stores severity_distribution at the event
             # level, not per-finding, so this is an overcount on
-            # multi-category events — reported as "severity hits" rather
-            # than "per-category severity".)
+            # multi-category events — reported as "severity HITS" rather
+            # than "per-category severity". See ``severity_by_event``
+            # above for the per-finding view.)
             if isinstance(severity_dist, dict):
                 for sev, count in severity_dist.items():
                     bd.severity_by_category[cat][sev] += int(count) if isinstance(
@@ -313,6 +341,34 @@ def render_table(bd: ProbeBreakdown, *, include_pass: bool) -> None:
         count = bd.categories.get(cat, 0)
         marker = "✓" if count > 0 else "✗"
         print(f"  {marker} {cat:<36s} {count:>6d}  {label}")
+
+    # ext8 #60: report BOTH severity views with explicit labels.
+    #
+    # 1. severity_by_event — per-event count (sums to actual finding
+    #    volume). Correct for "how many HIGH findings did Tier 2 catch?"
+    # 2. severity_by_category — per-category HITS (overcounts on multi-
+    #    category events). Distributional view, not a total.
+    if bd.severity_by_event:
+        print(
+            "\nSeverity distribution — per-event counts "
+            "(each event counted once, sums to total finding volume):"
+        )
+        for sev, count in bd.severity_by_event.most_common():
+            print(f"  {sev:<12s} {count:>6d}")
+
+    if bd.severity_by_category:
+        print(
+            "\nSeverity HITS by category "
+            "(multi-category events contribute to each category — "
+            "summing across categories will EXCEED the per-event total above; "
+            "this is a distributional view, not a count):"
+        )
+        for cat in bd.categories:
+            row = bd.severity_by_category.get(cat)
+            if not row:
+                continue
+            hits = ", ".join(f"{s}:{c}" for s, c in row.most_common())
+            print(f"  {cat:<22s} {hits}")
 
 
 def render_csv(bd: ProbeBreakdown, output_dir: Path) -> None:

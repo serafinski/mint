@@ -308,6 +308,33 @@ def _register_artifact_directly(
             # is responsible for populating artifact.input_schema and
             # artifact.output_schema (merge derives from parents, split
             # derives from the parent being specialized).
+            #
+            # ext8 #63 (2026-04-20): validate that the LLM-claimed schemas
+            # look sane. The MCP_TOOL path delegates to
+            # ``ToolLoader.register_tool`` which runs AST-based schema
+            # extraction; SKILL/AGENT have no AST equivalent because the
+            # "tool" is prose + embedded Python fences. Defensive check:
+            # if the artifact has executable content (skill_content /
+            # agent_config) but both schemas are empty, the LLM merge/
+            # split response didn't populate them — log a WARN so the
+            # issue surfaces in Chapter 4.5 disclosure rather than
+            # manifesting later as an unexecutable registry entry.
+            has_content = bool(
+                artifact.skill_content or artifact.agent_config
+            )
+            has_schemas = bool(
+                (artifact.input_schema or {})
+                or (artifact.output_schema or {})
+            )
+            if has_content and not has_schemas:
+                logger.warning(
+                    "ext8 #63: SKILL/AGENT variant '%s' registered with no "
+                    "input_schema / output_schema — optimizer merge/split "
+                    "LLM response may have omitted them. Downstream "
+                    "invocation may fail if the claimed schema mismatches "
+                    "the embedded code. Chapter 4.5 disclosure required.",
+                    name,
+                )
             metadata: dict[str, str] = {
                 "generated": "true",
                 "source": "optimizer",

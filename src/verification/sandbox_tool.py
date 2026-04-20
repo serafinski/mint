@@ -411,7 +411,15 @@ def _sandbox_execute_with_install(
             ],
             capture_output=True,
             text=True,
-            timeout=60,
+            # ext8 #74 (2026-04-20): bumped from 60s → 180s. Cold-PyPI
+            # installs of heavy data-science stacks (scipy + scikit-learn
+            # + pandas + openpyxl) routinely exceed 60s on home
+            # connections / slow PyPI mirrors. The narrower timeout
+            # depressed M1 via spurious gate rejections attributed to
+            # "artifact failed Tier 2" rather than "install timed out".
+            # Pip install is bounded (completes or fails cleanly) so
+            # 180s caps the worst case without risking infinite wait.
+            timeout=180,
         )
         if install_proc.returncode != 0:
             # Cleanup container
@@ -421,6 +429,11 @@ def _sandbox_execute_with_install(
                 "stderr": f"uv pip install failed: {install_proc.stderr}",
                 "exit_code": install_proc.returncode,
                 "success": False,
+                # ext8 #74: distinct error category so analyzers can
+                # separate dependency-install failures from genuine
+                # tool-correctness failures. M1 attribution should NOT
+                # blame the tool for a slow PyPI mirror.
+                "error_category": "dependency_install_failure",
             }
 
         # Commit container to ephemeral image
@@ -437,6 +450,8 @@ def _sandbox_execute_with_install(
         return {
             "stdout": "", "stderr": "Timeout during uv pip install",
             "exit_code": -1, "success": False,
+            # ext8 #74: distinct category for install timeouts.
+            "error_category": "dependency_install_timeout",
         }
     except Exception as exc:
         subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)

@@ -249,7 +249,16 @@ class TestExtractResult:
         assert result["output_in_range"] is False
 
     def test_registry_match_with_source_code_executes(self):
-        """Registry match with source_code in metadata → sandbox-executed."""
+        """Registry match with source_code in metadata → sandbox-executed.
+
+        ext8 #64 (2026-04-20): T07 declares ``required_files=["output.csv"]``
+        but this test's mocked executor returns a dict-only output with no
+        output_files. The post-fix shape-check flips ``output_in_range=False``
+        and sets ``failure_reason="output_shape_mismatch"`` so LangFuse M1
+        agrees with DuckDB M1. Pre-fix the same row counted as a success
+        (validator happy, shape check skipped). The updated assertions
+        codify the post-fix semantics.
+        """
         state = _make_state(
             artifacts=[],
             matches=[_make_match(source_code="# tool source")],
@@ -259,8 +268,12 @@ class TestExtractResult:
         with patch("tests.evaluation.harness._execute_artifact", return_value=fake_output):
             result = _extract_result(state, T07, loader)
         assert result["gate_passed"] is True
-        assert result["output_in_range"] is True
-        assert result["failure_reason"] == "none"
+        # ext8 #64: shape mismatch (no output.csv) flips output_in_range=False
+        # and promotes failure_reason accordingly.
+        assert result["output_in_range"] is False
+        assert result["failure_reason"] == "output_shape_mismatch"
+        assert result["output_shape_mismatch"] is True
+        assert "output.csv" in result["output_shape_missing_files"]
 
     def test_registry_match_without_source_code_cannot_validate(self):
         """Registry match without source_code → gate passes but output not validated."""

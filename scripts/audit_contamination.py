@@ -215,6 +215,92 @@ def stratified_sample(
     return out
 
 
+# ext8 #57 (2026-04-20): pre-commit sample plan persistence.
+#
+# Multi-session resume with a constant seed DOES NOT produce a coherent
+# uniform random sample across sessions — session N filters its pool to
+# unlabeled rows only (shrinking between sessions), so the union of
+# per-session samples isn't a single pre-committed uniform random
+# subset. Chapter 6's Clopper-Pearson CI on M2 assumes exactly that
+# single pre-committed sample.
+#
+# Fix: on FIRST invocation for a given audit campaign, draw the full
+# sample via ``stratified_sample`` + persist its row ids to a plan
+# file; on RESUME, read the plan file and return the subset of its
+# rows that are still unlabeled. Re-running the tool never re-draws.
+
+_SAMPLE_PLAN_FILENAME = "audit_sample_plan.json"
+
+
+def _sample_plan_path(db_path: Path) -> Path:
+    """Plan file lives alongside the DB so per-campaign isolation works."""
+    return db_path.parent / f".{db_path.stem}_{_SAMPLE_PLAN_FILENAME}"
+
+
+def get_or_create_sample_plan(
+    rows: list[AuditRow],
+    *,
+    db_path: Path,
+    conditions: list[str],
+    types: list[str],
+    per_stratum: int,
+    seed: int,
+) -> list[AuditRow]:
+    """Return the pre-committed sample plan, creating + persisting on first call.
+
+    ext8 #57 (2026-04-20): replaces raw ``stratified_sample`` at the main
+    call site so resumes draw the same sample-of-ids across sessions even
+    though each session's ``rows`` pool differs.
+    """
+    import json
+
+    plan_path = _sample_plan_path(db_path)
+    id_to_row = {r.row_id: r for r in rows}
+
+    if plan_path.exists():
+        try:
+            plan_ids = json.loads(plan_path.read_text())
+        except (OSError, ValueError) as exc:
+            print(
+                f"WARNING: sample plan at {plan_path} unreadable "
+                f"({exc}) — falling back to fresh draw. M2 CI assumption "
+                "may be violated across this resume.",
+                file=sys.stderr,
+            )
+            plan_ids = None
+        if plan_ids is not None:
+            # Filter to rows still unlabeled (rows currently in the pool).
+            resumed = [id_to_row[rid] for rid in plan_ids if rid in id_to_row]
+            print(
+                f"ext8 #57: loaded pre-committed sample plan from {plan_path} "
+                f"— {len(resumed)}/{len(plan_ids)} rows still unlabeled."
+            )
+            return resumed
+
+    # First invocation for this campaign — draw + persist.
+    sample = stratified_sample(
+        rows,
+        conditions=conditions,
+        types=types,
+        per_stratum=per_stratum,
+        seed=seed,
+    )
+    try:
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(json.dumps([r.row_id for r in sample]))
+        print(
+            f"ext8 #57: persisted new sample plan ({len(sample)} rows) to {plan_path}."
+        )
+    except OSError as exc:
+        print(
+            f"WARNING: failed to persist sample plan to {plan_path}: {exc}. "
+            "Continuing with an ephemeral plan — resume semantics will "
+            "re-draw from the pool, violating Chapter 6 M2 CI assumptions.",
+            file=sys.stderr,
+        )
+    return sample
+
+
 # ---------------------------------------------------------------------------
 # Source resolution
 # ---------------------------------------------------------------------------
@@ -423,8 +509,13 @@ def run_audit(
             run_ids=run_ids,
             since=since,
         )
-        sample = stratified_sample(
+        # ext8 #57: route through get_or_create_sample_plan so resumes
+        # read a persisted pre-committed plan rather than re-drawing from
+        # the shrinking pool (which would violate Chapter-6 M2 CI
+        # assumptions).
+        sample = get_or_create_sample_plan(
             pool,
+            db_path=db_path,
             conditions=conditions,
             types=types,
             per_stratum=per_stratum,

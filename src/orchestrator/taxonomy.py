@@ -58,6 +58,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ext8 #69 (2026-04-20): retry budget for the domain-classifier LLM call,
+# matching the strict-gate pattern used by decomposition (§12 #15),
+# classification (§12 #16), and verification (§12 #14).
+_MAX_TAXONOMY_ATTEMPTS = 3
+
 
 # ---------------------------------------------------------------------------
 # Structured-output schemas for the LLM calls
@@ -491,13 +496,34 @@ class DomainTaxonomy:
             taxonomy_list=taxonomy_list,
             query=query,
         )
-        try:
-            result: QueryDomainChoice = structured_llm.invoke(prompt)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "DomainTaxonomy.get_for_query LLM failure (query: %r): %s "
-                "— bypassing filter",
-                query[:80], exc,
+        # ext8 #69 (2026-04-20): retry per the strict-gate pattern used by
+        # decomposition (§12 #15), classification (§12 #16), and verification
+        # (§12 #14). Pre-fix a single LLM failure (rate limit, 500, network
+        # flap) demoted retrieval to unfiltered search, introducing random
+        # noise into Pillar 1 retrieval metrics under high-concurrency eval
+        # load. 3x retry matches the pattern's retry budget.
+        result: QueryDomainChoice | None = None
+        last_exc: Exception | None = None
+        for attempt in range(1, _MAX_TAXONOMY_ATTEMPTS + 1):
+            try:
+                result = structured_llm.invoke(prompt)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < _MAX_TAXONOMY_ATTEMPTS:
+                    logger.warning(
+                        "DomainTaxonomy.get_for_query attempt %d/%d failed "
+                        "(query: %r): %s — retrying",
+                        attempt, _MAX_TAXONOMY_ATTEMPTS, query[:80], exc,
+                    )
+
+        if result is None:
+            # Retry budget exhausted — loud-fail in logs but preserve the
+            # never-raises contract (caller falls back to unfiltered search).
+            logger.error(
+                "DomainTaxonomy.get_for_query exhausted %d attempts "
+                "(query: %r): %s — bypassing filter",
+                _MAX_TAXONOMY_ATTEMPTS, query[:80], last_exc,
             )
             return None
 
@@ -664,10 +690,26 @@ def classify_and_tag_artifacts(artifacts: list[GeneratedArtifact]) -> None:
             try:
                 artifact, result = future.result()
                 artifact.domain = result.domain
-                artifact.is_generic = result.is_generic
+                # ext8 #76 (2026-04-20): defense-in-depth. If the LLM
+                # said is_generic=True but the artifact's source contains
+                # hardcoded domain-specific string literals, force
+                # is_generic=False. A mis-classified hardcoded tool
+                # flagged is_generic=True pollutes every domain's search
+                # results via the `$or` clause in registry.search —
+                # single LLM decision shouldn't have cascading effects.
+                is_generic = bool(result.is_generic)
+                if is_generic and _contains_domain_specific_literals(artifact):
+                    logger.warning(
+                        "ext8 #76: classifier said is_generic=True for '%s' but "
+                        "code contains domain-specific literals — forcing "
+                        "is_generic=False (defense-in-depth).",
+                        artifact.capability_name,
+                    )
+                    is_generic = False
+                artifact.is_generic = is_generic
                 logger.info(
                     "classify_and_tag_artifacts: %s -> domain=%s is_generic=%s",
-                    artifact.capability_name, result.domain, result.is_generic,
+                    artifact.capability_name, result.domain, is_generic,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -675,3 +717,39 @@ def classify_and_tag_artifacts(artifacts: list[GeneratedArtifact]) -> None:
                     "— artifact left with domain=None",
                     exc,
                 )
+
+
+# ext8 #76 (2026-04-20): literals that mark a capability as domain-specific.
+# If these appear as string literals in source_code / skill_content /
+# agent_config, is_generic=True is suspicious and gets overridden.
+# Scoped to the Business Analytics Pipeline testbed's vocabulary (the
+# classifier's known-failure mode per line 207-210 examples above).
+_DOMAIN_SPECIFIC_LITERALS = (
+    "order_id", "product_id", "unit_price", "customer_id",
+    "company_name", "reorder", "inventory",
+    "needs_reorder", "days_of_stock", "region_revenue",
+)
+
+
+def _contains_domain_specific_literals(artifact: GeneratedArtifact) -> bool:
+    """Return True if the artifact's executable content contains string
+    literals matching a known domain-specific term.
+
+    Checks quoted occurrences only (``"order_id"`` / ``'order_id'``) so
+    matches in prose / comments don't trigger false positives.
+    """
+    texts: list[str] = []
+    if artifact.source_code:
+        texts.append(artifact.source_code)
+    if artifact.skill_content:
+        texts.append(artifact.skill_content)
+    if artifact.agent_config:
+        texts.append(
+            artifact.agent_config if isinstance(artifact.agent_config, str)
+            else str(artifact.agent_config)
+        )
+    for text in texts:
+        for term in _DOMAIN_SPECIFIC_LITERALS:
+            if f'"{term}"' in text or f"'{term}'" in text:
+                return True
+    return False

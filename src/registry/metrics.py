@@ -118,6 +118,18 @@ CREATE TABLE IF NOT EXISTS capability_events (
     details VARCHAR,
     occurred_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ext8 #62 (2026-04-20): the optimizer's ``_prev_optimizer_scores``
+-- nonlocal was wiped on every per-task pipeline recompile, so
+-- ``previous_utility_scores`` was always ``{}`` and KL divergence was
+-- computed against an empty baseline. This table carries the scores
+-- across pipeline invocations within a run AND across runs when
+-- MetricsStore is opened with a persistent db_path (ext8 #71).
+CREATE TABLE IF NOT EXISTS optimizer_prev_utility (
+    capability_id VARCHAR PRIMARY KEY,
+    utility_score DOUBLE NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 # Step 4 (B1 Pillar 3, 2026-04-15): forward-migrate existing invocation
@@ -168,6 +180,44 @@ class MetricsStore:
             pass
 
     # -- recording --------------------------------------------------------
+
+    # -- ext8 #62 optimizer previous-utility state persistence ------------
+
+    def load_previous_utility_scores(self) -> dict[str, float]:
+        """Return the optimizer's previous-run utility scores.
+
+        ext8 #62 (2026-04-20): the pipeline's ``_prev_optimizer_scores``
+        nonlocal is recreated on every per-task pipeline recompile (the
+        harness + both longitudinal runners compile a fresh pipeline per
+        task), so KL divergence was always measured against an empty
+        dict. This method reads the persisted scores so KL reflects the
+        true task-over-task delta. Paired with ext8 #71's persistent
+        MetricsStore, scores also survive across runs.
+        """
+        rows = self._conn.execute(
+            "SELECT capability_id, utility_score FROM optimizer_prev_utility"
+        ).fetchall()
+        return {r[0]: float(r[1]) for r in rows}
+
+    def persist_utility_scores(self, scores: dict[str, float]) -> None:
+        """Overwrite the persisted previous-utility map with ``scores``.
+
+        Called by the pipeline's ``_optimizer_node`` after each subgraph
+        invocation so the next task reads the just-computed scores as its
+        baseline.
+        """
+        # Idempotent replace: DELETE + INSERT is simpler than UPSERT and
+        # fine for small registries (20-50 entries typical).
+        self._conn.execute("DELETE FROM optimizer_prev_utility")
+        if scores:
+            from datetime import UTC, datetime
+            now = datetime.now(UTC)
+            rows = [(cid, float(s), now) for cid, s in scores.items()]
+            self._conn.executemany(
+                "INSERT INTO optimizer_prev_utility (capability_id, utility_score, updated_at) "
+                "VALUES (?, ?, ?)",
+                rows,
+            )
 
     def record_invocation(self, record: InvocationRecord) -> None:
         """Insert an invocation row from the Pydantic model."""

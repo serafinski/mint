@@ -670,15 +670,41 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
     # ext7 #50: exclude pilot invocations via the new is_pilot column. Pre-fix
     # the table had no pilot marker; legacy rows are backfilled via JOIN on
     # EvaluationStore init. COALESCE defends against any remaining NULL cases.
-    per_run_rows = conn.execute(
-        f"""
-        SELECT condition, run_id, capability_id, COUNT(*) AS invocations
-        FROM invocation_events
-        WHERE NOT COALESCE(is_pilot, FALSE){_SCOPE_SQL}
-        GROUP BY condition, run_id, capability_id
-        ORDER BY condition, run_id, capability_id
-        """
-    ).fetchall()
+    #
+    # ext8 #78 (2026-04-20): exclude invocations of capabilities that were
+    # later pruned (optimizer operation). Pre-fix, pruned caps' historical
+    # high-count invocations remained as "ghost" rows in the Gini
+    # computation, inflating inequality even after the optimizer
+    # successfully reduced active-registry concentration. The `cycle_events`
+    # table tracks `event_type='pruned'` per capability; LEFT JOIN + NULL
+    # filter excludes pruned caps' invocations. Legacy DBs without
+    # cycle_events gracefully skip the filter via COALESCE.
+    try:
+        per_run_rows = conn.execute(
+            f"""
+            SELECT ie.condition, ie.run_id, ie.capability_id, COUNT(*) AS invocations
+            FROM invocation_events ie
+            LEFT JOIN (
+                SELECT DISTINCT capability_id
+                FROM cycle_events
+                WHERE event_type = 'pruned'
+            ) pruned ON ie.capability_id = pruned.capability_id
+            WHERE NOT COALESCE(ie.is_pilot, FALSE)
+              AND pruned.capability_id IS NULL{_SCOPE_SQL.replace(' AND run_id ', ' AND ie.run_id ')}
+            GROUP BY ie.condition, ie.run_id, ie.capability_id
+            ORDER BY ie.condition, ie.run_id, ie.capability_id
+            """
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — legacy DB without cycle_events
+        per_run_rows = conn.execute(
+            f"""
+            SELECT condition, run_id, capability_id, COUNT(*) AS invocations
+            FROM invocation_events
+            WHERE NOT COALESCE(is_pilot, FALSE){_SCOPE_SQL}
+            GROUP BY condition, run_id, capability_id
+            ORDER BY condition, run_id, capability_id
+            """
+        ).fetchall()
 
     if not per_run_rows:
         print(f"\n{'='*80}")

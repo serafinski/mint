@@ -270,6 +270,87 @@ class TestLLMFailureHandling:
         assert tmp_taxonomy.get_for_query("some query", broken_llm) is None
 
 
+class TestExt8_69TaxonomyRetry:
+    """ext8 #69: get_for_query applies the 3x strict-gate retry pattern.
+    Pre-fix a single LLM failure (rate limit, 500, network flap) dropped
+    straight to unfiltered search — under high-concurrency eval load this
+    introduced uncontrolled noise into Pillar 1 retrieval metrics.
+    """
+
+    def test_retries_on_transient_failure_up_to_three_attempts(
+        self, tmp_taxonomy: DomainTaxonomy,
+    ):
+        # Pre-seed so the empty-taxonomy short-circuit doesn't fire.
+        seed_llm = _mock_llm_returning(
+            CapabilityDomainClassification(
+                domain="sales", is_new=True, new_description="",
+                is_generic=False, rationale="",
+            )
+        )
+        tmp_taxonomy.get_or_create_for_capability(_make_artifact(), seed_llm)
+
+        # Two transient failures, then success on the 3rd attempt.
+        flaky_llm = MagicMock()
+        flaky_llm.invoke.side_effect = [
+            RuntimeError("rate limit"),
+            RuntimeError("500 upstream"),
+            QueryDomainChoice(domain="sales", rationale="3rd try worked"),
+        ]
+        result = tmp_taxonomy.get_for_query("parse sales csv", flaky_llm)
+        assert result == "sales", (
+            "ext8 #69: taxonomy classifier must retry through transient "
+            "failures. Pre-fix returned None after a single exception."
+        )
+        assert flaky_llm.invoke.call_count == 3
+
+    def test_exhausted_retries_return_none_loud_fail(
+        self, tmp_taxonomy: DomainTaxonomy, caplog,
+    ):
+        seed_llm = _mock_llm_returning(
+            CapabilityDomainClassification(
+                domain="sales", is_new=True, new_description="",
+                is_generic=False, rationale="",
+            )
+        )
+        tmp_taxonomy.get_or_create_for_capability(_make_artifact(), seed_llm)
+
+        always_broken = MagicMock()
+        always_broken.invoke.side_effect = RuntimeError("persistent API down")
+
+        import logging
+        with caplog.at_level(logging.ERROR, logger="src.orchestrator.taxonomy"):
+            result = tmp_taxonomy.get_for_query("parse sales csv", always_broken)
+
+        assert result is None
+        assert always_broken.invoke.call_count == 3
+        # Must emit an ERROR log after exhausting retries (loud-fail contract).
+        assert any(
+            "exhausted" in rec.getMessage() and rec.levelname == "ERROR"
+            for rec in caplog.records
+        ), "ext8 #69: retry exhaustion must emit an ERROR log, not just WARN."
+
+    def test_first_attempt_success_does_not_retry(
+        self, tmp_taxonomy: DomainTaxonomy,
+    ):
+        """Happy path: first-attempt success returns immediately without
+        retry overhead.
+        """
+        seed_llm = _mock_llm_returning(
+            CapabilityDomainClassification(
+                domain="sales", is_new=True, new_description="",
+                is_generic=False, rationale="",
+            )
+        )
+        tmp_taxonomy.get_or_create_for_capability(_make_artifact(), seed_llm)
+
+        happy_llm = _mock_query_llm_returning(
+            QueryDomainChoice(domain="sales", rationale="match")
+        )
+        result = tmp_taxonomy.get_for_query("parse sales csv", happy_llm)
+        assert result == "sales"
+        assert happy_llm.invoke.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # File I/O robustness
 # ---------------------------------------------------------------------------
