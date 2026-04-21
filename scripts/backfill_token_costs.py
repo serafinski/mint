@@ -675,11 +675,32 @@ def compute_per_task_costs(
     return updates
 
 
-def main() -> None:
+def main() -> int:
+    """Backfill token costs from LangFuse.
+
+    Exit codes (ext12 #122 2026-04-21):
+        0: backfill completed cleanly (all non-static runs had LangFuse
+           generations matched, or --allow-partial was explicitly passed)
+        1: CLI / auth / connectivity failure
+        2: LangFuse returned ZERO generations in the window (ext6 #36
+           global-empty loud-fail, preserved)
+        3: some non-static runs had zero LangFuse generations matched —
+           M4 backfill would silently write zero cost for those runs.
+           Pass --allow-partial to override, with Chapter 4.5 disclosure.
+    """
     parser = argparse.ArgumentParser(description="Backfill token costs from LangFuse")
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--write", action="store_true", help="Actually update DuckDB")
     parser.add_argument("--csv", action="store_true", help="Export cost summary CSV")
+    # ext12 #122 (2026-04-21): per-run completeness guard.
+    parser.add_argument(
+        "--allow-partial", action="store_true",
+        help="Proceed even when some non-static runs have ZERO matched "
+             "LangFuse generations. Default: refuse with exit 3. When "
+             "passed, the affected runs receive token_cost=0 for every "
+             "record — Chapter 4.5 MUST disclose this as an M4 limitation. "
+             "ext12 #122.",
+    )
     args = parser.parse_args()
 
     print("Connecting to LangFuse REST API...")
@@ -687,14 +708,14 @@ def main() -> None:
         base_url, auth = _langfuse_client()
     except KeyError as e:
         print(f"ERROR: Missing env var {e}. Set LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST.")
-        sys.exit(1)
+        return 1
     # Quick auth check
     try:
         r = httpx.get(f"{base_url}/api/public/health", auth=auth, timeout=10)
         r.raise_for_status()
     except Exception as e:
         print(f"ERROR: LangFuse health check failed: {e}")
-        sys.exit(1)
+        return 1
     print(f"  Connected to {base_url}")
 
     # Get evaluation time window from DuckDB
@@ -703,7 +724,7 @@ def main() -> None:
     if not run_windows:
         print("No evaluation runs found in DB.")
         conn.close()
-        return
+        return 0
 
     start = min(rw["start_ts"] for rw in run_windows) - timedelta(minutes=5)
     end = max(rw["end_ts"] for rw in run_windows) + timedelta(minutes=5)
@@ -733,7 +754,7 @@ def main() -> None:
             file=sys.stderr,
         )
         conn.close()
-        sys.exit(2)
+        return 2
 
     # Map generations to runs
     print("Mapping generations to evaluation runs...")
@@ -746,6 +767,63 @@ def main() -> None:
     # Print summary
     print_summary(run_summaries)
     print_per_run_detail(run_summaries)
+
+    # ext12 #122 (2026-04-21): per-run completeness guard. Pre-fix, ext6 #36
+    # loud-failed ONLY when LangFuse returned zero generations globally.
+    # Partial coverage (generations exist for some runs but not others —
+    # common when LangFuse retention aged out the older traces) yielded
+    # n_generations=0 / total_tokens=0 for the uncovered runs, which
+    # ``compute_backfill_values`` happily wrote as token_cost=0 on every
+    # record of those runs. Row 17's M4 then under-reported those JIT
+    # conditions' per-task cost proportional to the missing coverage —
+    # worst-case, manufacturing thesis-favorable evidence.
+    zero_summary_runs = [
+        rid for rid, s in run_summaries.items()
+        if s.get("n_generations", 0) == 0 and s.get("condition") != "static"
+    ]
+
+    # Per-condition coverage breakdown (visible before any write).
+    by_condition: dict[str, tuple[int, int]] = {}
+    for rid, s in run_summaries.items():
+        cond = s.get("condition", "unknown")
+        has, total = by_condition.get(cond, (0, 0))
+        has += 1 if s.get("n_generations", 0) > 0 else 0
+        total += 1
+        by_condition[cond] = (has, total)
+    print("\n  Per-condition coverage (runs with >=1 matched LangFuse generation):")
+    for cond, (has, total) in sorted(by_condition.items()):
+        marker = "⚠" if has < total and cond != "static" else " "
+        print(f"  {marker} {cond:<18} {has}/{total}")
+
+    if zero_summary_runs:
+        preview = zero_summary_runs[:5]
+        more = f" (+{len(zero_summary_runs) - 5} more)" if len(zero_summary_runs) > 5 else ""
+        print(
+            f"\nERROR: {len(zero_summary_runs)} non-static runs have ZERO "
+            f"matched LangFuse generations: {preview}{more}",
+            file=sys.stderr,
+        )
+        print(
+            "  Likely causes: (a) LangFuse retention aged out this run's "
+            "traces, (b) LangFuse credentials changed between run and "
+            "backfill, (c) run_id naming drift between runner and trace "
+            "metadata.",
+            file=sys.stderr,
+        )
+        if not args.allow_partial:
+            print(
+                "  Refusing to write partial backfill. Pass --allow-partial "
+                "to proceed with zeros for these runs (document in Chapter "
+                "4.5 as an M4 limitation). ext12 #122. Exit 3.",
+                file=sys.stderr,
+            )
+            conn.close()
+            return 3
+        print(
+            f"  --allow-partial passed: proceeding with token_cost=0 for "
+            f"{len(zero_summary_runs)} runs. Chapter 4.5 disclosure REQUIRED.",
+            file=sys.stderr,
+        )
 
     # Compute backfill values — try per-task attribution first, then run-level
     records = get_per_record_info(conn)
@@ -798,7 +876,13 @@ def main() -> None:
         print(f"  CSV written to {csv_path}")
 
     print("Done.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    # ext12 #122: propagate main()'s integer return as the process exit
+    # code so orchestrators (run sheet, CI) can detect partial-coverage
+    # aborts via exit 3. Pre-fix, bare ``main()`` dropped every return
+    # value and the process exited 0 even when main explicitly called
+    # ``sys.exit(2)`` via the ext6 #36 path.
+    sys.exit(main() or 0)

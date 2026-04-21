@@ -60,6 +60,15 @@ class FailureReason(StrEnum):
     # execute_agent_artifact on the concurrent.futures TimeoutError path.
     AGENT_EXECUTION_TIMEOUT = "agent_execution_timeout"
     AGENT_EXECUTION_ERROR = "agent_execution_error"
+    # ext12 #119 (2026-04-21): distinct failure class for per-task
+    # SIGALRM watchdog aborts in longitudinal runners. Semantically
+    # distinct from ``agent_execution_timeout`` (that's a chain-step
+    # timeout on AGENT artefacts specifically) — the watchdog bounds
+    # the WHOLE pipeline.invoke call, including decomposition /
+    # classification / MCP_TOOL execution. Chapter 6 failure
+    # breakdown should report this separately so "hung Docker
+    # container" incidents don't pollute the AGENT-execution signal.
+    WATCHDOG_ABORT = "watchdog_abort"
 
 
 class HumanLabel(StrEnum):

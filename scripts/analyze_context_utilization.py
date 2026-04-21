@@ -28,6 +28,7 @@ import argparse
 import csv
 import os
 import sys
+import time
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from io import StringIO
@@ -132,14 +133,60 @@ def fetch_traces(
     return traces
 
 
-def fetch_observation(client: httpx.Client, obs_id: str) -> dict | None:
-    """Fetch a single observation by ID."""
-    try:
-        resp = client.get(f"/api/public/observations/{obs_id}")
-        resp.raise_for_status()
-        return resp.json()
-    except Exception:
-        return None
+def fetch_observation(
+    client: httpx.Client,
+    obs_id: str,
+    *,
+    max_retries: int = 3,
+) -> dict | None:
+    """Fetch a single observation by ID.
+
+    ext12 #120 (2026-04-21): pre-fix was a blanket ``except Exception:
+    return None`` with no retry. Transient LangFuse failures (rate-limit
+    throttling during a heavy read window, intermittent network egress
+    loss, token-auth expiration partway through the loop) got silently
+    swallowed. When every observation fetch for a given trace failed,
+    ``extract_trace_context`` then returned a zero-valued metrics dict
+    indistinguishable from a trace that genuinely had no GENERATION
+    observations — and the downstream aggregator pooled those phantom
+    zeros into Context Economy averages, silently deflating Chapter 6
+    numbers toward 0.
+
+    Now:
+    - Retry with exponential backoff on ``HTTPError`` / transient
+      status codes (anything other than 404/410 which mean "gone for
+      real"). ``max_retries=3`` absorbs the common ~50%-rate-limit
+      window without drowning the script.
+    - Callers can then distinguish "obs gone" (404 → ``None``) from
+      "every obs fetch failed transiently" by counting the None
+      returns across a full trace.
+    """
+    for attempt in range(max_retries):
+        try:
+            resp = client.get(f"/api/public/observations/{obs_id}")
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as exc:
+            # 404/410 mean the observation is genuinely gone — don't retry.
+            if exc.response.status_code in (404, 410):
+                return None
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            return None
+        except httpx.HTTPError:
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            return None
+        except Exception:
+            # Non-HTTP failures (JSON decode, etc.) are unlikely to
+            # self-heal — fail fast with a retry window anyway.
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            return None
+    return None
 
 
 def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
@@ -147,12 +194,24 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
 
     Returns a dict with step_count, peak_input_tokens, peak_output_tokens,
     total_tokens, reasoning_tokens, and per-step token progression.
+
+    ext12 #120 (2026-04-21): tracks ``_obs_attempted`` / ``_obs_failed``
+    / ``_fetch_degraded`` so the aggregate pass can filter out traces
+    whose every observation fetch failed. Pre-fix, all-fetches-failed
+    collapsed to a zero-valued metrics dict that looked identical to
+    "this trace had zero GENERATION observations"; the downstream
+    averager pooled the phantom zeros and deflated Chapter 6's Context
+    Economy percentages toward 0.
     """
     steps: list[dict] = []
+    n_attempted = 0
+    n_failed = 0
 
     for obs_id in trace["observation_ids"]:
+        n_attempted += 1
         obs = fetch_observation(client, obs_id)
         if obs is None:
+            n_failed += 1
             continue
 
         # Only look at GENERATION observations (LLM calls)
@@ -202,6 +261,11 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
     steps.sort(key=lambda s: s["start_time"] or datetime.min.replace(tzinfo=UTC))
 
     if not steps:
+        # ext12 #120: distinguish "every observation fetch failed" from
+        # "trace had observations but none were GENERATION-typed" —
+        # without the flag, downstream aggregation pools both cases as
+        # zero-util and deflates Chapter 6's Context Economy headline.
+        fetch_degraded = n_attempted > 0 and n_failed == n_attempted
         return {
             "step_count": 0,
             "peak_input_tokens": 0,
@@ -213,6 +277,9 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
             "total_cache_read_tokens": 0,
             "context_utilization_pct": 0.0,
             "context_utilization_chain_pct": 0.0,
+            "_fetch_degraded": fetch_degraded,
+            "_obs_attempted": n_attempted,
+            "_obs_failed": n_failed,
             "steps": [],
         }
 
@@ -245,6 +312,12 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
         "context_utilization_chain_pct": round(
             total_chain_input / MODEL_CONTEXT_WINDOW * 100, 1
         ),
+        # ext12 #120: a trace with usable GENERATION observations is never
+        # fetch-degraded (some fetches may have failed, but enough landed
+        # to produce real metrics — aggregating these is correct).
+        "_fetch_degraded": False,
+        "_obs_attempted": n_attempted,
+        "_obs_failed": n_failed,
         "steps": steps,
     }
 
@@ -542,6 +615,39 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    # ext12 #120: filter out traces whose every observation fetch failed.
+    # Pre-fix those landed in aggregates as phantom-zero rows, silently
+    # deflating Chapter 6's Context Economy averages proportional to
+    # LangFuse transient-failure rate during the analysis window. Now
+    # they're excluded from ALL downstream averages with a loud per-agent
+    # WARNING count. If every trace for every agent turned out degraded
+    # (catastrophic LangFuse outage during the analysis window) and the
+    # user hasn't passed --allow-empty, exit 3.
+    total_degraded = 0
+    total_valid = 0
+    for agent_name, trace_list in results.items():
+        degraded = [t for t in trace_list if t.get("_fetch_degraded")]
+        valid = [t for t in trace_list if not t.get("_fetch_degraded")]
+        if degraded:
+            print(
+                f"WARNING: {len(degraded)}/{len(trace_list)} {agent_name!r} "
+                f"traces had ALL observation fetches fail (likely LangFuse "
+                f"transient). Excluded from Context Economy averages.",
+                file=sys.stderr,
+            )
+        results[agent_name] = valid
+        total_degraded += len(degraded)
+        total_valid += len(valid)
+    if total_valid == 0 and total_degraded > 0 and not args.allow_empty:
+        print(
+            f"\nERROR: {total_degraded} traces fetched but ALL were "
+            f"fetch-degraded (every observation fetch failed). No valid "
+            f"data for Context Economy averages. Retry when LangFuse is "
+            f"healthy, or pass --allow-empty to proceed with no data.",
+            file=sys.stderr,
+        )
+        return 3
 
     print_summary(results, detail=args.detail)
 

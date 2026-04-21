@@ -118,7 +118,25 @@ def _condition_budget_watchdog(
         )
 
 
-def main() -> None:
+def main() -> int:
+    """Run the pilot campaign.
+
+    Returns an integer process exit code:
+
+    - ``0`` — campaign ran to completion and produced at least one record.
+    - ``2`` — argparse / CLI validation error (raised via ``sys.exit(2)``).
+    - ``4`` — campaign produced zero records with no watchdog abort
+      recorded (empty ``--tasks`` filter, harness setup failure, etc.).
+    - ``7`` — watchdog fired on a condition (ext10 #103 + ext12 #115).
+      Partial records may have been persisted; downstream analyzers
+      should gate on run-completeness before consuming. Distinct exit
+      code so orchestrators can tell "aborted" from "clean success".
+
+    ext12 #115: previously ``main()`` returned ``None`` unconditionally
+    and the module entrypoint used bare ``main()`` — watchdog aborts
+    and empty-record campaigns exited 0, indistinguishable from a
+    successful campaign at the process-exit layer.
+    """
     parser = argparse.ArgumentParser(description="JustInTimeMAS pilot evaluation runner")
     parser.add_argument(
         "--condition",
@@ -308,6 +326,12 @@ def main() -> None:
         logger.info("Snapshot: %s", snap_id)
 
         all_records = []
+        # ext12 #115: track watchdog-abort state so we can surface it as a
+        # non-zero process exit code. Pre-fix, a break-from-condition-loop
+        # fell through to the final summary + natural return, making a
+        # watchdog abort indistinguishable from a clean campaign at exit(0).
+        watchdog_aborted = False
+        abort_condition: str | None = None
         for condition in conditions:
             logger.info("=" * 60)
             logger.info("Running condition: %s  (%d task(s), %d run(s))", condition, len(tasks), args.n_runs)
@@ -345,10 +369,10 @@ def main() -> None:
                     "Skipping the remaining conditions.",
                     condition, exc,
                 )
-                # Re-raise as a flag for the outer loop to break early.
-                # We've logged the partial-results disclaimer; the user
-                # can inspect the DB to see which tasks completed before
-                # the budget fired.
+                # ext12 #115: capture abort state so the process exits with
+                # a dedicated non-zero code (7) after the final summary.
+                watchdog_aborted = True
+                abort_condition = condition
                 break
 
             # Print summary
@@ -410,6 +434,34 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             pass
 
+    # ext12 #115: surface abort state as a non-zero exit code. Orchestrators
+    # (cron, CI, downstream analyzers) can then distinguish:
+    #   - 0: clean success with at least one record written
+    #   - 4: zero records and no abort (filter/harness misconfig)
+    #   - 7: watchdog fired mid-campaign (partial data persisted)
+    if watchdog_aborted:
+        logger.error(
+            "Campaign aborted during condition '%s' by watchdog. "
+            "Partial data persisted; exiting with code 7 so orchestrators "
+            "can detect the abort.",
+            abort_condition,
+        )
+        return 7
+    if len(all_records) == 0:
+        logger.error(
+            "Campaign produced zero records and no watchdog abort was "
+            "recorded. Likely causes: empty --tasks filter, DB "
+            "misconfiguration, harness setup error. Exiting with code 4."
+        )
+        return 4
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    # ext12 #115: ``sys.exit(main() or 0)`` makes the integer return value
+    # of ``main()`` the actual process exit code. ``main() or 0`` only
+    # matters for the happy path (``return 0``); any non-zero integer
+    # propagates verbatim. Pre-fix, ``if __name__ == "__main__": main()``
+    # dropped every return value on the floor and process exit was always
+    # 0 regardless of watchdog abort or empty-records outcome.
+    sys.exit(main() or 0)

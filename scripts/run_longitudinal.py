@@ -50,7 +50,19 @@ SKILLS_DIR = DATA_DIR / "eval" / "skills"
 DEFAULT_DB = str(DATA_DIR / "eval" / "longitudinal.duckdb")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    """Run the longitudinal optimizer campaign.
+
+    ext12 #119 (2026-04-21): added per-task + campaign-level SIGALRM
+    watchdogs + exit-code propagation. Pre-fix, ``main()`` returned None
+    and the entrypoint was ``main()`` (not ``sys.exit(main())``), so a
+    watchdog abort or hanging task couldn't surface as a non-zero exit.
+
+    Returns:
+        0: campaign completed with all tasks attempted
+        3: per-task watchdog fired (at least one task exceeded budget)
+        5: campaign-level deadline exceeded (total wall-clock budget)
+    """
     parser = argparse.ArgumentParser(description="Longitudinal optimizer evaluation")
     parser.add_argument("--n-tasks", type=int, default=40, help="Number of sequential tasks (default: 40)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for task ordering")
@@ -72,7 +84,22 @@ def main() -> None:
             "experiments."
         ),
     )
-    args = parser.parse_args()
+    # ext12 #119: campaign watchdogs. Pre-fix, a single hung task (Docker
+    # stall, LangFuse rate-limit, DeepAgent recursion plateau) froze the
+    # whole row-9 campaign indefinitely.
+    parser.add_argument(
+        "--per-task-budget-seconds", type=int, default=1800,
+        help="SIGALRM budget per task (default: 1800s = 30 min). 0 disables "
+             "the per-task watchdog. A single hung task will otherwise "
+             "block the whole campaign indefinitely. ext12 #119.",
+    )
+    parser.add_argument(
+        "--campaign-budget-hours", type=float, default=12.0,
+        help="Total wall-clock budget for the full task sequence (default: "
+             "12h for --n-tasks 40). 0 disables the campaign-level deadline. "
+             "ext12 #119.",
+    )
+    args = parser.parse_args(argv)
 
     # --- Logging ---
     log_format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
@@ -229,8 +256,25 @@ def main() -> None:
 
     from tests.evaluation.cycle_flush import flush_task_cycle_state, now_utc
     from src.orchestrator.tracing import trace_context
+    from scripts._budget_watchdog import BudgetExceeded, budget_watchdog
+
+    # ext12 #119: campaign-level wall-clock deadline. Per-task watchdog alone
+    # can't bound total campaign time if many tasks each take just-under-budget.
+    campaign_deadline: float | None = (
+        time.monotonic() + args.campaign_budget_hours * 3600
+        if args.campaign_budget_hours > 0 else None
+    )
+    per_task_aborted = False
+    campaign_deadline_hit = False
 
     for i, task in enumerate(task_sequence):
+        if campaign_deadline is not None and time.monotonic() > campaign_deadline:
+            logger.error(
+                "ext12 #119: campaign deadline exhausted at task %d/%d; stopping early.",
+                i, len(task_sequence),
+            )
+            campaign_deadline_hit = True
+            break
         logger.info("=" * 60)
         logger.info("Task %d/%d: %s", i + 1, len(task_sequence), task.task_id)
         logger.info("=" * 60)
@@ -302,7 +346,16 @@ def main() -> None:
             user_id="longitudinal-runner",
         ):
             try:
-                final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
+                # ext12 #119: SIGALRM-bounded per-task invocation. A hung
+                # Docker container / stalled LangFuse API / DeepAgent
+                # recursion plateau now raises BudgetExceeded in main
+                # thread rather than blocking the campaign indefinitely.
+                with budget_watchdog(
+                    args.per_task_budget_seconds,
+                    name=f"task-{i + 1}-{task.task_id}",
+                    logger_=logger,
+                ):
+                    final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
                 # Security audit finding #27 (2026-04-20): pass metrics_store
                 # so compositional execution records invocations to the
                 # shared DB. Pre-fix, default None disabled recording and
@@ -313,6 +366,20 @@ def main() -> None:
                     final_state, task, loader,
                     metrics_store=metrics_store,
                 )
+            except BudgetExceeded as exc:
+                logger.error(
+                    "ext12 #119: task %s aborted by per-task watchdog: %s. "
+                    "Recording synthetic failure record; continuing with "
+                    "remaining tasks.",
+                    task.task_id, exc,
+                )
+                per_task_aborted = True
+                result = {
+                    "gate_passed": False,
+                    "output_in_range": False,
+                    "failure_reason": "watchdog_abort",
+                    "attempt_count": 0,
+                }
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Pipeline raised for task %s: %s", task.task_id, exc)
                 result = {
@@ -434,6 +501,17 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             pass
 
+    # ext12 #119: surface watchdog aborts as non-zero exit codes so
+    # orchestrators (cron, CI) can distinguish clean completion from
+    # campaign-level degradation. Campaign-deadline exit (5) takes
+    # precedence over per-task abort (3) because hitting the deadline
+    # implies the campaign did not attempt every task in the sequence.
+    if campaign_deadline_hit:
+        return 5
+    if per_task_aborted:
+        return 3
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

@@ -696,6 +696,60 @@ def test_auto_select_respects_per_condition_cap():
     assert fragment.count("'") == 8
 
 
+def test_auto_select_picks_n_distinct_run_ids_per_condition_at_production_density():
+    """ext12 #114 regression — canonical eval shape is 20 tasks per run
+    (one ``evaluation_runs`` row per task), NOT one row per run. Pre-fix
+    the CTE ranked ROWS via ``ROW_NUMBER()`` and then ``SELECT DISTINCT``
+    collapsed the result; at production density, ``rn <= 5`` picked 5
+    rows from the SINGLE most recent run_id per condition and DISTINCT
+    left exactly 1 run_id per condition = 4 total. The warning text
+    still promised "5 per condition".
+
+    Post-fix: the inner ``distinct_runs`` CTE collapses to one row per
+    (run_id, condition) BEFORE ranking, so ``rn <= 5`` correctly selects
+    5 DISTINCT run_ids per condition = 20 total.
+    """
+    import scripts.analyze_results as ar
+
+    store, conn = _open_in_memory_store()
+    latency = 0
+    # 4 conditions × 5 runs × 20 tasks per run = 400 rows, 20 distinct run_ids.
+    for condition in ("full", "no_verification", "no_optimization", "static"):
+        for run_idx in range(5):
+            run_id = f"{condition}_run_{run_idx:02d}"
+            for task_idx in range(20):
+                latency += 10
+                # Use a shared run_id across the 20 tasks — the production shape.
+                rec = _record(
+                    condition=condition,
+                    gate_passed=True,
+                    output_in_range=True,
+                    latency_ms=latency,
+                    task_id=f"T{task_idx + 1:02d}",
+                )
+                rec.run_id = run_id
+                store.record_run(rec)
+
+    fragment = ar._resolve_scope(conn, run_ids=None, since=None, per_condition_cap=5)
+    inner = fragment.split("IN (", 1)[1].rstrip(")")
+    selected_ids = [s.strip().strip("'") for s in inner.split(",")]
+    # Post-fix: 5 run_ids per condition × 4 conditions = 20.
+    assert len(selected_ids) == 20, (
+        f"ext12 #114: expected 20 distinct run_ids (5 per × 4 conditions), "
+        f"got {len(selected_ids)}. Pre-fix would typically return 4 "
+        f"(rn <= 5 over 100 rows/condition picks rows from a single run)."
+    )
+    # Per-condition balance check.
+    by_cond: dict[str, int] = {}
+    for rid in selected_ids:
+        cond = rid.rsplit("_run_", 1)[0]
+        by_cond[cond] = by_cond.get(cond, 0) + 1
+    for cond, count in by_cond.items():
+        assert count == 5, (
+            f"Condition {cond}: expected 5 distinct run_ids, got {count}"
+        )
+
+
 def test_auto_select_no_scope_needed_when_few_runs():
     """DB with ≤ condition_count distinct run_ids → legacy single-run mode
     (empty scope). The auto-select only kicks in when there are more run_ids

@@ -96,16 +96,44 @@ export CAMPAIGN_SESSION_IDS="$CAMPAIGN_RUN_IDS"
 # arbitrarily-picked timestamp, so ORDER BY on the non-selected timestamp
 # column could return a non-latest run_id. With multiple rows per run_id
 # (the normal append-only case) this silently picked the wrong campaign.
-#   SELECT run_id FROM evaluation_runs GROUP BY run_id ORDER BY MAX(timestamp) DESC LIMIT 1;
+# ext12 #117 (2026-04-21): the ext11 #111 rewrite was correct at the SQL
+# level but incomplete at the campaign level — a partial/aborted 5-row
+# run written AFTER a complete 40-row run won by MAX(timestamp). The
+# selector now carries a ``HAVING COUNT(*) >= :expected_rows`` completeness
+# filter so stub runs are rejected and the SystemExit fires if no complete
+# run exists in the DB. Pass the expected cycle count explicitly — the
+# default matches the canonical ``run_longitudinal.py --n-tasks 40``.
+#   SELECT run_id FROM evaluation_runs GROUP BY run_id
+#   HAVING COUNT(*) >= :expected_rows
+#   ORDER BY MAX(timestamp) DESC LIMIT 1;
+export EXPECTED_LONGITUDINAL_ROWS=40  # matches run_longitudinal.py --n-tasks
 export LONGITUDINAL_RUN_ID="$(uv run python -c "
-import duckdb
+import duckdb, sys
 conn = duckdb.connect('data/eval/longitudinal.duckdb')
-print(conn.execute('SELECT run_id FROM evaluation_runs GROUP BY run_id ORDER BY MAX(timestamp) DESC LIMIT 1').fetchone()[0])
+row = conn.execute(
+    'SELECT run_id FROM evaluation_runs GROUP BY run_id '
+    'HAVING COUNT(*) >= ? ORDER BY MAX(timestamp) DESC LIMIT 1',
+    [${EXPECTED_LONGITUDINAL_ROWS}],
+).fetchone()
+if row is None:
+    sys.exit('ERROR: no complete longitudinal run in DB '
+             '(expected >= ${EXPECTED_LONGITUDINAL_ROWS} rows). '
+             'Lower EXPECTED_LONGITUDINAL_ROWS, or re-run row 9.')
+print(row[0])
 ")"
 export SHIFT_RUN_ID="$(uv run python -c "
-import duckdb
+import duckdb, sys
 conn = duckdb.connect('data/eval/longitudinal_shifted.duckdb')
-print(conn.execute('SELECT run_id FROM evaluation_runs GROUP BY run_id ORDER BY MAX(timestamp) DESC LIMIT 1').fetchone()[0])
+row = conn.execute(
+    'SELECT run_id FROM evaluation_runs GROUP BY run_id '
+    'HAVING COUNT(*) >= ? ORDER BY MAX(timestamp) DESC LIMIT 1',
+    [${EXPECTED_LONGITUDINAL_ROWS}],
+).fetchone()
+if row is None:
+    sys.exit('ERROR: no complete longitudinal_shifted run in DB '
+             '(expected >= ${EXPECTED_LONGITUDINAL_ROWS} rows). '
+             'Lower EXPECTED_LONGITUDINAL_ROWS, or re-run row 10.')
+print(row[0])
 ")"
 ```
 

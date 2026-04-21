@@ -29,8 +29,15 @@ from src.schemas.evaluation import EvaluationRecord  # noqa: E402
 
 
 class TestKLDivergenceBetweenSnapshots:
-    def test_both_empty_returns_zero(self):
-        assert _kl_divergence_between_snapshots({}, {}) == 0.0
+    def test_both_empty_returns_nan(self):
+        """ext12 #118 (2026-04-21): empty-vs-empty returns NaN so the
+        convergence detector can skip cycles with no data, rather than
+        the pre-fix 0.0 sentinel that let zero-evidence DBs report
+        false-positive convergence.
+        """
+        import math
+        result = _kl_divergence_between_snapshots({}, {})
+        assert math.isnan(result)
 
     def test_prev_empty_curr_populated_returns_zero(self):
         # First-cycle sentinel — we're seeing the first real snapshot, so

@@ -69,6 +69,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -104,13 +105,21 @@ def _kl_divergence_between_snapshots(
     the U(c) formula; invocation counts are already non-negative).
 
     Returns:
-        - 0.0 if both distributions are empty
-        - float('inf') if prev is non-empty but curr is empty (catastrophic)
-        - 0.0 if curr is non-empty but prev is empty (first-cycle sentinel)
+        - ``float('nan')`` if both distributions are empty
+          (ext12 #118: no-data-at-all; the convergence detector MUST NOT
+          treat this as a sub-threshold signal. Pre-fix returned 0.0,
+          which let a 40-cycle DB with ZERO invocation/utility/event
+          rows report "converged at cycle 2" because 40 consecutive
+          empty-vs-empty pairs produced 40 consecutive KL=0.0 values
+          and the detector's ``min_consecutive`` streak fired trivially.)
+        - ``float('inf')`` if prev is non-empty but curr is empty (catastrophic)
+        - 0.0 if curr is non-empty but prev is empty (first-cycle sentinel;
+          intentional — we don't want the first real cycle flagged as
+          divergent just because there's no prior baseline)
         - otherwise the KL divergence as a non-negative float
     """
     if not prev_dist and not curr_dist:
-        return 0.0
+        return float("nan")
     if prev_dist and not curr_dist:
         return float("inf")
     if curr_dist and not prev_dist:
@@ -416,6 +425,13 @@ def _detect_convergence(
         return None
     run_len = 0
     for i, kl in enumerate(kls):
+        # ext12 #118: NaN means "no data at all for this cycle pair" —
+        # reset the streak rather than coercing it to sub-threshold. Pre-
+        # fix, the empty-vs-empty sentinel returned 0.0 and counted toward
+        # ``min_consecutive``, letting zero-evidence DBs report "converged".
+        if isinstance(kl, float) and math.isnan(kl):
+            run_len = 0
+            continue
         if kl < threshold:
             run_len += 1
             if run_len >= min_consecutive:
@@ -640,6 +656,26 @@ def main() -> int:
                         help="Specific longitudinal run_id to analyze. Default: latest "
                              "longitudinal run, with a WARNING on stderr if multiple are "
                              "present. Security audit finding #24 (2026-04-20).")
+    # ext12 #116: completeness guard. Pre-fix, the analyzer accepted ANY
+    # non-empty longitudinal DB and exited 0 whenever the convergence
+    # detector fired. A 5-cycle stub from an aborted 40-cycle campaign
+    # passed as "converged" silently. These flags make the campaign's
+    # expected shape explicit and refuse to proceed on short-fall DBs
+    # unless the user confirms via --allow-incomplete.
+    parser.add_argument(
+        "--expected-cycles", type=int, default=40,
+        help="Expected cycle count for a COMPLETE campaign (default: 40, "
+             "matching scripts/run_longitudinal.py --n-tasks 40). If the DB "
+             "has fewer cycles the analyzer refuses to proceed with exit 3, "
+             "unless --allow-incomplete is passed. ext12 #116.",
+    )
+    parser.add_argument(
+        "--allow-incomplete", action="store_true",
+        help="Proceed on a shortfall DB. Output is prefixed with an "
+             "[INCOMPLETE: N/expected] banner so Chapter 6 consumers can "
+             "see the shortfall at a glance. Exit code is still non-zero "
+             "so orchestrators don't treat incomplete as success. ext12 #116.",
+    )
     args = parser.parse_args()
 
     db_path = Path(args.db)
@@ -661,6 +697,56 @@ def main() -> int:
         print(f"       (evaluation_runs has no rows with condition='longitudinal')")
         conn.close()
         return 1
+
+    # ext12 #116: completeness guard. A 5-cycle stub from an aborted
+    # campaign must not silently pass as a complete run.
+    incomplete_banner: str | None = None
+    if len(cycles) < args.expected_cycles:
+        if not args.allow_incomplete:
+            print(
+                f"ERROR: longitudinal run has {len(cycles)} cycles, expected "
+                f"{args.expected_cycles}. Pass --allow-incomplete to proceed "
+                f"with an [INCOMPLETE] banner, or --expected-cycles N to "
+                f"override the expected count.",
+                file=sys.stderr,
+            )
+            conn.close()
+            return 3
+        incomplete_banner = (
+            f"[INCOMPLETE: {len(cycles)}/{args.expected_cycles} cycles]"
+        )
+        print(
+            f"WARNING: {incomplete_banner} — Chapter 6 consumers must cite "
+            f"the shortfall; downstream convergence / adaptation claims are "
+            f"not directly comparable to complete-campaign numbers.",
+            file=sys.stderr,
+        )
+
+    # ext12 #118: data-presence gate. A DB with evaluation_runs rows but
+    # NO invocation_events / cycle_utility_scores / cycle_events would
+    # otherwise produce empty-vs-empty KL values every cycle. Pre-NaN
+    # fix those were 0.0 (false-positive convergence); post-NaN fix they
+    # are NaN (streak-reset → no convergence). Still loud-fail here so
+    # the user is told WHY nothing converged rather than seeing a
+    # cryptic ⚠ "did not converge within N cycles" line.
+    has_any_signal = any(
+        c.get("cumulative_invocations")
+        or c.get("utility_scores")
+        or c.get("events")
+        for c in cycles
+    )
+    if not has_any_signal:
+        print(
+            f"ERROR: longitudinal DB has {len(cycles)} evaluation_runs cycles "
+            f"but NO invocation / utility-score / cycle-event rows. "
+            f"Convergence cannot be computed on zero-evidence runs. "
+            f"Likely causes: (a) Step 18.7 cycle-flush wiring failed mid-run, "
+            f"(b) DB predates the flush hooks, (c) a schema-drift dropped "
+            f"the event tables. Exit 4.",
+            file=sys.stderr,
+        )
+        conn.close()
+        return 4
 
     # Check whether the Step 18.7-follow-up tables are populated. If so,
     # we can use utility-score KL (proposal-literal). If not, fall back
@@ -736,7 +822,10 @@ def main() -> int:
             # Offset back to 1-indexed cycle numbers in the original sequence
             convergence_cycle += 1
 
-    _print_header("Longitudinal Registry Convergence — Step 18.7")
+    header_title = "Longitudinal Registry Convergence — Step 18.7"
+    if incomplete_banner is not None:
+        header_title = f"{incomplete_banner} {header_title}"
+    _print_header(header_title)
     print(f"  DB:              {db_path}")
     print(f"  Total cycles:    {len(cycles)}")
     print(f"  KL threshold:    {args.threshold}")
@@ -761,6 +850,29 @@ def main() -> int:
 
     # --- Distribution-shift analysis (Step 18.8, Pillar 3 RQ #3) ---
     shift_cycle = _detect_shift_point(cycles)
+    # ext12 #123: detect shift-campaign DBs where the marker never landed.
+    # Pre-fix, a missing marker silently omitted the RQ #3 section and
+    # main() still exited 0 on convergence, making row 19 look successful
+    # with zero adaptation evidence. Now: if the DB path suggests a shift
+    # campaign ("shift" or "shifted" in the filename) AND no marker is
+    # present, refuse with exit 5. The DB-path heuristic is load-bearing
+    # because the shift runner writes ``condition="longitudinal"`` (not
+    # ``longitudinal_shift``) so the condition column alone can't
+    # disambiguate; the filename is the user's own intent signal.
+    is_shift_campaign_by_path = any(
+        token in db_path.name.lower() for token in ("shift", "shifted")
+    )
+    if is_shift_campaign_by_path and shift_cycle is None:
+        print(
+            f"ERROR: DB '{db_path.name}' names a shift campaign but no "
+            f"distribution_shift marker was found in cycle_events. RQ #3 "
+            f"analysis cannot proceed. Check that the runner completed "
+            f"the shift-marker write (ext12 #123) or manually insert a "
+            f"cycle_events row before re-running this analyzer.",
+            file=sys.stderr,
+        )
+        conn.close()
+        return 5
     if shift_cycle is not None:
         _print_header(
             "Distribution-Shift Analysis — Pillar 3 RQ #3"
@@ -990,6 +1102,15 @@ def main() -> int:
                 print(f"  PNG written: {png_path}")
 
     conn.close()
+    # ext12 #116: exit-code contract (extended):
+    #   0  complete data + converged
+    #   1  empty DB (no longitudinal rows at all) — handled earlier
+    #   2  complete data but convergence not detected
+    #   3  incomplete campaign (shortfall) — returned even with --allow-incomplete
+    #   4  zero-evidence DB (rows present but no signal tables) — handled earlier
+    #   5  shift campaign missing distribution_shift marker (see ext12 #123)
+    if incomplete_banner is not None:
+        return 3
     return 0 if convergence_cycle is not None else 2
 
 

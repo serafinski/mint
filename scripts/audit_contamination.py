@@ -232,30 +232,97 @@ def stratified_sample(
 _SAMPLE_PLAN_FILENAME = "audit_sample_plan.json"
 
 
-def _sample_plan_path(db_path: Path) -> Path:
-    """Plan file lives alongside the DB so per-campaign isolation works."""
-    return db_path.parent / f".{db_path.stem}_{_SAMPLE_PLAN_FILENAME}"
+def _sample_plan_path(
+    db_path: Path,
+    *,
+    run_ids: list[str] | None,
+    since: str | None,
+    conditions: list[str],
+    types: list[str],
+    per_stratum: int,
+    seed: int,
+) -> Path:
+    """Plan file lives alongside the DB, scoped to the audit invocation.
+
+    ext12 #121 (2026-04-21): pre-fix keyed on ``db_path.stem`` alone. Two
+    invocations against the same DB with different ``--run-ids`` /
+    ``--per-stratum`` / ``--seed`` collided on the same plan file — the
+    first invocation's plan was loaded on the second, the intersection
+    with the second's scoped pool was empty, and the script exited 0
+    with "Nothing to audit" and no M2 labels produced.
+
+    Now the filename carries a SHA-256 hash of every parameter that can
+    legitimately produce a different sample: ``run_ids``, ``since``,
+    ``conditions``, ``types``, ``per_stratum``, ``seed``. Two distinct
+    scopes → two distinct plan files. Resumes WITHIN a scope still share
+    their plan (same inputs → same hash).
+    """
+    import hashlib
+    import json as _json
+    payload = _json.dumps(
+        {
+            "run_ids": sorted(run_ids) if run_ids else None,
+            "since": since,
+            "conditions": sorted(conditions),
+            "types": sorted(types),
+            "per_stratum": per_stratum,
+            "seed": seed,
+        },
+        sort_keys=True,
+    )
+    scope_hash = hashlib.sha256(payload.encode()).hexdigest()[:12]
+    return db_path.parent / f".{db_path.stem}_{scope_hash}_{_SAMPLE_PLAN_FILENAME}"
 
 
 def get_or_create_sample_plan(
     rows: list[AuditRow],
     *,
     db_path: Path,
+    run_ids: list[str] | None,
+    since: str | None,
     conditions: list[str],
     types: list[str],
     per_stratum: int,
     seed: int,
+    force_fresh_plan: bool = False,
 ) -> list[AuditRow]:
     """Return the pre-committed sample plan, creating + persisting on first call.
 
     ext8 #57 (2026-04-20): replaces raw ``stratified_sample`` at the main
     call site so resumes draw the same sample-of-ids across sessions even
     though each session's ``rows`` pool differs.
+
+    ext12 #121 (2026-04-21): plan path now keyed on scope-hash
+    (``run_ids`` / ``since`` / ``conditions`` / ``types`` /
+    ``per_stratum`` / ``seed``). Defence-in-depth: even with the
+    scope-hash key, if a resume loads a plan whose rows have zero
+    intersection with the current pool, raise ``SystemExit(3)`` rather
+    than silently collapsing to "Nothing to audit".
     """
     import json
 
-    plan_path = _sample_plan_path(db_path)
+    plan_path = _sample_plan_path(
+        db_path,
+        run_ids=run_ids, since=since,
+        conditions=conditions, types=types,
+        per_stratum=per_stratum, seed=seed,
+    )
     id_to_row = {r.row_id: r for r in rows}
+
+    # ext12 #121: explicit escape hatch — delete the plan file before sampling.
+    if force_fresh_plan and plan_path.exists():
+        try:
+            plan_path.unlink()
+            print(
+                f"ext12 #121: --force-fresh-plan — wiped {plan_path} before sampling."
+            )
+        except OSError as exc:
+            print(
+                f"WARNING: --force-fresh-plan requested but {plan_path} "
+                f"could not be deleted ({exc}). Continuing; resume may "
+                f"still read the stale plan.",
+                file=sys.stderr,
+            )
 
     if plan_path.exists():
         try:
@@ -271,6 +338,23 @@ def get_or_create_sample_plan(
         if plan_ids is not None:
             # Filter to rows still unlabeled (rows currently in the pool).
             resumed = [id_to_row[rid] for rid in plan_ids if rid in id_to_row]
+            # ext12 #121: zero-intersection → loud fail. Even with the
+            # scope-hash key this case should be unreachable, but if the
+            # user manually renamed plan files, changed DB contents
+            # underneath us, or passed a scope that happens to have no
+            # overlap with the persisted plan, surface that rather than
+            # collapsing to "Nothing to audit" silently.
+            if len(plan_ids) > 0 and len(resumed) == 0:
+                print(
+                    f"ERROR: plan file at {plan_path} has {len(plan_ids)} "
+                    f"rows, but ZERO of them are in the current scoped pool "
+                    f"of {len(rows)} rows. Possible scope mismatch. Delete "
+                    f"{plan_path} to force a fresh draw (or pass "
+                    f"--force-fresh-plan), or review your --run-ids / "
+                    f"--per-stratum / --seed args.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(3)
             print(
                 f"ext8 #57: loaded pre-committed sample plan from {plan_path} "
                 f"— {len(resumed)}/{len(plan_ids)} rows still unlabeled."
@@ -495,6 +579,7 @@ def run_audit(
     dry_run: bool,
     run_ids: list[str] | None = None,
     since: str | None = None,
+    force_fresh_plan: bool = False,
 ) -> int:
     if not db_path.exists():
         print(f"ERROR: eval DB not found at {db_path}", file=sys.stderr)
@@ -516,10 +601,13 @@ def run_audit(
         sample = get_or_create_sample_plan(
             pool,
             db_path=db_path,
+            run_ids=run_ids,
+            since=since,
             conditions=conditions,
             types=types,
             per_stratum=per_stratum,
             seed=seed,
+            force_fresh_plan=force_fresh_plan,
         )
 
         already_labeled = store._conn.execute(  # noqa: SLF001
@@ -660,6 +748,17 @@ def main() -> int:
         "--since", default=None,
         help="Include only rows with timestamp >= SINCE.",
     )
+    # ext12 #121 (2026-04-21): escape hatch when the user has changed the
+    # audit scope in a way the plan-file scope hash may not capture
+    # (manual plan-file renames, DB contents changing underneath the
+    # script, etc.).
+    parser.add_argument(
+        "--force-fresh-plan", action="store_true",
+        help="Delete any existing plan file for this scope before sampling. "
+             "Use when the audit scope or params changed in a way the "
+             "plan-file scope hash doesn't capture, or when manual plan-file "
+             "edits require a forced redraw. ext12 #121.",
+    )
     args = parser.parse_args()
 
     if args.help_labels:
@@ -688,6 +787,7 @@ def main() -> int:
         dry_run=args.dry_run,
         run_ids=args.run_ids,
         since=args.since,
+        force_fresh_plan=args.force_fresh_plan,
     )
 
 

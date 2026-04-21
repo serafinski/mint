@@ -216,17 +216,29 @@ def _resolve_scope(
     if total_available <= max(condition_count, 1):
         return ""
 
+    # ext12 #114: pre-fix this CTE ranked ROWS (one row per task) via
+    # ROW_NUMBER(), then DISTINCT-collapsed. On the canonical eval shape of
+    # 20 tasks per run, rn <= 5 picked 5 rows from the single most recent
+    # run, then DISTINCT collapsed to 1 run_id per condition. The inner
+    # ``distinct_runs`` CTE now collapses to one row per (run_id, condition)
+    # BEFORE ranking, so ROW_NUMBER() ranks distinct run_ids and rn <= N
+    # correctly selects N run_ids per condition.
     selected_rows = conn.execute(
         """
-        WITH ranked AS (
-            SELECT run_id, condition, timestamp,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY condition ORDER BY timestamp DESC
-                   ) AS rn
+        WITH distinct_runs AS (
+            SELECT run_id, condition, MAX(timestamp) AS latest_ts
             FROM evaluation_runs
             WHERE is_pilot = FALSE
+            GROUP BY run_id, condition
+        ),
+        ranked AS (
+            SELECT run_id, condition, latest_ts,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY condition ORDER BY latest_ts DESC
+                   ) AS rn
+            FROM distinct_runs
         )
-        SELECT DISTINCT run_id, condition
+        SELECT run_id, condition
         FROM ranked
         WHERE rn <= ?
         ORDER BY condition, run_id
@@ -251,8 +263,8 @@ def _resolve_scope(
     if total_available > len(latest):
         print(
             f"WARNING: DB contains {total_available} distinct non-pilot run_ids; "
-            f"auto-selecting the {per_condition_cap} most recent per condition "
-            f"({len(latest)} total across {len(selected_conditions)} conditions). "
+            f"auto-selected {len(latest)} total across {len(selected_conditions)} "
+            f"conditions (target cap: {per_condition_cap} per condition). "
             f"Pass --run-ids to override.",
             file=_sys.stderr,
         )

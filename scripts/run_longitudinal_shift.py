@@ -123,7 +123,21 @@ def _build_phased_sequence(
     return sequence[:total]
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Run the distribution-shift longitudinal experiment.
+
+    ext12 #119 (2026-04-21): per-task + campaign-level watchdogs added.
+    ext12 #123 (2026-04-21): shift-marker write now retries with jitter
+    and the campaign loud-fails (exit 4) if the marker never landed.
+
+    Returns:
+        0: campaign completed and shift marker recorded
+        1: CLI validation error (bad --shift-at / --total, bad task IDs)
+        3: per-task watchdog fired at least once
+        4: campaign completed but distribution_shift marker never landed
+           (ext12 #123 — downstream RQ #3 analysis cannot proceed)
+        5: campaign-level wall-clock deadline exceeded
+    """
     parser = argparse.ArgumentParser(
         description="Distribution-shift longitudinal experiment (Pillar 3 RQ #3)",
     )
@@ -168,7 +182,17 @@ def main() -> int:
             "contaminating Phase-A/Phase-B adaptation measurements."
         ),
     )
-    args = parser.parse_args()
+    # ext12 #119: campaign watchdogs. Same semantics as run_longitudinal.py.
+    parser.add_argument(
+        "--per-task-budget-seconds", type=int, default=1800,
+        help="SIGALRM budget per task (default: 1800s). 0 disables. ext12 #119.",
+    )
+    parser.add_argument(
+        "--campaign-budget-hours", type=float, default=12.0,
+        help="Total wall-clock budget for the full sequence (default: 12h). "
+             "0 disables. ext12 #119.",
+    )
+    args = parser.parse_args(argv)
 
     # --- Validation ---
     if args.shift_at <= 0 or args.shift_at >= args.total:
@@ -325,7 +349,25 @@ def main() -> int:
     cumulative_total = 0
     shift_marked = False
 
+    from scripts._budget_watchdog import BudgetExceeded, budget_watchdog
+
+    # ext12 #119: campaign-level wall-clock deadline. Prevents a hang storm
+    # from burning the full overnight budget on a single task.
+    campaign_deadline: float | None = (
+        time.monotonic() + args.campaign_budget_hours * 3600
+        if args.campaign_budget_hours > 0 else None
+    )
+    per_task_aborted = False
+    campaign_deadline_hit = False
+
     for i, task in enumerate(task_sequence):
+        if campaign_deadline is not None and time.monotonic() > campaign_deadline:
+            logger.error(
+                "ext12 #119: campaign deadline exhausted at cycle %d/%d; stopping early.",
+                i, args.total,
+            )
+            campaign_deadline_hit = True
+            break
         cycle = i + 1
         phase_label = "A" if cycle <= args.shift_at else "B"
         logger.info("=" * 60)
@@ -395,13 +437,32 @@ def main() -> int:
             user_id="longitudinal-shift-runner",
         ):
             try:
-                final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
+                # ext12 #119: SIGALRM-bounded per-task invocation.
+                with budget_watchdog(
+                    args.per_task_budget_seconds,
+                    name=f"cycle-{cycle}-{task.task_id}",
+                    logger_=logger,
+                ):
+                    final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
                 # Security audit finding #27 (2026-04-20): pass metrics_store
                 # so compositional execution records invocations.
                 result = _extract_result(
                     final_state, task, loader,
                     metrics_store=metrics_store,
                 )
+            except BudgetExceeded as exc:
+                logger.error(
+                    "ext12 #119: cycle %d (%s) aborted by per-task watchdog: %s. "
+                    "Recording synthetic failure record; continuing campaign.",
+                    cycle, task.task_id, exc,
+                )
+                per_task_aborted = True
+                result = {
+                    "gate_passed": False,
+                    "output_in_range": False,
+                    "failure_reason": "watchdog_abort",
+                    "attempt_count": 0,
+                }
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Pipeline raised for task %s: %s", task.task_id, exc)
                 result = {
@@ -465,31 +526,60 @@ def main() -> int:
             # "sluggish" by one cycle. Anchoring to the Phase A task's
             # own timestamp places the marker inside Phase A's bucket.
             if cycle == args.shift_at and not shift_marked:
-                try:
-                    details = (
-                        f"phase_a=[{','.join(t.task_id for t in phase_a_tasks)}], "
-                        f"phase_b=[{','.join(t.task_id for t in phase_b_tasks)}], "
-                        f"shift_at={args.shift_at}, total={args.total}"
-                    )
-                    eval_store.record_cycle_events(
-                        run_id=run_id,
-                        condition="longitudinal",
-                        task_id=task.task_id,  # the LAST Phase A task
-                        events=[{
-                            "capability_id": "__system__",
-                            "event_type": "distribution_shift",
-                            "details": details,
-                        }],
-                        occurred_at=record.timestamp,
-                    )
-                    shift_marked = True
-                    logger.info("=== DISTRIBUTION SHIFT at cycle %d ===", cycle)
-                    logger.info("    Phase A complete. Beginning Phase B at next cycle.")
+                details = (
+                    f"phase_a=[{','.join(t.task_id for t in phase_a_tasks)}], "
+                    f"phase_b=[{','.join(t.task_id for t in phase_b_tasks)}], "
+                    f"shift_at={args.shift_at}, total={args.total}"
+                )
+                # ext12 #123: retry the shift-marker write with jitter
+                # before giving up. Pre-fix, a single DuckDB transient
+                # lock or schema-drift raise was logged as a warning and
+                # the campaign continued, leaving the downstream
+                # ``analyze_longitudinal.py`` with no RQ #3 marker to
+                # anchor to. The analyzer would silently omit the
+                # Distribution-Shift Analysis section and still exit 0.
+                for attempt in range(3):
+                    try:
+                        eval_store.record_cycle_events(
+                            run_id=run_id,
+                            condition="longitudinal",
+                            task_id=task.task_id,  # the LAST Phase A task
+                            events=[{
+                                "capability_id": "__system__",
+                                "event_type": "distribution_shift",
+                                "details": details,
+                            }],
+                            occurred_at=record.timestamp,
+                        )
+                        shift_marked = True
+                        logger.info("=== DISTRIBUTION SHIFT at cycle %d ===", cycle)
+                        logger.info("    Phase A complete. Beginning Phase B at next cycle.")
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        if attempt < 2:
+                            logger.warning(
+                                "distribution_shift marker write failed "
+                                "(attempt %d/3): %s — retrying",
+                                attempt + 1, exc,
+                            )
+                            time.sleep(0.5 * (2 ** attempt))
+                        else:
+                            logger.error(
+                                "ext12 #123: distribution_shift marker write "
+                                "FAILED after 3 attempts: %s. RQ #3 analysis "
+                                "will be impossible without this marker; the "
+                                "campaign will exit 4 so orchestrators detect "
+                                "the degraded run.",
+                                exc,
+                            )
 
-                    # Step 13.7 Batch A5 — mirror the shift boundary into
-                    # LangFuse so Chapter 6 RQ #3 adaptation-verdict prose
-                    # can cite the event cross-reference. DuckDB row already
-                    # written above; this adds the LangFuse-UI marker.
+                # Step 13.7 Batch A5 — mirror the shift boundary into
+                # LangFuse so Chapter 6 RQ #3 adaptation-verdict prose
+                # can cite the event cross-reference. DuckDB row already
+                # written above (if shift_marked); this adds the
+                # LangFuse-UI marker. Best-effort: the DuckDB row is
+                # the primary source of truth, LangFuse is informational.
+                if shift_marked:
                     try:
                         from src.orchestrator.tracing import emit_langfuse_event
                         emit_langfuse_event(
@@ -507,8 +597,6 @@ def main() -> int:
                         )
                     except Exception as exc:  # noqa: BLE001
                         logger.debug("LangFuse distribution_shift emit failed: %s", exc)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to write distribution_shift marker: %s", exc)
 
         status = "OK" if record.success else "FAIL"
         logger.info(
@@ -555,8 +643,27 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             pass
 
+    # ext12 #119 + #123: surface degraded-campaign outcomes as non-zero exit
+    # codes so orchestrators can distinguish clean-complete from
+    # partial/degraded. Priority order: campaign deadline > shift-marker
+    # missing > per-task aborts. The shift-marker-missing case is the
+    # thesis-critical one (no RQ #3 evidence) so it beats per-task aborts.
+    if campaign_deadline_hit:
+        return 5
+    shift_reached = args.shift_at <= len(records)
+    if shift_reached and not shift_marked:
+        logger.error(
+            "ext12 #123: campaign completed without a distribution_shift "
+            "marker. Row 19 analysis will refuse the run. Re-run this "
+            "campaign or manually insert a cycle_events row "
+            "(event_type='distribution_shift', occurred_at=<last Phase-A "
+            "task timestamp>) before invoking analyze_longitudinal.py."
+        )
+        return 4
+    if per_task_aborted:
+        return 3
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main() or 0)
