@@ -7,12 +7,23 @@
 - [`security_audit_2026_04_19_ext6.md`](./security_audit_2026_04_19_ext6.md) — #19-#43 ✅ all FIXED 2026-04-20.
 - [`security_audit_2026_04_19_ext7.md`](./security_audit_2026_04_19_ext7.md) — #44-#55 ✅ all FIXED 2026-04-20.
 - [`security_audit_2026_04_19_ext8.md`](./security_audit_2026_04_19_ext8.md) — #56-#78 (21 ✅ fixed, 2 open: #61 MEDIUM latent, #63 P0).
-- [`security_audit_2026_04_19_ext9.md`](./security_audit_2026_04_19_ext9.md) — #79-#97 (#86 still P0 open per verification; others pending audit).
-- [`security_audit_2026_04_19_ext10.md`](./security_audit_2026_04_19_ext10.md) — #98-#108 open.
+- [`security_audit_2026_04_19_ext9.md`](./security_audit_2026_04_19_ext9.md) — #79-#98 ✅ **all FIXED** (re-verified 2026-04-21 by direct code-comment cross-reference; every finding carries a pinned fix).
+- [`security_audit_2026_04_19_ext10.md`](./security_audit_2026_04_19_ext10.md) — #98-#108 (re-verified 2026-04-21, second pass: #98-#107 ✅ FIXED; #108 ⚠ latent/documented — list still in execution order but `ChainResult.final_output` property + docstring document the hazard; all current consumers use the safe access path, audit-classified MEDIUM latent).
 
 **This extension's scope.** Two **P0 regressions against the ext8 #78 fix** (Gini pruned-cap exclusion) — both discovered via direct reproduction by the reviewer. One is a data-contamination bug (cross-run prune leakage), the other is a hard crash on a legitimate CLI path (`--since`). Both live in `scripts/analyze_results.py::print_gini_summary`; the ext8 #78 remediation solved the original "pruned caps inflate Gini" problem but introduced two new issues while doing so.
 
 **Status at time of write (2026-04-20):** all five **open**. Total open across audit series: **58 findings** (ext8+ext9+ext10+ext11).
+
+**Cross-audit status snapshot as of 2026-04-21 (post-ext12 + re-verification sweep):**
+- ext1-#18 parent: 18/18 ✅
+- ext6 #19-#43: 25/25 ✅
+- ext7 #44-#55: 12/12 ✅
+- ext8 #56-#78: 21/23 ✅ (open: **#61 MEDIUM latent** — acknowledged-not-fixed per §Remediation disposition; **#63 P0 PARTIAL** — WARN-log defensive check implemented, audit §A full AST-extract remediation NOT implemented; #70 is documentation-only Chapter 4.5 disclosure).
+- ext9 #79-#98: 20/20 ✅
+- ext10 #98-#107: 10/10 ✅; ext10 #108 ⚠ latent/documented (not structurally fixed).
+- ext11 #109-#113: 5/5 ✅
+- ext12 #114-#123: 10/10 ✅ (fixed 2026-04-21).
+**Total genuinely open: 2 (ext8 #61, ext8 #63). Total latent/documented: 2 (ext10 #108, ext8 #70).** No result-destroying bugs remain on the run-sheet critical path.
 
 **Status update 2026-04-21 — all five FIXED:**
 

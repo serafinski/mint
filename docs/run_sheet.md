@@ -4,7 +4,7 @@ At-a-glance command sequence for the thesis evaluation pipeline (Phase 3 smoke �
 
 **Source of truth:** `docs/MASTER_PLAN_2026_04_13.md` §6.1. This file is the distilled run sheet — if anything here disagrees with the master plan, the plan wins.
 
-**Last updated:** 2026-04-19 (after Step 13.6 Parts A+B+C+D + gap closure (registry FN audit) + nice-to-have #1 (Tier 2 probe breakdown) + **Step 13.5 full test-suite audit + cleanup**: all 1,578 audited tests resolved to 100% KEEP; +46 net new tests via coverage closures; 0 WEAK / 0 DUPLICATE / 0 SUSPICIOUS remaining).
+**Last updated:** 2026-04-21 (after security audit ext12 — 10 P0/HIGH findings #114-#123 closed; #114 balanced-per-condition CTE fix, #115/#119/#122 watchdog + exit-code contracts, #116/#118 longitudinal completeness + zero-evidence guards, #117 run-sheet completeness filter below, #120 Context Economy fetch-degraded flag, #121 audit sample-plan scope-hash, #123 distribution-shift marker retry + analyzer refusal). Unit suite: **1,974 passing** (1,925 → 1,974; +49 ext12 regression + e2e tests).
 
 ---
 
@@ -17,6 +17,7 @@ At-a-glance command sequence for the thesis evaluation pipeline (Phase 3 smoke �
 | Live internet | `test_allow_network.py` hits `api.github.com/zen`; skips cleanly if offline |
 | `uv` installed, repo checked out | All commands run via `uv run …` from repo root |
 | ~~**Step 13.5 test hygiene pass done**~~ | ✅ **DONE 2026-04-19** — full 1,578-test audit + cleanup pass completed. 0 WEAK / 0 DUPLICATE / 0 SUSPICIOUS. No remaining pre-eval blocker. |
+| ~~**Security audit ext12 (#114-#123) closed**~~ | ✅ **DONE 2026-04-21** — 10 P0/HIGH findings fixed: result-destroying bugs in rows 8/9/10/11/13/16/17/18/19 all closed. Only ext8 #61 (latent, Chapter-7) + ext8 #63 (partial — WARN + gate rollback) remain, both Chapter-4.5-disclosure, not eval-corrupting. |
 
 ---
 
@@ -26,7 +27,7 @@ Run sequentially; each gate must pass before the next. If any fails, **stop** an
 
 | # | Command | Why | Time |
 |---|---|---|---:|
-| 1 | `uv run pytest tests/unit/ -q` | Hermetic baseline — **1,600 unit tests** (post-Step-13.5 cleanup). Must be 100% pass. | ~3 min |
+| 1 | `uv run pytest tests/unit/ -q` | Hermetic baseline — **1,974 unit tests** (post-ext12 +49 regression/e2e). Must be 100% pass. | ~4 min |
 | 2 | `uv run scripts/test_pipeline.py` | Pillar 1 pipeline e2e (decompose → classify → generate → verify → register), real LLM | ~5 min |
 | 3 | `uv run scripts/test_verification.py` | Pillar 2 three-tier gate (Tier 1 / 1.5 / 2 / 3) on known-good + known-bad, real Docker + real adversarial | ~3 min |
 | 4 | `uv run scripts/test_allow_network.py` | Pillar 2 Tier 2 network-disconnect differential; `--network bridge` vs `--network none` Docker plumbing (Step 14.12) | ~2 min |
@@ -186,11 +187,12 @@ Not on the main path. Call these to debug a specific regression.
 
 ## Outstanding pre-eval work (per master plan TBD)
 
-**Nothing.** All pre-eval blockers closed as of 2026-04-19:
-- Step 13.5 (test suite hygiene) ✅ — full audit + cleanup done this session
+**Nothing.** All pre-eval blockers closed as of 2026-04-21:
+- Step 13.5 (test suite hygiene) ✅ — full audit + cleanup done 2026-04-19
 - Step 13.6 (scripts hygiene + Part D schedule update) ✅
 - Step 13.7 (LangFuse audit) ✅
 - All analyzer scripts ✅
+- Security audit ext12 (#114-#123) ✅ — 10 P0/HIGH findings closed 2026-04-21; every result-destroying bug on the run-sheet critical path is fixed. Remaining ext8 #61 (latent) + #63 (partial) are Chapter-4.5-disclosure only, not eval-corrupting.
 
 **Phase 3 smoke is immediately runnable.** Step 18 (the 400-record eval) runs once Phase 3 smoke passes.
 

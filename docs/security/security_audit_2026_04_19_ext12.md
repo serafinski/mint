@@ -7,8 +7,8 @@
 - [`security_audit_2026_04_19_ext6.md`](./security_audit_2026_04_19_ext6.md) — #19-#43 ✅ all FIXED 2026-04-20.
 - [`security_audit_2026_04_19_ext7.md`](./security_audit_2026_04_19_ext7.md) — #44-#55 ✅ all FIXED 2026-04-20.
 - [`security_audit_2026_04_19_ext8.md`](./security_audit_2026_04_19_ext8.md) — #56-#78 (21 ✅ fixed, 2 open: #61 MEDIUM latent, #63 P0).
-- [`security_audit_2026_04_19_ext9.md`](./security_audit_2026_04_19_ext9.md) — #79-#97 (#86 still P0 open per verification; others pending audit).
-- [`security_audit_2026_04_19_ext10.md`](./security_audit_2026_04_19_ext10.md) — #98-#108 open.
+- [`security_audit_2026_04_19_ext9.md`](./security_audit_2026_04_19_ext9.md) — #79-#98 ✅ **all FIXED** (re-verified 2026-04-21 by direct code-comment cross-reference; every finding carries a pinned fix).
+- [`security_audit_2026_04_19_ext10.md`](./security_audit_2026_04_19_ext10.md) — #98-#108 (re-verified 2026-04-21, second pass: #98-#107 ✅ FIXED; #108 ⚠ latent/documented — list still in execution order but `final_output` property + docstring document the hazard; current consumers use safe access path).
 - [`security_audit_2026_04_19_ext11.md`](./security_audit_2026_04_19_ext11.md) — #109-#113 ✅ all FIXED 2026-04-21.
 
 **This extension's scope.** Six findings surfaced 2026-04-21 via reviewer-run direct reproduction. All six are silent-wrong-answer / silent-success bugs that corrupt the Phase-5 eval pipeline's trust contracts:
@@ -20,7 +20,14 @@
 - **#118** — the KL helper returns 0.0 when both input distributions are empty, and the convergence detector consumes that as a valid sub-threshold signal. A 40-cycle longitudinal DB with ONLY `evaluation_runs` rows (no invocation/utility/event signal) reports "Cycles-to-convergence: 2, n_caps=0, exit 0."
 - **#119** — `run_longitudinal.py` and `run_longitudinal_shift.py` have no campaign-level watchdog. A single hanging task (Docker stall, LangFuse API stall, DeepAgent recursion plateau) blocks the rows 9/10 campaigns indefinitely with no abort signal; `run_pilot.py` has `_condition_budget_watchdog` for the same risk but the longitudinal drivers inherited none of it.
 
-**Status at time of write (2026-04-21):** all six **open**. Total open across audit series: **~62 findings** (ext8 + ext9 + ext10 + ext12).
+**Status at time of write (2026-04-21):** all six **open**. (Original write captured 6 findings before the set was extended to 10: #120-#123 were added same-day.) Total open across audit series: ~62 findings.
+
+**Status update 2026-04-21 — all TEN ✅ FIXED.** All ten findings (#114-#123) shipped in commit `7c8455d` this session. Full threat model + code references inline below. After this commit + the cross-audit re-verification sweep, the audit-series status is:
+
+- **Genuinely code-open:** 2 — ext8 #61 MEDIUM latent (intentional per §Remediation), ext8 #63 P0 PARTIAL (WARN-log only; audit §A full AST-extract NOT implemented).
+- **Latent/documented:** 2 — ext10 #108 MEDIUM (list still in execution order, `final_output` property provides safe access, all current consumers use it), ext8 #70 MEDIUM (methodology disclosure only; Chapter 4.5 doc).
+- **Total open P0s: 1** (ext8 #63, partial).
+- **No result-destroying bugs on the run-sheet critical path.**
 
 | # | Severity | Scope | Impact |
 |---|---|---|---|
