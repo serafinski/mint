@@ -21,10 +21,12 @@ from both layers as a fallback when ``get_config()`` returns nothing.
 
 from __future__ import annotations
 
+import contextvars
 import threading
+from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator
+from typing import Any, Callable, Iterator
 
 
 _trace_context_var: ContextVar[dict | None] = ContextVar(
@@ -103,6 +105,44 @@ def _read_trace_context() -> dict:
         return dict(ctx)
     with _trace_context_lock:
         return dict(_trace_context_global)
+
+
+def submit_with_context(pool: Any, fn: Callable, /, *args: Any, **kwargs: Any) -> Future:
+    """Submit ``fn`` to ``pool`` while propagating the current ContextVar state.
+
+    Security audit finding #104 (2026-04-19, ext10): plain
+    ``pool.submit(fn, *args)`` does NOT carry the parent thread's
+    ``ContextVar`` values into the worker — workers see whatever
+    default the ContextVar declared, then fall through to the
+    module-level ``_trace_context_global`` dict. Under concurrent
+    ``trace_context(...)`` invocations on different parent threads,
+    the worker can observe a global that another thread has wiped-and-
+    replaced (the brief window inside ``trace_context``'s critical
+    section where ``_trace_context_global`` reflects the OTHER thread's
+    context, not the one the worker was spawned under). This causes
+    silent cross-task event attribution.
+
+    ``contextvars.copy_context().run(fn, *args, **kwargs)`` snapshots the
+    submitting thread's ContextVar state and restores it inside the
+    worker before executing. The worker's ``_read_trace_context()``
+    then reads from the contextvar (set), not from the global
+    fallback (race-prone), eliminating the cross-thread attribution
+    drift.
+
+    Use this helper for EVERY ``pool.submit(...)`` inside a
+    ``trace_context(...)`` scope. Critical sites:
+    - ``src/verification/gate.py``'s tier-2 ThreadPool
+    - ``src/verification/adversarial.py``'s probe ThreadPool
+    - ``src/orchestrator/decomposition.py``'s decomposer-call ThreadPool
+    - ``src/optimizer/operations.py``'s phase-B verify-all ThreadPool
+
+    The module-level global fallback in ``_trace_context_global``
+    remains as a safety net for any submit site we haven't migrated;
+    once every submit site uses this helper, the global can be
+    deprecated (Chapter 7 cleanup).
+    """
+    ctx = contextvars.copy_context()
+    return pool.submit(ctx.run, fn, *args, **kwargs)
 
 
 def emit_langfuse_event(

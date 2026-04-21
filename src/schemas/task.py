@@ -593,11 +593,32 @@ class StepTiming(BaseModel):
 
 
 class ChainResult(BaseModel):
-    """Result of a compositional execution chain."""
+    """Result of a compositional execution chain.
+
+    Security audit finding #108 (2026-04-19, ext10): ``step_results``
+    is ordered by **execution (topological) order**, NOT by the
+    decomposer's original subtask index. For non-linear DAGs (any
+    chain whose ``execution_order`` differs from ``[0, 1, 2, ...]``),
+    positional access ``step_results[N]`` returns the N-th
+    EXECUTED step, not "subtask N's output." Current consumers use
+    ``step_results[-1]`` (topologically-last, the chain's logical
+    final output) which is safe; new consumers wanting "subtask N's
+    output" must look up via ``step_timings[i].step_index`` instead.
+    The ``final_output`` property below documents the safe access
+    pattern explicitly.
+    """
 
     chain_length: int = Field(..., ge=1)
     chain_success: bool
-    step_results: list[dict] = Field(default_factory=list)
+    step_results: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "Per-step output dicts in EXECUTION (topological) order — "
+            "NOT decomposer-subtask-index order. Use ``final_output`` "
+            "for the chain's last result; use ``step_timings[i].step_index`` "
+            "to map back to subtask indices. Security audit ext10 #108."
+        ),
+    )
     failed_step_index: int | None = None
     failed_step_name: str | None = None
     failed_step_reason: str | None = Field(
@@ -627,3 +648,16 @@ class ChainResult(BaseModel):
     )
 
     model_config = {"extra": "forbid"}
+
+    @property
+    def final_output(self) -> dict | None:
+        """Return the output of the topologically-last step (chain's final result).
+
+        Security audit finding #108 (2026-04-19, ext10): callers
+        wanting "the chain's final output" should prefer this
+        property over raw ``step_results[-1]`` so the topological-
+        order semantics are explicit at the call site. Returns
+        ``None`` when no steps executed (chain crashed before
+        producing any output).
+        """
+        return self.step_results[-1] if self.step_results else None

@@ -198,6 +198,35 @@ def map_generations_to_runs(
     # Sort run windows by start time
     sorted_rws = sorted(run_windows, key=lambda rw: rw["start_ts"])
 
+    # Security audit finding #105 (2026-04-19, ext10): pre-fix every
+    # run got an unconditional ±120s buffer, so two runs started
+    # within 4 minutes of each other had OVERLAPPING buffer windows.
+    # Generations in the overlap zone matched both runs; the first-
+    # match-wins attribution depended on iteration order rather than
+    # truth. Clip each run's buffer by the adjacent run's
+    # end/start (with a 30s no-man's-land between adjacent runs) so
+    # boundary-zone generations are unambiguously attributed to the
+    # closest run by midpoint distance — exactly the policy the
+    # tie-break below documents but couldn't enforce when boundaries
+    # overlapped. The 30s gap is half the upper-bound clock skew
+    # the buffer was originally meant to absorb (60s of LangFuse-vs-
+    # harness drift split symmetrically between adjacent runs).
+    NON_STATIC_RWS = [rw for rw in sorted_rws if rw["condition"] != "static"]
+    OVERLAP_GUARD = timedelta(seconds=30)
+    BUFFER = timedelta(seconds=120)
+    clipped_buffers: dict[str, tuple] = {}
+    for i, rw in enumerate(NON_STATIC_RWS):
+        lo = rw["start_ts"] - BUFFER
+        hi = rw["end_ts"] + BUFFER
+        if i > 0:
+            prev = NON_STATIC_RWS[i - 1]
+            lo = max(lo, prev["end_ts"] + OVERLAP_GUARD)
+        if i + 1 < len(NON_STATIC_RWS):
+            nxt = NON_STATIC_RWS[i + 1]
+            hi = min(hi, nxt["start_ts"] - OVERLAP_GUARD)
+        # Keyed by run_id since rw dicts aren't hashable.
+        clipped_buffers[rw["run_id"]] = (lo, hi)
+
     for gen in generations:
         ts = gen["start_time"]
         best_rw = None
@@ -207,8 +236,10 @@ def map_generations_to_runs(
             # Skip static runs (0 LLM cost)
             if rw["condition"] == "static":
                 continue
-            buf_start = rw["start_ts"] - timedelta(seconds=120)
-            buf_end = rw["end_ts"] + timedelta(seconds=120)
+            buf_start, buf_end = clipped_buffers.get(
+                rw["run_id"],
+                (rw["start_ts"] - BUFFER, rw["end_ts"] + BUFFER),
+            )
             if buf_start <= ts <= buf_end:
                 mid = rw["start_ts"] + (rw["end_ts"] - rw["start_ts"]) / 2
                 dist = abs(ts - mid)

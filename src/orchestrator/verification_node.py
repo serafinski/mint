@@ -245,13 +245,26 @@ def verification_node(
     # LangFuse UI; every verification.tier_*.{pass,reject},
     # adversarial.*, verification.coverage.* event nests as a child of
     # the originating pipeline trace.
-    from src.orchestrator.tracing import trace_context as _trace_context
+    from src.orchestrator.tracing import (
+        submit_with_context as _submit_with_context,
+        trace_context as _trace_context,
+    )
 
     # Run gate_fn in parallel — each call is independent (isolated Docker sandbox).
+    #
+    # Security audit finding #104 (2026-04-19, ext10): use
+    # ``submit_with_context`` so each worker inherits the parent
+    # thread's ContextVar state (the trace_id we just set above) via
+    # ``contextvars.copy_context().run`` instead of falling through
+    # to the module-level global fallback. Pre-fix concurrent
+    # verification calls from different tasks could see each other's
+    # global trace context during the brief wipe-and-replace window
+    # in ``trace_context.__enter__``, causing cross-task event
+    # attribution.
     with _trace_context(trace_id=state.trace_id), \
          concurrent.futures.ThreadPoolExecutor(max_workers=MAX_VERIFICATION_WORKERS) as pool:
         future_to_artifact = {
-            pool.submit(gate_fn, artifact): artifact
+            _submit_with_context(pool, gate_fn, artifact): artifact
             for artifact in artifacts_to_verify
         }
         for future in concurrent.futures.as_completed(future_to_artifact):

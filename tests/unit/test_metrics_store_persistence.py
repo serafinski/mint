@@ -181,3 +181,120 @@ def test_harness_default_preserves_legacy_behavior():
     )
     assert path_field.default is None
     assert default_cfg.metrics_store_path is None
+
+
+# ---------------------------------------------------------------------------
+# ext11 #113 — longitudinal runners must reset the metrics_store DB on
+# invocation unless ``--reuse-metrics-store`` is passed.
+# ---------------------------------------------------------------------------
+
+
+def test_longitudinal_runners_declare_reuse_metrics_store_flag():
+    """Both longitudinal runners must expose ``--reuse-metrics-store`` so
+    cross-invocation accumulation is opt-in (ext11 #113). Default = fresh
+    baseline per invocation.
+    """
+    runners = [
+        ROOT / "scripts" / "run_longitudinal.py",
+        ROOT / "scripts" / "run_longitudinal_shift.py",
+    ]
+    for path in runners:
+        src = path.read_text()
+        assert '"--reuse-metrics-store"' in src, (
+            f"ext11 #113: {path.name} must declare a --reuse-metrics-store "
+            "CLI flag so callers can opt into cross-invocation state "
+            "accumulation. Default behaviour must wipe the DB on start."
+        )
+
+
+def test_longitudinal_runners_reset_metrics_store_by_default():
+    """Both longitudinal runners must wipe their persistent MetricsStore DB
+    at the top of ``main()`` unless the caller passed
+    ``--reuse-metrics-store``. Pre-ext11-#113 the DB was never reset;
+    cycle-1 KL + prune thresholds silently inherited prior invocation's
+    state and Chapter 6 reproducibility broke across back-to-back runs.
+    """
+    import ast
+
+    runners = [
+        ROOT / "scripts" / "run_longitudinal.py",
+        ROOT / "scripts" / "run_longitudinal_shift.py",
+    ]
+    for path in runners:
+        src = path.read_text()
+        tree = ast.parse(src)
+        # Scan the ``main`` function for an ``unlink()`` call guarded by
+        # ``not args.reuse_metrics_store``. We don't execute it — AST
+        # shape is enough to prevent regression.
+        unlink_guarded = False
+        for fn_node in ast.walk(tree):
+            if not (
+                isinstance(fn_node, ast.FunctionDef) and fn_node.name == "main"
+            ):
+                continue
+            for node in ast.walk(fn_node):
+                if not isinstance(node, ast.If):
+                    continue
+                guard_src = ast.unparse(node.test)
+                if "reuse_metrics_store" not in guard_src:
+                    continue
+                body_src = "\n".join(ast.unparse(stmt) for stmt in node.body)
+                if "unlink" in body_src:
+                    unlink_guarded = True
+                    break
+        assert unlink_guarded, (
+            f"ext11 #113: {path.name} must wipe its MetricsStore DB at "
+            "invocation start when --reuse-metrics-store is NOT passed. "
+            "Expected pattern: "
+            "``if not args.reuse_metrics_store and <path>.exists(): "
+            "<path>.unlink()``."
+        )
+
+
+def test_longitudinal_reset_is_isolated_from_sibling_runner_store(tmp_path):
+    """Behavioural cross-check on the ext11 #113 reset semantics: wiping
+    the DB at invocation start clears every persisted row without affecting
+    a sibling DB at a different path.
+
+    Mirrors the runner's logic (``unlink()`` + open fresh ``MetricsStore``)
+    without spawning the full pipeline.
+    """
+    from src.registry.metrics import MetricsStore
+    from src.schemas.metrics import InvocationRecord
+
+    db_a = tmp_path / "a.duckdb"
+    db_b = tmp_path / "b.duckdb"
+
+    # Session 1 — populate both stores with a row.
+    for p in (db_a, db_b):
+        ms = MetricsStore(db_path=str(p))
+        ms.record_invocation(InvocationRecord(
+            capability_id="cap-x", task_id="T01", success=True,
+            token_cost=10, latency_ms=5,
+        ))
+        ms.close()
+    assert db_a.exists() and db_b.exists()
+
+    # Simulate runner A's invocation-start reset — B must be untouched.
+    if db_a.exists():
+        db_a.unlink()
+    ms_a = MetricsStore(db_path=str(db_a))
+    a_rows = ms_a._conn.execute(  # noqa: SLF001
+        "SELECT COUNT(*) FROM invocations WHERE capability_id = 'cap-x'"
+    ).fetchone()[0]
+    ms_a.close()
+
+    ms_b = MetricsStore(db_path=str(db_b))
+    b_rows = ms_b._conn.execute(  # noqa: SLF001
+        "SELECT COUNT(*) FROM invocations WHERE capability_id = 'cap-x'"
+    ).fetchone()[0]
+    ms_b.close()
+
+    assert a_rows == 0, (
+        "ext11 #113: wiped DB must be empty after re-open "
+        f"(got {a_rows} rows)."
+    )
+    assert b_rows == 1, (
+        "ext11 #113: wiping runner A's DB must not affect runner B's DB "
+        f"(got {b_rows} rows, expected 1)."
+    )

@@ -18,6 +18,7 @@ Optional flags::
     --all-conditions   run all 4 baseline conditions in sequence
     --tasks IDS        comma-separated task IDs (overrides --all-tasks)
     --n-runs N         number of runs per condition (default: 1)
+    --condition-budget-hours N  total wall-clock budget per condition (default: 6)
 
 Results are printed to stdout and persisted to data/eval/metrics.duckdb.
 """
@@ -25,8 +26,11 @@ Results are printed to stdout and persisted to data/eval/metrics.duckdb.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
+import signal
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -52,6 +56,66 @@ SKILLS_DIR = DATA_DIR / "eval" / "skills"
 _LEGACY_DB_PATH = str(DATA_DIR / "eval" / "metrics.duckdb")
 
 ALL_CONDITIONS = ["full", "no_verification", "no_optimization", "static"]
+
+
+# Security audit finding #103 (2026-04-19, ext10): SIGALRM-based
+# total-budget watchdog. Wraps a long-running ``harness.run_condition``
+# call so a hung Docker container or LangFuse-API stall can't silently
+# block an 18-hour campaign indefinitely. Unix-only (signal.SIGALRM is
+# unavailable on Windows). On budget exhaustion, raises BudgetExceeded
+# in the main thread — the caller is expected to log the partial
+# results recorded so far and skip the remaining work.
+class BudgetExceeded(RuntimeError):
+    """Raised by the run-condition watchdog when the budget elapses."""
+
+
+@contextlib.contextmanager
+def _condition_budget_watchdog(
+    seconds: int,
+    *,
+    condition: str,
+    logger_: logging.Logger,
+):
+    """Raise ``BudgetExceeded`` if the wrapped block exceeds ``seconds``.
+
+    Implementation note: SIGALRM only fires in the main Python thread.
+    The harness's per-task loop runs synchronously in main, so an
+    interpreter-level stall (LLM call, Docker exec, file I/O) DOES
+    interrupt cleanly. A C-extension stall that releases the GIL
+    (e.g., a stuck ``subprocess.run``) will fire the signal handler
+    only when the GIL returns — usually still within seconds of the
+    underlying call returning. Sub-second precision isn't the point
+    here; preventing 18-hour silent stalls is.
+    """
+    if not hasattr(signal, "SIGALRM"):  # Windows fallback: no-op.
+        logger_.warning(
+            "Condition budget watchdog requested (%ds) but signal.SIGALRM "
+            "is unavailable on this platform — skipping watchdog. A hung "
+            "Docker container will block the campaign without bound.",
+            seconds,
+        )
+        yield
+        return
+
+    def _on_alarm(_sig: int, _frame: object) -> None:
+        raise BudgetExceeded(
+            f"Condition '{condition}' exceeded {seconds}s budget — "
+            f"watchdog fired (security audit ext10 #103)"
+        )
+
+    prev_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(seconds)
+    try:
+        t_start = time.monotonic()
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, prev_handler)
+        elapsed = time.monotonic() - t_start
+        logger_.info(
+            "Condition '%s' watchdog: elapsed %.1fs / budget %ds (%.1f%%)",
+            condition, elapsed, seconds, 100.0 * elapsed / seconds,
+        )
 
 
 def main() -> None:
@@ -124,6 +188,18 @@ def main() -> None:
              "→ static). ext7 #48 methodology note: use this flag if Chapter "
              "4.5 wants to eliminate time/order confounders (LangFuse latency "
              "drift, Docker cache warmth) on M5 latency metrics.",
+    )
+    parser.add_argument(
+        "--condition-budget-hours",
+        type=float,
+        default=6.0,
+        help="Wall-clock budget per condition (hours). Security audit ext10 "
+             "#103: SIGALRM-based watchdog around the harness call so a "
+             "hung Docker container or LangFuse-API stall can't silently "
+             "block the campaign indefinitely. Default 6h is comfortable "
+             "for the 20-task × 5-runs eval; raise for slower hardware. "
+             "Set to 0 to disable the watchdog (NOT recommended for "
+             "unattended runs). Unix-only — no-op on Windows.",
     )
     args = parser.parse_args()
 
@@ -237,11 +313,43 @@ def main() -> None:
             logger.info("Running condition: %s  (%d task(s), %d run(s))", condition, len(tasks), args.n_runs)
             logger.info("=" * 60)
 
-            if args.n_runs == 1 and not args.all_conditions:
-                # Single pilot run
-                records = harness.run_pilot(tasks, condition=condition)
-            else:
-                records = harness.run_condition(condition, tasks)
+            # Security audit finding #103 (2026-04-19, ext10): wrap the
+            # synchronous harness call in a SIGALRM-based watchdog so a
+            # hung Docker container or stalled LangFuse API call can't
+            # block the campaign indefinitely. Watchdog raises
+            # ``BudgetExceeded`` in main thread on timeout; we log and
+            # skip the remaining conditions rather than abort the whole
+            # run (partial results from other conditions are preserved
+            # in the DB by the per-task ``record_run`` calls inside
+            # ``_execute_run``).
+            budget_seconds = max(0, int(args.condition_budget_hours * 3600))
+            watchdog_cm = (
+                _condition_budget_watchdog(
+                    budget_seconds, condition=condition, logger_=logger,
+                )
+                if budget_seconds > 0
+                else contextlib.nullcontext()
+            )
+            try:
+                with watchdog_cm:
+                    if args.n_runs == 1 and not args.all_conditions:
+                        # Single pilot run
+                        records = harness.run_pilot(tasks, condition=condition)
+                    else:
+                        records = harness.run_condition(condition, tasks)
+            except BudgetExceeded as exc:
+                logger.error(
+                    "Condition '%s' aborted by watchdog: %s. "
+                    "Partial per-task records ARE persisted via record_run "
+                    "inside _execute_run; downstream analyzers will see them. "
+                    "Skipping the remaining conditions.",
+                    condition, exc,
+                )
+                # Re-raise as a flag for the outer loop to break early.
+                # We've logged the partial-results disclaimer; the user
+                # can inspect the DB to see which tasks completed before
+                # the budget fired.
+                break
 
             # Print summary
             n_success = sum(r.success for r in records)

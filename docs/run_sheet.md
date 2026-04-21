@@ -89,17 +89,23 @@ print(' '.join(ids))
 export CAMPAIGN_SESSION_IDS="$CAMPAIGN_RUN_IDS"
 
 # Longitudinal runs emit ONE run_id per invocation (uuid-based). Capture
-# after Rows 9 / 10 complete by tailing the runner log or querying the DB:
-#   SELECT DISTINCT run_id FROM evaluation_runs ORDER BY timestamp DESC LIMIT 1;
+# after Rows 9 / 10 complete by tailing the runner log or querying the DB.
+# ext11 #111 (2026-04-20): use GROUP BY run_id ORDER BY MAX(timestamp) — the
+# prior ``SELECT DISTINCT run_id ... ORDER BY timestamp DESC LIMIT 1`` form
+# was a DuckDB hazard: DISTINCT collapses rows to one per run_id with an
+# arbitrarily-picked timestamp, so ORDER BY on the non-selected timestamp
+# column could return a non-latest run_id. With multiple rows per run_id
+# (the normal append-only case) this silently picked the wrong campaign.
+#   SELECT run_id FROM evaluation_runs GROUP BY run_id ORDER BY MAX(timestamp) DESC LIMIT 1;
 export LONGITUDINAL_RUN_ID="$(uv run python -c "
 import duckdb
 conn = duckdb.connect('data/eval/longitudinal.duckdb')
-print(conn.execute('SELECT DISTINCT run_id FROM evaluation_runs ORDER BY timestamp DESC LIMIT 1').fetchone()[0])
+print(conn.execute('SELECT run_id FROM evaluation_runs GROUP BY run_id ORDER BY MAX(timestamp) DESC LIMIT 1').fetchone()[0])
 ")"
 export SHIFT_RUN_ID="$(uv run python -c "
 import duckdb
 conn = duckdb.connect('data/eval/longitudinal_shifted.duckdb')
-print(conn.execute('SELECT DISTINCT run_id FROM evaluation_runs ORDER BY timestamp DESC LIMIT 1').fetchone()[0])
+print(conn.execute('SELECT run_id FROM evaluation_runs GROUP BY run_id ORDER BY MAX(timestamp) DESC LIMIT 1').fetchone()[0])
 ")"
 ```
 
@@ -110,7 +116,7 @@ Every analyzer row below passes the appropriate scope flag. Forgetting the flag 
 | # | Command | Why (proposal metric) | Time |
 |---|---|---|---:|
 | 11 | `uv run scripts/backfill_token_costs.py --db $CAMPAIGN_DB --write` | **M4** — populates `evaluation_runs.token_cost` from LangFuse GENERATION observations | ~5 min |
-| 12 | `uv run scripts/backfill_definition_token_costs.py --write` | **Pillar 3 U(c) token-cost input** — per-capability definition-string tokens (proposal §Pillar 3 four-metric table, line 170). Distinct from row 11's M4 (total per-task). Idempotent. | ~1 min |
+| 12 | `uv run scripts/backfill_definition_token_costs.py --write --stores eval` | **Pillar 3 U(c) token-cost input** — per-capability definition-string tokens (proposal §Pillar 3 four-metric table, line 170). Distinct from row 11's M4 (total per-task). Idempotent. ext11 #112: ``--stores eval`` is required so the backfill does not silently mutate ``data/cli/chroma`` during an eval campaign (the script defaults to ``--stores all``). | ~1 min |
 | 13 | `uv run scripts/analyze_context_utilization.py --session-ids $CAMPAIGN_SESSION_IDS` | **T3 naive-verbose half** — peak input-token % of 128k context window per agent type | ~1 min |
 | 14 | `uv run scripts/analyze_compression_loss.py --db $CAMPAIGN_DB --run-ids $CAMPAIGN_RUN_IDS` | **T3 aggressive-compression half** — 9-bucket failure taxonomy + most-dropped-keys table | ~1 min |
 | 15 | `uv run scripts/analyze_tier2_probes.py --environment default --session-ids $CAMPAIGN_SESSION_IDS` | **Chapter 4.3 methodology evidence** — per-Tier-2-probe-type detection breakdown. Reads `verification.tier_2.{pass,reject}` LangFuse events, groups by `metadata.categories`, reports per-category hit counts + per-capability-type distribution. Answers "of the N Tier 2 rejections, which probe types caught them?" — proposal §Pillar 2 line 133 grounding. | ~10 s |

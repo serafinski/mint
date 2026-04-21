@@ -676,20 +676,43 @@ def main() -> int:
     for c in cycles:
         snapshot = c["cumulative_invocations"]
         utility = c.get("utility_scores", {})
+        incremental = c.get("incremental_invocations", {})
         kl_invocations = _kl_divergence_between_snapshots(prev_snapshot, snapshot)
         kl_utility = (
             _kl_divergence_between_snapshots(prev_utility, utility)
             if has_utility_scores else None
         )
-        gini = _gini_coefficient(list(snapshot.values())) if snapshot else 0.0
+        # Security audit finding #107 (2026-04-19, ext10): report
+        # BOTH cumulative-Gini (pre-fix; smooth, stiffens over time)
+        # AND incremental-Gini (per-cycle slice; the signal Pillar 3
+        # RQ #1 actually asks about). If incremental converges toward
+        # cumulative the optimizer is genuinely stabilizing the
+        # invocation distribution; if incremental stays high while
+        # cumulative looks smooth, the smoothing is an artifact of
+        # cumulative anchoring. Chapter 6 figure should plot both
+        # trajectories; Chapter 4.5 should disclose which is the
+        # headline metric.
+        gini_cumulative = (
+            _gini_coefficient(list(snapshot.values())) if snapshot else 0.0
+        )
+        gini_incremental = (
+            _gini_coefficient(list(incremental.values())) if incremental else 0.0
+        )
         rows.append({
             "cycle": c["cycle"],
             "task_id": c["task_id"],
             "n_active_caps": c["active_cap_count"],
             "kl_utility": kl_utility,
             "kl_invocations": kl_invocations,
-            "gini": gini,
-            "n_new_invocations": sum(c["incremental_invocations"].values()),
+            # Back-compat: ``gini`` keeps the cumulative semantics so
+            # downstream consumers (CSV writers, plot helpers, the
+            # convergence summary) don't break. New consumers should
+            # prefer the explicit ``gini_cumulative`` /
+            # ``gini_incremental`` columns.
+            "gini": gini_cumulative,
+            "gini_cumulative": gini_cumulative,
+            "gini_incremental": gini_incremental,
+            "n_new_invocations": sum(incremental.values()),
             "events": c.get("events", []),
         })
         prev_snapshot = snapshot
@@ -812,9 +835,35 @@ def main() -> int:
 
     # --- Gini range + seeded-vs-evolved comparison (Pillar 3 RQ #1) ---
     if ginis:
+        # Security audit finding #107 (2026-04-19, ext10): also
+        # report incremental Gini so readers can distinguish
+        # "optimizer stabilizing the distribution" (incremental
+        # converges toward cumulative) from "cumulative anchoring
+        # smoothes a still-volatile signal" (incremental stays high
+        # while cumulative looks flat).
+        ginis_incremental = [r["gini_incremental"] for r in rows]
         print()
-        print(f"  Gini (final):    {ginis[-1]:.3f}")
-        print(f"  Gini range:      [{min(ginis):.3f}, {max(ginis):.3f}]")
+        print(f"  Gini (cumulative, final):    {ginis[-1]:.3f}")
+        print(f"  Gini (cumulative, range):    [{min(ginis):.3f}, {max(ginis):.3f}]")
+        if any(g > 0 for g in ginis_incremental):
+            print(
+                f"  Gini (incremental, final):   {ginis_incremental[-1]:.3f}"
+            )
+            print(
+                f"  Gini (incremental, range):   "
+                f"[{min(ginis_incremental):.3f}, {max(ginis_incremental):.3f}]"
+            )
+            # Diverging ranges flag the smoothing artifact directly.
+            if (
+                max(ginis_incremental) - min(ginis_incremental)
+                > 2 * (max(ginis) - min(ginis) + 1e-9)
+            ):
+                print(
+                    "  [diagnostic] Incremental Gini varies >2x more than "
+                    "cumulative — the cumulative trajectory understates "
+                    "per-cycle distribution instability. Cite incremental "
+                    "Gini in Pillar 3 RQ #1 figures."
+                )
         print(f"  # caps (final):  {n_caps[-1]}")
         print(f"  # caps range:    [{min(n_caps)}, {max(n_caps)}]")
         # Seeded vs evolved comparison — proposal Pillar 3 RQ #1.

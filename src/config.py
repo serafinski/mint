@@ -78,3 +78,22 @@ BINARY_EXTENSIONS: frozenset[str] = frozenset({
 
 #: Number of invocations before auto-enabling the optimizer in CLI mode.
 AUTO_OPTIMIZER_THRESHOLD: int = 20
+
+# ---------------------------------------------------------------------------
+# Verification (Pillar 2)
+# ---------------------------------------------------------------------------
+
+#: Reasoning effort passed to the adversarial DeepAgent's LLM (Pillar 2 Tier 3).
+#:
+#: Default ``"low"`` keeps Tier 3 cost bounded (~$0.01-0.02 per artifact at
+#: gpt-5-mini); raising to ``"medium"`` or ``"high"`` improves the prober's
+#: ability to detect sophisticated deceptive patterns at proportional cost.
+#: Override via ``JIT_ADVERSARIAL_REASONING`` for ablation studies — e.g.,
+#: run a 20-artifact subset at ``"high"`` and report the M2 detection delta
+#: in Chapter 4.5 ("reasoning-effort ablation: X% additional contamination
+#: caught at high vs. low"). Security audit finding #99 (2026-04-19, ext10)
+#: surfaced the pre-fix hardcoded-low setting at adversarial.py:354 as a
+#: capped Tier 3 quality knob with no override path.
+ADVERSARIAL_REASONING_EFFORT: str = os.getenv(
+    "JIT_ADVERSARIAL_REASONING", "low"
+)

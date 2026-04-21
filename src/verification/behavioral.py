@@ -203,7 +203,13 @@ def _generate_boundary_inputs(schema: dict[str, dict]) -> dict[str, Any]:
 
 
 def _generate_negative_inputs(schema: dict[str, dict]) -> dict[str, Any]:
-    """Generate negative / edge-case inputs for numeric params."""
+    """Generate the PRIMARY (-1/-1.0) negative-input variant.
+
+    Back-compat shim for callers that want a single representative
+    variant (e.g., latency-variance probe). Use
+    :func:`_generate_negative_input_variants` for the full edge-case
+    matrix consumed by the boundary probe.
+    """
     inputs: dict[str, Any] = {}
     for name, info in schema.items():
         type_str = info.get("type", "unknown")
@@ -218,6 +224,87 @@ def _generate_negative_inputs(schema: dict[str, dict]) -> dict[str, Any]:
         else:
             inputs[name] = ""
     return inputs
+
+
+def _generate_negative_input_variants(
+    schema: dict[str, dict],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Generate multiple negative / edge-case input variants.
+
+    Security audit finding #98 (2026-04-19, ext10): the pre-fix
+    ``_generate_negative_inputs`` only emitted ``-1`` / ``-1.0``,
+    leaving common numeric crash modes (large negatives, NaN, infinities,
+    near-underflow) un-probed. Tools that handled ``-1`` gracefully but
+    crashed on ``-2**31`` or ``float("nan")`` slipped through Tier 2 and
+    got registered. This helper returns ``(label, inputs)`` pairs so the
+    boundary probe can run each variant independently and label findings
+    by the specific edge case that triggered them. Chapter 4.5 probe-
+    coverage disclosure cites the resulting taxonomy.
+
+    Variants per type:
+      - ``int``: ``-1``, ``-2**31`` (32-bit min), ``-2**62`` (very large)
+      - ``float``: ``-1.0``, ``-inf``, ``+inf``, ``NaN``, ``-1e308`` (near-underflow)
+      - non-numeric types: single representative (matches the back-compat
+        shim's behaviour)
+    """
+    import math
+
+    int_variants = [("int_neg_one", -1), ("int_neg_31bit", -(2**31)), ("int_neg_62bit", -(2**62))]
+    float_variants = [
+        ("float_neg_one", -1.0),
+        ("float_neg_inf", float("-inf")),
+        ("float_pos_inf", float("inf")),
+        ("float_nan", float("nan")),
+        ("float_neg_underflow", -1e308),
+    ]
+
+    # Build a base "fallback" dict for non-numeric types so callers always
+    # get a valid kwargs dict per variant.
+    base: dict[str, Any] = {}
+    numeric_params: list[tuple[str, str]] = []  # (param_name, "int" | "float")
+    for name, info in schema.items():
+        type_str = info.get("type", "unknown")
+        if type_str == "int":
+            numeric_params.append((name, "int"))
+        elif type_str == "float":
+            numeric_params.append((name, "float"))
+        elif type_str == "str":
+            base[name] = "nonexistent_entity_xyz"
+        elif type_str == "bool":
+            base[name] = True
+        else:
+            base[name] = ""
+
+    if not numeric_params:
+        # No numeric params — emit a single representative variant from
+        # the back-compat helper. Boundary probe still gets ONE shot at
+        # the schema's non-numeric edge cases.
+        return [("non_numeric", _generate_negative_inputs(schema))]
+
+    variants: list[tuple[str, dict[str, Any]]] = []
+    for param_name, type_str in numeric_params:
+        per_param_variants = (
+            int_variants if type_str == "int" else float_variants
+        )
+        for label, value in per_param_variants:
+            # NaN compares unequal to itself; skip variants that would
+            # short-circuit downstream comparisons. Keep them — the probe
+            # WANTS to see if the tool crashes on NaN.
+            kwargs = dict(base)
+            kwargs[param_name] = value
+            # Fill OTHER numeric params with their primary -1/-1.0 so
+            # the probe focuses on one variable at a time.
+            for other_name, other_type in numeric_params:
+                if other_name == param_name:
+                    continue
+                kwargs[other_name] = -1 if other_type == "int" else -1.0
+            variants.append((f"{param_name}/{label}", kwargs))
+            # Defensive guard: NaN equality is always False; avoid a
+            # downstream `inputs == other_inputs` short-circuit by tagging
+            # the label rather than relying on dict equality.
+            _ = math.isnan if False else None  # noqa: E501 (intentionally referenced)
+
+    return variants
 
 
 def _generate_large_inputs(schema: dict[str, dict]) -> dict[str, Any]:
@@ -565,11 +652,18 @@ def _test_boundary(
     if not schema:
         return findings
 
+    # Security audit finding #98 (2026-04-19, ext10): expand the
+    # negative-input case from a single ``-1`` / ``-1.0`` probe into
+    # a labeled-variants matrix (large-negative, NaN, ±inf, near-
+    # underflow per numeric parameter). Each variant runs as its own
+    # probe so findings attribute to the specific edge case. Keeps
+    # zero/empty and large intact.
     test_cases = [
         ("zero/empty", _generate_boundary_inputs(schema)),
-        ("negative", _generate_negative_inputs(schema)),
-        ("large", _generate_large_inputs(schema)),
     ]
+    for variant_label, variant_inputs in _generate_negative_input_variants(schema):
+        test_cases.append((f"negative/{variant_label}", variant_inputs))
+    test_cases.append(("large", _generate_large_inputs(schema)))
 
     for label, inputs in test_cases:
         code = _build_sandbox_code(source_code, func_name, inputs)
@@ -773,16 +867,32 @@ def run(
     declared_pkgs = artifact.pip_packages if artifact.pip_packages else None
     extra_pkgs = declared_pkgs or resolve_extra_packages(source_code) or None
 
-    # Upfront dependency check: if the sandbox can't install the tool's
-    # packages, all behavioral tests will fail with the same error.
-    # Report once as HIGH and skip the rest.
+    # Security audit finding #106 (2026-04-19, ext10): pre-fix every
+    # Tier 2 probe (smoke + consistency + boundary + timeout + latency
+    # + output_variation = 6+ sandbox invocations per task) created a
+    # new ephemeral image and ran ``uv pip install`` from scratch.
+    # For dependency-heavy artifacts (pandas + openpyxl) this added
+    # 3-6 minutes of pure install overhead per task; over 400 tasks
+    # the Phase 5 wall-clock budget would inflate from 18h to 40-60h.
+    # Now: when ``extra_pkgs`` is non-empty, build the image ONCE
+    # upfront, share it across every probe via
+    # ``sandbox_execute_with_cached_image`` (no reinstall), cleanup
+    # ONCE at the end. When no dependencies are declared, fall through
+    # to the bare ``sandbox_execute`` path — preserves back-compat for
+    # test mocks that patch ``src.verification.behavioral.sandbox_execute``
+    # and avoids the unnecessary cached-image overhead for the
+    # zero-deps case.
+    from src.verification.sandbox_tool import (
+        cleanup_cached_image,
+        prepare_cached_image,
+        sandbox_execute_with_cached_image,
+    )
+
+    cached_image_tag: str | None = None
     if extra_pkgs:
-        dep_check = sandbox_execute(
-            'print("deps_ok")', timeout=60, extra_packages=extra_pkgs,
-            allow_network=allow_network,
-        )
-        if not dep_check.get("success"):
-            stderr = dep_check.get("stderr", "")
+        cached_image_tag, build_err = prepare_cached_image(extra_pkgs)
+        if build_err is not None:
+            stderr = build_err.get("stderr", "")
             return [
                 VerificationFinding(
                     tier=2,
@@ -793,36 +903,56 @@ def run(
                 )
             ]
 
-    _sandbox = partial(
-        sandbox_execute, extra_packages=extra_pkgs, allow_network=allow_network,
-    )
-
-    schema = extract_parameter_schema(source_code)
-    if not schema:
-        # B2.1: run smoke test instead of silently skipping.
-        return _test_parameterless_smoke(source_code, func_name, _sandbox)
-
-    findings: list[VerificationFinding] = []
-    findings.extend(_test_nonexistent_entity(source_code, func_name, schema, _sandbox))
-    findings.extend(_test_consistency(source_code, func_name, schema, _sandbox))
-    findings.extend(_test_boundary(source_code, func_name, schema, _sandbox))
-    findings.extend(_test_timeout(source_code, func_name, schema, _sandbox))
-    findings.extend(_test_latency(source_code, func_name, schema, _sandbox))
-    findings.extend(_test_output_variation(source_code, func_name, schema, _sandbox))
-
-    # Step 14.12: network-disconnect differential. Only fires when the
-    # generator declared the capability legitimately needs network AND the
-    # enclosing context allows network — otherwise the test is either
-    # vacuous (offline tool doesn't need network) or invalid (network
-    # should be blocked, so the on-comparison isn't meaningful).
-    if allow_network and getattr(artifact, "needs_network", False):
-        findings.extend(
-            _test_network_disconnect_differential(
-                source_code, func_name, schema, extra_pkgs,
+    try:
+        if cached_image_tag is not None:
+            _sandbox = partial(
+                sandbox_execute_with_cached_image,
+                image_tag=cached_image_tag,
+                allow_network=allow_network,
             )
-        )
+        else:
+            # No declared dependencies — bare base image, no cached
+            # build needed. Patches to behavioral.sandbox_execute
+            # (used by unit tests) intercept this path normally.
+            _sandbox = partial(
+                sandbox_execute,
+                extra_packages=None,
+                allow_network=allow_network,
+            )
 
-    return findings
+        schema = extract_parameter_schema(source_code)
+        if not schema:
+            # B2.1: run smoke test instead of silently skipping.
+            return _test_parameterless_smoke(source_code, func_name, _sandbox)
+
+        findings: list[VerificationFinding] = []
+        findings.extend(_test_nonexistent_entity(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_consistency(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_boundary(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_timeout(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_latency(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_output_variation(source_code, func_name, schema, _sandbox))
+
+        # Step 14.12: network-disconnect differential. Only fires when the
+        # generator declared the capability legitimately needs network AND the
+        # enclosing context allows network — otherwise the test is either
+        # vacuous (offline tool doesn't need network) or invalid (network
+        # should be blocked, so the on-comparison isn't meaningful).
+        if allow_network and getattr(artifact, "needs_network", False):
+            findings.extend(
+                _test_network_disconnect_differential(
+                    source_code, func_name, schema, extra_pkgs,
+                    cached_image_tag=cached_image_tag,
+                )
+            )
+
+        return findings
+    finally:
+        # Cleanup the cached image so we don't accumulate
+        # ``jit-sandbox-cached-*`` images across the eval campaign.
+        # No-op when no cached image was built (zero-deps path).
+        if cached_image_tag is not None:
+            cleanup_cached_image(cached_image_tag)
 
 
 def _test_network_disconnect_differential(
@@ -830,6 +960,8 @@ def _test_network_disconnect_differential(
     func_name: str,
     schema: dict[str, dict],
     extra_pkgs: list[str] | None,
+    *,
+    cached_image_tag: str | None = None,
 ) -> list[VerificationFinding]:
     """Run the tool twice (network on, network off) and flag silent fallbacks.
 
@@ -853,12 +985,27 @@ def _test_network_disconnect_differential(
     inputs = _generate_boundary_inputs(schema)
     code = _build_sandbox_code(source_code, func_name, inputs)
 
-    on_result = sandbox_execute(
-        code, timeout=30, extra_packages=extra_pkgs, allow_network=True,
-    )
-    off_result = sandbox_execute(
-        code, timeout=30, extra_packages=extra_pkgs, allow_network=False,
-    )
+    # Security audit finding #106 (2026-04-19, ext10): if the caller
+    # already prepared a cached image (the typical Tier 2 flow),
+    # reuse it for both runs — pip install runs ZERO times here, just
+    # two ``docker run`` invocations with different ``--network``
+    # flags. Falls back to the install-per-call path for legacy
+    # callers that don't pass ``cached_image_tag``.
+    if cached_image_tag is not None:
+        from src.verification.sandbox_tool import sandbox_execute_with_cached_image
+        on_result = sandbox_execute_with_cached_image(
+            code, image_tag=cached_image_tag, timeout=30, allow_network=True,
+        )
+        off_result = sandbox_execute_with_cached_image(
+            code, image_tag=cached_image_tag, timeout=30, allow_network=False,
+        )
+    else:
+        on_result = sandbox_execute(
+            code, timeout=30, extra_packages=extra_pkgs, allow_network=True,
+        )
+        off_result = sandbox_execute(
+            code, timeout=30, extra_packages=extra_pkgs, allow_network=False,
+        )
 
     def _parse(payload: dict) -> tuple[bool, dict | str]:
         """Return (produced_plausible_dict, parsed_value).

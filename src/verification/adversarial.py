@@ -62,6 +62,17 @@ ADVERSARIAL_RECURSION_LIMIT = 50
 # See docs/MASTER_PLAN_2026_04_13.md §14.11 for the full rationale.
 ADVERSARIAL_TIMEOUT_S = 480
 
+
+def _adversarial_reasoning_effort() -> str:
+    """Read the adversarial reasoning_effort knob from config.
+
+    Lazy-import via function so circular-import edge cases don't bite
+    at module-load time. Security audit finding #99 (2026-04-19, ext10).
+    """
+    from src.config import ADVERSARIAL_REASONING_EFFORT
+    return ADVERSARIAL_REASONING_EFFORT
+
+
 # Module-level LangFuse metadata, set by verification_node before
 # spawning the ThreadPoolExecutor. probe() reads this since
 # get_config() is thread-local and doesn't work in worker threads.
@@ -337,7 +348,7 @@ def _create_adversarial_agent(
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
 
-    from src.config import DEFAULT_LLM_MODEL
+    from src.config import ADVERSARIAL_REASONING_EFFORT, DEFAULT_LLM_MODEL
 
     if pip_packages or allow_network:
         probe_sandbox = _make_probe_sandbox_execute(
@@ -350,8 +361,19 @@ def _create_adversarial_agent(
     if allow_network:
         system_prompt = system_prompt + _ALLOW_NETWORK_PROMPT_ADDENDUM
 
+    # Security audit finding #99 (2026-04-19, ext10): the
+    # reasoning_effort knob is now config-driven via
+    # ``ADVERSARIAL_REASONING_EFFORT`` (env var
+    # ``JIT_ADVERSARIAL_REASONING``). Default ``"low"`` keeps Phase 5
+    # eval cost bounded; researchers can override to ``"medium"`` /
+    # ``"high"`` for ablation studies that quantify the M2 detection
+    # ceiling lifted by stronger reasoning. Pre-fix the hardcoded
+    # ``"low"`` capped Tier 3 quality with no override path.
     return create_deep_agent(
-        model=init_chat_model(DEFAULT_LLM_MODEL, reasoning_effort="low"),
+        model=init_chat_model(
+            DEFAULT_LLM_MODEL,
+            reasoning_effort=ADVERSARIAL_REASONING_EFFORT,
+        ),
         tools=[probe_sandbox],
         system_prompt=system_prompt,
         response_format=AdversarialFindings,
@@ -642,9 +664,17 @@ def probe(
     if langfuse_metadata:
         config["metadata"] = langfuse_metadata
 
+    # Security audit finding #104 (2026-04-19, ext10): propagate
+    # ContextVar state into the worker thread so the adversarial
+    # DeepAgent's LangFuse events nest under the parent pipeline's
+    # trace_context (tags / session_id / user_id / trace_id) instead
+    # of falling through to the global fallback (race-prone under
+    # concurrent verification of different artifacts).
+    from src.orchestrator.tracing import submit_with_context
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        future = pool.submit(
+        future = submit_with_context(
+            pool,
             agent.invoke,
             {"messages": [{"role": "user", "content": user_message}]},
             config,
@@ -717,7 +747,7 @@ def probe(
                 "capability_name": capability_name,
                 "capability_type": artifact.capability_type.value,
                 "classification": "fail_closed",
-                "reasoning_effort": "low",  # hardcoded in _create_adversarial_agent
+                "reasoning_effort": _adversarial_reasoning_effort(),  # config-driven (ext10 #99)
                 "recursion_limit": ADVERSARIAL_RECURSION_LIMIT,
                 "note": (
                     "Sub-probe count not instrumented at timeout — "

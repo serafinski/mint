@@ -925,10 +925,26 @@ class TestAllowNetworkPropagates:
     ``sandbox_execute`` call inside Tier 2.
     """
 
-    @patch("src.verification.behavioral.sandbox_execute")
-    def test_allow_network_true_forwards_to_dep_check(self, mock_sandbox):
-        """Dependency pre-check receives allow_network=True."""
-        mock_sandbox.return_value = _sandbox_success("42")
+    @patch("src.verification.sandbox_tool.cleanup_cached_image")
+    @patch("src.verification.sandbox_tool.sandbox_execute_with_cached_image")
+    @patch("src.verification.sandbox_tool.prepare_cached_image")
+    def test_allow_network_true_forwards_to_cached_image_probes(
+        self, mock_prepare, mock_cached_sandbox, mock_cleanup,
+    ):
+        """All Tier 2 probes against the cached image receive allow_network=True.
+
+        Security audit ext10 #106: pre-fix this test asserted the
+        dep-check call (a separate ``sandbox_execute`` invocation per
+        probe) received ``allow_network=True``. After ext10 #106 the
+        dep check is subsumed into ``prepare_cached_image`` (which
+        ALWAYS uses ``--network bridge`` because pip install needs
+        network — the policy applies to the tool execution, not the
+        image build). The new equivalent contract: every probe that
+        runs against the cached image receives the requested
+        ``allow_network`` value.
+        """
+        mock_prepare.return_value = ("jit-sandbox-cached-deadbeef", None)
+        mock_cached_sandbox.return_value = _sandbox_success("42")
         artifact = GeneratedArtifact(
             capability_name="net-tool",
             capability_type=CapabilityType.MCP_TOOL,
@@ -938,13 +954,26 @@ class TestAllowNetworkPropagates:
 
         run(artifact, allow_network=True)
 
-        # The dep_check call is the first one with extra_packages=...
-        dep_calls = [
-            c for c in mock_sandbox.call_args_list
-            if c.kwargs.get("extra_packages") == ["requests"]
-        ]
-        assert dep_calls
-        assert all(c.kwargs.get("allow_network") is True for c in dep_calls)
+        # prepare_cached_image was called with the declared packages
+        # (network policy not part of the build phase).
+        assert mock_prepare.call_args_list, "prepare_cached_image not called"
+        assert mock_prepare.call_args_list[0].args[0] == ["requests"]
+
+        # Every probe invocation routed through the cached-image helper
+        # with allow_network=True.
+        assert mock_cached_sandbox.call_args_list, (
+            "sandbox_execute_with_cached_image not invoked for any probe"
+        )
+        for call in mock_cached_sandbox.call_args_list:
+            assert call.kwargs.get("allow_network") is True, (
+                f"probe call missing allow_network=True: {call}"
+            )
+
+        # Cached image cleaned up at the end (one call per run).
+        assert mock_cleanup.call_args_list
+        assert (
+            mock_cleanup.call_args_list[0].args[0] == "jit-sandbox-cached-deadbeef"
+        )
 
     @patch("src.verification.behavioral.sandbox_execute")
     def test_allow_network_false_by_default(self, mock_sandbox):

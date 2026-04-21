@@ -49,27 +49,82 @@ class TestClassifyTaskLive:
         assert result.confidence >= 0.7
         assert len(result.rationale) > 0
 
-    def test_classify_skill(self):
-        """A multi-step domain workflow should classify as SKILL."""
-        task = (
-            "Build an inventory reorder pipeline using an inventory CSV and "
-            "a reorder rules YAML. Compute days of stock for each product, "
-            "identify items below the reorder threshold, compute reorder "
-            "quantities capped at max_order_value, and sum the total cost."
+    def test_classify_skill_subtask_per_gap(self):
+        """Per-gap classification (modern primary path) of a SKILL-shaped subtask.
+
+        Replaces the deleted ``test_classify_skill`` (root-cause
+        traced 2026-04-21):
+
+        The deleted test asked the LEGACY ``classify_task`` wrapper
+        to whole-task-classify the multi-step *"Build an inventory
+        reorder pipeline ... compute days of stock ... sum total
+        cost"* prompt as SKILL. That made sense in the **pre-Stage-2
+        world** (commit ``cab813a``, 2026-04-13) where the classifier
+        ran ONCE per task. Stage 2 pivoted to **per-gap
+        classification** — multi-step tasks are now decomposed FIRST,
+        then each subtask is independently classified via
+        ``classify_gap``. In production the inventory-reorder task
+        would be decomposed into three deterministic-compute gaps
+        (parse, apply rules, sum), each correctly classifying as
+        MCP_TOOL. There is no longer a "whole task is a SKILL"
+        classification step in the production path for multi-step
+        tasks.
+
+        Empirical confirmation (2026-04-21 reproduction):
+        ``classify_task`` on a SKILL-shaped prompt now returns either
+        ``MCP_TOOL`` (compute-pipeline anti-pattern, classifier prompt
+        explicitly excludes those) OR ``AGENT`` (multi-step + judgment
+        + adaptation language, which the prompt rewards). The legacy
+        wrapper has no robust SKILL niche left for non-trivial
+        prompts. Coverage of the legacy single-gap fallback wrapper is
+        already provided indirectly by ``test_classify_mcp_tool`` /
+        ``test_classify_agent`` which use trivial single-purpose
+        prompts that the wrapper still handles cleanly.
+        """
+        from src.orchestrator.classifier import classify_gap
+        from src.schemas.task import GapItem
+
+        # Parent task is procedural-with-domain-expertise. The
+        # subtask is the "apply rubric" step — clearly SKILL because
+        # the rubric application is per-team domain expertise, not
+        # raw compute.
+        parent_task = (
+            "Run a structured data quality review following our team's "
+            "data-cleaning SOP: profile the dataset against our quality "
+            "rubric, identify violations per the rule library, write a "
+            "report using the QA template, and produce escalation "
+            "recommendations per the approved patterns."
         )
-        result = classify_task(
-            task,
+        gap = GapItem(
+            query="apply-team-quality-rubric",
+            description=(
+                "Walk the dataset through the team's quality rubric "
+                "(completeness, consistency, validity) following the QA "
+                "playbook's prescribed step ordering. For each rule, "
+                "apply the team's standard severity-tagging convention "
+                "and use the approved finding-template phrasing."
+            ),
+        )
+        result = classify_gap(
+            gap=gap,
+            task_description=parent_task,
             required_capabilities=[
-                "parse-inventory",
-                "apply-reorder-rules",
-                "compute-cost",
+                "profile-against-rubric",
+                "apply-team-quality-rubric",
+                "write-qa-report",
             ],
         )
 
+        assert result is not None, (
+            "classify_gap returned None — three-attempt retry budget exhausted"
+        )
         assert isinstance(result, ClassifiedGap)
-        assert result.classified_type == CapabilityType.SKILL
+        assert result.classified_type == CapabilityType.SKILL, (
+            f"Expected SKILL for SKILL-shaped per-gap subtask, got "
+            f"{result.classified_type} (confidence {result.confidence}). "
+            f"Rationale: {result.rationale}"
+        )
         assert result.confidence >= 0.7
-        assert len(result.rationale) > 0
 
     def test_classify_agent(self):
         """An open-ended investigation task should classify as AGENT."""

@@ -85,15 +85,39 @@ def find_subtask_for_gap(
     gap: ClassifiedGap,
     subtasks: list[SubTask],
 ) -> SubTask | None:
-    """Return the subtask whose ``required_capabilities`` contains the gap query.
+    """Return the FIRST subtask whose ``required_capabilities`` contains the gap query.
 
     Used by both :func:`build_schema_context` and :func:`is_first_step_for_gap`
     so the lookup lives in one place.
+
+    Security audit finding #101 (2026-04-19, ext10): when a capability
+    is referenced by MULTIPLE subtasks (e.g. a CSV reader reused at
+    step 0 AND step 3), this function returns only the FIRST match.
+    Callers that need to reason about multi-position reuse should use
+    :func:`find_all_subtasks_for_gap` and check for mixed-position
+    cases (some matches with ``depends_on=[]``, others with non-empty
+    deps). The kept first-only signature preserves back-compat for
+    callers (``build_schema_context``) that only need a single
+    representative context block.
     """
     for st in subtasks:
         if gap.query in st.required_capabilities:
             return st
     return None
+
+
+def find_all_subtasks_for_gap(
+    gap: ClassifiedGap,
+    subtasks: list[SubTask],
+) -> list[SubTask]:
+    """Return ALL subtasks whose ``required_capabilities`` contains the gap query.
+
+    Security audit finding #101 (2026-04-19, ext10): companion to
+    :func:`find_subtask_for_gap` for callers that need to detect
+    capability reuse across positions. Returns an empty list when no
+    subtask matches.
+    """
+    return [st for st in subtasks if gap.query in st.required_capabilities]
 
 
 def is_first_step_for_gap(
@@ -106,11 +130,37 @@ def is_first_step_for_gap(
     downstream step, and ``None`` when the gap cannot be matched to a
     subtask (in which case callers should skip position-specific directives
     and validators).
+
+    Security audit finding #101 (2026-04-19, ext10): when a capability
+    is reused at MIXED positions (some subtasks have ``depends_on=[]``,
+    others have non-empty deps), this function emits a WARNING log so
+    the generator-prompt drift becomes visible — the resulting tool
+    needs to handle BOTH first-step and downstream invocations, but the
+    prompt steers toward whichever position the first match indicated.
+    Returning the first-match's value is back-compat; the WARNING is
+    the loud signal for future remediation.
     """
-    subtask = find_subtask_for_gap(gap, subtasks)
-    if subtask is None:
+    matches = find_all_subtasks_for_gap(gap, subtasks)
+    if not matches:
         return None
-    return len(subtask.depends_on) == 0
+    positions = {len(st.depends_on) == 0 for st in matches}
+    if len(positions) > 1:
+        # Mixed-position reuse: the LLM-generated tool will only have
+        # the shape appropriate for the FIRST match's position. Other
+        # invocations may break. Loud-log so the drift is visible in
+        # Phase 5 logs.
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "Capability '%s' reused across mixed positions: %d subtask(s) "
+            "as first-step (depends_on=[]) and %d subtask(s) as downstream. "
+            "Generator prompt will produce a single signature; the unused "
+            "position's invocation may fail. Security audit ext10 #101.",
+            gap.query,
+            sum(1 for st in matches if not st.depends_on),
+            sum(1 for st in matches if st.depends_on),
+        )
+    return len(matches[0].depends_on) == 0
 
 
 def build_schema_context(
@@ -132,15 +182,51 @@ def build_schema_context(
 
     lines: list[str] = []
 
-    # Input contract: upstream steps' output_schema
+    # Input contract: upstream steps' output_schema.
+    #
+    # Security audit finding #102 (2026-04-19, ext10): when two
+    # predecessors emit the SAME output-key (e.g., both produce
+    # ``"count": int`` with different semantics), the pre-fix code
+    # appended both verbatim to a flat list — the LLM saw
+    # ``- "count": rows`` AND ``- "count": errors`` with no
+    # provenance, and silently picked one or worse generated code
+    # assuming both were available. Now: tag each key with its
+    # source step (``from step N``) and emit an explicit
+    # ``**COLLISION**`` marker when two predecessors produce the
+    # same key, listing both descriptions so the LLM can disambiguate.
+    # Mirrors the executor's last-write-wins merge order via the
+    # depends_on iteration (also caught by
+    # ``_detect_upstream_key_collisions`` at the decomposition layer
+    # as a soft warning per ext6 #13).
     if target_subtask.depends_on:
         input_parts: list[str] = []
+        seen_keys: dict[str, tuple[int, str]] = {}  # key → (first dep_idx, desc)
+        collision_warnings: list[str] = []
         for dep_idx in target_subtask.depends_on:
             if 0 <= dep_idx < len(subtasks):
                 dep = subtasks[dep_idx]
                 if dep.output_schema:
                     for key, desc in dep.output_schema.items():
-                        input_parts.append(f"  - \"{key}\": {desc}")
+                        if key in seen_keys:
+                            prev_idx, prev_desc = seen_keys[key]
+                            input_parts.append(
+                                f"  - \"{key}\" **COLLISION** "
+                                f"(produced by both step {prev_idx} "
+                                f"and step {dep_idx}): "
+                                f"step {prev_idx} = {prev_desc} | "
+                                f"step {dep_idx} = {desc}. "
+                                "Last-write-wins at runtime — "
+                                "step "
+                                f"{dep_idx}'s value will overwrite "
+                                f"step {prev_idx}'s. Use other keys to "
+                                "disambiguate or rename one upstream."
+                            )
+                            collision_warnings.append(key)
+                        else:
+                            input_parts.append(
+                                f"  - \"{key}\" (from step {dep_idx}): {desc}"
+                            )
+                            seen_keys[key] = (dep_idx, desc)
         if input_parts:
             lines.append("**Your step receives a dict from the previous step with these keys:**")
             lines.extend(input_parts)
@@ -148,6 +234,14 @@ def build_schema_context(
                 "Use these exact key names to read the upstream data. "
                 "Do NOT assume different key names."
             )
+            if collision_warnings:
+                lines.append(
+                    f"**WARNING:** {len(collision_warnings)} upstream "
+                    f"key collision(s) detected ({', '.join(sorted(set(collision_warnings)))}) "
+                    "— see COLLISION markers above. The merged "
+                    "``upstream_data`` dict will only carry the "
+                    "last-written value per colliding key."
+                )
             lines.append("")
 
     # Output contract: this step's output_schema

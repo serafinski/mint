@@ -592,10 +592,17 @@ def decomposition_node(
     # shutdown(wait=False) on timeout — the context-manager form calls
     # shutdown(wait=True) from __exit__, which blocks until the thread
     # finishes even after TimeoutError is raised.
+    # Security audit finding #104 (2026-04-19, ext10): use
+    # ``submit_with_context`` so the decomposer DeepAgent's worker
+    # thread inherits the parent's ContextVar state. The agent's
+    # internal LangChain @tool callbacks emit LangFuse events that
+    # need the parent trace's tags / session_id to nest correctly.
+    from src.orchestrator.tracing import submit_with_context
     for attempt in range(1, MAX_DECOMPOSITION_ATTEMPTS + 1):
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            future = pool.submit(
+            future = submit_with_context(
+                pool,
                 agent.invoke,
                 {"messages": [{"role": "user", "content": state.task_description}]},
                 config,

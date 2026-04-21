@@ -137,6 +137,30 @@ _COMPLETENESS_BANNER: str = ""
 _DEFAULT_PER_CONDITION_CAP = 5
 
 
+def _scope_for_table(table: str, scope_sql: str | None = None) -> str:
+    """Return the scope fragment appropriate for ``table``.
+
+    Most queries read ``evaluation_runs`` and use ``_SCOPE_SQL`` verbatim —
+    its ``timestamp`` column name matches the --since scope fragment's
+    hardcoded column. Two tables (``invocation_events``, ``cycle_events``)
+    use ``occurred_at`` as their time column instead; applying the raw
+    ``_SCOPE_SQL`` to queries against those tables crashes DuckDB with
+    ``Binder Error: Referenced column "timestamp" not found in FROM clause``.
+
+    ext11 #110 (2026-04-20): pre-fix, ``print_gini_summary`` hand-rewrote
+    ``run_id`` → ``ie.run_id`` but did nothing for the ``--since`` case, so
+    ``--since`` scoped invocations of the Gini query crashed hard. This
+    helper rewrites the column name when the active scope is
+    ``--since``-based. ``--run-ids`` / auto-select scopes use ``run_id``
+    which all three tables share, so this is a no-op for those cases.
+    """
+    if scope_sql is None:
+        scope_sql = _SCOPE_SQL
+    if table in ("invocation_events", "cycle_events"):
+        return scope_sql.replace(" AND timestamp >= ", " AND occurred_at >= ")
+    return scope_sql
+
+
 def _resolve_scope(
     conn: duckdb.DuckDBPyConnection,
     run_ids: list[str] | None,
@@ -679,12 +703,26 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
 
 
 def print_token_cost_summary(conn: duckdb.DuckDBPyConnection) -> None:
-    """Token cost per condition (from backfilled LangFuse data)."""
+    """Token cost per condition (from backfilled LangFuse data).
+
+    Security audit finding #100 (2026-04-19, ext10): pre-fix the
+    headline ``Avg/JIT Task`` column averaged ONLY over rows with
+    ``token_cost > 0``, excluding zero-cost tasks (retrieval-tasks,
+    static-matched tasks, tasks that failed before any LLM call) from
+    the denominator. For a condition with 20 tasks where 10 cost 1000
+    tokens and 10 are free, the reported avg was ``10000/10 = 1000``
+    when the actual per-task-across-the-condition cost was ``500`` —
+    a 2x over-report. Now reports BOTH ``Avg/Task`` (all rows,
+    proposal-correct denominator) AND ``Avg/Nonzero`` (filtered, the
+    pre-fix value, kept as a diagnostic). Chapter 6 M4 cites the
+    all-rows column.
+    """
     rows = conn.execute(
         f"""
         SELECT condition,
                SUM(token_cost) AS total_tokens,
-               AVG(CASE WHEN token_cost > 0 THEN token_cost ELSE NULL END) AS avg_per_jit_task,
+               AVG(token_cost) AS avg_per_task,
+               AVG(CASE WHEN token_cost > 0 THEN token_cost ELSE NULL END) AS avg_per_nonzero_task,
                COUNT(CASE WHEN token_cost > 0 THEN 1 END) AS n_with_cost,
                COUNT(*) AS n_total
         FROM evaluation_runs
@@ -698,15 +736,24 @@ def print_token_cost_summary(conn: duckdb.DuckDBPyConnection) -> None:
         "  Token Cost Summary (backfilled from LangFuse)",
         f"{'='*80}",
     ]
-    header = f"{'Condition':<22} {'Total Tokens':>14} {'Avg/JIT Task':>14} {'With Cost':>10}"
+    header = (
+        f"{'Condition':<22} {'Total Tokens':>14} {'Avg/Task':>12} "
+        f"{'Avg/Nonzero':>14} {'With Cost':>11}"
+    )
     lines.append(header)
     lines.append("-" * len(header))
     for r in rows:
         label = CONDITION_LABELS.get(r[0], r[0])
-        avg = f"{r[2]:,.0f}" if r[2] else "—"
+        avg_all = f"{r[2]:,.0f}" if r[2] else "—"
+        avg_nz = f"{r[3]:,.0f}" if r[3] else "—"
         lines.append(
-            f"{label:<22} {r[1]:>14,} {avg:>14} {r[3]:>5}/{r[4]}"
+            f"{label:<22} {r[1]:>14,} {avg_all:>12} {avg_nz:>14} {r[4]:>5}/{r[5]}"
         )
+    lines.append("")
+    lines.append(
+        "  Avg/Task = AVG over ALL rows (proposal-correct denominator; M4 headline). "
+        "Avg/Nonzero = AVG over rows with token_cost > 0 (diagnostic; pre-#100 behavior)."
+    )
     for line in lines:
         print(line)
 
@@ -768,8 +815,7 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
         return
 
     # Per-condition, per-run Gini
-    # ext7 #44: filter by scope BEFORE grouping. invocation_events uses the same
-    # run_id column as evaluation_runs so _SCOPE_SQL applies verbatim.
+    # ext7 #44: filter by scope BEFORE grouping.
     # ext7 #50: exclude pilot invocations via the new is_pilot column. Pre-fix
     # the table had no pilot marker; legacy rows are backfilled via JOIN on
     # EvaluationStore init. COALESCE defends against any remaining NULL cases.
@@ -778,22 +824,39 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
     # later pruned (optimizer operation). Pre-fix, pruned caps' historical
     # high-count invocations remained as "ghost" rows in the Gini
     # computation, inflating inequality even after the optimizer
-    # successfully reduced active-registry concentration. The `cycle_events`
-    # table tracks `event_type='pruned'` per capability; LEFT JOIN + NULL
-    # filter excludes pruned caps' invocations. Legacy DBs without
-    # cycle_events gracefully skip the filter via COALESCE.
+    # successfully reduced active-registry concentration.
+    #
+    # ext11 #109 (2026-04-20): the prune subquery is now correlated on
+    # (capability_id, run_id) AND scoped by ``_scope_for_table("cycle_events")``.
+    # Pre-fix, the subquery selected every prune event across the whole DB
+    # — pruning ``cap_x`` in run B erased run A's invocations of ``cap_x``
+    # from run A's Gini. Correlating on run_id confines the exclusion to the
+    # run that actually pruned the cap; scoping the subquery is
+    # belt-and-suspenders for future cross-run bugs.
+    #
+    # ext11 #110 (2026-04-20): both fragments go through ``_scope_for_table``
+    # so ``--since`` rewrites the column to ``occurred_at`` instead of the
+    # ``timestamp`` column that only exists on ``evaluation_runs``.
+    scope_ie = _scope_for_table("invocation_events").replace(
+        " AND run_id ", " AND ie.run_id "
+    )
+    scope_ce = _scope_for_table("cycle_events")
     try:
         per_run_rows = conn.execute(
             f"""
             SELECT ie.condition, ie.run_id, ie.capability_id, COUNT(*) AS invocations
             FROM invocation_events ie
             LEFT JOIN (
-                SELECT DISTINCT capability_id
+                SELECT DISTINCT run_id, capability_id
                 FROM cycle_events
                 WHERE event_type = 'pruned'
-            ) pruned ON ie.capability_id = pruned.capability_id
+                  {scope_ce}
+            ) pruned
+                ON ie.capability_id = pruned.capability_id
+                AND ie.run_id = pruned.run_id
             WHERE NOT COALESCE(ie.is_pilot, FALSE)
-              AND pruned.capability_id IS NULL{_SCOPE_SQL.replace(' AND run_id ', ' AND ie.run_id ')}
+              AND pruned.capability_id IS NULL
+              {scope_ie}
             GROUP BY ie.condition, ie.run_id, ie.capability_id
             ORDER BY ie.condition, ie.run_id, ie.capability_id
             """
@@ -803,7 +866,7 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
             f"""
             SELECT condition, run_id, capability_id, COUNT(*) AS invocations
             FROM invocation_events
-            WHERE NOT COALESCE(is_pilot, FALSE){_SCOPE_SQL}
+            WHERE NOT COALESCE(is_pilot, FALSE){_scope_for_table("invocation_events")}
             GROUP BY condition, run_id, capability_id
             ORDER BY condition, run_id, capability_id
             """

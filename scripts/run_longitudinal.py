@@ -56,6 +56,22 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42, help="Random seed for task ordering")
     parser.add_argument("--db", type=str, default=DEFAULT_DB, help="DuckDB output path")
     parser.add_argument("--log-file", type=str, default=None, help="Log file path ('auto' for timestamped)")
+    parser.add_argument(
+        "--reuse-metrics-store",
+        action="store_true",
+        default=False,
+        help=(
+            "Inherit the prior invocation's MetricsStore DB (utility scores, "
+            "invocation counts, prune events). Default: fresh DB per run — "
+            "each invocation starts from a clean baseline so Day-N decisions "
+            "don't depend on Day-(N-1) state. ext11 #113 (2026-04-20): "
+            "ext8 #71 made the MetricsStore path persistent for within-run "
+            "accumulation but never reset between invocations, silently "
+            "contaminating cycle-1 KL + prune thresholds across back-to-back "
+            "runs. Pass this flag only for explicit cross-invocation "
+            "experiments."
+        ),
+    )
     args = parser.parse_args()
 
     # --- Logging ---
@@ -180,12 +196,24 @@ def main() -> None:
         collection_name="capabilities",
     )
     seed_registry(registry)
-    # ext8 #71 (2026-04-20): persist MetricsStore across runs so
-    # maintenance_burden (and any other cross-run state consumed by the
-    # Pillar 3 optimizer) accumulates. The path is co-located with the
-    # longitudinal DB for per-campaign isolation.
-    _metrics_store_path = str(DATA_DIR / "eval" / "longitudinal_metrics_store.duckdb")
-    metrics_store = MetricsStore(db_path=_metrics_store_path)
+    # ext8 #71 (2026-04-20): persist MetricsStore WITHIN a run so
+    # maintenance_burden (and any other state the Pillar 3 optimizer
+    # accumulates across pipeline recompiles) survives. The path is
+    # co-located with the longitudinal DB for per-campaign isolation.
+    #
+    # ext11 #113 (2026-04-20): the previous fix never reset the DB between
+    # script invocations, so a second ``uv run scripts/run_longitudinal.py``
+    # inherited the prior run's final utility scores, invocation counts,
+    # and prune-event history — cycle-1 KL was computed against Day-1's
+    # converged state, prune thresholds fired on stale combined counts,
+    # and Chapter 6 numbers were silently non-reproducible. Default now:
+    # wipe the DB at invocation start. Cross-invocation accumulation is
+    # still available via --reuse-metrics-store for explicit experiments.
+    _metrics_store_path = Path(DATA_DIR / "eval" / "longitudinal_metrics_store.duckdb")
+    if not args.reuse_metrics_store and _metrics_store_path.exists():
+        _metrics_store_path.unlink()
+        logger.info("ext11 #113: wiped %s for a clean baseline", _metrics_store_path)
+    metrics_store = MetricsStore(db_path=str(_metrics_store_path))
     loader = ToolLoader()
 
     # --- Evaluation store ---

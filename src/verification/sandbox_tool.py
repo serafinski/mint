@@ -496,3 +496,192 @@ def _sandbox_execute_with_install(
         Path(script_path).unlink(missing_ok=True)
         # Cleanup ephemeral image
         subprocess.run(["docker", "rmi", "-f", ephemeral_tag], capture_output=True)
+
+
+# ---------------------------------------------------------------------------
+# Cached-image probe batching (security audit ext10 #106)
+# ---------------------------------------------------------------------------
+#
+# Pre-fix every Tier 2 probe call to ``_sandbox_execute_with_install``
+# created a NEW UUID-tagged ephemeral image, ran ``uv pip install``,
+# committed, used, and removed it. For dependency-heavy artifacts (T07
+# pandas, T08 data-quality, T11 pandas+openpyxl) the per-task install
+# overhead was 6 probes × 30-60s = 3-6 minutes wasted on redundant
+# installs. The audit's fix is to prepare ONE image per task,
+# share it across all probes, and clean up at the end.
+
+
+def prepare_cached_image(
+    packages: list[str],
+) -> tuple[str, dict | None]:
+    """Build a single ephemeral image with the declared packages installed.
+
+    Security audit finding #106 (2026-04-19, ext10). Run pip install
+    ONCE per task; downstream Tier 2 probes invoke
+    ``sandbox_execute_with_cached_image`` against the returned tag,
+    paying only the ``docker run`` overhead per probe (no reinstall).
+
+    Returns ``(image_tag, error_dict_or_None)``. On install failure the
+    error_dict matches the shape returned by ``_sandbox_execute_with_install``
+    (``{"success": False, "error_category": ..., ...}``) so callers can
+    propagate the failure to all probes uniformly.
+
+    Caller is responsible for ``cleanup_cached_image(tag)`` in a finally
+    block. The image tag is unique per call (UUID-suffixed).
+    """
+    import uuid
+
+    if not packages:
+        return SANDBOX_IMAGE, None
+
+    # Reuse the install logic from _sandbox_execute_with_install. We
+    # can't call it directly because it commits then immediately uses
+    # the image; refactoring would risk regression in the single-call
+    # path. Inline the install phase here, keeping the validation +
+    # error-shape behaviour identical.
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    good: list[str] = []
+    rejected: list[tuple[str, str]] = []
+    for p in packages:
+        try:
+            Requirement(p)
+            good.append(p)
+        except InvalidRequirement as exc:
+            rejected.append((p, str(exc)))
+
+    if rejected:
+        logger.warning(
+            "prepare_cached_image: dropping malformed pip requirements "
+            "(not PEP 508): %s",
+            rejected,
+        )
+
+    if not good:
+        return "", {
+            "stdout": "",
+            "stderr": (
+                "All pip requirements rejected as malformed — no-install "
+                "fallback would mask missing deps. "
+                f"Rejected: {rejected}"
+            ),
+            "exit_code": -1,
+            "success": False,
+            "pip_requirement_rejected": rejected,
+        }
+
+    ephemeral_tag = f"jit-sandbox-cached-{uuid.uuid4().hex[:8]}"
+    pip_args = ", ".join(repr(p) for p in good)
+    install_script = (
+        "import subprocess; "
+        f"subprocess.check_call(['uv', 'pip', 'install', '--system', '--no-cache', {pip_args}])"
+    )
+    try:
+        install_proc = subprocess.run(
+            [
+                "docker", "run",
+                "--name", ephemeral_tag,
+                "--network", "bridge",
+                "--memory", "256m",
+                "--cpus", "0.5",
+                "--user", "root",
+                SANDBOX_IMAGE,
+                "-c", install_script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if install_proc.returncode != 0:
+            subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
+            return "", {
+                "stdout": "",
+                "stderr": f"uv pip install failed: {install_proc.stderr}",
+                "exit_code": install_proc.returncode,
+                "success": False,
+                "error_category": "dependency_install_failure",
+            }
+
+        subprocess.run(
+            ["docker", "commit", ephemeral_tag, ephemeral_tag],
+            capture_output=True,
+            timeout=30,
+        )
+        subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
+
+    except subprocess.TimeoutExpired:
+        subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
+        return "", {
+            "stdout": "", "stderr": "Timeout during uv pip install (prepare_cached_image)",
+            "exit_code": -1, "success": False,
+            "error_category": "dependency_install_timeout",
+        }
+    except Exception as exc:
+        subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
+        return "", {"stdout": "", "stderr": str(exc), "exit_code": -1, "success": False}
+
+    return ephemeral_tag, None
+
+
+def cleanup_cached_image(image_tag: str) -> None:
+    """Remove a cached image produced by ``prepare_cached_image``.
+
+    Safe to call with the base image tag (``SANDBOX_IMAGE``) — the
+    function no-ops in that case so callers don't need to guard.
+    """
+    if not image_tag or image_tag == SANDBOX_IMAGE:
+        return
+    subprocess.run(["docker", "rmi", "-f", image_tag], capture_output=True)
+
+
+def sandbox_execute_with_cached_image(
+    code: str,
+    image_tag: str,
+    *,
+    timeout: int = 30,
+    workspace_path: str | Path | None = None,
+    allow_network: bool = False,
+) -> dict:
+    """Execute ``code`` against a pre-built cached image.
+
+    Security audit finding #106 (2026-04-19, ext10). Skips the pip-
+    install phase entirely — pairs with ``prepare_cached_image``.
+    Pass ``image_tag=SANDBOX_IMAGE`` (or whatever the helper returned
+    when ``packages`` was empty) to run against the bare base image.
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(code)
+        script_path = f.name
+
+    network_flag = "bridge" if allow_network else "none"
+    docker_args = [
+        "docker", "run", "--rm",
+        "--network", network_flag,
+        "--memory", "128m",
+        "--cpus", "0.5",
+        "--user", "sandbox",
+        "-v", f"{script_path}:/sandbox/script.py:ro",
+    ]
+    if workspace_path is not None:
+        docker_args += ["-v", f"{workspace_path}:/workspace"]
+    docker_args += [image_tag, "/sandbox/script.py"]
+
+    try:
+        proc = subprocess.run(
+            docker_args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return {
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "exit_code": proc.returncode,
+            "success": proc.returncode == 0,
+        }
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "Timeout", "exit_code": -1, "success": False}
+    except Exception as exc:
+        return {"stdout": "", "stderr": str(exc), "exit_code": -1, "success": False}
+    finally:
+        Path(script_path).unlink(missing_ok=True)

@@ -831,6 +831,12 @@ def test_every_analyzer_query_applies_scope_or_is_exempt():
     that reads evaluation_runs or invocation_events must either reference
     _SCOPE_SQL OR be explicitly exempt (startup sanity checks, scope resolution
     itself). Catches future queries added without scope.
+
+    ext11 #110 (2026-04-20): extended to also recognize ``_scope_for_table(...)``
+    calls + local variables rebound from those calls (``scope_ie``, ``scope_ce``).
+    The helper is the table-aware wrapper introduced when ``--since`` scopes
+    crashed on ``invocation_events`` because ``_SCOPE_SQL`` hardcoded the
+    ``timestamp`` column.
     """
     import ast
 
@@ -841,10 +847,15 @@ def test_every_analyzer_query_applies_scope_or_is_exempt():
     # Expand with care — every entry is a Chapter-6-integrity waiver.
     SCOPE_EXEMPT = {
         "_resolve_scope",          # the scope-resolution call itself
+        "_scope_for_table",        # the table-aware scope wrapper
         "_count_check",            # startup sanity, runs before scope is resolved
         "_print_header_counts",    # header block prints raw row counts pre-scope
     }
     SCOPED_TABLES = ("evaluation_runs", "invocation_events")
+    # Any of these tokens in a f-string's placeholder expression counts as
+    # explicit scope handling. Variable names are the ones used inside
+    # ``print_gini_summary`` after the ext11 #110 refactor.
+    SCOPE_TOKENS = ("_SCOPE_SQL", "_scope_for_table", "scope_ie", "scope_ce")
 
     # Collect (enclosing_fn_name, lineno, sql_snippet).
     offenders: list[tuple[str, int, str]] = []
@@ -877,7 +888,7 @@ def test_every_analyzer_query_applies_scope_or_is_exempt():
                     elif isinstance(v, ast.FormattedValue):
                         expr = ast.unparse(v.value)
                         parts.append(f"{{{expr}}}")
-                        if "_SCOPE_SQL" in expr:
+                        if any(tok in expr for tok in SCOPE_TOKENS):
                             has_scope_placeholder = True
                 sql = "".join(parts)
                 if has_scope_placeholder:
@@ -888,7 +899,7 @@ def test_every_analyzer_query_applies_scope_or_is_exempt():
             if not any(tbl in sql for tbl in SCOPED_TABLES):
                 # Query doesn't read a scoped table — pass.
                 continue
-            if "_SCOPE_SQL" in sql:
+            if any(tok in sql for tok in SCOPE_TOKENS):
                 continue
             # Existence / availability probes (``SELECT 1 FROM t LIMIT 1``) don't
             # aggregate scoped rows — they just check the table exists. Safe.
@@ -1133,3 +1144,142 @@ def test_invocation_events_is_pilot_backfill_from_evaluation_runs(tmp_path):
     by_run = {r[0]: r[1] for r in rows}
     assert by_run["full_r"] is False
     assert by_run["pilot_r"] is True
+
+
+# ---------------------------------------------------------------------------
+# ext11 #109 — Gini prune-exclusion must not bleed across runs
+# ---------------------------------------------------------------------------
+
+
+def test_gini_prune_exclusion_does_not_bleed_across_runs(capsys):
+    """Pre-fix (ext8 #78 one-shot), the prune subquery matched ``capability_id``
+    alone — pruning ``cap-x`` in run B erased run A's invocations of
+    ``cap-x`` from run A's Gini because the subquery pulled every pruned
+    cap across the whole DB. Post-ext11-#109, the subquery is correlated
+    on ``(capability_id, run_id)``; pruning in run B must not touch run A.
+
+    Seed:
+    - run_A uses cap-x=100, cap-y=1 → expected Gini ≈ 0.4901.
+    - run_B prunes cap-x (no invocations needed).
+
+    Scope analysis to run_A: Gini must match the un-pruned distribution.
+    """
+    import scripts.analyze_results as ar
+
+    store, conn = _open_in_memory_store()
+    # run_A — heavy use of cap-x plus one cap-y. Never pruned in this run.
+    _record_invocations(
+        store, run_id="run_A", condition="full", task_id="T04",
+        counts_by_cap={"cap-x": 100, "cap-y": 1},
+    )
+    # run_B — records a prune event for cap-x (no invocations of its own).
+    store.record_cycle_events(
+        run_id="run_B", condition="full", task_id="T04",
+        events=[{"capability_id": "cap-x", "event_type": "pruned"}],
+    )
+
+    ar._SCOPE_SQL = " AND run_id IN ('run_A')"
+    try:
+        print_gini_summary(conn)
+    finally:
+        ar._SCOPE_SQL = ""
+    output = capsys.readouterr().out
+
+    # Pre-fix, cap-x was stripped → per-run Gini collapsed to [1] → 0.0.
+    # Post-fix, cap-x stays → Gini ≈ 0.49 (printed to 3 decimals).
+    assert "Gini Coefficient" in output
+    # The "0.490" token would appear in post-fix output; pre-fix showed "0.000".
+    assert "0.490" in output, (
+        f"Expected run_A Gini ≈ 0.490 after ext11 #109 fix; got:\n{output}"
+    )
+
+
+def test_gini_prune_exclusion_still_works_within_same_run(capsys):
+    """ext11 #109 must not regress ext8 #78: pruning a cap IN THE SAME RUN
+    still excludes that cap's ghost invocations from the Gini distribution.
+    The correlation on (capability_id, run_id) keeps within-run pruning
+    behaving as ext8 #78 intended.
+    """
+    import scripts.analyze_results as ar
+
+    store, conn = _open_in_memory_store()
+    # run_A — heavy use of cap-x (100) + one cap-y.
+    _record_invocations(
+        store, run_id="run_A", condition="full", task_id="T04",
+        counts_by_cap={"cap-x": 100, "cap-y": 1},
+    )
+    # Same run prunes cap-x — its ghost invocations must be excluded.
+    store.record_cycle_events(
+        run_id="run_A", condition="full", task_id="T04",
+        events=[{"capability_id": "cap-x", "event_type": "pruned"}],
+    )
+
+    ar._SCOPE_SQL = " AND run_id IN ('run_A')"
+    try:
+        print_gini_summary(conn)
+    finally:
+        ar._SCOPE_SQL = ""
+    output = capsys.readouterr().out
+
+    # cap-x excluded → counts become [1] → Gini = 0.0 (single element / empty
+    # after zero-pad against the per-condition cap union which is {cap-y}).
+    assert "Gini Coefficient" in output
+    assert "0.000" in output
+
+
+# ---------------------------------------------------------------------------
+# ext11 #110 — --since scope must use `occurred_at` on invocation_events
+# ---------------------------------------------------------------------------
+
+
+def test_since_scope_uses_occurred_at_on_invocation_events(capsys):
+    """Pre-fix, ``_resolve_scope(since=...)`` returned a fragment
+    ``AND timestamp >= '...'`` which crashed the Gini query hard because
+    ``invocation_events`` uses ``occurred_at``. Post-ext11-#110 the
+    ``_scope_for_table`` helper rewrites the column for non-evaluation_runs
+    tables so the query runs cleanly.
+    """
+    import scripts.analyze_results as ar
+
+    store, conn = _open_in_memory_store()
+    _record_invocations(
+        store, run_id="r1", condition="full", task_id="T04",
+        counts_by_cap={"cap-a": 3, "cap-b": 1},
+    )
+
+    # Simulate a --since scope fragment; the exact timestamp is
+    # inconsequential — we just need the query to run instead of crashing.
+    ar._SCOPE_SQL = " AND timestamp >= '1970-01-01T00:00:00'"
+    try:
+        print_gini_summary(conn)  # Pre-fix: BinderException. Post-fix: clean.
+    finally:
+        ar._SCOPE_SQL = ""
+    output = capsys.readouterr().out
+    assert "Gini Coefficient" in output
+
+
+def test_scope_for_table_rewrites_since_column_for_occurred_at_tables():
+    """Unit-level guard for ``_scope_for_table``: --since fragments are
+    rewritten to ``occurred_at`` for the two tables that use that column,
+    and untouched for evaluation_runs and for --run-ids / auto-select scopes.
+    """
+    import scripts.analyze_results as ar
+
+    since_sql = " AND timestamp >= '2026-04-20T00:00:00'"
+    run_ids_sql = " AND run_id IN ('r1', 'r2')"
+
+    # --since rewrites for invocation_events / cycle_events, not evaluation_runs.
+    assert ar._scope_for_table("invocation_events", since_sql) == (
+        " AND occurred_at >= '2026-04-20T00:00:00'"
+    )
+    assert ar._scope_for_table("cycle_events", since_sql) == (
+        " AND occurred_at >= '2026-04-20T00:00:00'"
+    )
+    assert ar._scope_for_table("evaluation_runs", since_sql) == since_sql
+
+    # --run-ids uses `run_id` — identical for all three tables.
+    for table in ("invocation_events", "cycle_events", "evaluation_runs"):
+        assert ar._scope_for_table(table, run_ids_sql) == run_ids_sql
+
+    # Empty scope → empty scope, regardless of table.
+    assert ar._scope_for_table("invocation_events", "") == ""

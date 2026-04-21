@@ -156,6 +156,18 @@ def main() -> int:
         "--log-file", type=str, default=None,
         help="Log file path ('auto' for timestamped, else an explicit path)",
     )
+    parser.add_argument(
+        "--reuse-metrics-store",
+        action="store_true",
+        default=False,
+        help=(
+            "Inherit the prior invocation's MetricsStore DB. Default: "
+            "fresh DB per run. ext11 #113 (2026-04-20): match "
+            "run_longitudinal.py — ext8 #71 made the path persistent "
+            "within a run but never reset across invocations, "
+            "contaminating Phase-A/Phase-B adaptation measurements."
+        ),
+    )
     args = parser.parse_args()
 
     # --- Validation ---
@@ -290,12 +302,18 @@ def main() -> int:
         collection_name="capabilities",
     )
     seed_registry(registry)
-    # ext8 #71 (2026-04-20): persist MetricsStore — see run_longitudinal.py
-    # for rationale.
-    _metrics_store_path = str(
+    # ext8 #71 (2026-04-20): persist MetricsStore within a run — see
+    # run_longitudinal.py for full rationale.
+    # ext11 #113 (2026-04-20): wipe at invocation start by default.
+    # Without this, back-to-back runs inherit stale utility scores and
+    # prune history, swamping the Phase-A → Phase-B adaptation signal.
+    _metrics_store_path = Path(
         DATA_DIR / "eval" / "longitudinal_shift_metrics_store.duckdb"
     )
-    metrics_store = MetricsStore(db_path=_metrics_store_path)
+    if not args.reuse_metrics_store and _metrics_store_path.exists():
+        _metrics_store_path.unlink()
+        logger.info("ext11 #113: wiped %s for a clean baseline", _metrics_store_path)
+    metrics_store = MetricsStore(db_path=str(_metrics_store_path))
     loader = ToolLoader()
 
     # --- Evaluation store ---

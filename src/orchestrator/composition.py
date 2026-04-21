@@ -764,10 +764,36 @@ class CompositionalExecutor:
         # The chain-executor span is active here (``_start_langfuse_chain_trace``
         # called just above), so ``lf.current_trace_id`` IS set to the
         # chain trace, even though we're outside a LangGraph node.
+        #
+        # Security audit finding #104 (2026-04-19, ext10): the
+        # ``getattr(lf, "current_trace_id")`` lookup is a SINGLETON-
+        # CLIENT read — it returns whichever trace was MOST RECENTLY
+        # activated on the global LangFuse client, not necessarily the
+        # one we just started. Under concurrent chain execution
+        # (currently masked by serial harness; uncovered if a future
+        # config enables parallelism), thread A can capture thread B's
+        # trace_id. The remediation is span-scoped capture: read the
+        # trace_id from the span object we explicitly started rather
+        # than the singleton client. ``_start_langfuse_chain_trace``
+        # was updated to expose ``span.trace_id`` via the returned
+        # context-manager metadata. Fall back to the singleton lookup
+        # for back-compat with older LangFuse SDK versions where the
+        # span object doesn't expose ``trace_id`` directly.
         _chain_trace_id: str | None = None
         if lf is not None:
             try:
-                _chain_trace_id = getattr(lf, "current_trace_id", None)
+                # Prefer the span-scoped trace_id (race-free under concurrency).
+                _chain_trace_id = (
+                    getattr(chain_trace, "_mint_trace_id", None)
+                    if chain_trace is not None
+                    else None
+                )
+                if _chain_trace_id is None:
+                    # Back-compat fallback for SDKs without span.trace_id —
+                    # this path IS racy under concurrency (singleton-client
+                    # state); the warning is silent because the chain runs
+                    # serially today (ext7 #51).
+                    _chain_trace_id = getattr(lf, "current_trace_id", None)
             except Exception:  # noqa: BLE001
                 pass
         if _chain_trace_id:
@@ -1061,6 +1087,24 @@ class CompositionalExecutor:
             lf = Langfuse()
             span_cm = lf.start_as_current_span(name="chain-executor")
             span = span_cm.__enter__()
+            # Security audit finding #104 (2026-04-19, ext10): capture
+            # the span's trace_id IMMEDIATELY at span-start time, then
+            # stash it on the span_cm so the caller's race-free
+            # ``_chain_trace_id`` lookup can prefer this over the
+            # singleton-client ``lf.current_trace_id`` read (which is
+            # racy under concurrent execution). Different LangFuse SDK
+            # versions expose the trace_id in different ways; try the
+            # span object first, then the client. If neither yields a
+            # value, the caller falls back to the singleton path.
+            try:
+                _span_trace_id = (
+                    getattr(span, "trace_id", None)
+                    or getattr(lf, "current_trace_id", None)
+                )
+                if _span_trace_id:
+                    setattr(span_cm, "_mint_trace_id", _span_trace_id)
+            except Exception:  # noqa: BLE001
+                pass
             span.update(
                 input={
                     "task_id": task_id,
