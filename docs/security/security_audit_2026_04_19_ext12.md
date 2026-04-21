@@ -6,7 +6,7 @@
 - [`security_audit_2026_04_19_ext5.md`](./security_audit_2026_04_19_ext5.md) — #15-#18 ✅ (folded into parent).
 - [`security_audit_2026_04_19_ext6.md`](./security_audit_2026_04_19_ext6.md) — #19-#43 ✅ all FIXED 2026-04-20.
 - [`security_audit_2026_04_19_ext7.md`](./security_audit_2026_04_19_ext7.md) — #44-#55 ✅ all FIXED 2026-04-20.
-- [`security_audit_2026_04_19_ext8.md`](./security_audit_2026_04_19_ext8.md) — #56-#78 (21 ✅ fixed, 2 open: #61 MEDIUM latent, #63 P0).
+- [`security_audit_2026_04_19_ext8.md`](./security_audit_2026_04_19_ext8.md) — #56-#78 (20 ✅ FIXED + 1 ❎ false-positive (#56) + 1 ✅ partial (#63, Chapter 7 remainder) + 2 ❎ acknowledged (#61 MEDIUM latent, #70 MEDIUM methodology). Genuinely-code-open: 2 — #61, #63).
 - [`security_audit_2026_04_19_ext9.md`](./security_audit_2026_04_19_ext9.md) — #79-#98 ✅ **all FIXED** (re-verified 2026-04-21 by direct code-comment cross-reference; every finding carries a pinned fix).
 - [`security_audit_2026_04_19_ext10.md`](./security_audit_2026_04_19_ext10.md) — #98-#108 (re-verified 2026-04-21, second pass: #98-#107 ✅ FIXED; #108 ⚠ latent/documented — list still in execution order but `final_output` property + docstring document the hazard; current consumers use safe access path).
 - [`security_audit_2026_04_19_ext11.md`](./security_audit_2026_04_19_ext11.md) — #109-#113 ✅ all FIXED 2026-04-21.

@@ -9,6 +9,8 @@
 - #13 — **open**, new **P0**
 - #14 — **likely closed as a side-effect of the Issue #6 fix** (see §Issue #14 below); needs a one-line confirmation test.
 
+**Status update 2026-04-20 (ext4 content folded into parent — all three FIXED):** per the parent audit's post-remediation header (*"All eighteen reproduced and verified... All eighteen fixed 2026-04-20"*), #12 + #13 + #14 were remediated alongside #1-#11 in the two-session sweep. The per-finding fix evidence lives in the parent document's TL;DR rows #12-#14. This extension file is retained for the original detail-section + Tranche-ordering text that the parent never carried; the status claims above are preserved as the pre-fix audit trail.
+
 **Line numbers.** All line references below are against the current `iter/6-execution-backends` tip, not the audit author's in-session numbering. The user-reported line numbers (`composition.py:706`, `runner.py:1341/1367/1379`, `sandbox_tool.py:354`) are approximately correct but drifted by ~5-15 lines after the Issue #6/#9/#11 fixes landed.
 
 ---

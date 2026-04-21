@@ -4,7 +4,7 @@
 **Sibling extensions:**
 - [`security_audit_2026_04_19_ext4.md`](./security_audit_2026_04_19_ext4.md) — #12-#14 ✅ (folded into parent).
 - [`security_audit_2026_04_19_ext5.md`](./security_audit_2026_04_19_ext5.md) — #15-#18 ✅ (folded into parent).
-- [`security_audit_2026_04_19_ext6.md`](./security_audit_2026_04_19_ext6.md) — #19-#43 open as of 2026-04-20.
+- [`security_audit_2026_04_19_ext6.md`](./security_audit_2026_04_19_ext6.md) — #19-#43 ✅ all FIXED 2026-04-20.
 
 **Why this file exists (separate from ext6).** Two post-remediation regressions surfaced 2026-04-20 after the ext6 analyzer-scoping batch (#38/#40/#41) was drafted. Both are narrow, specific, and stem from two layers of the fix landing without the third:
 

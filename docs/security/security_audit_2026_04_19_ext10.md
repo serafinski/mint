@@ -6,8 +6,8 @@
 - [`security_audit_2026_04_19_ext5.md`](./security_audit_2026_04_19_ext5.md) — #15-#18 ✅ (folded into parent).
 - [`security_audit_2026_04_19_ext6.md`](./security_audit_2026_04_19_ext6.md) — #19-#43 ✅ all FIXED 2026-04-20.
 - [`security_audit_2026_04_19_ext7.md`](./security_audit_2026_04_19_ext7.md) — #44-#55 ✅ all FIXED 2026-04-20.
-- [`security_audit_2026_04_19_ext8.md`](./security_audit_2026_04_19_ext8.md) — #56-#78 open.
-- [`security_audit_2026_04_19_ext9.md`](./security_audit_2026_04_19_ext9.md) — #79-#97 open.
+- [`security_audit_2026_04_19_ext8.md`](./security_audit_2026_04_19_ext8.md) — #56-#78 (20 ✅ FIXED + 1 ❎ false-positive (#56) + 1 ✅ partial (#63) + 2 ❎ acknowledged (#61 latent, #70 methodology). Genuinely-code-open: 2 — #61, #63).
+- [`security_audit_2026_04_19_ext9.md`](./security_audit_2026_04_19_ext9.md) — #79-#98 ✅ **all FIXED** (re-verified 2026-04-21).
 
 **This extension's scope.** A reviewer submitted 40 claims (their local numbering #101-#140). **6 confirmed** as genuine new findings and logged as #98-#103 below. **34 are duplicates of prior extensions, not-reproducible, documented design choices, or overstated** — logged in §"Claims not added" with specific evidence.
 

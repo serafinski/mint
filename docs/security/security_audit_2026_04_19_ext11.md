@@ -6,7 +6,7 @@
 - [`security_audit_2026_04_19_ext5.md`](./security_audit_2026_04_19_ext5.md) — #15-#18 ✅ (folded into parent).
 - [`security_audit_2026_04_19_ext6.md`](./security_audit_2026_04_19_ext6.md) — #19-#43 ✅ all FIXED 2026-04-20.
 - [`security_audit_2026_04_19_ext7.md`](./security_audit_2026_04_19_ext7.md) — #44-#55 ✅ all FIXED 2026-04-20.
-- [`security_audit_2026_04_19_ext8.md`](./security_audit_2026_04_19_ext8.md) — #56-#78 (21 ✅ fixed, 2 open: #61 MEDIUM latent, #63 P0).
+- [`security_audit_2026_04_19_ext8.md`](./security_audit_2026_04_19_ext8.md) — #56-#78 (20 ✅ FIXED + 1 ❎ false-positive (#56) + 1 ✅ partial (#63, Chapter 7 remainder) + 2 ❎ acknowledged (#61 MEDIUM latent, #70 MEDIUM methodology). Genuinely-code-open: 2 — #61, #63).
 - [`security_audit_2026_04_19_ext9.md`](./security_audit_2026_04_19_ext9.md) — #79-#98 ✅ **all FIXED** (re-verified 2026-04-21 by direct code-comment cross-reference; every finding carries a pinned fix).
 - [`security_audit_2026_04_19_ext10.md`](./security_audit_2026_04_19_ext10.md) — #98-#108 (re-verified 2026-04-21, second pass: #98-#107 ✅ FIXED; #108 ⚠ latent/documented — list still in execution order but `ChainResult.final_output` property + docstring document the hazard; all current consumers use the safe access path, audit-classified MEDIUM latent).
 
@@ -18,7 +18,7 @@
 - ext1-#18 parent: 18/18 ✅
 - ext6 #19-#43: 25/25 ✅
 - ext7 #44-#55: 12/12 ✅
-- ext8 #56-#78: 21/23 ✅ (open: **#61 MEDIUM latent** — acknowledged-not-fixed per §Remediation disposition; **#63 P0 PARTIAL** — WARN-log defensive check implemented, audit §A full AST-extract remediation NOT implemented; #70 is documentation-only Chapter 4.5 disclosure).
+- ext8 #56-#78: 20 ✅ FIXED + 1 ❎ false-positive (#56) + 1 ✅ PARTIAL (#63, WARN-log defensive check; audit §A full AST-extract remediation is Chapter 7 work per audit's own estimate ~3-4h) + 2 ❎ acknowledged-not-fixed (#61 MEDIUM latent Chapter-7, #70 MEDIUM methodology Chapter 4.5 doc). **Genuinely code-open: 2 (#61, #63).**
 - ext9 #79-#98: 20/20 ✅
 - ext10 #98-#107: 10/10 ✅; ext10 #108 ⚠ latent/documented (not structurally fixed).
 - ext11 #109-#113: 5/5 ✅

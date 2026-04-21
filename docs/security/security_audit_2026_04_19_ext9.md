@@ -6,7 +6,7 @@
 - [`security_audit_2026_04_19_ext5.md`](./security_audit_2026_04_19_ext5.md) — #15-#18 ✅ (folded into parent).
 - [`security_audit_2026_04_19_ext6.md`](./security_audit_2026_04_19_ext6.md) — #19-#43 ✅ all FIXED 2026-04-20.
 - [`security_audit_2026_04_19_ext7.md`](./security_audit_2026_04_19_ext7.md) — #44-#55 ✅ all FIXED 2026-04-20.
-- [`security_audit_2026_04_19_ext8.md`](./security_audit_2026_04_19_ext8.md) — #56-#78 ✅ all FIXED 
+- [`security_audit_2026_04_19_ext8.md`](./security_audit_2026_04_19_ext8.md) — #56-#78 (20 ✅ FIXED + 1 ❎ false-positive (#56) + 1 ✅ partial (#63, Chapter 7 remainder) + 2 ❎ acknowledged-not-fixed (#61 MEDIUM latent, #70 MEDIUM methodology). Genuinely-code-open: 2 (#61, #63).)
 
 **This extension's scope.** A reviewer submitted 20 claims (their numbering #81-#100). 7 distinct findings independently confirmed and added as #79-#85 below. Each new finding consolidates one-to-three user claims that share a root cause (e.g., #83 covers user claims #89+#90+#91 — the same pip-packages-persistence chain across three layers). 13 user claims are either (a) not reproducible, (b) already-fixed by prior extensions, (c) documented design choices, or (d) subsumed by an existing ext8 finding — each logged in §"Claims not added" for audit trail.
 

@@ -13,6 +13,14 @@
 
 **Status at time of write (2026-04-20):** all twenty-three **open**.
 
+**Status update 2026-04-20 / 2026-04-21 (per-issue flags in the TL;DR below):**
+- **20 ✅ FIXED** (#57, #58, #59, #60, #62, #64, #65, #66, #67, #68, #69, #71, #72, #73, #74, #75, #76, #77, #78) — each with code-reference + regression guards.
+- **1 ❎ INVESTIGATED — false positive** (#56): empirical trace showed `occurred_at > evaluation_runs.timestamp` holds in production; the audit-assumed pre-condition doesn't. Not a bug. Detail in §#56.
+- **1 ✅ PARTIAL** (#63): defensive WARN-log landed 2026-04-20 catching the "LLM forgot to populate schemas" case. Full AST-based schema extraction for SKILL (embedded Python fences) + AGENT (config cross-check) is Chapter 7 work per audit §Remediation A (~3-4h). Pragmatic subset closed.
+- **2 ❎ ACKNOWLEDGED-NOT-FIXED** (#61 MEDIUM latent, #70 MEDIUM methodology): both explicitly classified by the audit itself as deferred. #61 is a Chapter-7 cost-weighted-Gini extension (no current analyzer reads the zeroed column); #70 is a Chapter 4.5 methodology disclosure (fixture injection + pip timeout padding, not a code bug).
+
+**Cross-audit tally as of 2026-04-21:** genuinely-code-open items in ext8 = **2** (#61 + #63). #56 is false-positive; #70 is docs-only. No eval-blocking ext8 items remain on the run-sheet critical path.
+
 | # | Severity | Scope | Impact |
 |---|---|---|---|
 | 56 | **P0 (CRITICAL)** | `analyze_longitudinal.py::_load_cycle_data` | ❎ **INVESTIGATED 2026-04-20 — audit claim is a FALSE POSITIVE.** Empirical trace: `invocation_events.occurred_at` is set at FLUSH time (`record_invocation_events:346 → datetime.now(UTC)`), AFTER `record_run` in `_execute_run`. Production `occurred_at > evaluation_runs.timestamp`, so the pre-fix loop (`while task_boundaries[cycle_idx+1][0] <= inv_ts`) correctly attributes invocations. Audit assumed `occurred_at < task_boundaries[N]` — would only hold if `record_invocation_events` preserved original `invoked_at` (it overwrites with `datetime.now(UTC)`). Pre-existing `test_analyze_longitudinal.py::TestLoadCycleData` passes (uses occurred_at > task timestamp). Comments in `analyze_longitudinal.py:274-290` now document the empirical trace. A true fix would thread `invoked_at` through the flush — deferred as out of scope. |

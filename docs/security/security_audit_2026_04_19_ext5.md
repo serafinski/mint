@@ -7,6 +7,8 @@
 
 **Status at time of write (2026-04-20):** all four **open**. #15 and #18 are **P0**s; #16 is **P1** (biases but doesn't invert conclusions); #17 is **P0 for Chapter 6** (straightforward to fix).
 
+**Status update 2026-04-20 (ext5 content folded into parent — all four FIXED):** per the parent audit's post-remediation header (*"All eighteen reproduced and verified... All eighteen fixed 2026-04-20"*), #15-#18 were remediated alongside #1-#14 in the two-session sweep. The per-finding fix evidence lives in the parent document's TL;DR rows #15-#18. This extension file is retained for the original detail sections the parent never carried; the status claims above are preserved as the pre-fix audit trail.
+
 **Numbering.** Continues from the parent audit's #1-#11 + ext4's #12-#14.
 
 ---
