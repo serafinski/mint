@@ -649,6 +649,29 @@ def main() -> int:
         )
         return 3
 
+    # ext13 #133: per-agent-family presence gate. ext12 #120's fix filters
+    # degraded traces but doesn't require every expected agent family to
+    # have at least one valid trace. When e.g. task-decomposer has data
+    # but adversarial-prober / skill-executor / agent-executor are all
+    # empty, the per-agent comparison table prints dashes and the script
+    # exited 0 silently. Now: refuse with exit 4 unless --allow-empty is
+    # passed. The existing --allow-empty flag covers this case too.
+    missing_agents = [
+        name for name in AGENT_TRACE_NAMES
+        if not results.get(name)
+    ]
+    if missing_agents and not args.allow_empty:
+        print(
+            f"\nERROR: {len(missing_agents)}/{len(AGENT_TRACE_NAMES)} "
+            f"agent families have zero valid traces: {missing_agents}. "
+            f"Chapter 6 Context Economy requires per-agent comparison — "
+            f"dashed rows in the summary cannot substitute for real data. "
+            f"Pass --allow-empty to proceed with missing rows (Chapter 4.5 "
+            f"disclosure REQUIRED). ext13 #133. Exit 4.",
+            file=sys.stderr,
+        )
+        return 4
+
     print_summary(results, detail=args.detail)
 
     if args.csv:

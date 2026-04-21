@@ -262,10 +262,15 @@ def test_analyze_longitudinal_exits_5_on_shift_db_without_marker(tmp_path):
     finally:
         conn.close()
 
+    # ext13 #124 (2026-04-21): the DB has no cycle_utility_scores rows,
+    # which the new proposal-literal-KL gate rejects with exit 6 before
+    # reaching the ext12 #123 shift-marker check. Pass --allow-proxy-kl
+    # so this test continues to exercise #123's code path.
     result = _run_script(
         "analyze_longitudinal.py",
         "--db", str(db),
         "--expected-cycles", "40",
+        "--allow-proxy-kl",
     )
     assert result.returncode == 5, (
         f"Expected exit 5 (shift campaign missing marker), got "
@@ -652,7 +657,7 @@ shutil.rmtree = lambda *a, **kw: None
 
 # Stub flush_task_cycle_state so we don't depend on DB state.
 import tests.evaluation.cycle_flush as _cf
-_cf.flush_task_cycle_state = lambda **kw: None
+_cf.flush_task_cycle_state = lambda **kw: _cf.FlushResult(invocations_ok=True, utility_scores_ok=True, events_ok=True)
 
 import scripts.run_longitudinal as _rl
 sys.argv = [
@@ -723,7 +728,7 @@ _h._extract_result = lambda *a, **kw: {{
 _lock.acquire_runner_lock = lambda **kw: MagicMock()
 
 import tests.evaluation.cycle_flush as _cf
-_cf.flush_task_cycle_state = lambda **kw: None
+_cf.flush_task_cycle_state = lambda **kw: _cf.FlushResult(invocations_ok=True, utility_scores_ok=True, events_ok=True)
 
 # Patch the trace_context to a no-op so we don't need langfuse.
 import src.orchestrator.tracing as _tracing

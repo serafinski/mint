@@ -233,6 +233,16 @@ def main() -> int:
     parser.add_argument(
         "--verbose", action="store_true", help="Print per-paraphrase ranks"
     )
+    # ext13 #135: minimum capability-coverage threshold. Pre-fix a
+    # paraphrase-generation failure that skipped 7 of 8 caps silently
+    # reported "100% recall" on the remaining 1. Default 90%.
+    parser.add_argument(
+        "--min-cap-coverage", type=float, default=0.9,
+        help="Minimum fraction of capabilities that must be probed after "
+             "the paraphrase-generation retry pass (default 0.9). Below "
+             "this, exit 2 instead of reporting recall on a biased "
+             "subset. ext13 #135.",
+    )
     args = parser.parse_args()
 
     print("=" * 70)
@@ -261,6 +271,7 @@ def main() -> int:
     )
 
     results: list[CapProbeResult] = []
+    skipped_caps: list[str] = []
     for i, cap in enumerate(caps, 1):
         if args.verbose:
             print(
@@ -272,6 +283,7 @@ def main() -> int:
         )
         if not paraphrases:
             print(f"  WARNING: skipped {cap.name} (no paraphrases generated)")
+            skipped_caps.append(cap.name)
             continue
 
         result = probe_cap(
@@ -291,12 +303,63 @@ def main() -> int:
                 f"@thr={result.above_threshold_hits}/{result.total}"
             )
 
+    # ext13 #135: retry pass for transient paraphrase-generation failures.
+    # Pre-fix, a capability whose first paraphrase call raised was silently
+    # dropped from the audit; recall was then computed on the non-skipped
+    # subset, masking the biased sample. Re-try each skipped cap once;
+    # anything still failing after the retry is reported via the coverage
+    # gate below.
+    if skipped_caps:
+        print(
+            f"\n  Retrying {len(skipped_caps)} skipped capability/ies once "
+            f"(paraphrase-generation transient?)..."
+        )
+        still_skipped: list[str] = []
+        for cap in caps:
+            if cap.name not in skipped_caps:
+                continue
+            paraphrases = generate_paraphrases(
+                cap, args.paraphrases_per_cap, structured_llm
+            )
+            if not paraphrases:
+                still_skipped.append(cap.name)
+                continue
+            result = probe_cap(
+                registry, cap, paraphrases,
+                threshold=args.threshold, verbose=args.verbose,
+            )
+            results.append(result)
+            print(
+                f"    {cap.name:30s} recovered on retry: "
+                f"top3={result.top3_hits}/{result.total}"
+            )
+        skipped_caps = still_skipped
+
     # ------------------------------------------------------------------
     # Report
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("  AGGREGATE FALSE-NEGATIVE AUDIT REPORT")
     print("=" * 70)
+
+    # ext13 #135: minimum capability-coverage gate. Pre-fix a 7/8 skip
+    # rate (paraphrase generation failing on most caps) produced a
+    # "100% recall" report on the 1 cap that survived. Now: refuse with
+    # exit 2 when coverage falls below --min-cap-coverage (default 90%).
+    _MIN_CAP_COVERAGE = args.min_cap_coverage
+    cap_coverage = len(results) / len(caps) if caps else 1.0
+    if cap_coverage < _MIN_CAP_COVERAGE:
+        print(
+            f"\nERROR: paraphrase-generation coverage is {cap_coverage:.1%} "
+            f"({len(results)}/{len(caps)} capabilities probed, "
+            f"{len(skipped_caps)} skipped after retry). Below threshold "
+            f"{_MIN_CAP_COVERAGE:.0%} — refusing to report recall on a "
+            f"biased subset. Skipped: {skipped_caps[:10]}"
+            f"{' (+more)' if len(skipped_caps) > 10 else ''}. "
+            f"ext13 #135. Exit 2.",
+            file=sys.stderr,
+        )
+        return 2
 
     total_queries = sum(r.total for r in results)
     if total_queries == 0:

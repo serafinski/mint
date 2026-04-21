@@ -254,7 +254,11 @@ def main(argv: list[str] | None = None) -> int:
     cumulative_success = 0
     cumulative_total = 0
 
-    from tests.evaluation.cycle_flush import flush_task_cycle_state, now_utc
+    from tests.evaluation.cycle_flush import (
+        FlushResult,
+        flush_task_cycle_state,
+        now_utc,
+    )
     from src.orchestrator.tracing import trace_context
     from scripts._budget_watchdog import BudgetExceeded, budget_watchdog
 
@@ -266,6 +270,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     per_task_aborted = False
     campaign_deadline_hit = False
+
+    # ext13 #125: accumulate per-task flush results so we can exit 5 when
+    # any batch failed silently. Pre-fix, cycle_flush swallowed every
+    # persistence error and returned None, hiding partial telemetry that
+    # then cascaded into silent-downgrade KL analysis (#124) + silent-M3
+    # skips (#126). The runner now owns the detection.
+    flush_results: list[FlushResult] = []
 
     for i, task in enumerate(task_sequence):
         if campaign_deadline is not None and time.monotonic() > campaign_deadline:
@@ -417,7 +428,9 @@ def main(argv: list[str] | None = None) -> int:
             # Chapter 6 KL convergence + per-type op-count analyses via
             # scripts/analyze_longitudinal.py. Never-raises — flush failure
             # must not break the longitudinal loop.
-            flush_task_cycle_state(
+            # ext13 #125: capture the FlushResult so partial flush surfaces
+            # as a non-zero exit code at campaign end.
+            fr = flush_task_cycle_state(
                 eval_store=eval_store,
                 metrics_store=metrics_store,
                 registry=registry,
@@ -427,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
                 task_events_cutoff=task_events_cutoff,
                 is_pilot=False,  # ext7 #50 — longitudinal is always non-pilot
             )
+            flush_results.append(fr)
 
         cumulative_total += 1
         if record.success:
@@ -501,12 +515,40 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001
             pass
 
+    # ext13 #125: surface partial flush at campaign end. The per-batch
+    # `FlushResult` accumulated across the loop lets us distinguish
+    # "telemetry fully landed" from "some batches silently dropped",
+    # which directly drives analyze_longitudinal.py's KL / Gini / shift
+    # conclusions downstream.
+    n_bad_invocations = sum(1 for r in flush_results if not r.invocations_ok)
+    n_bad_utility = sum(1 for r in flush_results if not r.utility_scores_ok)
+    n_bad_events = sum(1 for r in flush_results if not r.events_ok)
+    partial_flush = bool(
+        flush_results and (n_bad_invocations or n_bad_utility or n_bad_events)
+    )
+    if partial_flush:
+        logger.error(
+            "ext13 #125: per-task flush partial failures detected. "
+            "invocations=%d/%d bad, utility=%d/%d bad, events=%d/%d bad. "
+            "Row 18/19 analysis (analyze_longitudinal.py) will see partial "
+            "telemetry; #124 may silently downgrade to proxy KL. "
+            "Investigate transient causes or re-run this campaign.",
+            n_bad_invocations, len(flush_results),
+            n_bad_utility, len(flush_results),
+            n_bad_events, len(flush_results),
+        )
+
     # ext12 #119: surface watchdog aborts as non-zero exit codes so
     # orchestrators (cron, CI) can distinguish clean completion from
     # campaign-level degradation. Campaign-deadline exit (5) takes
     # precedence over per-task abort (3) because hitting the deadline
     # implies the campaign did not attempt every task in the sequence.
+    # ext13 #125: partial-flush exit code (5) shares the slot with
+    # campaign-deadline — both are "campaign did not complete cleanly".
+    # Precedence: deadline > partial-flush > per-task-abort.
     if campaign_deadline_hit:
+        return 5
+    if partial_flush:
         return 5
     if per_task_aborted:
         return 3

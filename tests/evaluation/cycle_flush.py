@@ -8,18 +8,45 @@ Step 18.8 surfaced that ``scripts/run_longitudinal.py`` and the new
 bypass the harness — so without a shared helper they'd also bypass the
 flush hooks. This module factors the flush logic out so both the harness
 (``tests.evaluation.harness._execute_run``) and the longitudinal scripts
-call the exact same code path. Never-raises contract: any flush failure
-emits a warning log and proceeds — flush failure must not break the
-surrounding eval/longitudinal loop.
+call the exact same code path.
+
+Never-raises-but-surfaces contract: ext13 #125 (2026-04-21) — the three
+persistence writes (`invocation_events`, `cycle_utility_scores`,
+`cycle_events`) still each swallow exceptions so a transient DB hiccup
+doesn't break the surrounding 5-hour campaign, but the helper now returns
+a :class:`FlushResult` reporting per-batch success. Callers (longitudinal
+runners, harness) aggregate these and exit non-zero at campaign-end when
+any flush batch failed — partial flush is silent no longer.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FlushResult:
+    """Per-batch success/failure tally for one ``flush_task_cycle_state`` call.
+
+    ext13 #125: the helper used to return ``None``, with broad-except
+    logging warnings internally — callers had no mechanism to detect
+    partial flush. Every batch now sets its own boolean and collected
+    errors; ``all_ok`` drives the runner's exit-code decision.
+    """
+
+    invocations_ok: bool = False
+    utility_scores_ok: bool = False
+    events_ok: bool = False
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def all_ok(self) -> bool:
+        return self.invocations_ok and self.utility_scores_ok and self.events_ok
 
 
 def flush_task_cycle_state(
@@ -32,7 +59,7 @@ def flush_task_cycle_state(
     task_id: str,
     task_events_cutoff: datetime,
     is_pilot: bool = False,
-) -> None:
+) -> FlushResult:
     """Flush per-task cycle state to EvaluationStore.
 
     Copies three batches from the in-memory ``metrics_store`` + fresh
@@ -62,7 +89,14 @@ def flush_task_cycle_state(
         task_id: The task_id of the just-completed task.
         task_events_cutoff: datetime captured BEFORE pipeline.invoke —
             used to filter capability_events to just this task's events.
+
+    Returns:
+        A :class:`FlushResult` with per-batch ``*_ok`` flags and an
+        ``errors`` list. Never raises; callers must inspect the result
+        (ext13 #125).
     """
+    result = FlushResult()
+
     # --- Invocation events (Step 18.5) ---
     # Security audit finding #23 (2026-04-20): pass ``since=task_events_cutoff``
     # so fetch returns only THIS cycle's invocations. Pre-fix the fetch
@@ -81,10 +115,12 @@ def flush_task_cycle_state(
             events=task_invocations,
             is_pilot=is_pilot,  # ext7 #50
         )
+        result.invocations_ok = True
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Failed to flush invocation_events for task %s: %s", task_id, exc
         )
+        result.errors.append(f"invocation_events: {exc}")
 
     # --- Cycle utility scores (Step 18.7) ---
     try:
@@ -96,10 +132,12 @@ def flush_task_cycle_state(
             task_id=task_id,
             scores=utilities,
         )
+        result.utility_scores_ok = True
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Failed to flush cycle_utility_scores for task %s: %s", task_id, exc
         )
+        result.errors.append(f"cycle_utility_scores: {exc}")
 
     # --- Cycle events (Step 18.7) ---
     try:
@@ -110,15 +148,18 @@ def flush_task_cycle_state(
             task_id=task_id,
             events=task_events,
         )
+        result.events_ok = True
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Failed to flush cycle_events for task %s: %s", task_id, exc
         )
+        result.errors.append(f"cycle_events: {exc}")
 
     # Step 13.7 Batch C2: emit a LangFuse cross-reference tag linking
     # the active trace to the just-flushed DuckDB row keys. Chapter 5/6
     # reviewers can then navigate LangFuse → DuckDB or vice versa
-    # without a timestamp join. Never raises.
+    # without a timestamp join. Never raises; informational only so
+    # failure here doesn't flip any FlushResult flag.
     try:
         from src.orchestrator.tracing import emit_langfuse_event
         emit_langfuse_event(
@@ -134,6 +175,8 @@ def flush_task_cycle_state(
         )
     except Exception:  # noqa: BLE001
         pass
+
+    return result
 
 
 def now_utc() -> datetime:

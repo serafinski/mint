@@ -628,6 +628,33 @@ def compute_per_task_costs(
             ):
                 run_retrieval_record_counts[rec["run_id"]] += 1
 
+    # ext13 #129: enumerate (run_id, task_id) keys present vs expected
+    # for every tagged run. A missing key means that task's traces never
+    # carried a task_id tag; ``run_task_tokens.get(key, 0)`` would
+    # silently write 0 for every record of that task below, and ext12
+    # #122's run-level gate would pass because other tasks in the same
+    # run were tagged. Stash the missing keys on the function so main()
+    # can refuse the write unless --allow-partial-task-coverage is set.
+    expected_keys_per_tagged_run: dict[str, set[tuple[str, str]]] = {}
+    for rec in records:
+        if rec["condition"] == "static":
+            continue
+        rid = rec["run_id"]
+        if rid in tagged_run_ids:
+            expected_keys_per_tagged_run.setdefault(rid, set()).add(
+                (rid, rec["task_id"])
+            )
+    present_keys = set(run_task_tokens.keys())
+    per_run_missing_tasks: dict[str, list[str]] = {}
+    for rid, expected in expected_keys_per_tagged_run.items():
+        missing = sorted(tid for (r, tid) in expected - present_keys)
+        if missing:
+            per_run_missing_tasks[rid] = missing
+    # Attach diagnostics to the function object so main() can read them
+    # without restructuring the call signature.
+    compute_per_task_costs.last_missing_task_tags = per_run_missing_tasks  # type: ignore[attr-defined]
+    compute_per_task_costs.last_tagged_run_ids = frozenset(tagged_run_ids)  # type: ignore[attr-defined]
+
     # Build updates
     updates: list[tuple[str, int]] = []
     for rec in records:
@@ -678,7 +705,7 @@ def compute_per_task_costs(
 def main() -> int:
     """Backfill token costs from LangFuse.
 
-    Exit codes (ext12 #122 2026-04-21):
+    Exit codes (ext12 #122 + ext13 #129/#130 2026-04-21):
         0: backfill completed cleanly (all non-static runs had LangFuse
            generations matched, or --allow-partial was explicitly passed)
         1: CLI / auth / connectivity failure
@@ -687,6 +714,11 @@ def main() -> int:
         3: some non-static runs had zero LangFuse generations matched —
            M4 backfill would silently write zero cost for those runs.
            Pass --allow-partial to override, with Chapter 4.5 disclosure.
+        9: per-task tag coverage gap within a tagged run (ext13 #129).
+           Pass --allow-partial-task-coverage to override.
+        10: generations-per-JIT-record below threshold (ext13 #130).
+            Pass --allow-under-coverage (with --min-gens-per-jit-record)
+            to override.
     """
     parser = argparse.ArgumentParser(description="Backfill token costs from LangFuse")
     parser.add_argument("--db", default=DB_PATH)
@@ -700,6 +732,33 @@ def main() -> int:
              "passed, the affected runs receive token_cost=0 for every "
              "record — Chapter 4.5 MUST disclose this as an M4 limitation. "
              "ext12 #122.",
+    )
+    # ext13 #129: per-run per-task tag coverage gate. ext12 #122 covers
+    # the run-level case (a run with zero tagged generations); this flag
+    # covers the finer-granularity case — a run with SOME tasks tagged
+    # and others missing the task_id tag. Without this gate the missing
+    # tasks silently get token_cost=0 (``run_task_tokens.get(key, 0)``).
+    parser.add_argument(
+        "--allow-partial-task-coverage", action="store_true",
+        help="Proceed with token_cost=0 for tasks within tagged runs that "
+             "lack LangFuse per-task traces. Default: refuse with exit 9. "
+             "Chapter 4.5 disclosure REQUIRED. ext13 #129.",
+    )
+    # ext13 #130: quantitative generations-per-JIT-record threshold.
+    # ext12 #122's zero-vs-nonzero check lets a run with one matched
+    # generation across 20 tasks pass the gate; this flag sets a minimum
+    # ratio of generations per JIT record.
+    parser.add_argument(
+        "--allow-under-coverage", action="store_true",
+        help="Proceed when LangFuse generation count per JIT record is "
+             "below --min-gens-per-jit-record. Default: refuse with exit "
+             "10. Chapter 4.5 disclosure REQUIRED. ext13 #130.",
+    )
+    parser.add_argument(
+        "--min-gens-per-jit-record", type=float, default=0.5,
+        help="Minimum LangFuse generations per JIT record for a run to be "
+             "considered adequately covered (default 0.5). Below this, "
+             "exit 10 unless --allow-under-coverage is passed. ext13 #130.",
     )
     args = parser.parse_args()
 
@@ -828,6 +887,91 @@ def main() -> int:
     # Compute backfill values — try per-task attribution first, then run-level
     records = get_per_record_info(conn)
 
+    # ext13 #130: quantitative coverage gate — per-run generations-per-
+    # JIT-record ratio. ext12 #122's binary zero-vs-nonzero gate lets a
+    # 20-task run with 1 matched generation through; Row 17 M4 then
+    # under-reports by ~20x silently. Enforce a minimum ratio (default
+    # 0.5 gens / JIT record) unless --allow-under-coverage is passed.
+    from collections import Counter as _Counter
+    jit_records_per_run: _Counter[str] = _Counter()
+    for rec in records:
+        if rec["condition"] == "static":
+            continue
+        if (
+            rec["condition"] != "longitudinal"
+            and rec["task_id"] in RETRIEVAL_TASKS
+        ):
+            continue  # retrieval tasks don't generate
+        jit_records_per_run[rec["run_id"]] += 1
+
+    under_covered_runs: list[tuple[str, int, int, float]] = []
+    min_ratio = args.min_gens_per_jit_record
+    for rid, s in run_summaries.items():
+        if s.get("condition") == "static":
+            continue
+        n_gens = s.get("n_generations", 0)
+        jit_records = jit_records_per_run.get(rid, 0)
+        if jit_records <= 0:
+            continue
+        ratio = n_gens / jit_records
+        if ratio < min_ratio:
+            under_covered_runs.append((rid, n_gens, jit_records, ratio))
+
+    # Per-condition quantitative display (replaces ext12 #122's binary
+    # "1/1" readout when the under-coverage information is available).
+    print(
+        "\n  Per-condition LangFuse coverage (generations-per-JIT-record, "
+        f"threshold {min_ratio:.2f}):"
+    )
+    by_cond_gens: dict[str, int] = {}
+    by_cond_jit: dict[str, int] = {}
+    for rid, s in run_summaries.items():
+        cond = s.get("condition", "unknown")
+        by_cond_gens[cond] = by_cond_gens.get(cond, 0) + s.get("n_generations", 0)
+        by_cond_jit[cond] = by_cond_jit.get(cond, 0) + jit_records_per_run.get(rid, 0)
+    for cond in sorted(set(by_cond_gens) | set(by_cond_jit)):
+        gens = by_cond_gens.get(cond, 0)
+        jit_records = by_cond_jit.get(cond, 0)
+        ratio = gens / jit_records if jit_records > 0 else 0.0
+        marker = "⚠" if ratio < min_ratio and cond != "static" else " "
+        print(
+            f"  {marker} {cond:<18} {gens:>4d} gens / {jit_records:>4d} "
+            f"JIT records = {ratio:.2f}/record"
+        )
+
+    if under_covered_runs:
+        preview = under_covered_runs[:5]
+        more = (
+            f" (+{len(under_covered_runs) - 5} more)"
+            if len(under_covered_runs) > 5 else ""
+        )
+        print(
+            f"\nERROR: {len(under_covered_runs)} non-static run(s) have FEWER "
+            f"LangFuse generations than threshold {min_ratio:.2f}/JIT-record:"
+            f"{more}",
+            file=sys.stderr,
+        )
+        for rid, n_gens, jit_records, ratio in preview:
+            print(
+                f"  {rid}: {n_gens} gens / {jit_records} JIT records "
+                f"= {ratio:.2f} (expected >= {min_ratio:.2f})",
+                file=sys.stderr,
+            )
+        if not args.allow_under_coverage:
+            print(
+                "  Refusing to write severely under-covered backfill. Pass "
+                "--allow-under-coverage to proceed (Chapter 4.5 disclosure "
+                "REQUIRED). ext13 #130. Exit 10.",
+                file=sys.stderr,
+            )
+            conn.close()
+            return 10
+        print(
+            f"  --allow-under-coverage passed: proceeding with low-ratio "
+            f"writes. Chapter 4.5 disclosure REQUIRED.",
+            file=sys.stderr,
+        )
+
     print("\nChecking for per-task trace tags...")
     per_task_updates = compute_per_task_costs(
         base_url, auth, records, run_windows,
@@ -836,6 +980,47 @@ def main() -> int:
     if per_task_updates is not None:
         updates = per_task_updates
         print("  Using per-task attribution (traces tagged with task_id).")
+        # ext13 #129: per-task tag coverage gate. compute_per_task_costs
+        # stashes missing (run_id, task_id) keys on the function object;
+        # read and refuse the write if any tagged run has missing tasks
+        # unless --allow-partial-task-coverage is set.
+        per_run_missing = getattr(
+            compute_per_task_costs, "last_missing_task_tags", {}
+        )
+        if per_run_missing:
+            total_missing = sum(len(v) for v in per_run_missing.values())
+            print(
+                f"\nERROR: {len(per_run_missing)} tagged run(s) have missing "
+                f"per-task LangFuse traces ({total_missing} (run_id, task_id) "
+                f"keys). Affected tasks would be silently written as "
+                f"token_cost=0:",
+                file=sys.stderr,
+            )
+            for rid, tasks in sorted(per_run_missing.items())[:5]:
+                print(f"  {rid}: missing {tasks}", file=sys.stderr)
+            if len(per_run_missing) > 5:
+                print(
+                    f"  (+{len(per_run_missing) - 5} more runs)",
+                    file=sys.stderr,
+                )
+            print(
+                "  Likely causes:\n"
+                "    (a) ThreadPool trace-context bleed (see ext10 #104)\n"
+                "    (b) task_id tag dropped at emit time\n"
+                "    (c) LangFuse retention aged out per-task traces\n"
+                "  Pass --allow-partial-task-coverage to proceed with zeros "
+                "for affected tasks (Chapter 4.5 disclosure REQUIRED). "
+                "ext13 #129. Exit 9.",
+                file=sys.stderr,
+            )
+            if not args.allow_partial_task_coverage:
+                conn.close()
+                return 9
+            print(
+                "  --allow-partial-task-coverage passed: proceeding. "
+                "Chapter 4.5 disclosure REQUIRED.",
+                file=sys.stderr,
+            )
     else:
         updates = compute_backfill_values(records, run_summaries)
         print("  No per-task tags found — using run-level averaging (legacy mode).")

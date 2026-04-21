@@ -640,7 +640,21 @@ def run_audit(
 
         registry = SkillRegistry(persist_directory=str(registry_path))
 
-        counts = {"correct": 0, "contaminated": 0, "partial": 0, "skip": 0}
+        # ext13 #137: per-branch auto-skip counters separate from the
+        # user-initiated `skip`. Pre-fix, every auto-skip path silently
+        # `continue`'d without incrementing any counter — a DB whose
+        # unlabeled rows all resolved to one of these branches produced
+        # `correct=0 contaminated=0 partial=0 skip=0` and exited 0,
+        # effectively reporting "audit complete" with zero labels.
+        counts = {
+            "correct": 0,
+            "contaminated": 0,
+            "partial": 0,
+            "skip": 0,
+            "auto_skip_no_invocation": 0,
+            "auto_skip_seeded": 0,
+            "auto_skip_no_source": 0,
+        }
         for idx, row in enumerate(sample, start=1):
             # Primary path (post-Step-18.10 Option B): the DB has the
             # source-body snapshot, no registry lookup needed.
@@ -666,10 +680,12 @@ def run_audit(
 
                 if cap_name is None:
                     print("  (no invocation_events row matches this run; skipping)")
+                    counts["auto_skip_no_invocation"] += 1
                     continue
 
                 if is_seeded(registry, cap_name):
                     print(f"  (capability '{cap_name}' is a pinned seed, not generated; skipping)")
+                    counts["auto_skip_seeded"] += 1
                     continue
 
                 source = resolve_source(registry, cap_name)
@@ -677,6 +693,7 @@ def run_audit(
                     print(f"  (capability '{cap_name}' not in registry — "
                           f"snapshot may have been reset; skipping — "
                           f"legacy DB without Step 18.10 Option B snapshot column)")
+                    counts["auto_skip_no_source"] += 1
                     continue
 
                 kind, body, domain = source
@@ -696,16 +713,46 @@ def run_audit(
 
         print("\n" + "═" * 100)
         print("Audit complete.")
-        print(f"  correct:      {counts['correct']}")
-        print(f"  contaminated: {counts['contaminated']}")
-        print(f"  partial:      {counts['partial']}")
-        print(f"  skipped:      {counts['skip']}")
+        print(f"  correct:              {counts['correct']}")
+        print(f"  contaminated:         {counts['contaminated']}")
+        print(f"  partial:              {counts['partial']}")
+        print(f"  skipped (user):       {counts['skip']}")
+        total_auto_skipped = (
+            counts["auto_skip_no_invocation"]
+            + counts["auto_skip_seeded"]
+            + counts["auto_skip_no_source"]
+        )
+        if total_auto_skipped:
+            print(f"  auto-skipped (total): {total_auto_skipped}")
+            print(f"    no invocation_events match:    "
+                  f"{counts['auto_skip_no_invocation']}")
+            print(f"    seeded capability:             "
+                  f"{counts['auto_skip_seeded']}")
+            print(f"    not in registry (snap reset):  "
+                  f"{counts['auto_skip_no_source']}")
         total_labeled = counts["correct"] + counts["contaminated"] + counts["partial"]
         if total_labeled:
             rate = 100.0 * counts["contaminated"] / total_labeled
             print(f"\n  contamination rate (this session): "
                   f"{counts['contaminated']}/{total_labeled} = {rate:.1f}%")
         print("═" * 100)
+
+        # ext13 #137: loud-fail when no labels landed. Without this the
+        # unconditional ``return 0`` below signals success to any
+        # orchestrator while Row 17's M2 had no fresh labels to compute on.
+        if total_labeled == 0:
+            print(
+                f"\nERROR: zero labels produced. {total_auto_skipped} rows "
+                f"auto-skipped across 3 legacy-fallback branches; "
+                f"{counts['skip']} user-skipped. Row 17 M2 will have no "
+                f"fresh labels from this session.\n"
+                f"  Likely causes: legacy DB without Step 18.10 Option B "
+                f"snapshot column, OR snapshot reset between campaign and "
+                f"audit. Re-seed the Option B source_snapshots column or "
+                f"run the audit on a fresh campaign. ext13 #137. Exit 3.",
+                file=sys.stderr,
+            )
+            return 3
         return 0
     finally:
         store.close()

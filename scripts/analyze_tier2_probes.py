@@ -437,6 +437,18 @@ def main() -> int:
         "--session-ids", nargs="+", default=None,
         help="Restrict to specific LangFuse session_ids.",
     )
+    # ext13 #138: zero-events loud-fail. Mirrors ext7 #47's pattern for
+    # the sibling analyzer. Any filter typo (nonexistent session id,
+    # wrong environment, window outside data) used to silently print
+    # "Fetched 0 events" + empty table and exit 0.
+    parser.add_argument(
+        "--allow-empty", action="store_true",
+        help="Proceed with exit 0 when zero Tier 2 probe events match. "
+             "Default: refuse with exit 2 so filter typos / window "
+             "mismatches don't silently produce empty Row 15 output. "
+             "Mirrors ext7 #47 for analyze_context_utilization.py. "
+             "ext13 #138.",
+    )
     args = parser.parse_args()
 
     try:
@@ -467,6 +479,29 @@ def main() -> int:
             environment=args.environment,
             session_ids=args.session_ids,
         )
+
+    # ext13 #138: refuse empty fetch unless --allow-empty is set. An
+    # empty fetch usually indicates filter/window misconfiguration
+    # rather than "no Tier 2 events actually fired in this campaign".
+    if not events and not args.allow_empty:
+        print(
+            f"\nERROR: zero Tier 2 probe events fetched for "
+            f"environment={args.environment!r}, "
+            f"window=[{start.isoformat()}..{end.isoformat()}]"
+            + (
+                f", session_ids={args.session_ids!r}"
+                if args.session_ids else ""
+            )
+            + ". Check:\n"
+            "  (a) runner emission convention (runners use environment='default'),\n"
+            "  (b) --session-ids filter spelling,\n"
+            "  (c) --days / --start / --end window bounds,\n"
+            "  (d) LangFuse retention hasn't aged out the target window.\n"
+            "  Pass --allow-empty to suppress this check. "
+            "ext13 #138. Exit 2.",
+            file=sys.stderr,
+        )
+        return 2
 
     print(f"Fetched {len(events)} events.\n")
 

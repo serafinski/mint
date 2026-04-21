@@ -889,7 +889,10 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
         print("  Gini Coefficient of Capability Invocation Counts")
         print(f"{'='*80}")
         print("  (skipped: invocation_events table is empty)")
-        return
+        # ext13 #126: globally-empty invocation_events used to silently
+        # exit 0 with M3 absent from Chapter 6. Return False so main()
+        # accumulates this in ``missing_metrics`` and exits 7.
+        return False
 
     # Group by (condition, run_id) → counts keyed by capability, so we
     # can zero-pad against the per-condition active-registry proxy
@@ -956,6 +959,24 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
         "carry all traffic, others are dead weight). The\n  proposal's "
         "\"healthy registry\" prediction is moderate values (~0.3-0.6)."
     )
+
+    # ext13 #128: per-condition coverage check. ext13 #126 already covers
+    # the globally-empty case above; this sibling handles the case where
+    # invocation_events has rows for SOME conditions but not all — the
+    # JIT-vs-static M3 comparison needs every condition present.
+    missing_conditions = [
+        cond for cond in CONDITIONS
+        if not condition_ginis.get(cond)
+    ]
+    if missing_conditions:
+        print(
+            f"\n  ⚠ M3 partial coverage: no invocation_events for "
+            f"{len(missing_conditions)}/{len(CONDITIONS)} conditions: "
+            f"{', '.join(missing_conditions)}",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> None:
@@ -1270,7 +1291,9 @@ def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
             "label a stratified sample, then re-run this analyzer. "
             "Chapter 6 §M2 should report as *deferred* until the audit lands."
         )
-        return
+        # ext13 #126: thesis-critical metric absent; main() treats this
+        # as a missing-metric and exits 7.
+        return False
 
     # Security audit finding #84 (2026-04-19, ext9): M2's
     # proposal-literal definition is *"fraction containing fabricated
@@ -1334,11 +1357,28 @@ def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
         "§11 for the sampling protocol and labelling criteria."
     )
 
+    # ext13 #132: per-condition coverage check. A DB with labels only
+    # in SOME conditions (e.g., only `full`) passes the rows-exist gate
+    # above but destroys the JIT-vs-static contamination comparison.
+    # Flag missing conditions so main() exits 7 on partial M2 coverage.
+    present_conditions = {r[0] for r in rows}
+    expected_conditions = set(CONDITIONS)
+    missing_conditions = expected_conditions - present_conditions
+    if missing_conditions:
+        print(
+            f"\n  ⚠ M2 partial coverage: labels missing for "
+            f"{len(missing_conditions)}/{len(expected_conditions)} conditions: "
+            f"{sorted(missing_conditions)}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description="Statistical analysis of evaluation results")
     parser.add_argument("--db", default=str(ROOT / "data" / "eval" / "metrics.duckdb"))
     parser.add_argument("--csv", action="store_true", help="Export tables to data/analysis/")
@@ -1380,6 +1420,17 @@ def main() -> None:
         help="Proceed even if the scoped dataset doesn't match the expected "
              "campaign shape. Every output table carries an [INCOMPLETE] banner. "
              "ext7 #52.",
+    )
+    # ext13 #126: thesis-critical metrics (M2 contamination, M3 Gini)
+    # used to silently exit 0 when `human_label` / `invocation_events`
+    # were empty or had per-condition gaps. Track absences in a list and
+    # exit 7 unless the user opts in with --allow-missing-metrics.
+    parser.add_argument(
+        "--allow-missing-metrics", action="store_true",
+        help="Proceed with exit 0 even when thesis-critical metrics "
+             "(M2 contamination, M3 Gini) cannot be computed or have "
+             "per-condition gaps. Chapter 4.5 disclosure REQUIRED. "
+             "Default: refuse with exit 7. ext13 #126 / #128 / #132.",
     )
     args = parser.parse_args()
 
@@ -1430,15 +1481,42 @@ def main() -> None:
         for c in sorted(missing):
             issues.append(f"condition '{c}' missing entirely (0 rows)")
 
+    # ext13 #131: extend ext7 #52's row-count gate with distinct-task
+    # coverage + per-(condition, task_id) uniformity checks. A 400-row
+    # DB of T01 repeated 100x per condition passes the row-count gate
+    # and yields Chapter 6 headlines computed on 1/20 of the testbed.
+    per_cond_task_coverage = conn.execute(
+        f"SELECT condition, COUNT(DISTINCT task_id) "
+        f"FROM evaluation_runs WHERE is_pilot = FALSE{_SCOPE_SQL} "
+        f"GROUP BY condition"
+    ).fetchall()
+    for condition, distinct_tasks in per_cond_task_coverage:
+        if distinct_tasks != expected_tasks:
+            issues.append(
+                f"condition '{condition}': {distinct_tasks} distinct tasks, "
+                f"expected {expected_tasks}"
+            )
+    uneven = conn.execute(
+        f"SELECT condition, task_id, COUNT(*) AS n "
+        f"FROM evaluation_runs WHERE is_pilot = FALSE{_SCOPE_SQL} "
+        f"GROUP BY condition, task_id HAVING COUNT(*) != ?",
+        [expected_runs],
+    ).fetchall()
+    for condition, task_id, n in uneven:
+        issues.append(
+            f"condition '{condition}', task '{task_id}': {n} rows, "
+            f"expected {expected_runs}"
+        )
+
     if issues and not args.allow_incomplete:
         print(
             "\nERROR: dataset appears incomplete — refusing to produce Chapter-6 output.\n"
             "Issues:\n  - " + "\n  - ".join(issues) + "\n"
             "Pass --allow-incomplete to override (output will be marked "
-            "INCOMPLETE in every table header). ext7 #52.",
+            "INCOMPLETE in every table header). ext7 #52 + ext13 #131.",
             file=sys.stderr,
         )
-        sys.exit(2)
+        return 2
 
     # Stash the banner on the module so table printers can render it when
     # --allow-incomplete forces a partial-data run. Empty string = complete.
@@ -1496,13 +1574,20 @@ def main() -> None:
     # See print_classification_accuracy docstring for framing rationale.
     print_classification_accuracy(conn)
 
+    # ext13 #126 / #128 / #132: accumulate thesis-critical metric
+    # absences so we can exit 7 at the bottom rather than silently
+    # exiting 0 with the section skipped.
+    missing_metrics: list[str] = []
+
     # ── Gini coefficient of capability invocation counts (§Metrics) ──────
-    print_gini_summary(conn)
+    if not print_gini_summary(conn):
+        missing_metrics.append("M3 (Gini / Pillar 3 RQ #1)")
 
     # ── M2 mock contamination rate (Step 18.10, proposal §M2) ────────────
     # Graceful fallback prints "audit not performed" when human_label
     # column is unpopulated.
-    print_contamination_rate(conn)
+    if not print_contamination_rate(conn):
+        missing_metrics.append("M2 (Contamination)")
 
     conn.close()
 
@@ -1515,6 +1600,21 @@ def main() -> None:
         (out_dir / "per_task_detail.csv").write_text("\n".join(csv_per_task) + "\n")
         print(f"\nCSV files written to {out_dir}/")
 
+    # ext13 #126 / #128 / #132: exit 7 when any thesis-critical metric
+    # was absent or partial. Override via --allow-missing-metrics.
+    if missing_metrics:
+        msg = (
+            "\n" + "!" * 80 + "\n"
+            "  CHAPTER 6 INCOMPLETE — the following metrics could not be "
+            "computed or had per-condition gaps:\n"
+            + "\n".join(f"    - {m}" for m in missing_metrics)
+            + "\n" + "!" * 80
+        )
+        print(msg, file=sys.stderr)
+        if not args.allow_missing_metrics:
+            return 7
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

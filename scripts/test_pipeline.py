@@ -196,8 +196,19 @@ def run_pipeline_and_verify(
                 sev = str(getattr(f, "severity", "")).upper()
                 msg = getattr(f, "message", "")[:80]
                 print(f"       [{sev}] {msg}")
+        # ext13 #136: stage 5 used to only fail when explicit findings
+        # were present; an empty ``verification_results`` with artifacts
+        # still generated passed silently (Pillar 2 gate bypassed).
         if verif_results:
             print("     OK")
+        elif artifacts:
+            print(
+                "     FAIL: artifacts generated but no verification "
+                "reports — Pillar 2 gate was skipped entirely"
+            )
+            all_pass = False
+        else:
+            print("     OK (no artifacts to verify)")
 
         # --- 6. Loading + registration ---
         status = _get("status", "?")
@@ -209,8 +220,18 @@ def run_pipeline_and_verify(
         new_caps = final_count - initial_count
         print(f"     Registry: {initial_count} -> {final_count} ({new_caps} new)")
 
+        # ext13 #136: stage 6 used to print WARN when gaps existed but no
+        # caps registered; the ``all_pass`` boolean never flipped. A
+        # pipeline that detected gaps, generated artifacts, then failed
+        # to register them silently passed smoke-test.
         if artifacts and new_caps > 0:
             print("     OK")
+        elif gaps and artifacts and new_caps == 0:
+            print(
+                "     FAIL: gaps detected and artifacts generated, but no "
+                "new capabilities registered — loader no-op"
+            )
+            all_pass = False
         elif gaps and new_caps == 0:
             print("     WARN: Gaps existed but no new capabilities registered")
         else:

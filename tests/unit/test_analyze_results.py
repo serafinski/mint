@@ -1103,6 +1103,10 @@ def _seed_partial_campaign(store, rows_per_condition: dict[str, int]) -> None:
 def test_completeness_guard_refuses_partial_dataset(monkeypatch, capsys, tmp_path):
     """ext7 #52: partial DB + no --allow-incomplete → exit 2 with a clear
     'dataset appears incomplete' error.
+
+    ext13 #131 (2026-04-21): main() now returns the exit code rather
+    than calling ``sys.exit(2)`` directly; the __main__ wrapper does the
+    ``sys.exit(main() or 0)``. Assert on the return value.
     """
     import scripts.analyze_results as ar
 
@@ -1117,9 +1121,8 @@ def test_completeness_guard_refuses_partial_dataset(monkeypatch, capsys, tmp_pat
         "--expected-tasks", "20", "--expected-runs-per-condition", "5",
     ])
 
-    with __import__("pytest").raises(SystemExit) as exc:
-        ar.main()
-    assert exc.value.code == 2
+    rc = ar.main()
+    assert rc == 2, f"expected exit 2, got {rc}"
     err = capsys.readouterr().err
     assert "dataset appears incomplete" in err
 

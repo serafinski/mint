@@ -588,9 +588,20 @@ def _emit_plot(
     return True
 
 
+# ext13 #124 + #127: banner state for section headers. Set in ``main()``
+# after the proxy-KL downgrade / sparse-telemetry gates decide whether to
+# proceed under an override flag. Every section header then interpolates
+# whichever banner is active, so Chapter 6 reviewers cannot skim past the
+# degraded-data annotation.
+_PROXY_BANNER: str = ""
+_SPARSE_BANNER: str = ""
+
+
 def _print_header(title: str) -> None:
+    prefix_parts = [p for p in (_PROXY_BANNER, _SPARSE_BANNER) if p]
+    prefix = (" ".join(prefix_parts) + " ") if prefix_parts else ""
     print(f"\n{'=' * 80}")
-    print(f"  {title}")
+    print(f"  {prefix}{title}")
     print(f"{'=' * 80}")
 
 
@@ -676,6 +687,37 @@ def main() -> int:
              "see the shortfall at a glance. Exit code is still non-zero "
              "so orchestrators don't treat incomplete as success. ext12 #116.",
     )
+    # ext13 #124: proposal-literal KL lives on cycle_utility_scores; when
+    # that table is empty we silently fell back to invocation-count KL
+    # (proxy) and reported convergence as if it were the primary metric.
+    # Now: refuse with exit 6 unless the user explicitly opts in to the
+    # proxy. Override surfaces a [PROXY KL] banner on every section header
+    # so Chapter 4.5 disclosure isn't optional.
+    parser.add_argument(
+        "--allow-proxy-kl", action="store_true",
+        help="Proceed when cycle_utility_scores is empty, using the "
+             "invocation-count KL proxy. Every section header is prefixed "
+             "[PROXY KL]. Chapter 4.5 disclosure REQUIRED. Default: refuse "
+             "with exit 6. ext13 #124.",
+    )
+    # ext13 #127: ext12 #118's data-presence gate is a global ``any()`` —
+    # a 40-cycle DB with a single invocation event passes and the
+    # convergence detector fires on the empty-vs-empty NaN pattern. Now
+    # require a per-cycle coverage floor (default 50%) and refuse with
+    # exit 8 below it unless --allow-sparse-signal is passed.
+    parser.add_argument(
+        "--allow-sparse-signal", action="store_true",
+        help="Proceed with convergence analysis when per-cycle telemetry "
+             "coverage is below --min-cycle-coverage. Every section header "
+             "is prefixed [SPARSE: N/M]. Chapter 4.5 disclosure REQUIRED. "
+             "Default: refuse with exit 8. ext13 #127.",
+    )
+    parser.add_argument(
+        "--min-cycle-coverage", type=float, default=0.5,
+        help="Minimum fraction of cycles that must carry signal (default "
+             "0.5). Below this, exit 8 unless --allow-sparse-signal is "
+             "passed. ext13 #127.",
+    )
     args = parser.parse_args()
 
     db_path = Path(args.db)
@@ -748,12 +790,89 @@ def main() -> int:
         conn.close()
         return 4
 
+    # ext13 #127: per-cycle coverage gate. ext12 #118's ``any()`` passes
+    # on a single row of signal across the whole campaign; compute a
+    # coverage ratio and refuse below the threshold unless the user
+    # opts in via --allow-sparse-signal.
+    cycles_with_signal = sum(
+        1 for c in cycles
+        if c.get("cumulative_invocations")
+        or c.get("utility_scores")
+        or c.get("events")
+    )
+    coverage_ratio = cycles_with_signal / len(cycles) if cycles else 0.0
+    if coverage_ratio < args.min_cycle_coverage:
+        if not args.allow_sparse_signal:
+            print(
+                f"ERROR: longitudinal DB has signal in only "
+                f"{cycles_with_signal}/{len(cycles)} cycles "
+                f"({coverage_ratio:.0%}); below threshold "
+                f"{args.min_cycle_coverage:.0%}. Convergence analysis "
+                f"on sparse telemetry is unreliable — a single invocation "
+                f"event can pass ext12 #118's global presence gate while "
+                f"the remaining cycles carry no signal, and the convergence "
+                f"detector fires on sub-threshold empty-vs-empty comparisons.\n"
+                f"  Likely causes:\n"
+                f"    (a) cycle_flush.py partial-flush failures (ext13 #125)\n"
+                f"    (b) metrics_store lost state mid-campaign\n"
+                f"    (c) registry/store sync broken at flush boundary\n"
+                f"  Pass --allow-sparse-signal to proceed with a "
+                f"[SPARSE: N/M] banner (Chapter 4.5 disclosure REQUIRED). "
+                f"Exit 8. ext13 #127.",
+                file=sys.stderr,
+            )
+            conn.close()
+            return 8
+        global _SPARSE_BANNER
+        _SPARSE_BANNER = f"[SPARSE: {cycles_with_signal}/{len(cycles)}]"
+        print(
+            f"WARNING: {_SPARSE_BANNER} — Chapter 4.5 must disclose the "
+            f"per-cycle coverage gap. Convergence / adaptation verdicts "
+            f"below are NOT directly comparable to full-coverage numbers.",
+            file=sys.stderr,
+        )
+
     # Check whether the Step 18.7-follow-up tables are populated. If so,
     # we can use utility-score KL (proposal-literal). If not, fall back
     # to invocation-count KL (proxy).
     has_utility_scores = any(c.get("utility_scores") for c in cycles)
     has_events = any(c.get("events") for c in cycles)
     primary_kl_source = "utility_scores" if has_utility_scores else "invocation_counts"
+
+    # ext13 #124: proposal-literal KL lives on utility scores. When
+    # cycle_utility_scores is empty (partial-flush per ext13 #125, legacy
+    # DB pre-Step-18.7-follow-up, or registry/store sync broken at flush),
+    # we used to silently downgrade to the invocation-count proxy and
+    # report "converged at cycle N" as if it were the proposal-literal
+    # metric. Now: refuse with exit 6 unless --allow-proxy-kl is set; if
+    # the override is set, every section header carries a [PROXY KL] banner.
+    if primary_kl_source == "invocation_counts":
+        if not args.allow_proxy_kl:
+            print(
+                f"ERROR: cycle_utility_scores is empty. The proposal-literal "
+                f"convergence metric (utility-score KL, per §Metrics item 6) "
+                f"cannot be computed. The invocation-count KL is a SENSITIVITY "
+                f"proxy, not the primary metric, so reporting convergence on "
+                f"it would be a methodology violation.\n"
+                f"  Likely causes:\n"
+                f"    (a) cycle_flush.py utility-flush failure (ext13 #125)\n"
+                f"    (b) DB predates Step 18.7 follow-up wiring (pre-2026-04-17)\n"
+                f"    (c) metrics_store / registry sync broken at flush time\n"
+                f"  Pass --allow-proxy-kl to proceed with a [PROXY KL] banner "
+                f"on every section header (Chapter 4.5 disclosure REQUIRED). "
+                f"Exit 6. ext13 #124.",
+                file=sys.stderr,
+            )
+            conn.close()
+            return 6
+        global _PROXY_BANNER
+        _PROXY_BANNER = "[PROXY KL]"
+        print(
+            f"WARNING: {_PROXY_BANNER} — proceeding with invocation-count KL "
+            f"proxy per --allow-proxy-kl. Every section header below is "
+            f"prefixed [PROXY KL]; Chapter 4.5 must disclose the downgrade.",
+            file=sys.stderr,
+        )
 
     # Compute per-cycle KL (both series when possible) + Gini
     rows: list[dict] = []
@@ -1102,13 +1221,15 @@ def main() -> int:
                 print(f"  PNG written: {png_path}")
 
     conn.close()
-    # ext12 #116: exit-code contract (extended):
+    # Exit-code contract (extended across ext12 + ext13):
     #   0  complete data + converged
     #   1  empty DB (no longitudinal rows at all) — handled earlier
     #   2  complete data but convergence not detected
     #   3  incomplete campaign (shortfall) — returned even with --allow-incomplete
     #   4  zero-evidence DB (rows present but no signal tables) — handled earlier
-    #   5  shift campaign missing distribution_shift marker (see ext12 #123)
+    #   5  shift campaign missing distribution_shift marker (ext12 #123)
+    #   6  proposal-literal KL unavailable, --allow-proxy-kl required (ext13 #124)
+    #   8  sparse per-cycle telemetry, --allow-sparse-signal required (ext13 #127)
     if incomplete_banner is not None:
         return 3
     return 0 if convergence_cycle is not None else 2

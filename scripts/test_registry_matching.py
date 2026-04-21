@@ -1780,6 +1780,49 @@ def _print_summary(
             and r.verdict is not None
         ]
 
+        # ext13 #134: judge-outage coverage gate. Pre-fix a full LLM-judge
+        # outage (every Phase B call raising) produced ``verdict=None`` for
+        # every row; the filter above then yielded ``pos_audited==[]`` and
+        # ``trap_audited==[]``, and the ``all_pass_b`` computation below
+        # silently returned True because neither ``pos_lost`` nor
+        # ``trap_let_through`` was positive. Gate it: require at least
+        # 80% of eligible rows to have a verdict, otherwise flip
+        # ``all_pass_b`` and print the outage category breakdown.
+        _MIN_AUDIT_COVERAGE = 0.8
+        eligible_pos = [
+            r for r in phase_b
+            if r.probe.expected_seed is not None and r.probe.context_compatible
+        ]
+        eligible_trap = [
+            r for r in phase_b
+            if r.probe.expected_seed is not None and not r.probe.context_compatible
+        ]
+        total_eligible = len(eligible_pos) + len(eligible_trap)
+        total_audited = len(pos_audited) + len(trap_audited)
+        audited_ratio = (
+            total_audited / total_eligible if total_eligible else 1.0
+        )
+        insufficient_audit = (
+            total_eligible > 0 and audited_ratio < _MIN_AUDIT_COVERAGE
+        )
+        if insufficient_audit:
+            error_counts: dict[str, int] = {}
+            for r in phase_b:
+                if r.verdict is None and r.error:
+                    category = r.error.split(":")[0]
+                    error_counts[category] = error_counts.get(category, 0) + 1
+            print()
+            print(
+                f"  ERROR: Phase B judge coverage {audited_ratio:.1%} "
+                f"({total_audited}/{total_eligible}) below threshold "
+                f"{_MIN_AUDIT_COVERAGE:.0%} — likely LLM-judge outage. "
+                f"Refusing to report OVERALL: PASS on a tiny audited "
+                f"subset. ext13 #134.",
+                file=sys.stderr,
+            )
+            for cat, n in sorted(error_counts.items(), key=lambda x: -x[1]):
+                print(f"    {cat}: {n}", file=sys.stderr)
+
         pos_kept = sum(1 for r in pos_audited if r.verdict.compatible)
         pos_lost = len(pos_audited) - pos_kept
         trap_caught = sum(1 for r in trap_audited if not r.verdict.compatible)
@@ -1810,7 +1853,14 @@ def _print_summary(
 
         # Pass criteria for phase B: every trap must be caught AND
         # every true positive must be retained.
-        all_pass_b = trap_let_through == 0 and pos_lost == 0
+        # ext13 #134: also require audit coverage >= threshold so a
+        # judge outage can't silently mint "OVERALL: PASS" with zero
+        # actual audits.
+        all_pass_b = (
+            trap_let_through == 0
+            and pos_lost == 0
+            and not insufficient_audit
+        )
 
         # Derived metric: naive vs. audit-adjusted precision on the
         # positive+trap universe. This is the number the thesis cares

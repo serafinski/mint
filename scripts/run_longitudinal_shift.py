@@ -231,7 +231,11 @@ def main(argv: list[str] | None = None) -> int:
     from src.registry.store import SkillRegistry, seed_registry
     from src.schemas.evaluation import EvaluationRecord
     from src.schemas.task import TaskState
-    from tests.evaluation.cycle_flush import flush_task_cycle_state, now_utc
+    from tests.evaluation.cycle_flush import (
+        FlushResult,
+        flush_task_cycle_state,
+        now_utc,
+    )
     from tests.evaluation.harness import _extract_result
     from tests.evaluation.snapshots import restore_clean_snapshot, take_clean_snapshot
     from tests.evaluation.tasks import ALL_TASKS
@@ -359,6 +363,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     per_task_aborted = False
     campaign_deadline_hit = False
+
+    # ext13 #125: accumulate per-task flush results so we can exit 5 when
+    # any batch failed silently. Partial flush in a shift campaign would
+    # otherwise feed the Phase A/B convergence + adaptation-verdict
+    # analyzer (analyze_longitudinal.py) with silently-incomplete data.
+    flush_results: list[FlushResult] = []
 
     for i, task in enumerate(task_sequence):
         if campaign_deadline is not None and time.monotonic() > campaign_deadline:
@@ -500,7 +510,8 @@ def main(argv: list[str] | None = None) -> int:
                 cumulative_success += 1
 
             # --- Persist per-task cycle state (Step 18.7 flush helper) ---
-            flush_task_cycle_state(
+            # ext13 #125: capture FlushResult for campaign-end exit-code.
+            fr = flush_task_cycle_state(
                 eval_store=eval_store,
                 metrics_store=metrics_store,
                 registry=registry,
@@ -510,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
                 task_events_cutoff=task_events_cutoff,
                 is_pilot=False,  # ext7 #50 — longitudinal is always non-pilot
             )
+            flush_results.append(fr)
 
             # --- Write shift marker at the cycle boundary (Step 18.8) ---
             # The marker is a synthetic cycle_events row with event_type
@@ -643,11 +655,33 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001
             pass
 
+    # ext13 #125: surface partial flush at campaign end. Same pattern as
+    # run_longitudinal.py — partial telemetry silently corrupts the
+    # downstream analyzer's Phase A/B verdicts.
+    n_bad_invocations = sum(1 for r in flush_results if not r.invocations_ok)
+    n_bad_utility = sum(1 for r in flush_results if not r.utility_scores_ok)
+    n_bad_events = sum(1 for r in flush_results if not r.events_ok)
+    partial_flush = bool(
+        flush_results and (n_bad_invocations or n_bad_utility or n_bad_events)
+    )
+    if partial_flush:
+        logger.error(
+            "ext13 #125: per-task flush partial failures detected. "
+            "invocations=%d/%d bad, utility=%d/%d bad, events=%d/%d bad. "
+            "Row 19 analysis (analyze_longitudinal.py) will see partial "
+            "telemetry; #124 may silently downgrade to proxy KL. "
+            "Investigate transient causes or re-run this campaign.",
+            n_bad_invocations, len(flush_results),
+            n_bad_utility, len(flush_results),
+            n_bad_events, len(flush_results),
+        )
+
     # ext12 #119 + #123: surface degraded-campaign outcomes as non-zero exit
     # codes so orchestrators can distinguish clean-complete from
     # partial/degraded. Priority order: campaign deadline > shift-marker
-    # missing > per-task aborts. The shift-marker-missing case is the
-    # thesis-critical one (no RQ #3 evidence) so it beats per-task aborts.
+    # missing > partial-flush > per-task aborts. The shift-marker-missing
+    # case is the thesis-critical one (no RQ #3 evidence) so it beats
+    # per-task aborts and partial flush.
     if campaign_deadline_hit:
         return 5
     shift_reached = args.shift_at <= len(records)
@@ -660,6 +694,8 @@ def main(argv: list[str] | None = None) -> int:
             "task timestamp>) before invoking analyze_longitudinal.py."
         )
         return 4
+    if partial_flush:
+        return 5
     if per_task_aborted:
         return 3
     return 0

@@ -433,8 +433,12 @@ class EvaluationHarness:
                 # ``tests.evaluation.cycle_flush.flush_task_cycle_state`` so
                 # the longitudinal scripts (which inline their own task loops)
                 # call the same code path. Never-raises.
+                # ext13 #125: the helper now returns a FlushResult. Harness
+                # partial-flush detection fires a warning log rather than
+                # an exit-code (the harness is library code, not a runner);
+                # longitudinal runners own the campaign-level exit 5.
                 from tests.evaluation.cycle_flush import flush_task_cycle_state
-                flush_task_cycle_state(
+                fr = flush_task_cycle_state(
                     eval_store=self._store,
                     metrics_store=metrics_store,
                     registry=registry,
@@ -444,6 +448,16 @@ class EvaluationHarness:
                     task_events_cutoff=task_events_cutoff,
                     is_pilot=is_pilot,  # ext7 #50
                 )
+                if not fr.all_ok:
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning(
+                        "ext13 #125: cycle_flush partial failure for task=%s "
+                        "condition=%s run_id=%s: invocations_ok=%s "
+                        "utility_scores_ok=%s events_ok=%s errors=%s",
+                        task.task_id, condition, run_id,
+                        fr.invocations_ok, fr.utility_scores_ok, fr.events_ok,
+                        fr.errors,
+                    )
 
         return records
 
