@@ -88,15 +88,31 @@ def fetch_traces(
     end: datetime,
     environment: str | None = None,
     session_ids: list[str] | None = None,
-) -> list[dict]:
+    *,
+    max_pages: int = 200,
+) -> tuple[list[dict], set[str], bool]:
     """Fetch all traces with a given name within the time window.
 
     Security audit finding #39 (2026-04-20): accepts ``environment`` and
     ``session_ids`` to scope fetches to a single campaign. Pre-fix, any
     trace in the time window with a matching name was returned,
     including smoke-test / dev runs and prior campaigns.
+
+    ext14 #139 (2026-04-21): returns the set of sessionIds that actually
+    contributed ≥1 row so ``main()`` can verify coverage vs. the
+    ``--session-ids`` request. Pre-fix, typo / retention-aged / partial
+    sessions silently dropped at line 114 with no caller-visible signal.
+
+    ext14 #140 (2026-04-21): returns a ``truncated`` bool so ``main()``
+    can refuse aggregates when the hard pagination ceiling was hit.
+    Pre-fix, the bare ``break`` at page > 200 silently dropped every row
+    past the 20k ceiling.
     """
-    traces = []
+    import logging as _lg
+
+    traces: list[dict] = []
+    contributed_sessions: set[str] = set()
+    truncated = False
     page = 1
     while True:
         params = {"name": name, "limit": 100, "page": page}
@@ -111,13 +127,16 @@ def fetch_traces(
         for t in data:
             ts = _parse_dt(t.get("timestamp"))
             if ts and start <= ts <= end:
-                if session_ids and t.get("sessionId") not in session_ids:
+                sid = t.get("sessionId")
+                if session_ids and sid not in session_ids:
                     continue
+                if sid is not None:
+                    contributed_sessions.add(sid)
                 traces.append({
                     "id": t["id"],
                     "name": t.get("name", ""),
                     "timestamp": ts,
-                    "session_id": t.get("sessionId"),
+                    "session_id": sid,
                     "latency": t.get("latency", 0) or 0,
                     "total_cost": t.get("totalCost", 0) or 0,
                     "observation_ids": t.get("observations", []),
@@ -127,10 +146,17 @@ def fetch_traces(
         if len(data) < 100:
             break
         page += 1
-        if page > 200:
+        if page > max_pages:
+            _lg.getLogger(__name__).warning(
+                "ext14 #140: fetch_traces hit pagination ceiling at page %d "
+                "(max_pages=%d, ~%d records fetched). Data beyond the ceiling "
+                "was silently dropped.",
+                page, max_pages, len(traces),
+            )
+            truncated = True
             break
 
-    return traces
+    return traces, contributed_sessions, truncated
 
 
 def fetch_observation(
@@ -553,6 +579,25 @@ def main() -> int:
              "exit 2 if total fetched traces across all agents is zero, so a "
              "silently-empty Chapter 6 T3 section is loud instead of invisible.",
     )
+    # ext14 #139 (2026-04-21): per-requested-session coverage gate.
+    parser.add_argument(
+        "--allow-partial-sessions", action="store_true",
+        help="ext14 #139: proceed when some --session-ids contributed zero "
+             "rows. Default: refuse with exit 4. Chapter 4.5 disclosure "
+             "REQUIRED.",
+    )
+    # ext14 #140 (2026-04-21): pagination truncation signal.
+    parser.add_argument(
+        "--max-pages", type=int, default=200,
+        help="ext14 #140: LangFuse pagination ceiling (default: 200 = 20k "
+             "records at 100/page). Raise for larger campaigns; expect longer "
+             "fetch and higher API cost.",
+    )
+    parser.add_argument(
+        "--allow-truncated", action="store_true",
+        help="ext14 #140: proceed when the pagination ceiling was hit. "
+             "Default: refuse with exit 5. Chapter 4.5 disclosure REQUIRED.",
+    )
     args = parser.parse_args()
 
     base_url, auth = _langfuse_client()
@@ -572,15 +617,23 @@ def main() -> int:
     print(f"Window: {start.strftime('%Y-%m-%d %H:%M')} -> {end.strftime('%Y-%m-%d %H:%M')} UTC")
 
     results: dict[str, list[dict]] = {}
+    # ext14 #139: which sessionIds contributed ≥1 row (union across agents).
+    contributed_sessions_total: set[str] = set()
+    # ext14 #140: whether any per-agent fetch hit the pagination ceiling.
+    any_truncated = False
 
     with httpx.Client(base_url=base_url, auth=auth, timeout=30.0) as client:
         for agent_name, label in AGENT_TRACE_NAMES.items():
             print(f"\nFetching '{agent_name}' traces...", end=" ", flush=True)
-            traces = fetch_traces(
+            traces, contributed, truncated = fetch_traces(
                 client, agent_name, start, end,
                 environment=args.environment,
                 session_ids=args.session_ids,
+                max_pages=args.max_pages,
             )
+            contributed_sessions_total |= contributed
+            if truncated:
+                any_truncated = True
             print(f"{len(traces)} found.", end=" ", flush=True)
 
             if not traces:
@@ -601,6 +654,44 @@ def main() -> int:
 
             results[agent_name] = trace_results
             print("done.")
+
+    # ext14 #140 (2026-04-21): pagination-truncation gate. Refuse to publish
+    # aggregates computed from a silently-truncated fetch unless the operator
+    # explicitly opts in with --allow-truncated (Chapter 4.5 disclosure).
+    if any_truncated and not args.allow_truncated:
+        print(
+            f"\nERROR: fetcher hit the {args.max_pages}-page ceiling "
+            f"(~{args.max_pages * 100:,} records). Data beyond the ceiling "
+            f"was silently dropped. Options:\n"
+            f"  (a) narrow --days window\n"
+            f"  (b) narrow --session-ids to the specific campaign\n"
+            f"  (c) raise --max-pages (tradeoff: longer fetch time + higher "
+            f"LangFuse API cost)\n"
+            f"  (d) pass --allow-truncated to proceed with undersampled "
+            f"aggregates (Chapter 4.5 disclosure REQUIRED). ext14 #140. Exit 5.",
+            file=sys.stderr,
+        )
+        return 5
+
+    # ext14 #139 (2026-04-21): per-requested-session coverage gate. Typo /
+    # retention-aged / partial-ingest session IDs silently drop at the
+    # per-trace filter; verify every requested ID actually contributed.
+    if args.session_ids:
+        requested = set(args.session_ids)
+        missing = requested - contributed_sessions_total
+        if missing and not args.allow_partial_sessions:
+            print(
+                f"\nERROR: {len(missing)}/{len(requested)} requested session "
+                f"IDs contributed zero rows: {sorted(missing)}\n"
+                f"  Likely causes: (a) typo in --session-ids, (b) LangFuse "
+                f"retention aged out the session's traces, (c) partial "
+                f"ingestion mid-campaign.\n"
+                f"  Pass --allow-partial-sessions to proceed with the "
+                f"surviving subset (Chapter 4.5 disclosure REQUIRED). "
+                f"ext14 #139. Exit 4.",
+                file=sys.stderr,
+            )
+            return 4
 
     # ext7 #47: loud-fail when no traces found — converts invisible-empty T3
     # section into an actionable error. Overridable via --allow-empty.
@@ -671,6 +762,28 @@ def main() -> int:
             file=sys.stderr,
         )
         return 4
+
+    # ext14 #139 / #140 (2026-04-21): in-band banners when overrides are used.
+    # Chapter 4.5 disclosure REQUIRED for any results that carry these banners.
+    banners: list[str] = []
+    if any_truncated and args.allow_truncated:
+        banners.append(
+            f"[TRUNCATED: {args.max_pages * 100:,}+ records — aggregates "
+            f"under-sample; Chapter 4.5 disclosure REQUIRED]"
+        )
+    if args.session_ids:
+        requested = set(args.session_ids)
+        missing = requested - contributed_sessions_total
+        if missing and args.allow_partial_sessions:
+            banners.append(
+                f"[PARTIAL SESSIONS: "
+                f"{len(requested) - len(missing)}/{len(requested)} contributed; "
+                f"missing={sorted(missing)}; Chapter 4.5 disclosure REQUIRED]"
+            )
+    if banners:
+        print()
+        for b in banners:
+            print(f"  ⚠ {b}", file=sys.stderr)
 
     print_summary(results, detail=args.detail)
 

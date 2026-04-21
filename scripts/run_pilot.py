@@ -219,6 +219,18 @@ def main() -> int:
              "Set to 0 to disable the watchdog (NOT recommended for "
              "unattended runs). Unix-only — no-op on Windows.",
     )
+    # ext14 #148 (2026-04-21): propagate FlushResult signal from the
+    # harness path. Pre-fix, Row 8 exited 0 on partial per-task cycle_flush
+    # failures because the harness logged a WARNING but did not escalate.
+    # Reuses exit code 5 from ext13 #125 (the sibling fix that landed for
+    # longitudinal runners).
+    parser.add_argument(
+        "--allow-partial-flush",
+        action="store_true",
+        help="ext14 #148: proceed with exit 0 even when per-task cycle_flush "
+             "partially failed. Default: refuse with exit 5. Chapter 4.5 "
+             "disclosure REQUIRED.",
+    )
     args = parser.parse_args()
 
     # ext7 #49: resolve the DB path + refuse silent pooling.
@@ -423,6 +435,11 @@ def main() -> int:
         print(final_summary)
         logger.info("Final summary:\n%s", final_summary)
 
+        # ext14 #148 (2026-04-21): snapshot the harness's per-task
+        # FlushResult list BEFORE the ``with`` block closes the harness.
+        # The exit-code gate at the end of main() inspects this copy.
+        harness_flush_results = list(harness.flush_results)
+
     # Flush LangFuse traces before exit
     if langfuse_handler is not None:
         try:
@@ -438,6 +455,7 @@ def main() -> int:
     # (cron, CI, downstream analyzers) can then distinguish:
     #   - 0: clean success with at least one record written
     #   - 4: zero records and no abort (filter/harness misconfig)
+    #   - 5: per-task cycle_flush partial failure (ext14 #148)
     #   - 7: watchdog fired mid-campaign (partial data persisted)
     if watchdog_aborted:
         logger.error(
@@ -454,6 +472,29 @@ def main() -> int:
             "misconfiguration, harness setup error. Exiting with code 4."
         )
         return 4
+
+    # ext14 #148 (2026-04-21): per-task cycle_flush health gate. ext13 #125
+    # wired FlushResult into the longitudinal runners but not the Row 8
+    # harness path. The harness accumulates every task's FlushResult; we
+    # snapshotted the list before the ``with`` block closed. Gate exit
+    # code on the aggregate here.
+    partial_flushes = [fr for fr in harness_flush_results if not fr.all_ok]
+    if partial_flushes:
+        logger.error(
+            "ext14 #148: %d/%d per-task cycle_flush operations partially "
+            "failed. Downstream M3 (Row 17), Pillar 3 RQ #2 (Row 18/19) "
+            "will see partial telemetry. Consider re-running or inspecting "
+            "flush errors in the log. First error sample: %s",
+            len(partial_flushes), len(harness_flush_results),
+            partial_flushes[0].errors[:3] if partial_flushes[0].errors else "<no errors recorded>",
+        )
+        if not args.allow_partial_flush:
+            logger.error(
+                "Exiting with code 5. Pass --allow-partial-flush to "
+                "proceed with exit 0 (Chapter 4.5 disclosure REQUIRED)."
+            )
+            return 5
+
     return 0
 
 

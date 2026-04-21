@@ -580,6 +580,7 @@ def run_audit(
     run_ids: list[str] | None = None,
     since: str | None = None,
     force_fresh_plan: bool = False,
+    allow_partial_runs: bool = False,
 ) -> int:
     if not db_path.exists():
         print(f"ERROR: eval DB not found at {db_path}", file=sys.stderr)
@@ -587,6 +588,44 @@ def run_audit(
 
     store = EvaluationStore(db_path=str(db_path))
     try:
+        # ext14 #143 (2026-04-21): per-requested-run_id coverage gate.
+        # Check DB-level presence of requested run_ids separately from the
+        # unlabeled-pool lookup — a typo or missing run_id silently drops
+        # from the SQL filter otherwise, producing "Nothing to audit" with
+        # exit 0.
+        if run_ids:
+            db_run_ids = {
+                r[0] for r in store._conn.execute(  # noqa: SLF001
+                    "SELECT DISTINCT run_id FROM evaluation_runs "
+                    "WHERE run_id IN ({}) AND NOT is_pilot".format(
+                        ", ".join("?" * len(run_ids))
+                    ),
+                    run_ids,
+                ).fetchall()
+            }
+            requested = set(run_ids)
+            missing = requested - db_run_ids
+            if missing and not allow_partial_runs:
+                print(
+                    f"\nERROR: {len(missing)}/{len(requested)} requested "
+                    f"run_ids are NOT present in the DB: {sorted(missing)}\n"
+                    f"  Possible causes: (a) typo in --run-ids, (b) run_id "
+                    f"naming drift, (c) run was never written.\n"
+                    f"  Pass --allow-partial-runs to proceed with the "
+                    f"surviving subset (Chapter 4.5 disclosure REQUIRED). "
+                    f"ext14 #143. Exit 4.",
+                    file=sys.stderr,
+                )
+                return 4
+            if missing and allow_partial_runs:
+                print(
+                    f"\n  ⚠ [PARTIAL RUNS: "
+                    f"{len(requested) - len(missing)}/{len(requested)} "
+                    f"contributed; missing={sorted(missing)}; "
+                    f"Chapter 4.5 disclosure REQUIRED]",
+                    file=sys.stderr,
+                )
+
         pool = fetch_unlabeled_rows(
             store._conn,  # noqa: SLF001 — internal for direct query
             conditions=conditions,
@@ -633,6 +672,31 @@ def run_audit(
             return 0
 
         if not sample:
+            # ext14 #143 (2026-04-21): distinguish "all already labeled" (a
+            # legitimate resume state) from "filter matched zero rows" (a
+            # misconfiguration). When --run-ids is scoped, check whether
+            # the scope contains any rows at all. Zero in-scope rows →
+            # exit 3 (filter wrong); non-zero in-scope rows → exit 0
+            # (genuinely all labeled).
+            if run_ids:
+                total_in_scope = store._conn.execute(  # noqa: SLF001
+                    "SELECT COUNT(*) FROM evaluation_runs "
+                    "WHERE run_id IN ({}) AND NOT is_pilot".format(
+                        ", ".join("?" * len(run_ids))
+                    ),
+                    run_ids,
+                ).fetchone()[0]
+                if total_in_scope == 0:
+                    print(
+                        f"\nERROR: --run-ids {run_ids} matched zero rows in "
+                        f"DB. Filter dropped everything — verify spelling / "
+                        f"scope. ext14 #143. Exit 3.",
+                        file=sys.stderr,
+                    )
+                    return 3
+                print(
+                    "\nNothing to audit — all in-scope rows already labeled.")
+                return 0
             print("\nNothing to audit — all strata empty or already labeled.")
             return 0
 
@@ -806,6 +870,13 @@ def main() -> int:
              "plan-file scope hash doesn't capture, or when manual plan-file "
              "edits require a forced redraw. ext12 #121.",
     )
+    # ext14 #143 (2026-04-21): per-requested-run_id coverage gate.
+    parser.add_argument(
+        "--allow-partial-runs", action="store_true",
+        help="ext14 #143: proceed when some --run-ids are not present in the "
+             "DB at all. Default: refuse with exit 4. Chapter 4.5 disclosure "
+             "REQUIRED.",
+    )
     args = parser.parse_args()
 
     if args.help_labels:
@@ -835,6 +906,7 @@ def main() -> int:
         run_ids=args.run_ids,
         since=args.since,
         force_fresh_plan=args.force_fresh_plan,
+        allow_partial_runs=args.allow_partial_runs,
     )
 
 

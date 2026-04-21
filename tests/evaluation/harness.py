@@ -195,6 +195,15 @@ class EvaluationHarness:
         self._config = config
         self._store = EvaluationStore(db_path=config.db_path)
         self._snap_id: str | None = None
+        # ext14 #148 (2026-04-21): accumulate per-task FlushResult objects
+        # across every _execute_run call on this harness instance so the
+        # Row 8 runner (``scripts/run_pilot.py``) can gate exit code on
+        # flush health. Pre-fix, harness logged per-task warnings but did
+        # not propagate the signal — Row 8 exited 0 with partial telemetry
+        # and downstream #147/ext13 #127/ext14 #144 gates fired on the
+        # resulting data without attribution.
+        from tests.evaluation.cycle_flush import FlushResult
+        self._flush_results: list[FlushResult] = []
         # ext6 #35: emit a one-time WARN listing permissive metadata-only
         # validators so the uniform-inflation disclosure is unmissable in logs.
         from tests.evaluation.tasks import warn_permissive_validators_once
@@ -311,6 +320,17 @@ class EvaluationHarness:
     @property
     def store(self) -> EvaluationStore:
         return self._store
+
+    @property
+    def flush_results(self) -> list[Any]:
+        """Per-task FlushResult objects accumulated across all runs.
+
+        ext14 #148 (2026-04-21): exposes the sticky per-task flush state
+        so Row 8 runners (``scripts/run_pilot.py``) can exit non-zero when
+        any per-task ``cycle_flush`` partially failed. Returns the live
+        list reference, not a copy — callers should not mutate it.
+        """
+        return self._flush_results
 
     def close(self) -> None:
         self._store.close()
@@ -448,6 +468,9 @@ class EvaluationHarness:
                     task_events_cutoff=task_events_cutoff,
                     is_pilot=is_pilot,  # ext7 #50
                 )
+                # ext14 #148 (2026-04-21): accumulate on the harness so
+                # Row 8 runner can gate exit code on aggregate flush health.
+                self._flush_results.append(fr)
                 if not fr.all_ok:
                     import logging as _lg
                     _lg.getLogger(__name__).warning(

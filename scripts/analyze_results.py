@@ -714,7 +714,7 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
         print(line)
 
 
-def print_token_cost_summary(conn: duckdb.DuckDBPyConnection) -> None:
+def print_token_cost_summary(conn: duckdb.DuckDBPyConnection) -> bool:
     """Token cost per condition (from backfilled LangFuse data).
 
     Security audit finding #100 (2026-04-19, ext10): pre-fix the
@@ -728,6 +728,14 @@ def print_token_cost_summary(conn: duckdb.DuckDBPyConnection) -> None:
     proposal-correct denominator) AND ``Avg/Nonzero`` (filtered, the
     pre-fix value, kept as a diagnostic). Chapter 6 M4 cites the
     all-rows column.
+
+    ext14 #149 (2026-04-21): signature now returns ``bool``. Returns
+    False when ALL JIT conditions have <50% non-zero ``token_cost``
+    ratio — this detects campaigns where Row 11 backfill was skipped
+    or silently failed (ext14 #141 pagination truncation, ext12 #122
+    zero-generations, ext14 #145 partial CAMPAIGN_RUN_IDS). Pre-fix,
+    Row 17 printed uniform zeros and exited 0, silently manufacturing
+    infinite pro-JIT cost efficiency.
     """
     rows = conn.execute(
         f"""
@@ -768,6 +776,31 @@ def print_token_cost_summary(conn: duckdb.DuckDBPyConnection) -> None:
     )
     for line in lines:
         print(line)
+
+    # ext14 #149 (2026-04-21): M4 silent-zero gate. Static's token_cost=0
+    # is legitimate (no LLM calls in the retrieval path), so exempt it.
+    # JIT conditions MUST have a meaningful fraction of rows with non-zero
+    # cost — if every JIT condition is <50% non-zero, Row 11 backfill did
+    # not run cleanly, and the M4 headline is a silent zero lie.
+    jit_conditions = {"full", "no_verification", "no_optimization"}
+    by_cond = {r[0]: (int(r[4] or 0), int(r[5] or 0)) for r in rows}
+    jit_ratios: list[float] = []
+    for cond in jit_conditions:
+        nonzero, total = by_cond.get(cond, (0, 0))
+        if total > 0:
+            jit_ratios.append(nonzero / total)
+    if not jit_ratios or max(jit_ratios) < 0.5:
+        ratios_str = ", ".join(f"{r:.2f}" for r in jit_ratios) or "(no JIT rows)"
+        print(
+            f"\n  ⚠ M4 silent zero: JIT conditions have non-zero ratios "
+            f"[{ratios_str}] (max < 0.5). Likely cause: Row 11 not run, "
+            f"or ext14 #141 pagination truncation / ext12 #122 partial-runs "
+            f"/ ext14 #145 partial CAMPAIGN_RUN_IDS silently zeroed this "
+            f"campaign's costs. ext14 #149.",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _gini_coefficient(counts: list[int]) -> float:
@@ -973,6 +1006,38 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
             f"\n  ⚠ M3 partial coverage: no invocation_events for "
             f"{len(missing_conditions)}/{len(CONDITIONS)} conditions: "
             f"{', '.join(missing_conditions)}",
+            file=sys.stderr,
+        )
+        return False
+
+    # ext14 #147 (2026-04-21): per-(condition, run_id) M3 completeness
+    # check. ext13 #128's gate above fires only when an ENTIRE CONDITION
+    # has no invocations. A complete evaluation_runs shape (5 runs/cond)
+    # paired with invocation_events for only 1 run/cond silently passes
+    # that gate — Chapter 6's "N runs" column lies. Sibling of ext14 #144
+    # for M3. Cross-check per-condition invocation coverage against the
+    # expected per-condition run_id count in evaluation_runs.
+    expected_per_condition = dict(conn.execute(
+        f"""
+        SELECT condition, COUNT(DISTINCT run_id)
+        FROM evaluation_runs
+        WHERE NOT is_pilot{_SCOPE_SQL}
+        GROUP BY condition
+        """
+    ).fetchall())
+    per_run_gaps: list[tuple[str, int, int]] = []
+    for cond in CONDITIONS:
+        expected_n = expected_per_condition.get(cond, 0)
+        present_n = len(condition_ginis.get(cond, []))
+        if expected_n > 0 and present_n < expected_n:
+            per_run_gaps.append((cond, present_n, expected_n))
+    if per_run_gaps:
+        gap_str = "; ".join(
+            f"{c}: {p}/{e} run_ids have invocations"
+            for c, p, e in per_run_gaps
+        )
+        print(
+            f"\n  ⚠ M3 partial per-run coverage: {gap_str} (ext14 #147)",
             file=sys.stderr,
         )
         return False
@@ -1361,14 +1426,66 @@ def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
     # in SOME conditions (e.g., only `full`) passes the rows-exist gate
     # above but destroys the JIT-vs-static contamination comparison.
     # Flag missing conditions so main() exits 7 on partial M2 coverage.
+    #
+    # ext14 #146 (2026-04-21): M2 is JIT-only per proposal §M2 — "fraction
+    # of generated artifacts that contain fabricated elements". Static rows
+    # have no generated artifacts by definition (they execute pre-seeded
+    # capabilities), so Row 16's default flow cannot label them. Dropping
+    # "static" from the expected-conditions set restores satisfiability of
+    # the contract; Chapter 4.5 discloses that static is structurally
+    # excluded from contamination auditing.
     present_conditions = {r[0] for r in rows}
-    expected_conditions = set(CONDITIONS)
+    expected_conditions = set(CONDITIONS) - {"static"}
     missing_conditions = expected_conditions - present_conditions
     if missing_conditions:
         print(
             f"\n  ⚠ M2 partial coverage: labels missing for "
             f"{len(missing_conditions)}/{len(expected_conditions)} conditions: "
-            f"{sorted(missing_conditions)}",
+            f"{sorted(missing_conditions)} (static is JIT-only-excluded "
+            f"per proposal §M2; ext14 #146)",
+            file=sys.stderr,
+        )
+        return False
+
+    # ext14 #144 (2026-04-21): per-(condition, run_id) M2 completeness
+    # check. ext13 #132's gate above fires only when an ENTIRE CONDITION
+    # has no labels. A campaign with 5 runs/condition but labels for only
+    # 1 run/condition passes that gate because every JIT condition has
+    # ≥1 labeled row. Compounds with ext14 #143 (audit_contamination.py
+    # fail-open on per-run coverage) to silently half the effective M2
+    # sample. Check per-(condition, run_id) now.
+    per_cond_run = conn.execute(
+        f"""
+        SELECT condition, run_id, COUNT(*) AS n_labeled
+        FROM evaluation_runs
+        WHERE human_label IS NOT NULL
+          AND NOT is_pilot{_SCOPE_SQL}
+        GROUP BY condition, run_id
+        """
+    ).fetchall()
+    expected_per_condition = dict(conn.execute(
+        f"""
+        SELECT condition, COUNT(DISTINCT run_id)
+        FROM evaluation_runs
+        WHERE NOT is_pilot{_SCOPE_SQL}
+        GROUP BY condition
+        """
+    ).fetchall())
+    present_per_cond: dict[str, set[str]] = {}
+    for cond, rid, _n in per_cond_run:
+        present_per_cond.setdefault(cond, set()).add(rid)
+    per_run_gaps: list[tuple[str, int, int]] = []
+    for cond in (set(CONDITIONS) - {"static"}):
+        expected_n = expected_per_condition.get(cond, 0)
+        present_n = len(present_per_cond.get(cond, set()))
+        if expected_n > 0 and present_n < expected_n:
+            per_run_gaps.append((cond, present_n, expected_n))
+    if per_run_gaps:
+        gap_str = "; ".join(
+            f"{c}: {p}/{e} run_ids labeled" for c, p, e in per_run_gaps
+        )
+        print(
+            f"\n  ⚠ M2 partial per-run coverage: {gap_str} (ext14 #144)",
             file=sys.stderr,
         )
         return False
@@ -1564,7 +1681,11 @@ def main() -> int:
     print_failure_breakdown(failures, condition_totals)
 
     # ── Token costs ──────────────────────────────────────────────────────
-    print_token_cost_summary(conn)
+    # ext14 #149 (2026-04-21): capture return value so missing_metrics
+    # below can flag silent-zero M4 campaigns (Row 11 skipped / truncated /
+    # partial) and exit 7 rather than emitting infinite pro-JIT manufactured
+    # evidence.
+    m4_ok = print_token_cost_summary(conn)
 
     # ── Latency summary ──────────────────────────────────────────────────
     print_latency_summary(conn)
@@ -1574,8 +1695,8 @@ def main() -> int:
     # See print_classification_accuracy docstring for framing rationale.
     print_classification_accuracy(conn)
 
-    # ext13 #126 / #128 / #132: accumulate thesis-critical metric
-    # absences so we can exit 7 at the bottom rather than silently
+    # ext13 #126 / #128 / #132 + ext14 #149: accumulate thesis-critical
+    # metric absences so we can exit 7 at the bottom rather than silently
     # exiting 0 with the section skipped.
     missing_metrics: list[str] = []
 
@@ -1588,6 +1709,13 @@ def main() -> int:
     # column is unpopulated.
     if not print_contamination_rate(conn):
         missing_metrics.append("M2 (Contamination)")
+
+    # ext14 #149: M4 silent-zero gate sits in the same missing-metrics
+    # family as M2 / M3. Chapter 6 M4 is thesis-critical Pillar 3 Context
+    # Economy evidence; a uniform-zero campaign passes Row 17 without this
+    # gate (pre-fix behaviour).
+    if not m4_ok:
+        missing_metrics.append("M4 (Token Cost / Pillar 3 Context Economy)")
 
     conn.close()
 

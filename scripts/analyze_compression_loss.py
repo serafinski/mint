@@ -469,6 +469,19 @@ def main() -> int:
         "--since", default=None,
         help="Include only rows with timestamp >= SINCE.",
     )
+    # ext14 #142 (2026-04-21): per-requested-run_id coverage gate.
+    parser.add_argument(
+        "--allow-partial-runs", action="store_true",
+        help="ext14 #142: proceed when some --run-ids are not present in the "
+             "DB at all. Default: refuse with exit 4. Chapter 4.5 disclosure "
+             "REQUIRED.",
+    )
+    parser.add_argument(
+        "--allow-empty", action="store_true",
+        help="ext14 #142: treat a zero-row filtered result as success (exit 0). "
+             "Default: when --run-ids is passed and the filter produces zero "
+             "rows, exit 2 (distinguishes typo from genuine zero-failures).",
+    )
     args = parser.parse_args()
 
     db_path = Path(args.db)
@@ -498,13 +511,68 @@ def main() -> int:
             run_ids=args.run_ids,
             since=args.since,
         )
+        # ext14 #142 (2026-04-21): check DB-level presence of requested
+        # run_ids separately from failure presence. A valid run_id with
+        # zero failures is legitimate; a typo / missing run_id silently
+        # drops from the filter with no visible signal.
+        db_run_ids: set[str] = set()
+        if args.run_ids:
+            db_run_ids = {
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT run_id FROM evaluation_runs "
+                    "WHERE run_id IN ({}) AND NOT is_pilot".format(
+                        ", ".join("?" * len(args.run_ids))
+                    ),
+                    args.run_ids,
+                ).fetchall()
+            }
     finally:
         conn.close()
+
+    # ext14 #142 (2026-04-21): per-requested-run_id coverage gate. A typo
+    # drops silently from the SQL filter otherwise.
+    if args.run_ids:
+        requested = set(args.run_ids)
+        missing = requested - db_run_ids
+        if missing and not args.allow_partial_runs:
+            print(
+                f"\nERROR: {len(missing)}/{len(requested)} requested run_ids "
+                f"are NOT present in the DB: {sorted(missing)}\n"
+                f"  Likely causes: (a) typo in --run-ids, (b) run_id naming "
+                f"drift, (c) run was never written.\n"
+                f"  Pass --allow-partial-runs to proceed with the surviving "
+                f"subset (Chapter 4.5 disclosure REQUIRED). ext14 #142. Exit 4.",
+                file=sys.stderr,
+            )
+            return 4
+        if missing and args.allow_partial_runs:
+            print(
+                f"\n  ⚠ [PARTIAL RUNS: {len(requested) - len(missing)}"
+                f"/{len(requested)} contributed; missing={sorted(missing)}; "
+                f"Chapter 4.5 disclosure REQUIRED]",
+                file=sys.stderr,
+            )
 
     print(f"Loaded {len(rows)} failure rows from {db_path}")
     if args.condition:
         print(f"Filtered to condition: {args.condition}")
     if not rows:
+        # ext14 #142 (2026-04-21): distinguish "filter dropped everything"
+        # from "campaign genuinely had no Tier 3 compression failures".
+        # When --run-ids is scoped and every requested run exists in the
+        # DB but produced zero failure rows, that's a legitimate clean
+        # result. When the filter matches zero rows and the caller hasn't
+        # opted in via --allow-empty, surface it as an error.
+        if args.run_ids and not args.allow_empty:
+            print(
+                f"\nERROR: zero failure rows for --run-ids {args.run_ids}. "
+                f"Either the filter dropped all matching runs (typo?) or "
+                f"the campaign genuinely had no Tier 3 compression failures. "
+                f"Pass --allow-empty to treat zero-rows as success (exit 0); "
+                f"otherwise exit 2. ext14 #142.",
+                file=sys.stderr,
+            )
+            return 2
         print("No failure rows found — nothing to classify.")
         return 0
 

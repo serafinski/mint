@@ -67,16 +67,47 @@ def _parse_dt(s: str | None) -> datetime | None:
 
 
 def fetch_all_generations(
-    base_url: str, auth: httpx.Auth, start: datetime, end: datetime
-) -> list[dict]:
-    """Fetch all GENERATION observations within the time window via REST API."""
-    generations = []
+    base_url: str,
+    auth: httpx.Auth,
+    start: datetime,
+    end: datetime,
+    *,
+    max_pages: int = 500,
+) -> tuple[list[dict], bool]:
+    """Fetch all GENERATION observations within the time window via REST API.
+
+    ext14 #141 (2026-04-21): applies server-side ``fromStartTime`` /
+    ``toStartTime`` filters so the 50k-page budget is spent on in-window
+    observations only. Pre-fix, the request was unscoped and the 50k
+    ceiling could be burned on CLI traces / prior campaigns / other
+    projects on the same LangFuse instance before any in-window rows
+    were reached, silently producing spurious "zero generations" for
+    runs whose data fell past the ceiling.
+
+    Returns ``(generations, truncated)`` — ``truncated`` is True when the
+    pagination ceiling was hit. Pre-fix, truncation was silent and
+    downstream per-run coverage gates (ext12 #122, ext13 #130) fired
+    spuriously while misattributing the cause to retention.
+    """
+    import logging as _lg
+
+    generations: list[dict] = []
+    truncated = False
     page = 1
     with httpx.Client(base_url=base_url, auth=auth, timeout=30.0) as client:
         while True:
             resp = client.get(
                 "/api/public/observations",
-                params={"type": "GENERATION", "limit": 100, "page": page},
+                params={
+                    "type": "GENERATION",
+                    "limit": 100,
+                    "page": page,
+                    # ext14 #141: server-side time scoping — reduces false-
+                    # positive truncation by whatever fraction of the haystack
+                    # is out-of-window.
+                    "fromStartTime": start.isoformat(),
+                    "toStartTime": end.isoformat(),
+                },
             )
             resp.raise_for_status()
             data = resp.json().get("data", [])
@@ -104,9 +135,16 @@ def fetch_all_generations(
             if len(data) < 100:
                 break
             page += 1
-            if page > 500:  # safety limit
+            if page > max_pages:
+                _lg.getLogger(__name__).warning(
+                    "ext14 #141: fetch_all_generations hit pagination ceiling "
+                    "at page %d (max_pages=%d, ~%d observations fetched). "
+                    "Data beyond the ceiling was silently dropped.",
+                    page, max_pages, len(generations),
+                )
+                truncated = True
                 break
-    return generations
+    return generations, truncated
 
 
 # ── Evaluation DB queries ────────────────────────────────────────────────────
@@ -760,6 +798,21 @@ def main() -> int:
              "considered adequately covered (default 0.5). Below this, "
              "exit 10 unless --allow-under-coverage is passed. ext13 #130.",
     )
+    # ext14 #141 (2026-04-21): pagination truncation signal + server-side
+    # time filter. Prevents silent 50k-row drops when the LangFuse instance
+    # has accumulated history larger than the ceiling.
+    parser.add_argument(
+        "--max-pages", type=int, default=500,
+        help="ext14 #141: LangFuse pagination ceiling (default: 500 = 50k "
+             "observations at 100/page). Raise for larger campaigns; expect "
+             "longer fetch and higher API cost.",
+    )
+    parser.add_argument(
+        "--allow-truncated", action="store_true",
+        help="ext14 #141: proceed with Row 11 backfill when the pagination "
+             "ceiling was hit. Default: refuse with exit 5. Chapter 4.5 "
+             "disclosure REQUIRED.",
+    )
     args = parser.parse_args()
 
     print("Connecting to LangFuse REST API...")
@@ -791,8 +844,42 @@ def main() -> int:
 
     # Fetch LangFuse data
     print("Fetching GENERATION observations from LangFuse...")
-    generations = fetch_all_generations(base_url, auth, start, end)
+    generations, truncated = fetch_all_generations(
+        base_url, auth, start, end, max_pages=args.max_pages,
+    )
     print(f"  Found {len(generations)} generations in evaluation window.")
+
+    # ext14 #141 (2026-04-21): pagination-truncation gate. Refuse to proceed
+    # with M4 backfill when the fetch hit the hard ceiling — silently
+    # truncated pages produce spurious "zero generations for run X" errors
+    # (ext12 #122) and per-task under-coverage (ext13 #130) while the real
+    # cause is truncation rather than retention.
+    if truncated and not args.allow_truncated:
+        print(
+            f"\nERROR: fetch_all_generations hit the {args.max_pages}-page "
+            f"ceiling (~{args.max_pages * 100:,} observations). Data beyond "
+            f"the ceiling was silently dropped. This can produce spurious "
+            f"'zero generations for run X' errors (ext12 #122) and per-task "
+            f"under-coverage (ext13 #130) when the real cause is truncation, "
+            f"NOT retention.\n"
+            f"  Options:\n"
+            f"    (a) narrow the eval window (--since / shorter campaign)\n"
+            f"    (b) raise --max-pages (tradeoff: longer fetch + higher API cost)\n"
+            f"    (c) verify server-side time filter is applied "
+            f"(fromStartTime/toStartTime)\n"
+            f"    (d) pass --allow-truncated to proceed with undersampled M4\n"
+            f"       (Chapter 4.5 disclosure REQUIRED). ext14 #141. Exit 5.",
+            file=sys.stderr,
+        )
+        conn.close()
+        return 5
+    if truncated and args.allow_truncated:
+        print(
+            f"\n  ⚠ [TRUNCATED: {args.max_pages * 100:,}+ observations] — "
+            f"M4 numbers under-report. Chapter 4.5 disclosure REQUIRED. "
+            f"ext14 #141.\n",
+            file=sys.stderr,
+        )
 
     if not generations:
         # Security audit finding #36 (2026-04-20): flipped from

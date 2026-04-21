@@ -161,8 +161,16 @@ def test_scoping_convention_uses_dynamic_discovery_not_fixed_literal():
     adapting automatically to any ``--n-runs`` value.
     """
     text = RUN_SHEET.read_text()
-    # Must have the dynamic-discovery subshell.
-    assert 'SELECT DISTINCT run_id FROM evaluation_runs' in text, (
+    # Must have the dynamic-discovery subshell. ext14 #145 (2026-04-21):
+    # the SELECT switched from ``SELECT DISTINCT run_id`` to a GROUP BY /
+    # HAVING COUNT(*) completeness filter so partial/aborted run_ids
+    # don't silently enter $CAMPAIGN_RUN_IDS. Either the pre-fix DISTINCT
+    # form or the post-#145 GROUP BY form satisfies the dynamic-discovery
+    # requirement tested here.
+    assert (
+        "SELECT DISTINCT run_id FROM evaluation_runs" in text
+        or "FROM evaluation_runs\n    WHERE NOT is_pilot\n    GROUP BY run_id" in text
+    ), (
         "run_sheet.md scoping convention must populate CAMPAIGN_RUN_IDS via a "
         "dynamic DB query, not a literal example — see thesis-alignment audit "
         "2026-04-20 for the 4-vs-20 silent-scope-to-20%-of-campaign hazard."
@@ -170,6 +178,13 @@ def test_scoping_convention_uses_dynamic_discovery_not_fixed_literal():
     assert "NOT is_pilot" in text, (
         "The CAMPAIGN_RUN_IDS discovery query must filter `WHERE NOT is_pilot` "
         "so Row 7 smoke-pilot rows don't contaminate the Phase-4 campaign scope."
+    )
+    # ext14 #145 (2026-04-21): the discovery must carry a completeness
+    # filter so partial/aborted runs don't silently enter scope.
+    assert "HAVING COUNT(" in text, (
+        "ext14 #145: CAMPAIGN_RUN_IDS discovery SQL must include a "
+        "`HAVING COUNT(*)` completeness filter so partial/aborted run_ids "
+        "don't silently enter downstream rows 14/16/17."
     )
     # MUST NOT carry the original 4-id fixed-literal example.
     assert '"full_00_abc123 no_verification_00_def456' not in text, (

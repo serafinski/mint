@@ -635,7 +635,7 @@ from unittest.mock import MagicMock
 import scripts.analyze_tier2_probes as atp
 
 atp._langfuse_client = lambda: ("http://stub", MagicMock())
-atp.fetch_tier2_events = lambda *a, **kw: []
+atp.fetch_tier2_events = lambda *a, **kw: ([], set(), False)  # ext14 #139/#140
 
 import httpx
 httpx.Client = MagicMock()
@@ -661,7 +661,7 @@ from unittest.mock import MagicMock
 import scripts.analyze_tier2_probes as atp
 
 atp._langfuse_client = lambda: ("http://stub", MagicMock())
-atp.fetch_tier2_events = lambda *a, **kw: []
+atp.fetch_tier2_events = lambda *a, **kw: ([], set(), False)  # ext14 #139/#140
 
 import httpx
 httpx.Client = MagicMock()

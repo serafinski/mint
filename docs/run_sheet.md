@@ -74,14 +74,45 @@ Every Row below that reads `data/eval/metrics.duckdb` or a longitudinal DB MUST 
 ```bash
 # 20 run_ids from this Phase-4 campaign (4 conditions × 5 runs).
 # Runs AFTER Row 8 completes; reads $CAMPAIGN_DB set in the isolation block above.
+#
+# ext14 #145 (2026-04-21): add HAVING COUNT(*) >= :expected_rows_per_run
+# AND COUNT(DISTINCT task_id) = :expected_tasks completeness filter so
+# partial/aborted run_ids don't silently enter $CAMPAIGN_RUN_IDS. Without
+# this, a watchdog-aborted stub run written alongside the real campaign
+# (see ext12 #115) contributes as if it were a complete 20-task run and
+# drags per-condition averages. Mirrors ext12 #117's completeness filter
+# for the longitudinal selectors below.
+export EXPECTED_ROWS_PER_RUN=20      # --all-tasks (T01-T20) × 1 row/task-run
+export EXPECTED_TASKS_PER_RUN=20     # one distinct task_id per row
 export CAMPAIGN_RUN_IDS="$(uv run python -c "
-import duckdb
+import duckdb, sys
 conn = duckdb.connect('$CAMPAIGN_DB')
-ids = [r[0] for r in conn.execute(
-    'SELECT DISTINCT run_id FROM evaluation_runs '
-    'WHERE NOT is_pilot ORDER BY run_id'
-).fetchall()]
-print(' '.join(ids))
+rows = conn.execute('''
+    SELECT run_id, COUNT(*) AS n_rows, COUNT(DISTINCT task_id) AS n_tasks
+    FROM evaluation_runs
+    WHERE NOT is_pilot
+    GROUP BY run_id
+    HAVING COUNT(*) >= ${EXPECTED_ROWS_PER_RUN}
+       AND COUNT(DISTINCT task_id) = ${EXPECTED_TASKS_PER_RUN}
+    ORDER BY run_id
+''').fetchall()
+if not rows:
+    sys.exit('ERROR: zero complete run_ids in \$CAMPAIGN_DB. Lower '
+             'EXPECTED_ROWS_PER_RUN/EXPECTED_TASKS_PER_RUN, or re-run Row 8.')
+# Sanity-report any run_ids that were dropped for incompleteness.
+dropped = conn.execute('''
+    SELECT run_id, COUNT(*) AS n_rows, COUNT(DISTINCT task_id) AS n_tasks
+    FROM evaluation_runs WHERE NOT is_pilot
+    GROUP BY run_id
+    HAVING COUNT(*) < ${EXPECTED_ROWS_PER_RUN}
+        OR COUNT(DISTINCT task_id) < ${EXPECTED_TASKS_PER_RUN}
+''').fetchall()
+if dropped:
+    print(f'WARNING: dropped {len(dropped)} partial run_id(s) from '
+          f'CAMPAIGN_RUN_IDS (ext14 #145):', file=sys.stderr)
+    for rid, n, t in dropped:
+        print(f'  {rid}: {n} rows, {t} distinct tasks', file=sys.stderr)
+print(' '.join(r[0] for r in rows))
 ")"
 
 # LangFuse session_id == DuckDB run_id (harness.py:396) — reuse the run_ids.

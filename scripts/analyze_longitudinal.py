@@ -794,9 +794,19 @@ def main() -> int:
     # on a single row of signal across the whole campaign; compute a
     # coverage ratio and refuse below the threshold unless the user
     # opts in via --allow-sparse-signal.
+    #
+    # ext14 #150 (2026-04-21): swap ``cumulative_invocations`` →
+    # ``incremental_invocations``. ``cumulative_invocations`` is a running
+    # snapshot — once any cycle lands an invocation, every subsequent
+    # snapshot carries that event forward, so a 40-cycle DB with one
+    # cycle-1 invocation reported ``cycles_with_signal=40/40`` and passed
+    # the gate that was built to reject exactly that case. The
+    # ``incremental_invocations`` dict holds only *this cycle's* new
+    # invocations → empty on a cycle with no new events → falsy → not
+    # counted as "signal". Restores ext13 #127's intended semantics.
     cycles_with_signal = sum(
         1 for c in cycles
-        if c.get("cumulative_invocations")
+        if c.get("incremental_invocations")
         or c.get("utility_scores")
         or c.get("events")
     )

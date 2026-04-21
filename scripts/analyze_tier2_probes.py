@@ -164,7 +164,8 @@ def fetch_tier2_events(
     event_names: tuple[str, ...],
     environment: str | None,
     session_ids: list[str] | None = None,
-) -> list[dict]:
+    max_pages: int = 200,
+) -> tuple[list[dict], set[str], bool]:
     """Fetch LangFuse EVENT-type observations matching our Tier 2 names.
 
     Security audit finding #42 (2026-04-20): accepts ``session_ids`` to
@@ -172,10 +173,19 @@ def fetch_tier2_events(
     Concurrent production runs landing in the same time window would
     otherwise cross-contaminate.
 
+    ext14 #139 (2026-04-21): returns contributed sessionIds so ``main()``
+    can verify per-requested-session coverage. ext14 #140: returns a
+    ``truncated`` bool so the caller can refuse aggregates when the hard
+    pagination ceiling was hit.
+
     The REST API's ``/api/public/observations`` endpoint supports ``name`` +
     ``type`` filters; we iterate over event_names and paginate.
     """
+    import logging as _lg
+
     events: list[dict] = []
+    contributed_sessions: set[str] = set()
+    truncated = False
     for name in event_names:
         page = 1
         while True:
@@ -195,22 +205,34 @@ def fetch_tier2_events(
             for obs in data:
                 ts = _parse_dt(obs.get("startTime") or obs.get("timestamp"))
                 if ts and start <= ts <= end:
-                    if session_ids:
-                        # Session id may live on the observation or its
-                        # parent trace; LangFuse puts it under "trace".
-                        sid = (
-                            (obs.get("trace") or {}).get("sessionId")
-                            or obs.get("sessionId")
-                        )
-                        if sid not in session_ids:
-                            continue
+                    # Session id may live on the observation or its parent
+                    # trace; LangFuse puts it under "trace".
+                    sid = (
+                        (obs.get("trace") or {}).get("sessionId")
+                        or obs.get("sessionId")
+                    )
+                    if session_ids and sid not in session_ids:
+                        continue
+                    if sid is not None:
+                        contributed_sessions.add(sid)
                     events.append(obs)
             if len(data) < 100:
                 break
             page += 1
-            if page > 200:
+            if page > max_pages:
+                _lg.getLogger(__name__).warning(
+                    "ext14 #140: fetch_tier2_events hit pagination ceiling at "
+                    "page %d (max_pages=%d, ~%d records fetched, name=%s). "
+                    "Data beyond the ceiling was silently dropped.",
+                    page, max_pages, len(events), name,
+                )
+                truncated = True
                 break
-    return events
+    # ext14 #139 / #140 (2026-04-21): return contributed-session set and
+    # truncation flag for caller-side coverage + ceiling gates. See ext14
+    # audit #139 (partial-session fail-open) and #140 (silent pagination
+    # truncation at 20k rows) — both previously dropped data silently.
+    return events, contributed_sessions, truncated
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +471,25 @@ def main() -> int:
              "Mirrors ext7 #47 for analyze_context_utilization.py. "
              "ext13 #138.",
     )
+    # ext14 #139 (2026-04-21): per-requested-session coverage gate.
+    parser.add_argument(
+        "--allow-partial-sessions", action="store_true",
+        help="ext14 #139: proceed when some --session-ids contributed zero "
+             "events. Default: refuse with exit 4. Chapter 4.5 disclosure "
+             "REQUIRED.",
+    )
+    # ext14 #140 (2026-04-21): pagination truncation signal.
+    parser.add_argument(
+        "--max-pages", type=int, default=200,
+        help="ext14 #140: LangFuse pagination ceiling per event name "
+             "(default: 200 = 20k records at 100/page). Raise for larger "
+             "campaigns; expect longer fetch and higher API cost.",
+    )
+    parser.add_argument(
+        "--allow-truncated", action="store_true",
+        help="ext14 #140: proceed when the pagination ceiling was hit. "
+             "Default: refuse with exit 5. Chapter 4.5 disclosure REQUIRED.",
+    )
     args = parser.parse_args()
 
     try:
@@ -471,14 +512,51 @@ def main() -> int:
     )
 
     with httpx.Client(base_url=host, auth=auth, timeout=30.0) as client:
-        events = fetch_tier2_events(
+        events, contributed_sessions, truncated = fetch_tier2_events(
             client,
             start,
             end,
             event_names=event_names,
             environment=args.environment,
             session_ids=args.session_ids,
+            max_pages=args.max_pages,
         )
+
+    # ext14 #140 (2026-04-21): pagination-truncation gate. Refuse aggregates
+    # computed from a silently-truncated fetch unless the operator opts in
+    # with --allow-truncated (Chapter 4.5 disclosure required).
+    if truncated and not args.allow_truncated:
+        print(
+            f"\nERROR: fetch_tier2_events hit the {args.max_pages}-page "
+            f"ceiling (~{args.max_pages * 100:,} records). Data beyond the "
+            f"ceiling was silently dropped. Options:\n"
+            f"  (a) narrow --days window\n"
+            f"  (b) narrow --session-ids to the specific campaign\n"
+            f"  (c) raise --max-pages (tradeoff: longer fetch + higher API cost)\n"
+            f"  (d) pass --allow-truncated to proceed with undersampled "
+            f"aggregates (Chapter 4.5 disclosure REQUIRED). ext14 #140. Exit 5.",
+            file=sys.stderr,
+        )
+        return 5
+
+    # ext14 #139 (2026-04-21): per-requested-session coverage gate. Verify
+    # every requested session ID actually contributed ≥1 event.
+    if args.session_ids:
+        requested = set(args.session_ids)
+        missing = requested - contributed_sessions
+        if missing and not args.allow_partial_sessions:
+            print(
+                f"\nERROR: {len(missing)}/{len(requested)} requested session "
+                f"IDs contributed zero events: {sorted(missing)}\n"
+                f"  Likely causes: (a) typo in --session-ids, (b) LangFuse "
+                f"retention aged out the session's events, (c) partial "
+                f"ingestion mid-campaign.\n"
+                f"  Pass --allow-partial-sessions to proceed with the "
+                f"surviving subset (Chapter 4.5 disclosure REQUIRED). "
+                f"ext14 #139. Exit 4.",
+                file=sys.stderr,
+            )
+            return 4
 
     # ext13 #138: refuse empty fetch unless --allow-empty is set. An
     # empty fetch usually indicates filter/window misconfiguration
@@ -504,6 +582,26 @@ def main() -> int:
         return 2
 
     print(f"Fetched {len(events)} events.\n")
+
+    # ext14 #139 / #140 (2026-04-21): in-band banners when overrides are used.
+    # Chapter 4.5 disclosure REQUIRED for any results that carry these banners.
+    if truncated and args.allow_truncated:
+        print(
+            f"  ⚠ [TRUNCATED: {args.max_pages * 100:,}+ records — aggregates "
+            f"under-sample; Chapter 4.5 disclosure REQUIRED]",
+            file=sys.stderr,
+        )
+    if args.session_ids:
+        _requested = set(args.session_ids)
+        _missing = _requested - contributed_sessions
+        if _missing and args.allow_partial_sessions:
+            print(
+                f"  ⚠ [PARTIAL SESSIONS: "
+                f"{len(_requested) - len(_missing)}/{len(_requested)} "
+                f"contributed; missing={sorted(_missing)}; "
+                f"Chapter 4.5 disclosure REQUIRED]",
+                file=sys.stderr,
+            )
 
     bd = aggregate(events)
     render_table(bd, include_pass=args.include_pass)

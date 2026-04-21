@@ -62,7 +62,9 @@ def test_default_environment_matches_runner_emission_convention(monkeypatch):
 
     def _capture_env(*args, **kwargs):
         captured["environment"] = kwargs.get("environment")
-        return []
+        # ext14 #139 / #140 (2026-04-21): fetch_traces now returns
+        # (traces, contributed_sessions, truncated).
+        return [], set(), False
 
     monkeypatch.setattr(acu, "fetch_traces", _capture_env)
     monkeypatch.setattr(acu, "print_summary", lambda *a, **kw: None)
@@ -108,7 +110,8 @@ def test_fails_loud_on_zero_traces_across_all_agents(capsys, monkeypatch):
         "get": _StubHttpx.get,
         "Client": _StubClient,
     }))
-    monkeypatch.setattr(acu, "fetch_traces", lambda *a, **kw: [])
+    # ext14 #139 / #140: fetch_traces returns (traces, contributed, truncated).
+    monkeypatch.setattr(acu, "fetch_traces", lambda *a, **kw: ([], set(), False))
 
     # Invoke main with only the required defaults.
     monkeypatch.setattr(sys, "argv", ["analyze_context_utilization.py"])
@@ -142,7 +145,8 @@ def test_allow_empty_suppresses_loud_fail(capsys, monkeypatch):
         "get": lambda *a, **k: type("R", (), {"raise_for_status": lambda self: None})(),
         "Client": _StubClient,
     }))
-    monkeypatch.setattr(acu, "fetch_traces", lambda *a, **kw: [])
+    # ext14 #139 / #140: fetch_traces returns (traces, contributed, truncated).
+    monkeypatch.setattr(acu, "fetch_traces", lambda *a, **kw: ([], set(), False))
     monkeypatch.setattr(acu, "print_summary", lambda *a, **kw: None)
 
     monkeypatch.setattr(sys, "argv", ["analyze_context_utilization.py", "--allow-empty"])

@@ -266,11 +266,23 @@ def test_analyze_longitudinal_exits_5_on_shift_db_without_marker(tmp_path):
     # which the new proposal-literal-KL gate rejects with exit 6 before
     # reaching the ext12 #123 shift-marker check. Pass --allow-proxy-kl
     # so this test continues to exercise #123's code path.
+    #
+    # ext14 #150 (2026-04-21): the fixture seeds ONE invocation_event at
+    # cycle 1 but no utility/events in the remaining 39 cycles. Pre-#150
+    # the sparse-signal gate read `cumulative_invocations`, which carried
+    # the single event forward snapshot-by-snapshot and reported 40/40
+    # cycles-with-signal, letting the test reach the shift-marker gate
+    # cleanly. Post-#150 the gate reads `incremental_invocations`, so
+    # only cycle 1 counts as signal → 1/40 → exit 8 fires BEFORE the
+    # shift-marker gate. Pass --allow-sparse-signal so this test stays
+    # narrowly focused on #123's shift-marker code path rather than the
+    # sparse-signal code path.
     result = _run_script(
         "analyze_longitudinal.py",
         "--db", str(db),
         "--expected-cycles", "40",
         "--allow-proxy-kl",
+        "--allow-sparse-signal",
     )
     assert result.returncode == 5, (
         f"Expected exit 5 (shift campaign missing marker), got "
