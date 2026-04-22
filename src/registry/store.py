@@ -810,6 +810,148 @@ def seed_registry(registry: SkillRegistry) -> None:
                 "top 5 records).\n"
             ),
         ),
+        _cap(
+            "inventory-reorder-policy",
+            (
+                "Apply a fixed inventory reorder workflow to stock data using "
+                "reorder thresholds and capped order values from a YAML policy. "
+                "Returns product_count, items_below_threshold, and total_reorder_cost."
+            ),
+            CapabilityType.SKILL,
+            domain="inventory-management",
+            input_schema={"inventory_csv_path": "str", "rules_yaml_path": "str"},
+            output_schema={
+                "product_count": "int",
+                "items_below_threshold": "int",
+                "total_reorder_cost": "float",
+            },
+            skill_content=(
+                "---\n"
+                "name: inventory-reorder-policy\n"
+                "description: Apply a deterministic reorder policy to inventory data\n"
+                "---\n\n"
+                "# Inventory Reorder Policy\n\n"
+                "1. Load inventory rows and reorder rules.\n"
+                "2. Compute days_of_stock = current_stock / daily_usage.\n"
+                "3. Mark items below min_days_of_stock for reorder.\n"
+                "4. Compute reorder_qty = ceil(daily_usage * reorder_days_supply).\n"
+                "5. Cap order_cost at max_order_value and sum the total.\n"
+            ),
+        ),
+        _cap(
+            "sales-integration-report",
+            (
+                "Integrate sales CSV data with a product catalog and target table, "
+                "then emit a regional revenue summary as an Excel workbook."
+            ),
+            CapabilityType.SKILL,
+            domain="sales-analytics",
+            input_schema={
+                "sales_csv_path": "str",
+                "products_xlsx_path": "str",
+                "targets_csv_path": "str",
+            },
+            output_schema={
+                "summary_row_count": "int",
+                "region_revenues": "dict",
+                "regions_meeting_target": "int",
+                "output_file": "str",
+            },
+            skill_content=(
+                "---\n"
+                "name: sales-integration-report\n"
+                "description: Join sales, products, and targets into a regional summary workbook\n"
+                "---\n\n"
+                "# Sales Integration Report\n\n"
+                "1. Parse sales CSV and product catalog workbook.\n"
+                "2. Join on product_id.\n"
+                "3. Aggregate quantity * unit_price by region.\n"
+                "4. Compare each region against its target.\n"
+                "5. Write an Excel summary with region, revenue, target, and meets_target.\n"
+            ),
+        ),
+        _cap(
+            "budget-allocation-policy",
+            (
+                "Aggregate departmental transactions, compare the totals against "
+                "budget limits, and count flagged transactions over a fixed threshold."
+            ),
+            CapabilityType.SKILL,
+            domain="budget-reconciliation",
+            input_schema={
+                "departments_csv_path": "str",
+                "transactions_tsv_path": "str",
+                "rules_json_path": "str",
+            },
+            output_schema={
+                "department_count": "int",
+                "department_spending": "dict",
+                "over_budget_count": "int",
+                "flagged_transactions": "int",
+            },
+            skill_content=(
+                "---\n"
+                "name: budget-allocation-policy\n"
+                "description: Reconcile spending against budget policy thresholds\n"
+                "---\n\n"
+                "# Budget Allocation Policy\n\n"
+                "1. Load department budgets and transactions.\n"
+                "2. Sum transaction amounts per department.\n"
+                "3. Flag departments above annual budget.\n"
+                "4. Count transactions above max_single_transaction.\n"
+            ),
+        ),
+        _cap(
+            "monitoring-aggregation-policy",
+            (
+                "Aggregate hourly monitoring data into daily metrics using a "
+                "JSON policy and count alert days where thresholds are exceeded."
+            ),
+            CapabilityType.SKILL,
+            domain="monitoring",
+            input_schema={"hourly_csv_path": "str", "config_json_path": "str"},
+            output_schema={
+                "n_days": "int",
+                "metrics_aggregated": "int",
+                "alert_days": "int",
+            },
+            skill_content=(
+                "---\n"
+                "name: monitoring-aggregation-policy\n"
+                "description: Apply daily monitoring aggregations and alert thresholds\n"
+                "---\n\n"
+                "# Monitoring Aggregation Policy\n\n"
+                "1. Group hourly metric rows by day.\n"
+                "2. Apply configured aggregations per metric.\n"
+                "3. Count days where any aggregated metric breaches a threshold.\n"
+            ),
+        ),
+        _cap(
+            "eligibility-policy-classifier",
+            (
+                "Apply a fixed eligibility-rule set to application rows and "
+                "return eligible/ineligible counts plus the number of rules applied."
+            ),
+            CapabilityType.SKILL,
+            domain="eligibility",
+            input_schema={"applications_csv_path": "str", "policy_json_path": "str"},
+            output_schema={
+                "total_applications": "int",
+                "eligible_count": "int",
+                "ineligible_count": "int",
+                "rules_applied": "int",
+            },
+            skill_content=(
+                "---\n"
+                "name: eligibility-policy-classifier\n"
+                "description: Classify applications using a deterministic rule set\n"
+                "---\n\n"
+                "# Eligibility Policy Classifier\n\n"
+                "1. Load the policy JSON and application rows.\n"
+                "2. Apply every rule to every row.\n"
+                "3. Count eligible and ineligible applications.\n"
+            ),
+        ),
         # AGENT type
         _cap(
             "data-analysis-agent",
@@ -841,6 +983,30 @@ def seed_registry(registry: SkillRegistry) -> None:
                 '"node_config": {"name": "data_analysis_node", '
                 f'"model": "{DEFAULT_LLM_MODEL}", '
                 '"description": "Autonomous EDA agent"}, '
+                '"is_deep_agent": true}'
+            ),
+        ),
+        _cap(
+            "anomaly-investigation-agent",
+            (
+                "Investigate time-series metrics against declared baselines, "
+                "identify every out-of-range point, and summarize anomalies."
+            ),
+            CapabilityType.AGENT,
+            domain="monitoring",
+            input_schema={"metrics_csv_path": "str", "baselines_json_path": "str"},
+            output_schema={
+                "anomaly_count": "int",
+                "anomalies": "list[dict]",
+                "metrics_analyzed": "int",
+            },
+            agent_config=(
+                '{"system_prompt": "You investigate monitoring anomalies by reading '
+                'metrics and baseline files, identifying out-of-range values, and '
+                'returning a structured anomaly list.", '
+                '"node_config": {"name": "anomaly_investigation_node", '
+                f'"model": "{DEFAULT_LLM_MODEL}", '
+                '"description": "Deterministic anomaly investigation agent"}, '
                 '"is_deep_agent": true}'
             ),
         ),

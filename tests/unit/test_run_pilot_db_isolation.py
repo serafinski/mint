@@ -29,10 +29,13 @@ sys.path.insert(0, str(ROOT))
 def _make_stub_harness(monkeypatch):
     """Stub the harness + tasks imports so main() short-circuits."""
     import scripts.run_pilot as rp
+    captured_configs = []
+    condition_metrics_paths = []
 
     class _StubHarness:
         def __init__(self, config):
             self._config = config
+            captured_configs.append(config)
 
         def __enter__(self):
             return self
@@ -44,9 +47,11 @@ def _make_stub_harness(monkeypatch):
             return "snap-stub"
 
         def run_pilot(self, tasks, condition):
+            condition_metrics_paths.append((condition, self._config.metrics_store_path))
             return []
 
         def run_condition(self, condition, tasks):
+            condition_metrics_paths.append((condition, self._config.metrics_store_path))
             return []
 
     class _StubConfig:
@@ -60,6 +65,8 @@ def _make_stub_harness(monkeypatch):
     monkeypatch.setattr(
         "tests.evaluation.harness.HarnessConfig", _StubConfig, raising=True,
     )
+    rp._captured_configs = captured_configs  # type: ignore[attr-defined]
+    rp._condition_metrics_paths = condition_metrics_paths  # type: ignore[attr-defined]
     return rp
 
 
@@ -138,3 +145,76 @@ def test_default_db_path_is_timestamped(tmp_path, monkeypatch, capsys):
     assert "fresh timestamped DB path" in out
     # Timestamped path pattern: metrics_YYYYMMDD_HHMMSS.duckdb.
     assert "metrics_" in out and ".duckdb" in out
+
+
+def test_metrics_store_defaults_to_campaign_scoped_path(tmp_path, monkeypatch):
+    """Without --metrics-store, run_pilot derives a sibling DB-scoped store path."""
+    rp = _make_stub_harness(monkeypatch)
+
+    db = tmp_path / "campaign.duckdb"
+    monkeypatch.setattr(sys, "argv", [
+        "run_pilot.py", "--db", str(db), "--tasks", "T01",
+    ])
+
+    try:
+        rp.main()
+    except SystemExit:
+        pass
+    except Exception:
+        pass
+
+    cfg = rp._captured_configs[-1]  # type: ignore[attr-defined]
+    assert cfg.metrics_store_path == str(tmp_path / "campaign_metrics_store.duckdb")
+
+
+def test_metrics_store_explicit_path_is_passed_to_harness(tmp_path, monkeypatch):
+    """Explicit --metrics-store flows through to HarnessConfig."""
+    rp = _make_stub_harness(monkeypatch)
+
+    db = tmp_path / "campaign.duckdb"
+    metrics = tmp_path / "custom_metrics.duckdb"
+    monkeypatch.setattr(sys, "argv", [
+        "run_pilot.py",
+        "--db", str(db),
+        "--metrics-store", str(metrics),
+        "--tasks", "T01",
+    ])
+
+    try:
+        rp.main()
+    except SystemExit:
+        pass
+    except Exception:
+        pass
+
+    cfg = rp._captured_configs[-1]  # type: ignore[attr-defined]
+    assert cfg.metrics_store_path == str(metrics)
+
+
+def test_all_conditions_use_isolated_metrics_store_paths(tmp_path, monkeypatch):
+    """A multi-condition campaign must not share one MetricsStore file across conditions."""
+    rp = _make_stub_harness(monkeypatch)
+
+    db = tmp_path / "campaign.duckdb"
+    metrics = tmp_path / "campaign_metrics.duckdb"
+    monkeypatch.setattr(sys, "argv", [
+        "run_pilot.py",
+        "--db", str(db),
+        "--metrics-store", str(metrics),
+        "--all-conditions",
+        "--tasks", "T01",
+    ])
+
+    try:
+        rp.main()
+    except SystemExit:
+        pass
+    except Exception:
+        pass
+
+    seen = dict(rp._condition_metrics_paths)  # type: ignore[attr-defined]
+    assert set(seen) == {"full", "no_verification", "no_optimization", "static"}
+    assert seen["full"].endswith("campaign_metrics_full.duckdb")
+    assert seen["no_verification"].endswith("campaign_metrics_no_verification.duckdb")
+    assert seen["no_optimization"].endswith("campaign_metrics_no_optimization.duckdb")
+    assert seen["static"].endswith("campaign_metrics_static.duckdb")

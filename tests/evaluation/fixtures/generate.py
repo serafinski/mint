@@ -1295,6 +1295,99 @@ def _gen_t18(fixtures_dir: Path, rng: random.Random) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# T20 — Eligibility classification (targets SKILL classification)
+# ---------------------------------------------------------------------------
+
+_T20_INDUSTRIES = [
+    "Technology", "Healthcare", "Manufacturing", "Education",
+    "Retail", "Hospitality", "Construction", "Finance",
+]
+
+
+def _gen_t20(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Grant-applications CSV + eligibility-policy JSON."""
+    policy = {
+        "program_name": "Small Business Innovation Grant",
+        "rules": [
+            {
+                "rule_id": "R1",
+                "field": "annual_revenue",
+                "operator": "less_than",
+                "threshold": 500000,
+                "description": "Annual revenue must be under $500,000",
+            },
+            {
+                "rule_id": "R2",
+                "field": "employee_count",
+                "operator": "between",
+                "min": 1,
+                "max": 50,
+                "description": "Must have between 1 and 50 employees",
+            },
+            {
+                "rule_id": "R3",
+                "field": "years_in_business",
+                "operator": "greater_than_or_equal",
+                "threshold": 2,
+                "description": "Must be in business for at least 2 years",
+            },
+            {
+                "rule_id": "R4",
+                "field": "industry",
+                "operator": "in_list",
+                "allowed": ["Technology", "Healthcare", "Manufacturing", "Education"],
+                "description": "Must be in an eligible industry",
+            },
+        ],
+    }
+    (fixtures_dir / "t20_eligibility_policy.json").write_text(
+        json.dumps(policy, indent=2)
+    )
+
+    fieldnames = [
+        "applicant_id", "business_name", "annual_revenue",
+        "employee_count", "years_in_business", "industry",
+    ]
+    rows = []
+    eligible_count = 0
+    for i in range(1, 37):
+        row = {
+            "applicant_id": f"A{i:03d}",
+            "business_name": f"Business_{i}",
+            "annual_revenue": rng.randint(50_000, 900_000),
+            "employee_count": rng.randint(1, 90),
+            "years_in_business": rng.randint(0, 15),
+            "industry": rng.choice(_T20_INDUSTRIES),
+        }
+        rows.append(row)
+
+        passes = (
+            row["annual_revenue"] < 500_000
+            and 1 <= row["employee_count"] <= 50
+            and row["years_in_business"] >= 2
+            and row["industry"] in set(policy["rules"][3]["allowed"])
+        )
+        if passes:
+            eligible_count += 1
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    (fixtures_dir / "t20_applications.csv").write_text(buf.getvalue())
+
+    total = len(rows)
+    return {
+        "T20": {
+            "total_applications": total,
+            "eligible_count": eligible_count,
+            "ineligible_count": total - eligible_count,
+            "rules_applied": len(policy["rules"]),
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 

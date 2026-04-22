@@ -6,7 +6,7 @@ EvaluationRecord rows to the EvaluationStore.
 Baseline conditions
 -------------------
 full            : full pipeline (JIT + verification + optimizer)
-no_verification : JIT pipeline with verification gate bypassed (gate_fn=None)
+no_verification : JIT + optimizer with verification gate bypassed (gate_fn=None)
 no_optimization : JIT pipeline without optimizer (run_optimizer=False)
 static          : registry lookup only, no JIT generation
 
@@ -69,6 +69,7 @@ from src.registry.evaluation_store import EvaluationStore
 from src.registry.store import SkillRegistry, seed_registry
 from src.schemas.evaluation import EvaluationRecord, GeneratedArtifactSnapshot
 from src.schemas.task import GeneratedArtifact, OutputContract, TaskState
+from tests.evaluation.conditions import get_condition_profile
 from tests.evaluation.snapshots import restore_clean_snapshot, take_clean_snapshot
 from tests.evaluation.tasks import TaskDefinition
 
@@ -112,6 +113,34 @@ class HarnessConfig:
     # leave ``None`` for the legacy in-memory behavior (test helpers do
     # this intentionally).
     metrics_store_path: str | None = None
+
+
+@dataclass(frozen=True)
+class StaticImplementationResult:
+    """Normalized output from a hand-written static capability implementation."""
+
+    output: dict
+    output_files: dict[str, bytes]
+
+
+def _normalize_static_implementation_result(
+    raw: dict | tuple[dict, dict[str, bytes]] | StaticImplementationResult,
+) -> StaticImplementationResult:
+    """Backwards-compatible adapter for static implementations.
+
+    Historical implementations returned only the output dict. File-producing
+    static implementations can now return ``(output, output_files)`` without
+    breaking existing tests or call sites.
+    """
+    if isinstance(raw, StaticImplementationResult):
+        return raw
+    if isinstance(raw, tuple):
+        output, output_files = raw
+        return StaticImplementationResult(
+            output=dict(output),
+            output_files=dict(output_files),
+        )
+    return StaticImplementationResult(output=dict(raw), output_files={})
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +499,10 @@ class EvaluationHarness:
                     run_id=run_id,
                     condition=condition,
                     task_id=task.task_id,
+                    task_family_id=task.family_id,
+                    task_instance_id=task.instance_id,
+                    variant_id=task.variant_id,
+                    benchmark_track=task.benchmark_track,
                     task_events_cutoff=task_events_cutoff,
                     is_pilot=is_pilot,  # ext7 #50
                 )
@@ -508,11 +541,16 @@ class EvaluationHarness:
         _tags: list[str] = [
             condition,
             task.task_id,
+            f"task_family:{task.family_id}",
+            f"task_instance:{task.instance_id}",
+            f"benchmark:{task.benchmark_track}",
             f"tier:{task.tier}",
             *(f"format:{fmt}" for fmt in sorted(_file_formats)),
             f"allow_network:{str(self._config.allow_network).lower()}",
             f"static_coverage:{str(task.has_static_coverage).lower()}",
         ]
+        if task.variant_id:
+            _tags.append(f"variant:{task.variant_id}")
         if is_pilot:
             _tags.append("pilot")
         return _tags
@@ -532,8 +570,9 @@ class EvaluationHarness:
     ) -> EvaluationRecord:
         """Execute one task under one condition and return an EvaluationRecord."""
         t_start = time.monotonic()
+        profile = get_condition_profile(condition)
 
-        if condition == "static":
+        if not profile.jit_enabled:
             # ext8 #65: thread metrics_store so static runs record invocations.
             result = self._run_static(task, registry, metrics_store)
         else:
@@ -553,6 +592,10 @@ class EvaluationHarness:
             run_id=run_id,
             condition=condition,
             task_id=task.task_id,
+            task_family_id=task.family_id,
+            task_instance_id=task.instance_id,
+            variant_id=task.variant_id,
+            benchmark_track=task.benchmark_track,
             task_tier=task.tier,
             attempt_count=result.get("attempt_count", 0),
             capability_type=result.get("capability_type"),
@@ -632,13 +675,18 @@ class EvaluationHarness:
 
         # Execute the pre-written static implementation
         try:
-            output = _run_static_implementation(task.task_id, task.fixture_paths)
-            in_range = task.validator(output)
+            static_result = _normalize_static_implementation_result(
+                _run_static_implementation(task.task_id, task.fixture_paths)
+            )
+            output = static_result.output
+            output_files = static_result.output_files
+            if output_files and task.file_validator is not None:
+                in_range = task.file_validator(output, output_files)
+            else:
+                in_range = task.validator(output)
             # ext8 #68: apply the same output-contract check JIT paths use.
-            # Single-artifact static path has no output_files (file writers
-            # live in compositional JIT chains only) so pass an empty dict.
             shape_check = (
-                task.output_contract.check(output, {})
+                task.output_contract.check(output, output_files)
                 if task.output_contract
                 else None
             )
@@ -711,15 +759,14 @@ class EvaluationHarness:
         """JIT conditions: invoke the pipeline, then validate output."""
         from src.orchestrator.pipeline import create_pipeline
 
-        run_optimizer = condition == "full"
-        verification_enabled = condition != "no_verification"
+        profile = get_condition_profile(condition)
 
         pipeline = create_pipeline(
             registry,
             loader,
-            run_optimizer=run_optimizer,
+            optimizer_config=profile.optimizer_config,
             metrics_store=metrics_store,
-            verification_enabled=verification_enabled,
+            verification_enabled=profile.verification_enabled,
         ).compile()
 
         # Per-task LangFuse tracing: pass task_id and condition via config
@@ -754,6 +801,10 @@ class EvaluationHarness:
                 "langfuse_user_id": "eval-harness",
                 "langfuse_tags": _tags,
                 "task_id": task.task_id,
+                "task_family_id": task.family_id,
+                "task_instance_id": task.instance_id,
+                "variant_id": task.variant_id,
+                "benchmark_track": task.benchmark_track,
                 "condition": condition,
                 "run_id": run_id,
                 "tier": task.tier,
@@ -996,7 +1047,7 @@ def _extract_result_compositional(
         allow_network=allow_network,
     )
 
-    chain_result = executor.run(task_id=task.task_id)
+    chain_result = executor.run(task_id=task.instance_id)
 
     # Validate final output
     output_in_range = False
@@ -1281,8 +1332,14 @@ def _extract_result(
     elif gate_passed and not artifacts and task.has_static_coverage:
         # Registry match with static implementation available — execute it.
         try:
-            output = _run_static_implementation(task.task_id, task.fixture_paths)
-            output_in_range = task.validator(output)
+            static_result = _normalize_static_implementation_result(
+                _run_static_implementation(task.task_id, task.fixture_paths)
+            )
+            output = static_result.output
+            if static_result.output_files and task.file_validator is not None:
+                output_in_range = task.file_validator(output, static_result.output_files)
+            else:
+                output_in_range = task.validator(output)
             if not output_in_range:
                 failure_reason = "output_rejected"
             logger.info(
@@ -1752,7 +1809,9 @@ def _build_fixture_inputs(task: TaskDefinition, source_code: str | None = None) 
 # ---------------------------------------------------------------------------
 
 
-def _run_static_implementation(task_id: str, fixture_paths: list[Path]) -> dict:
+def _run_static_implementation(
+    task_id: str, fixture_paths: list[Path],
+) -> dict | tuple[dict, dict[str, bytes]]:
     """Execute a hand-written static implementation for seeded tasks.
 
     Security audit finding #97 (2026-04-19, ext9): the dispatch table
@@ -1773,8 +1832,20 @@ def _run_static_implementation(task_id: str, fixture_paths: list[Path]) -> dict:
         return _static_t05(fixture_paths[0])
     if task_id == "T09":
         return _static_t09(fixture_paths[0])
+    if task_id == "T04":
+        return _static_t04(fixture_paths[0], fixture_paths[1])
+    if task_id == "T11":
+        return _static_t11(fixture_paths[0], fixture_paths[1], fixture_paths[2])
+    if task_id == "T13":
+        return _static_t13(fixture_paths[0], fixture_paths[1])
+    if task_id == "T14":
+        return _static_t14(fixture_paths[0], fixture_paths[1], fixture_paths[2])
+    if task_id == "T15":
+        return _static_t15(fixture_paths[0], fixture_paths[1])
     if task_id == "T19":
         return _static_t19(fixture_paths[0])
+    if task_id == "T20":
+        return _static_t20(fixture_paths[0], fixture_paths[1])
     raise ValueError(f"No static implementation for {task_id}")
 
 
@@ -1784,7 +1855,7 @@ def _run_static_implementation(task_id: str, fixture_paths: list[Path]) -> dict:
 # startup assertion at the bottom of this module enforces the
 # bidirectional invariant.
 _STATIC_IMPLEMENTATION_TASKS: frozenset[str] = frozenset(
-    {"T01", "T02", "T05", "T09", "T19"}
+    {"T01", "T02", "T04", "T05", "T09", "T11", "T13", "T14", "T15", "T19", "T20"}
 )
 
 
@@ -1857,6 +1928,41 @@ def _static_t05(csv_path: Path) -> dict:
     return {"output_row_count": len(unique), "null_count": null_count}
 
 
+def _static_t04(csv_path: Path, yaml_path: Path) -> dict:
+    """Apply the reorder policy from YAML to the inventory CSV."""
+    import csv as _csv
+    import math as _math
+
+    import yaml
+
+    rules = yaml.safe_load(yaml_path.read_text())
+    min_days = float(rules["min_days_of_stock"])
+    reorder_days = float(rules["reorder_days_supply"])
+    max_order_value = float(rules["max_order_value"])
+
+    with csv_path.open() as f:
+        rows = list(_csv.DictReader(f))
+
+    below_threshold = 0
+    total_cost = 0.0
+    for row in rows:
+        current_stock = float(row["current_stock"])
+        daily_usage = float(row["daily_usage"])
+        unit_cost = float(row["unit_cost"])
+        days_of_stock = current_stock / daily_usage if daily_usage else float("inf")
+        if days_of_stock < min_days:
+            below_threshold += 1
+            reorder_qty = _math.ceil(daily_usage * reorder_days)
+            order_cost = reorder_qty * unit_cost
+            total_cost += min(order_cost, max_order_value)
+
+    return {
+        "product_count": len(rows),
+        "items_below_threshold": below_threshold,
+        "total_reorder_cost": round(total_cost, 2),
+    }
+
+
 def _static_t09(data_path: Path) -> dict:
     """Generate a structured report from XML data."""
     import xml.etree.ElementTree as ET
@@ -1897,6 +2003,183 @@ def _static_t09(data_path: Path) -> dict:
     return {"summary": summary, "stats_table": stats_table, "anomalies": anomalies}
 
 
+def _static_t11(
+    sales_csv_path: Path,
+    products_xlsx_path: Path,
+    targets_csv_path: Path,
+) -> tuple[dict, dict[str, bytes]]:
+    """Join sales/products/targets and emit an Excel summary."""
+    import csv as _csv
+    import io
+
+    import openpyxl
+
+    with sales_csv_path.open() as f:
+        sales = list(_csv.DictReader(f))
+
+    products_wb = openpyxl.load_workbook(products_xlsx_path, read_only=True)
+    product_rows = list(products_wb.active.iter_rows(values_only=True))
+    product_headers = [str(v) for v in product_rows[0]]
+    products = [dict(zip(product_headers, row, strict=False)) for row in product_rows[1:]]
+    products_by_id = {str(p["product_id"]): p for p in products}
+
+    with targets_csv_path.open() as f:
+        targets = list(_csv.DictReader(f))
+    targets_by_region = {row["region"]: float(row["target_revenue"]) for row in targets}
+
+    region_revenues: dict[str, float] = {}
+    for sale in sales:
+        product_id = str(sale["product_id"])
+        if product_id not in products_by_id:
+            continue
+        region = str(sale["region"])
+        revenue = float(sale["quantity"]) * float(sale["unit_price"])
+        region_revenues[region] = region_revenues.get(region, 0.0) + revenue
+
+    sorted_regions = sorted(region_revenues)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "summary"
+    ws.append(["region", "total_revenue", "target_revenue", "meets_target"])
+
+    regions_meeting_target = 0
+    for region in sorted_regions:
+        total_revenue = round(region_revenues[region], 2)
+        target_revenue = float(targets_by_region[region])
+        meets_target = total_revenue >= target_revenue
+        regions_meeting_target += int(meets_target)
+        ws.append([region, total_revenue, target_revenue, meets_target])
+        region_revenues[region] = total_revenue
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    output = {
+        "summary_row_count": len(sorted_regions),
+        "region_revenues": region_revenues,
+        "regions_meeting_target": regions_meeting_target,
+        "output_file": "output.xlsx",
+    }
+    return output, {"output.xlsx": buf.getvalue()}
+
+
+def _static_t13(metrics_csv_path: Path, baselines_json_path: Path) -> dict:
+    """Detect anomalies directly from the metric baselines."""
+    import csv as _csv
+    import json as _json
+
+    baselines = _json.loads(baselines_json_path.read_text())
+    with metrics_csv_path.open() as f:
+        rows = list(_csv.DictReader(f))
+
+    anomalies = []
+    for row in rows:
+        timestamp = row["timestamp"]
+        for metric, bounds in baselines.items():
+            value = float(row[metric])
+            if value < float(bounds["min"]) or value > float(bounds["max"]):
+                anomalies.append({
+                    "timestamp": timestamp,
+                    "metric": metric,
+                    "value": value,
+                })
+
+    return {
+        "anomaly_count": len(anomalies),
+        "anomalies": anomalies,
+        "metrics_analyzed": len(baselines),
+    }
+
+
+def _static_t14(
+    departments_csv_path: Path,
+    transactions_tsv_path: Path,
+    rules_json_path: Path,
+) -> dict:
+    """Aggregate department spending and apply the budget policy."""
+    import csv as _csv
+    import json as _json
+
+    with departments_csv_path.open() as f:
+        departments = list(_csv.DictReader(f))
+    budgets = {
+        row["department"]: float(row["annual_budget"])
+        for row in departments
+    }
+
+    with transactions_tsv_path.open() as f:
+        transactions = list(_csv.DictReader(f, delimiter="\t"))
+
+    rules = _json.loads(rules_json_path.read_text())
+    threshold = float(rules["max_single_transaction"])
+
+    department_spending = {department: 0.0 for department in budgets}
+    flagged_transactions = 0
+    for row in transactions:
+        department = row["department"]
+        amount = float(row["amount"])
+        department_spending[department] = department_spending.get(department, 0.0) + amount
+        if amount > threshold:
+            flagged_transactions += 1
+
+    department_spending = {
+        department: round(total, 2)
+        for department, total in department_spending.items()
+    }
+    over_budget_count = sum(
+        1 for department, total in department_spending.items()
+        if total > budgets[department]
+    )
+    return {
+        "department_count": len(budgets),
+        "department_spending": department_spending,
+        "over_budget_count": over_budget_count,
+        "flagged_transactions": flagged_transactions,
+    }
+
+
+def _static_t15(hourly_metrics_csv_path: Path, config_json_path: Path) -> dict:
+    """Apply config-driven daily aggregations and threshold checks."""
+    import csv as _csv
+    import json as _json
+    from collections import defaultdict
+
+    config = _json.loads(config_json_path.read_text())
+    with hourly_metrics_csv_path.open() as f:
+        rows = list(_csv.DictReader(f))
+
+    by_day: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        day = row["timestamp"].split(" ")[0]
+        by_day[day].append(row)
+
+    alert_days = 0
+    metrics_cfg = config["metrics"]
+    thresholds = config["alert_thresholds"]
+    for day_rows in by_day.values():
+        day_alert = False
+        for metric, aggregations in metrics_cfg.items():
+            values = [float(r[metric]) for r in day_rows]
+            for agg in aggregations:
+                if agg == "mean":
+                    agg_value = sum(values) / len(values)
+                elif agg == "max":
+                    agg_value = max(values)
+                elif agg == "sum":
+                    agg_value = sum(values)
+                else:
+                    continue
+                threshold = thresholds.get(f"{metric}_{agg}")
+                if threshold is not None and agg_value > float(threshold):
+                    day_alert = True
+        alert_days += int(day_alert)
+
+    return {
+        "n_days": len(by_day),
+        "metrics_aggregated": len(metrics_cfg),
+        "alert_days": alert_days,
+    }
+
+
 def _static_t19(csv_path: Path) -> dict:
     """Exploratory data analysis on product sales CSV.
 
@@ -1922,6 +2205,48 @@ def _static_t19(csv_path: Path) -> dict:
         "n_rows": len(rows),
         "n_categories": len(categories),
         "categories": categories,
+    }
+
+
+def _static_t20(applications_csv_path: Path, policy_json_path: Path) -> dict:
+    """Apply the eligibility rules to every application row."""
+    import csv as _csv
+    import json as _json
+
+    policy = _json.loads(policy_json_path.read_text())
+    rules = policy["rules"]
+
+    with applications_csv_path.open() as f:
+        applications = list(_csv.DictReader(f))
+
+    def _passes_rule(application: dict, rule: dict) -> bool:
+        value = application[rule["field"]]
+        op = rule["operator"]
+        if op == "less_than":
+            return float(value) < float(rule["threshold"])
+        if op == "between":
+            numeric = float(value)
+            return float(rule["min"]) <= numeric <= float(rule["max"])
+        if op == "greater_than_or_equal":
+            return float(value) >= float(rule["threshold"])
+        if op == "in_list":
+            return value in set(rule["allowed"])
+        raise ValueError(f"Unsupported operator: {op}")
+
+    eligible_count = 0
+    ineligible_count = 0
+    for application in applications:
+        passed = all(_passes_rule(application, rule) for rule in rules)
+        if passed:
+            eligible_count += 1
+        else:
+            ineligible_count += 1
+
+    return {
+        "total_applications": len(applications),
+        "eligible_count": eligible_count,
+        "ineligible_count": ineligible_count,
+        "rules_applied": len(rules),
     }
 
 

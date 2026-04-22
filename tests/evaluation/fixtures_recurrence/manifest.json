@@ -1,0 +1,19 @@
+[
+  {
+    "task_family_id": "T04",
+    "task_instance_id": "T04.v01",
+    "variant_id": "v01",
+    "benchmark_track": "recurrence",
+    "seed": 8201,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T04/v01/t04_inventory.csv",
+      "tests/evaluation/fixtures_recurrence/T04/v01/t04_reorder_rules.yaml"
+    ],
+    "expected_values": {
+      "product_count": 10,
+      "items_below_threshold": 4,
+      "total_reorder_cost": 19261.26,
+      "min_days_of_stock": 14
+    }
+  }
+]

@@ -58,6 +58,27 @@ _LEGACY_DB_PATH = str(DATA_DIR / "eval" / "metrics.duckdb")
 ALL_CONDITIONS = ["full", "no_verification", "no_optimization", "static"]
 
 
+def _condition_metrics_store_path(
+    base_path: Path | None,
+    *,
+    condition: str,
+    n_conditions: int,
+) -> Path | None:
+    """Return the MetricsStore path for a condition.
+
+    A single-condition run uses the base path as-is. Multi-condition campaigns
+    get one MetricsStore DB per condition so optimizer history does not leak
+    across the ablation cells.
+    """
+    if base_path is None:
+        return None
+    if n_conditions <= 1:
+        return base_path
+    if base_path.suffix:
+        return base_path.with_name(f"{base_path.stem}_{condition}{base_path.suffix}")
+    return base_path.with_name(f"{base_path.name}_{condition}")
+
+
 # Security audit finding #103 (2026-04-19, ext10): SIGALRM-based
 # total-budget watchdog. Wraps a long-running ``harness.run_condition``
 # call so a hung Docker container or LangFuse-API stall can't silently
@@ -195,6 +216,14 @@ def main() -> int:
         help="Append to an existing DB (mutually exclusive with --fresh-db). "
              "Use when resuming a campaign with a different --condition.",
     )
+    parser.add_argument(
+        "--metrics-store",
+        type=str,
+        default=None,
+        help="MetricsStore DuckDB path. Default: derive a campaign-scoped path "
+             "next to --db (e.g. metrics_<ts>_metrics_store.duckdb). Pass "
+             "'memory' to keep legacy in-memory behavior.",
+    )
     # ext7 #48 (2026-04-20): condition-order randomization. Default is fixed
     # order (deterministic, easier to debug + reproduce); opt-in when the
     # campaign wants order-randomization as a methodology-purity measure.
@@ -263,6 +292,15 @@ def main() -> int:
 
     DB_PATH = str(db_path)
 
+    if args.metrics_store == "memory":
+        base_metrics_store_path = None
+        print("MetricsStore: in-memory backend requested via --metrics-store memory")
+    elif args.metrics_store:
+        base_metrics_store_path = Path(args.metrics_store)
+    else:
+        base_metrics_store_path = db_path.with_name(f"{db_path.stem}_metrics_store.duckdb")
+        print(f"ext8 #71: using campaign-scoped MetricsStore path: {base_metrics_store_path}")
+
     # ext7 #51: acquire the advisory lock on shared eval registry dirs. Retain
     # the handle in a local so the OS releases on process exit.
     from scripts._eval_registry_lock import acquire_runner_lock
@@ -303,16 +341,6 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         logger.info("LangFuse tracing disabled: %s", exc)
 
-    config = HarnessConfig(
-        chroma_dir=CHROMA_DIR,
-        mcp_tools_dir=MCP_TOOLS_DIR,
-        skills_dir=SKILLS_DIR,
-        db_path=DB_PATH,
-        n_runs=args.n_runs,
-        base_seed=42,
-        langfuse_handler=langfuse_handler,
-    )
-
     if args.tasks:
         tasks = [get_task(tid.strip()) for tid in args.tasks.split(",")]
     elif args.all_tasks:
@@ -332,6 +360,49 @@ def main() -> int:
             conditions,
         )
 
+    condition_metrics_paths = {
+        condition: _condition_metrics_store_path(
+            base_metrics_store_path,
+            condition=condition,
+            n_conditions=len(conditions),
+        )
+        for condition in conditions
+    }
+    for condition, condition_metrics_store_path in condition_metrics_paths.items():
+        if condition_metrics_store_path is None:
+            continue
+        if condition_metrics_store_path.exists() and condition_metrics_store_path.stat().st_size > 0:
+            if args.fresh_db:
+                condition_metrics_store_path.unlink()
+                print(
+                    f"ext8 #71: wiped existing MetricsStore at {condition_metrics_store_path} "
+                    f"for condition {condition} per --fresh-db",
+                )
+            elif not args.append:
+                print(
+                    f"ERROR: MetricsStore exists at {condition_metrics_store_path} "
+                    f"(condition {condition}). Pass --fresh-db to wipe it, "
+                    "--append to reuse it, choose a different --metrics-store path, "
+                    "or use --metrics-store memory.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+
+    config = HarnessConfig(
+        chroma_dir=CHROMA_DIR,
+        mcp_tools_dir=MCP_TOOLS_DIR,
+        skills_dir=SKILLS_DIR,
+        db_path=DB_PATH,
+        n_runs=args.n_runs,
+        base_seed=42,
+        langfuse_handler=langfuse_handler,
+        metrics_store_path=(
+            str(condition_metrics_paths[conditions[0]])
+            if condition_metrics_paths[conditions[0]] is not None
+            else None
+        ),
+    )
+
     with EvaluationHarness(config) as harness:
         logger.info("Taking clean snapshot...")
         snap_id = harness.prepare()
@@ -345,9 +416,19 @@ def main() -> int:
         watchdog_aborted = False
         abort_condition: str | None = None
         for condition in conditions:
+            harness._config.metrics_store_path = (
+                str(condition_metrics_paths[condition])
+                if condition_metrics_paths[condition] is not None
+                else None
+            )
             logger.info("=" * 60)
             logger.info("Running condition: %s  (%d task(s), %d run(s))", condition, len(tasks), args.n_runs)
             logger.info("=" * 60)
+            logger.info(
+                "Condition %s using MetricsStore: %s",
+                condition,
+                harness._config.metrics_store_path or ":memory:",
+            )
 
             # Security audit finding #103 (2026-04-19, ext10): wrap the
             # synchronous harness call in a SIGALRM-based watchdog so a

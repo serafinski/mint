@@ -61,7 +61,7 @@ def test_search_empty_registry(registry):
 
 def test_seed_registry(registry):
     seed_registry(registry)
-    assert registry.count == 8
+    assert registry.count == 14
 
 
 def test_search_relevance(seeded_registry):
@@ -120,11 +120,11 @@ def test_persistent_registry(tmp_path):
     col_name = f"test-{uuid.uuid4().hex[:8]}"
     registry = SkillRegistry(persist_directory=persist_dir, collection_name=col_name)
     seed_registry(registry)
-    assert registry.count == 8
+    assert registry.count == 14
 
     # Reopen from disk
     registry2 = SkillRegistry(persist_directory=persist_dir, collection_name=col_name)
-    assert registry2.count == 8
+    assert registry2.count == 14
     results = registry2.search("fibonacci")
     assert results[0][0].name == "fibonacci"
 
@@ -247,7 +247,7 @@ def test_delete_nonexistent(registry):
 
 def test_list_all(seeded_registry):
     all_caps = seeded_registry.list_all(is_active=None)
-    assert len(all_caps) == 8
+    assert len(all_caps) == 14
 
 
 def test_list_by_type(seeded_registry):
@@ -256,12 +256,12 @@ def test_list_by_type(seeded_registry):
     assert all(c.capability_type == CapabilityType.MCP_TOOL for c in tools)
 
     skills = seeded_registry.list_all(capability_type=CapabilityType.SKILL)
-    assert len(skills) == 2
+    assert len(skills) == 7
     assert all(c.capability_type == CapabilityType.SKILL for c in skills)
 
     agents = seeded_registry.list_all(capability_type=CapabilityType.AGENT)
-    assert len(agents) == 1
-    assert agents[0].capability_type == CapabilityType.AGENT
+    assert len(agents) == 2
+    assert all(agent.capability_type == CapabilityType.AGENT for agent in agents)
 
 
 def test_list_by_domain(seeded_registry):
@@ -350,18 +350,24 @@ def test_search_relevance_with_hierarchical_docs(seeded_registry):
 
 def test_expanded_seed(registry):
     seed_registry(registry)
-    assert registry.count == 8
+    assert registry.count == 14
 
     all_caps = registry.list_all(is_active=None)
     names = {c.name for c in all_caps}
     expected = {
+        "anomaly-investigation-agent",
+        "budget-allocation-policy",
         "fibonacci",
         "csv-parser",
         "date-formatter",
         "json-validator",
         "text-statistics",
         "data-cleaning-workflow",
+        "eligibility-policy-classifier",
+        "inventory-reorder-policy",
+        "monitoring-aggregation-policy",
         "report-generation",
+        "sales-integration-report",
         "data-analysis-agent",
     }
     assert names == expected

@@ -57,6 +57,10 @@ def flush_task_cycle_state(
     run_id: str,
     condition: str,
     task_id: str,
+    task_family_id: str | None = None,
+    task_instance_id: str | None = None,
+    variant_id: str | None = None,
+    benchmark_track: str = "breadth",
     task_events_cutoff: datetime,
     is_pilot: bool = False,
 ) -> FlushResult:
@@ -86,7 +90,11 @@ def flush_task_cycle_state(
         registry: SkillRegistry instance (passed to compute_all_utilities).
         run_id: The run ID for this longitudinal/harness run.
         condition: BaselineCondition value (e.g. "full", "longitudinal").
-        task_id: The task_id of the just-completed task.
+        task_id: Canonical task family ID for the just-completed task.
+        task_family_id: Stable family-level identifier. Defaults to ``task_id``.
+        task_instance_id: Concrete task-instance identifier. Defaults to ``task_id``.
+        variant_id: Optional recurrence variant identifier.
+        benchmark_track: Benchmark track label (``breadth`` / ``recurrence``).
         task_events_cutoff: datetime captured BEFORE pipeline.invoke —
             used to filter capability_events to just this task's events.
 
@@ -96,6 +104,9 @@ def flush_task_cycle_state(
         (ext13 #125).
     """
     result = FlushResult()
+
+    task_family_id = task_family_id or task_id
+    task_instance_id = task_instance_id or task_id
 
     # --- Invocation events (Step 18.5) ---
     # Security audit finding #23 (2026-04-20): pass ``since=task_events_cutoff``
@@ -112,6 +123,10 @@ def flush_task_cycle_state(
             run_id=run_id,
             condition=condition,
             task_id=task_id,
+            task_family_id=task_family_id,
+            task_instance_id=task_instance_id,
+            variant_id=variant_id,
+            benchmark_track=benchmark_track,
             events=task_invocations,
             is_pilot=is_pilot,  # ext7 #50
         )
@@ -130,6 +145,10 @@ def flush_task_cycle_state(
             run_id=run_id,
             condition=condition,
             task_id=task_id,
+            task_family_id=task_family_id,
+            task_instance_id=task_instance_id,
+            variant_id=variant_id,
+            benchmark_track=benchmark_track,
             scores=utilities,
         )
         result.utility_scores_ok = True
@@ -146,6 +165,10 @@ def flush_task_cycle_state(
             run_id=run_id,
             condition=condition,
             task_id=task_id,
+            task_family_id=task_family_id,
+            task_instance_id=task_instance_id,
+            variant_id=variant_id,
+            benchmark_track=benchmark_track,
             events=task_events,
         )
         result.events_ok = True
@@ -170,6 +193,10 @@ def flush_task_cycle_state(
                 "run_id": run_id,
                 "condition": condition,
                 "task_id": task_id,
+                "task_family_id": task_family_id,
+                "task_instance_id": task_instance_id,
+                "variant_id": variant_id,
+                "benchmark_track": benchmark_track,
                 "cutoff_iso": task_events_cutoff.isoformat(),
             },
         )

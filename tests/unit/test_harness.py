@@ -14,7 +14,7 @@ from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import GeneratedArtifact, MatchItem, TaskState
 from src.schemas.verification import VerificationReport
 from tests.evaluation.harness import EvaluationHarness, HarnessConfig, _extract_result
-from tests.evaluation.tasks import T01, T04, T07
+from tests.evaluation.tasks import T01, T03, T04, T07
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -80,7 +80,7 @@ class TestRunStatic:
     def test_no_static_coverage_returns_failure(self, config):
         harness = EvaluationHarness(config)
         mock_registry = MagicMock()
-        result = harness._run_static(T04, mock_registry)  # T04 has no static coverage
+        result = harness._run_static(T03, mock_registry)  # T03 has no static coverage
         assert result["gate_passed"] is False
         assert result["failure_reason"] == "generation_failed"
 

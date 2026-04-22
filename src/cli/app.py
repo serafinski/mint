@@ -693,7 +693,7 @@ def seed(
     _load_env()
     if not force:
         console.print(
-            "This will add 8 baseline capabilities (fibonacci, csv-parser, text-statistics, etc.)."
+            "This will add 14 baseline capabilities (fibonacci, csv-parser, inventory-reorder-policy, etc.)."
         )
         confirm = typer.confirm("Continue?")
         if not confirm:

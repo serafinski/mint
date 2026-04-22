@@ -25,6 +25,10 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     run_id                    VARCHAR NOT NULL,
     condition                 VARCHAR NOT NULL,
     task_id                   VARCHAR NOT NULL,
+    task_family_id            VARCHAR NOT NULL,
+    task_instance_id          VARCHAR NOT NULL,
+    variant_id                VARCHAR,
+    benchmark_track           VARCHAR NOT NULL DEFAULT 'breadth',
     task_tier                 VARCHAR NOT NULL,
     attempt_count             INTEGER NOT NULL DEFAULT 0,
     capability_type           VARCHAR,
@@ -69,6 +73,10 @@ CREATE TABLE IF NOT EXISTS invocation_events (
     run_id                    VARCHAR NOT NULL,
     condition                 VARCHAR NOT NULL,
     task_id                   VARCHAR NOT NULL,
+    task_family_id            VARCHAR NOT NULL DEFAULT '',
+    task_instance_id          VARCHAR NOT NULL DEFAULT '',
+    variant_id                VARCHAR,
+    benchmark_track           VARCHAR NOT NULL DEFAULT 'breadth',
     capability_id             VARCHAR NOT NULL,
     capability_type           VARCHAR,
     success                   BOOLEAN NOT NULL,
@@ -101,6 +109,10 @@ CREATE TABLE IF NOT EXISTS cycle_utility_scores (
     run_id                    VARCHAR NOT NULL,
     condition                 VARCHAR NOT NULL,
     task_id                   VARCHAR NOT NULL,
+    task_family_id            VARCHAR NOT NULL DEFAULT '',
+    task_instance_id          VARCHAR NOT NULL DEFAULT '',
+    variant_id                VARCHAR,
+    benchmark_track           VARCHAR NOT NULL DEFAULT 'breadth',
     capability_id             VARCHAR NOT NULL,
     utility_score             DOUBLE NOT NULL,
     occurred_at               TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -119,6 +131,10 @@ CREATE TABLE IF NOT EXISTS cycle_events (
     run_id                    VARCHAR NOT NULL,
     condition                 VARCHAR NOT NULL,
     task_id                   VARCHAR NOT NULL,
+    task_family_id            VARCHAR NOT NULL DEFAULT '',
+    task_instance_id          VARCHAR NOT NULL DEFAULT '',
+    variant_id                VARCHAR,
+    benchmark_track           VARCHAR NOT NULL DEFAULT 'breadth',
     capability_id             VARCHAR NOT NULL,
     event_type                VARCHAR NOT NULL,
     details                   VARCHAR NOT NULL DEFAULT '',
@@ -137,6 +153,10 @@ CREATE INDEX IF NOT EXISTS idx_cycle_events_type
 # inserted via record_run() always supply explicit values, and old rows
 # with NULL are coerced to safe defaults in _row_to_record().
 _MIGRATIONS = [
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS task_family_id VARCHAR",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS task_instance_id VARCHAR",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS variant_id VARCHAR",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS benchmark_track VARCHAR",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS chain_length INTEGER",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS chain_success BOOLEAN",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS matched_and_executed_count INTEGER",
@@ -163,6 +183,18 @@ _MIGRATIONS = [
     # ext7 #50 (2026-04-20) — mirror is_pilot onto invocation_events so M3 Gini
     # can exclude pilot rows. Nullable on migrate; backfilled below.
     "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS is_pilot BOOLEAN",
+    "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS task_family_id VARCHAR",
+    "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS task_instance_id VARCHAR",
+    "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS variant_id VARCHAR",
+    "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS benchmark_track VARCHAR",
+    "ALTER TABLE cycle_utility_scores ADD COLUMN IF NOT EXISTS task_family_id VARCHAR",
+    "ALTER TABLE cycle_utility_scores ADD COLUMN IF NOT EXISTS task_instance_id VARCHAR",
+    "ALTER TABLE cycle_utility_scores ADD COLUMN IF NOT EXISTS variant_id VARCHAR",
+    "ALTER TABLE cycle_utility_scores ADD COLUMN IF NOT EXISTS benchmark_track VARCHAR",
+    "ALTER TABLE cycle_events ADD COLUMN IF NOT EXISTS task_family_id VARCHAR",
+    "ALTER TABLE cycle_events ADD COLUMN IF NOT EXISTS task_instance_id VARCHAR",
+    "ALTER TABLE cycle_events ADD COLUMN IF NOT EXISTS variant_id VARCHAR",
+    "ALTER TABLE cycle_events ADD COLUMN IF NOT EXISTS benchmark_track VARCHAR",
 ]
 
 # ext7 #50: backfill is_pilot on legacy invocation_events rows by joining to
@@ -176,6 +208,69 @@ WHERE ie.run_id = er.run_id
   AND ie.task_id = er.task_id
   AND ie.is_pilot IS NULL
 """
+
+_TASK_IDENTITY_BACKFILL_SQL = [
+    """
+    UPDATE evaluation_runs
+    SET task_family_id = task_id
+    WHERE task_family_id IS NULL
+    """,
+    """
+    UPDATE evaluation_runs
+    SET task_instance_id = task_id
+    WHERE task_instance_id IS NULL
+    """,
+    """
+    UPDATE evaluation_runs
+    SET benchmark_track = 'breadth'
+    WHERE benchmark_track IS NULL
+    """,
+    """
+    UPDATE invocation_events
+    SET task_family_id = task_id
+    WHERE task_family_id IS NULL
+    """,
+    """
+    UPDATE invocation_events
+    SET task_instance_id = task_id
+    WHERE task_instance_id IS NULL
+    """,
+    """
+    UPDATE invocation_events
+    SET benchmark_track = 'breadth'
+    WHERE benchmark_track IS NULL
+    """,
+    """
+    UPDATE cycle_utility_scores
+    SET task_family_id = task_id
+    WHERE task_family_id IS NULL
+    """,
+    """
+    UPDATE cycle_utility_scores
+    SET task_instance_id = task_id
+    WHERE task_instance_id IS NULL
+    """,
+    """
+    UPDATE cycle_utility_scores
+    SET benchmark_track = 'breadth'
+    WHERE benchmark_track IS NULL
+    """,
+    """
+    UPDATE cycle_events
+    SET task_family_id = task_id
+    WHERE task_family_id IS NULL
+    """,
+    """
+    UPDATE cycle_events
+    SET task_instance_id = task_id
+    WHERE task_instance_id IS NULL
+    """,
+    """
+    UPDATE cycle_events
+    SET benchmark_track = 'breadth'
+    WHERE benchmark_track IS NULL
+    """,
+]
 
 
 class EvaluationStore:
@@ -193,6 +288,8 @@ class EvaluationStore:
         # ext7 #50 (2026-04-20): backfill invocation_events.is_pilot from
         # evaluation_runs for legacy rows. No-op on fresh DBs.
         self._conn.execute(_INVOCATION_IS_PILOT_BACKFILL_SQL)
+        for stmt in _TASK_IDENTITY_BACKFILL_SQL:
+            self._conn.execute(stmt)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -219,7 +316,8 @@ class EvaluationStore:
         self._conn.execute(
             """
             INSERT INTO evaluation_runs (
-                id, run_id, condition, task_id, task_tier,
+                id, run_id, condition, task_id, task_family_id, task_instance_id,
+                variant_id, benchmark_track, task_tier,
                 attempt_count, capability_type, verification_tier_reached,
                 gate_passed, output_in_range, token_cost, attempt_latency_ms,
                 failure_reason, registry_snapshot_id, invocation_record_id,
@@ -231,13 +329,17 @@ class EvaluationStore:
                 output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
                 generated_artifact_sources, langfuse_trace_id,
                 timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 row_id,
                 record.run_id,
                 record.condition,
                 record.task_id,
+                record.task_family_id,
+                record.task_instance_id,
+                record.variant_id,
+                record.benchmark_track,
                 record.task_tier,
                 record.attempt_count,
                 record.capability_type,
@@ -340,6 +442,10 @@ class EvaluationStore:
         run_id: str,
         condition: str,
         task_id: str,
+        task_family_id: str,
+        task_instance_id: str,
+        variant_id: str | None = None,
+        benchmark_track: str = "breadth",
         events: list[dict],
         is_pilot: bool = False,
     ) -> int:
@@ -378,6 +484,10 @@ class EvaluationStore:
                 run_id,
                 condition,
                 task_id,
+                task_family_id,
+                task_instance_id,
+                variant_id,
+                benchmark_track,
                 ev["capability_id"],
                 ev.get("capability_type"),
                 bool(ev["success"]),
@@ -389,10 +499,11 @@ class EvaluationStore:
         self._conn.executemany(
             """
             INSERT INTO invocation_events (
-                id, run_id, condition, task_id, capability_id,
+                id, run_id, condition, task_id, task_family_id, task_instance_id,
+                variant_id, benchmark_track, capability_id,
                 capability_type, success, token_cost, latency_ms,
                 is_pilot, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -404,6 +515,10 @@ class EvaluationStore:
         run_id: str,
         condition: str,
         task_id: str,
+        task_family_id: str,
+        task_instance_id: str,
+        variant_id: str | None = None,
+        benchmark_track: str = "breadth",
         scores: dict[str, float],
         occurred_at: datetime | None = None,
     ) -> int:
@@ -432,6 +547,10 @@ class EvaluationStore:
                 run_id,
                 condition,
                 task_id,
+                task_family_id,
+                task_instance_id,
+                variant_id,
+                benchmark_track,
                 cap_name,
                 float(score),
                 now,
@@ -441,9 +560,10 @@ class EvaluationStore:
         self._conn.executemany(
             """
             INSERT INTO cycle_utility_scores (
-                id, run_id, condition, task_id, capability_id,
+                id, run_id, condition, task_id, task_family_id, task_instance_id,
+                variant_id, benchmark_track, capability_id,
                 utility_score, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -455,6 +575,10 @@ class EvaluationStore:
         run_id: str,
         condition: str,
         task_id: str,
+        task_family_id: str,
+        task_instance_id: str,
+        variant_id: str | None = None,
+        benchmark_track: str = "breadth",
         events: list[dict],
         occurred_at: datetime | None = None,
     ) -> int:
@@ -488,6 +612,10 @@ class EvaluationStore:
                 run_id,
                 condition,
                 task_id,
+                task_family_id,
+                task_instance_id,
+                variant_id,
+                benchmark_track,
                 ev["capability_id"],
                 ev["event_type"],
                 ev.get("details", "") or "",
@@ -496,9 +624,10 @@ class EvaluationStore:
         self._conn.executemany(
             """
             INSERT INTO cycle_events (
-                id, run_id, condition, task_id, capability_id,
+                id, run_id, condition, task_id, task_family_id, task_instance_id,
+                variant_id, benchmark_track, capability_id,
                 event_type, details, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -532,7 +661,8 @@ class EvaluationStore:
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self._conn.execute(
             f"""
-            SELECT run_id, condition, task_id, task_tier, attempt_count,
+            SELECT run_id, condition, task_id, task_family_id, task_instance_id,
+                   variant_id, benchmark_track, task_tier, attempt_count,
                    capability_type, verification_tier_reached, gate_passed,
                    output_in_range, token_cost, attempt_latency_ms,
                    failure_reason, registry_snapshot_id, invocation_record_id,
@@ -633,7 +763,8 @@ class EvaluationStore:
 
 def _row_to_record(row: tuple) -> EvaluationRecord:
     (
-        run_id, condition, task_id, task_tier, attempt_count,
+        run_id, condition, task_id, task_family_id, task_instance_id,
+        variant_id, benchmark_track, task_tier, attempt_count,
         capability_type, verification_tier_reached, gate_passed,
         output_in_range, token_cost, attempt_latency_ms,
         failure_reason, registry_snapshot_id, invocation_record_id,
@@ -692,6 +823,10 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         run_id=run_id,
         condition=BaselineCondition(condition),
         task_id=task_id,
+        task_family_id=task_family_id or task_id,
+        task_instance_id=task_instance_id or task_id,
+        variant_id=variant_id,
+        benchmark_track=benchmark_track or "breadth",
         task_tier=TaskTier(task_tier),
         attempt_count=attempt_count,
         capability_type=capability_type,

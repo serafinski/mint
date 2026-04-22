@@ -53,7 +53,10 @@ class TestTaskRegistry:
 
     def test_static_coverage_count(self):
         static = [t for t in ALL_TASKS if t.has_static_coverage]
-        assert len(static) == 5  # T01, T02, T03, T05, T09
+        assert {t.task_id for t in static} == {
+            "T01", "T02", "T04", "T05", "T09",
+            "T11", "T13", "T14", "T15", "T19", "T20",
+        }
 
     def test_tiers_present(self):
         tiers = {t.tier for t in ALL_TASKS}

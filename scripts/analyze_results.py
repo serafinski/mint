@@ -46,7 +46,7 @@ ALL_TASK_IDS = [t.task_id for t in ALL_TASKS]
 SYNTHESIS_TASK_IDS = [t for t in ALL_TASK_IDS if t not in RETRIEVAL_TASKS]
 CONDITION_LABELS = {
     "static": "Static",
-    "no_verification": "JIT only",
+    "no_verification": "JIT + Opt",
     "no_optimization": "JIT + Verif",
     "full": "JIT + Verif + Opt",
 }

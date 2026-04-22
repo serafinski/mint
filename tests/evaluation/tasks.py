@@ -120,6 +120,24 @@ class TaskDefinition:
     # "core work" type — see assignments per task definition below.
     expected_type: Literal["mcp_tool", "skill", "agent"] | None = None
     is_pilot: bool = False
+    # Recurrence-track identity. Breadth tasks leave these at their defaults.
+    # Recurrence task instances keep task_id stable as the canonical family key
+    # (e.g. "T11") and thread the variantized identity through the dedicated
+    # fields below instead of inventing synthetic task IDs like "T11_V01".
+    task_family_id: str | None = None
+    task_instance_id: str | None = None
+    variant_id: str | None = None
+    benchmark_track: Literal["breadth", "recurrence"] = "breadth"
+
+    @property
+    def family_id(self) -> str:
+        """Stable family-level task key used across breadth/recurrence."""
+        return self.task_family_id or self.task_id
+
+    @property
+    def instance_id(self) -> str:
+        """Concrete task-instance key; equals task_id for breadth runs."""
+        return self.task_instance_id or self.task_id
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +299,8 @@ T04 = TaskDefinition(
         "- 'items_below_threshold' (int): number of products needing reorder\n"
         "- 'total_reorder_cost' (float): sum of capped order costs"
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="inventory-reorder-policy",
     fixture_paths=[
         FIXTURES_DIR / "t04_inventory.csv",
         FIXTURES_DIR / "t04_reorder_rules.yaml",
@@ -763,8 +781,8 @@ T11 = TaskDefinition(
         "'regions_meeting_target' (int, count of regions where revenue >= target), "
         "and 'output_file' (str, 'output.xlsx')."
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="sales-integration-report",
     fixture_paths=[
         FIXTURES_DIR / "t11_sales.csv",
         FIXTURES_DIR / "t11_products.xlsx",
@@ -895,8 +913,8 @@ T13 = TaskDefinition(
         "'anomalies' (list of dicts, each with keys 'timestamp', 'metric', 'value'), "
         "and 'metrics_analyzed' (int, number of unique metrics you examined)."
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="anomaly-investigation-agent",
     fixture_paths=[
         FIXTURES_DIR / "t13_metrics.csv",
         FIXTURES_DIR / "t13_baselines.json",
@@ -962,8 +980,8 @@ T14 = TaskDefinition(
         "- 'over_budget_count' (int): number of departments where spending > annual_budget\n"
         "- 'flagged_transactions' (int): count of transactions exceeding max_single_transaction"
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="budget-allocation-policy",
     fixture_paths=[
         FIXTURES_DIR / "t14_departments.csv",
         FIXTURES_DIR / "t14_transactions.tsv",
@@ -1027,8 +1045,8 @@ T15 = TaskDefinition(
         "- 'metrics_aggregated' (int): number of distinct metrics processed\n"
         "- 'alert_days' (int): number of days where at least one threshold was breached"
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="monitoring-aggregation-policy",
     fixture_paths=[
         FIXTURES_DIR / "t15_hourly_metrics.csv",
         FIXTURES_DIR / "t15_agg_config.json",
@@ -1327,8 +1345,8 @@ T20 = TaskDefinition(
         "- 'ineligible_count' (int): number of applications failing at least one rule\n"
         "- 'rules_applied' (int): number of rules in the policy that were applied"
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="eligibility-policy-classifier",
     fixture_paths=[
         FIXTURES_DIR / "t20_applications.csv",
         FIXTURES_DIR / "t20_eligibility_policy.json",

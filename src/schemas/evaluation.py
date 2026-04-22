@@ -147,6 +147,20 @@ class EvaluationRecord(BaseModel):
         ..., description="Baseline condition"
     )
     task_id: str = Field(..., description="Testbed task identifier (e.g. 'T01')")
+    task_family_id: str = Field(
+        ..., description="Stable task-family identifier (e.g. 'T11') across breadth/recurrence"
+    )
+    task_instance_id: str = Field(
+        ..., description="Concrete task instance identifier (e.g. 'T11.v02'); equals task_id for breadth"
+    )
+    variant_id: str | None = Field(
+        default=None,
+        description="Variant identifier within a task family (e.g. 'v02'); None for breadth rows",
+    )
+    benchmark_track: str = Field(
+        default="breadth",
+        description="Benchmark track label (typically 'breadth' or 'recurrence')",
+    )
     task_tier: TaskTier = Field(
         ..., description="Difficulty tier of the task"
     )
