@@ -1261,6 +1261,21 @@ def _extract_result(
                 failure_reason = "output_rejected"
             elif gate_passed and output_in_range:
                 failure_reason = "none"
+            # Invocation recording parity (2026-04-22) — pre-fix, single-artifact
+            # path never called record_invocation, so M3 Gini only saw static
+            # condition rows. Mirrors composition.py:482 and harness.py:661.
+            if metrics_store is not None:
+                try:
+                    from src.schemas.metrics import InvocationRecord
+                    metrics_store.record_invocation(InvocationRecord(
+                        capability_id=getattr(artifact, "capability_name", None) or "",
+                        task_id=task.task_id[:64],
+                        success=bool(output_in_range),
+                        token_cost=0,
+                        latency_ms=0,
+                    ))
+                except Exception:  # noqa: BLE001
+                    logger.debug("record_invocation failed (single-artifact)", exc_info=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Artifact execution failed for task %s: %s", task.task_id, exc)
     elif gate_passed and not artifacts and task.has_static_coverage:
@@ -1275,6 +1290,27 @@ def _extract_result(
                 task.task_id,
                 output_in_range,
             )
+            # Invocation recording parity for the JIT-registry-match path.
+            if metrics_store is not None and matches:
+                try:
+                    from src.schemas.metrics import InvocationRecord
+                    first_match = matches[0]
+                    cap = first_match.capability if hasattr(first_match, "capability") else first_match.get("capability")
+                    cap_name = (
+                        getattr(cap, "capability_name", None)
+                        or (cap.get("capability_name") if isinstance(cap, dict) else None)
+                        or task.static_capability_name
+                        or ""
+                    )
+                    metrics_store.record_invocation(InvocationRecord(
+                        capability_id=cap_name,
+                        task_id=task.task_id[:64],
+                        success=bool(output_in_range),
+                        token_cost=0,
+                        latency_ms=0,
+                    ))
+                except Exception:  # noqa: BLE001
+                    logger.debug("record_invocation failed (registry-match)", exc_info=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Static execution for registry-matched task %s failed: %s",
