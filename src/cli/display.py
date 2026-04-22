@@ -14,6 +14,13 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+def _val(obj: Any, key: str, default: Any = None) -> Any:
+    """Get a value from a dict or Pydantic model."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline stage tracking
 # ---------------------------------------------------------------------------
@@ -143,14 +150,90 @@ def show_pipeline_result(
     verification_results = _get("verification_results", []) or []
     attempt_count = _get("attempt_count", 0)
     task_description = _get("task_description", "") or ""
+    generated_artifacts = _get("generated_artifacts", []) or []
 
-    # Verification findings
-    if verification_results and artifact:
-        _show_verification_findings(verification_results, artifact, verbose=verbose)
+    # Multi-capability summary
+    subtasks = _get("subtasks", []) or []
+    matches = _get("matches", []) or []
+    _is_compositional = len(subtasks) > 1 and (len(generated_artifacts) + len(matches) > 1)
+
+    # For single-artifact, show verification then multi-cap summary.
+    # For compositional chains, the live spinner already showed chain steps;
+    # show verification notes with severity labels after.
+    if not _is_compositional:
+        if verification_results and artifact:
+            _show_verification_findings(verification_results, artifact, verbose=verbose)
+        if len(generated_artifacts) > 1:
+            _show_multi_capability_summary(generated_artifacts, artifact)
+
+    if _is_compositional and verification_results:
+        _SEV_LABELS = {
+            "critical": ("[bold red]Critical[/bold red]", "bold red"),
+            "high": ("[red]Warning[/red]", "red"),
+            "medium": ("[yellow]Note[/yellow]", "yellow"),
+            "low": ("[dim]Info[/dim]", "dim"),
+            "info": ("[dim]Info[/dim]", "dim"),
+        }
+        # Deduplicate to latest report per capability (verification_results
+        # accumulates across retries; earlier reports may have CRITICALs that
+        # were fixed on retry — only the final verdict matters).
+        latest_by_cap: dict[str, object] = {}
+        for report in verification_results:
+            cap_name = getattr(report, "capability_name", "?")
+            latest_by_cap[cap_name] = report  # last one wins
+
+        # Group findings by (capability, explanation) and count
+        grouped: dict[str, list[tuple[str, str, str]]] = {}  # cap → [(sev, label, explanation)]
+        for report in latest_by_cap.values():
+            findings = getattr(report, "findings", []) or []
+            if not findings:
+                continue
+            cap_name = getattr(report, "capability_name", "?")
+            for f in findings:
+                sev = str(_val(f, "severity", "info")).lower()
+                if not verbose and sev in ("low", "info"):
+                    continue
+                label, style = _SEV_LABELS.get(sev, ("[dim]Info[/dim]", "dim"))
+                explanation = _explain_finding(f)
+                grouped.setdefault(cap_name, []).append((sev, label, explanation))
+
+        has_notes = bool(grouped)
+        if has_notes:
+            console.print()
+        for cap_name, items in grouped.items():
+            # Deduplicate same explanation for same capability
+            seen: dict[str, tuple[str, str, int]] = {}  # explanation → (sev, label, count)
+            for sev, label, explanation in items:
+                if explanation in seen:
+                    prev_sev, prev_label, count = seen[explanation]
+                    # Keep highest severity
+                    sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+                    if sev_order.get(sev, 9) < sev_order.get(prev_sev, 9):
+                        seen[explanation] = (sev, label, count + 1)
+                    else:
+                        seen[explanation] = (prev_sev, prev_label, count + 1)
+                else:
+                    seen[explanation] = (sev, label, 1)
+
+            shown = 0
+            for explanation, (sev, label, count) in seen.items():
+                if shown >= 3 and not verbose:
+                    remaining = len(seen) - shown
+                    if remaining > 0:
+                        console.print(f"  [dim]  ... and {remaining} more for {cap_name}[/dim]")
+                    break
+                count_str = f" (x{count})" if count > 1 else ""
+                console.print(f"  {label}: {cap_name} — {explanation}{count_str}")
+                shown += 1
+
+        if has_notes:
+            console.print(
+                "[dim]  Details in verification.json inside the run output directory.[/dim]"
+            )
 
     # Output
     console.print()
-    if artifact:
+    if artifact and not _is_compositional:
         cap_type = str(artifact.capability_type).split(".")[-1].upper()
         cap_name = artifact.capability_name
         console.print(f"Capability: [bold]{cap_name}[/bold] ([cyan]{cap_type}[/cyan])")
@@ -193,8 +276,17 @@ def show_pipeline_result(
     # Footer
     elapsed_s = elapsed_ms / 1000
     parts = [f"{elapsed_s:.1f}s"]
-    if artifact:
+    if _is_compositional and generated_artifacts:
+        # Show all types in the chain
+        type_counts: dict[str, int] = {}
+        for a in generated_artifacts:
+            t = str(_val(a, "capability_type", "")).split(".")[-1].upper()
+            type_counts[t] = type_counts.get(t, 0) + 1
+        type_summary = ", ".join(f"{n} {t}" for t, n in type_counts.items())
+        parts.append(type_summary)
+    elif artifact:
         parts.append(str(artifact.capability_type).split(".")[-1].upper())
+    if artifact:
         parts.append(f"{attempt_count} attempt(s)")
     console.print(f"\n[dim]{' | '.join(parts)}[/dim]")
 
@@ -206,6 +298,112 @@ def _find_report(verification_results: list, artifact: Any) -> Any | None:
             if r.capability_name == name:
                 return r
     return verification_results[-1] if verification_results else None
+
+
+def _show_chain_summary(
+    subtasks: list,
+    generated_artifacts: list,
+    matches: list,
+) -> None:
+    """Show the chain execution steps when the compositional executor was used."""
+    # Build lookup: gap_query → artifact
+    art_by_query: dict[str, Any] = {}
+    for art in generated_artifacts:
+        q = _val(art, "gap_query")
+        if q:
+            art_by_query[q] = art
+
+    # Build lookup: original query → match
+    match_by_query: dict[str, Any] = {}
+    for m in matches:
+        q = _val(m, "query", "")
+        if q:
+            match_by_query[q] = m
+        else:
+            cap = _val(m, "capability")
+            if cap:
+                match_by_query[_val(cap, "name", "")] = m
+
+    n_steps = len(subtasks)
+    console.print()
+    console.print(f"[dim]Chain execution ({n_steps} steps):[/dim]")
+
+    for i, st in enumerate(subtasks):
+        caps = _val(st, "required_capabilities", []) or []
+        cap_name = caps[0] if caps else "?"
+
+        source = "?"
+        cap_type = "?"
+        resolved_name = cap_name
+        if cap_name in match_by_query:
+            source = "registry"
+            m = match_by_query[cap_name]
+            c = _val(m, "capability")
+            cap_type = str(_val(c, "capability_type", "")).split(".")[-1].upper()
+            resolved_name = _val(c, "name", cap_name)
+        elif cap_name in art_by_query:
+            source = "generated"
+            a = art_by_query[cap_name]
+            cap_type = str(_val(a, "capability_type", "")).split(".")[-1].upper()
+            resolved_name = _val(a, "capability_name", cap_name)
+
+        step_label = f"Step {i + 1}/{n_steps}"
+        console.print(
+            f"  [dim]{step_label}:[/dim] [bold]{resolved_name}[/bold] "
+            f"([cyan]{cap_type}[/cyan], {source})"
+        )
+
+    console.print()
+
+
+def _show_multi_capability_summary(
+    generated_artifacts: list, executed_artifact: Any | None
+) -> None:
+    """Show all generated capabilities, marking which one was executed.
+
+    Phase 2's per-gap restoration produces multiple artifacts per task. The
+    executor's priority sort picks ONE for execution; the rest are registered
+    in the registry but not run for this task. Phase 3's compositional
+    executor will run them all in dependency order via the workspace.
+
+    Until Phase 3 lands, this display section makes the multi-artifact
+    output visible so users know what was generated even if only one ran.
+    """
+    executed_name = getattr(executed_artifact, "capability_name", None)
+    n_total = len(generated_artifacts)
+    n_executed = 1 if executed_name else 0
+
+    console.print()
+    console.print(
+        f"[dim]Generated {n_total} capabilities ({n_executed} executed):[/dim]"
+    )
+
+    # Sort for stable display: executed first, then alphabetical by name
+    def _sort_key(a: Any) -> tuple[int, str]:
+        name = getattr(a, "capability_name", "") or ""
+        return (0 if name == executed_name else 1, name)
+
+    for art in sorted(generated_artifacts, key=_sort_key):
+        name = getattr(art, "capability_name", "?") or "?"
+        cap_type = str(getattr(art, "capability_type", "")).split(".")[-1].upper()
+        gap_query = getattr(art, "gap_query", None)
+        is_executed = name == executed_name
+
+        marker = "[green]✓[/green]" if is_executed else "[dim]•[/dim]"
+        status = (
+            "[green]\\[executed][/green]"
+            if is_executed
+            else "[dim]\\[registered, not executed][/dim]"
+        )
+        gap_suffix = f" [dim](from gap: {gap_query})[/dim]" if gap_query else ""
+        console.print(
+            f"  {marker} [bold]{name}[/bold] ([cyan]{cap_type}[/cyan]) {status}{gap_suffix}"
+        )
+
+    if n_total > n_executed:
+        console.print(
+            "  [dim]Only the top-priority capability was executed for this task.[/dim]"
+        )
 
 
 def _show_verification_findings(
@@ -260,9 +458,17 @@ def _show_verification_findings(
             if verbose:
                 console.print(f"    [dim]Raw: {msg}[/dim]")
         if hidden > 0:
-            console.print(f"  [dim]... and {hidden} more (use --verbose)[/dim]")
+            console.print(f"  [dim]... and {hidden} minor note(s) not shown[/dim]")
     elif hidden > 0:
-        console.print(f"[dim]{hidden} minor verification note(s) (use --verbose to see)[/dim]")
+        # Show the minor findings inline instead of hiding behind --verbose.
+        # Group by category for a compact summary.
+        categories: dict[str, int] = {}
+        for f in findings:
+            cat = str(getattr(f, "category", "") or _explain_finding(f)[:40])
+            categories[cat] = categories.get(cat, 0) + 1
+        summary = "; ".join(f"{cat} ({n})" if n > 1 else cat for cat, n in categories.items())
+        cap_name = getattr(artifact, "capability_name", "?")
+        console.print(f"[dim]Verification notes for {cap_name}: {summary}[/dim]")
 
 
 def _explain_finding(finding: Any) -> str:
@@ -446,10 +652,19 @@ def show_capability_detail(
     ct = str(cap.capability_type).split(".")[-1].upper()
     active = "[green]active[/green]" if cap.is_active else "[red]inactive[/red]"
 
-    # Metadata panel
+    # Metadata panel. Domain + is_generic come from the evolutionary
+    # taxonomy (B1 Step 3.5f) and are load-bearing for gap-detection
+    # retrieval — a generic capability bypasses the domain filter at
+    # search time via the ``$or`` ChromaDB where clause.
+    generic_label = (
+        "[green]yes[/green] (bypasses domain filter in gap detection)"
+        if cap.is_generic
+        else "[dim]no[/dim] (domain-scoped)"
+    )
     meta_lines = [
         f"[bold]Type:[/bold] {ct}",
         f"[bold]Domain:[/bold] {cap.domain}",
+        f"[bold]Generic:[/bold] {generic_label}",
         f"[bold]Status:[/bold] {active}",
         f"[bold]Tags:[/bold] {', '.join(cap.tags) if cap.tags else '(none)'}",
         f"[bold]Created:[/bold] {cap.created_at:%Y-%m-%d %H:%M}",
@@ -584,7 +799,7 @@ def show_history(
         return
 
     table = Table(title="Invocation History", expand=False)
-    table.add_column("Time", style="dim")
+    table.add_column("When", style="dim")
     table.add_column("Capability", style="bold")
     table.add_column("Task", max_width=35)
     table.add_column("Success", justify="center")
@@ -593,7 +808,7 @@ def show_history(
     for r in records:
         success = "[green]\u2713[/green]" if r.success else "[red]\u2717[/red]"
         table.add_row(
-            f"{r.invoked_at:%H:%M:%S}",
+            f"{r.invoked_at:%Y-%m-%d %H:%M:%S}",
             r.capability_id,
             r.task_id[:35],
             success,

@@ -3,16 +3,18 @@
 Generates edge-case test inputs, executes them in the Docker sandbox,
 and detects behavioral contamination. No LLM calls — pure Python.
 
-Five test categories:
+Six test categories:
   - Nonexistent entity: empty / missing / invalid inputs
   - Consistency: same input twice must produce same output
   - Boundary: min/max values, zero, negative, empty strings
-  - Latency: execution must complete within a reasonable bound
+  - Timeout: execution must complete within a reasonable timeout (5s)
+  - Latency (variance): mock-smell detection — very fast AND very uniform
   - Output variation: different inputs should produce different outputs
 """
 
 import ast
 import json
+import statistics
 import textwrap
 import time
 from functools import partial
@@ -22,7 +24,7 @@ from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import Severity, VerificationFinding
 from src.verification.sandbox_tool import resolve_extra_packages, sandbox_execute
 
-LATENCY_THRESHOLD_S = 5.0
+TIMEOUT_THRESHOLD_S = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -64,15 +66,94 @@ def extract_parameter_schema(source_code: str) -> dict[str, dict]:
     return {}
 
 
-def _extract_function_name(source_code: str) -> str | None:
-    """Return the name of the first public async function in source_code."""
+def _find_mcp_tool_function(source_code: str) -> str | None:
+    """Return the name of the ``@mcp.tool``-decorated public async function.
+
+    Security audit finding #8 (2026-04-19): the decorator is the only
+    unambiguous signal that identifies the tool entrypoint in a FastMCP
+    module. Every pre-fix call site used an ordering heuristic (``dir()``
+    alphabetical in ``ToolLoader``, ``ast.walk`` source order elsewhere)
+    that silently picked the wrong function when a helper was defined
+    before the decorated entrypoint (reporter's repro:
+    ``helper_format_rows`` ordered before ``@mcp.tool summarize_sales``).
+
+    Returns the function name when exactly one public async def carries
+    an ``@mcp.tool`` / ``@mcp.tool()`` decorator. Returns ``None`` on
+    parse error, zero matches (fall back to the single-async heuristic
+    in ``_extract_function_name``), or multiple matches (ambiguous;
+    caller should surface this as a verification failure rather than
+    silently pick one).
+
+    Accepts both bare ``@mcp.tool`` and call-form ``@mcp.tool(...)``.
+    Ignores non-``.tool`` decorators (``@lru_cache``, ``@contextmanager``).
+    Only scans top-level nodes — nested ``async def`` inside a helper
+    doesn't count.
+    """
     try:
         tree = ast.parse(source_code)
     except SyntaxError:
         return None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and not node.name.startswith("_"):
-            return node.name
+
+    matches: list[str] = []
+    for node in ast.iter_child_nodes(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        if node.name.startswith("_"):
+            continue
+        for dec in node.decorator_list:
+            # ``@mcp.tool`` → dec is ast.Attribute; ``@mcp.tool(...)`` →
+            # dec is ast.Call whose .func is ast.Attribute.
+            target = dec.func if isinstance(dec, ast.Call) else dec
+            if isinstance(target, ast.Attribute) and target.attr == "tool":
+                matches.append(node.name)
+                break
+
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _extract_function_name(source_code: str) -> str | None:
+    """Return the name of the MCP tool entrypoint in ``source_code``.
+
+    Resolution order (security audit finding #8, 2026-04-19):
+
+    1. **Decorator match** via :func:`_find_mcp_tool_function` — unambiguous,
+       uses the FastMCP ``@mcp.tool`` signal. This is the correct answer
+       for generator output and merge/split LLM output when the FastMCP
+       pattern is followed.
+    2. **Zero decorator matches, exactly one public async def** —
+       legacy / non-FastMCP artifacts. Use that function, log a WARNING
+       that the decorator was missing.
+    3. **Ambiguous** (zero decorators + multiple public async defs, or
+       parse error) — return ``None``. Callers must fail verification
+       rather than silently pick one.
+    """
+    decorated = _find_mcp_tool_function(source_code)
+    if decorated is not None:
+        return decorated
+
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return None
+
+    public_async = [
+        node.name
+        for node in ast.iter_child_nodes(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and not node.name.startswith("_")
+    ]
+    if len(public_async) == 1:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Tool source has no @mcp.tool-decorated function; falling back "
+            "to the single public async def %r. This is a legacy pattern — "
+            "future artifacts should declare @mcp.tool explicitly.",
+            public_async[0],
+        )
+        return public_async[0]
+
+    # Zero or multiple public async defs and no decorator — ambiguous.
     return None
 
 
@@ -427,23 +508,34 @@ def _test_boundary(
                     )
                 )
             else:
+                # Distinguish dependency install failures (tool is broken)
+                # from code crashes on bad input (expected for boundaries).
+                is_dep_failure = (
+                    "pip install failed" in stderr
+                    or "No solution found" in stderr
+                    or "No matching distribution" in stderr
+                )
                 findings.append(
                     VerificationFinding(
                         tier=2,
-                        category="boundary",
-                        severity=Severity.MEDIUM,
-                        message=f"Tool crashed on {label} boundary inputs: {stderr[:200] or '(no stderr)'}",
-                        location=f"boundary/{label}",
+                        category="dependency" if is_dep_failure else "boundary",
+                        severity=Severity.HIGH if is_dep_failure else Severity.MEDIUM,
+                        message=(
+                            f"Dependency install failed: {stderr[:300] or '(no stderr)'}"
+                            if is_dep_failure
+                            else f"Tool crashed on {label} boundary inputs: {stderr[:200] or '(no stderr)'}"
+                        ),
+                        location="pip_packages" if is_dep_failure else f"boundary/{label}",
                     )
                 )
 
     return findings
 
 
-def _test_latency(
+def _test_timeout(
     source_code: str, func_name: str, schema: dict[str, dict], _sandbox=sandbox_execute
 ) -> list[VerificationFinding]:
-    """Check that execution completes within a reasonable time."""
+    """Check that execution completes within a reasonable timeout (5s)."""
     findings: list[VerificationFinding] = []
     if not schema:
         return findings
@@ -459,13 +551,81 @@ def _test_latency(
     # Use the tool-reported elapsed if available, otherwise wall time
     elapsed = parsed.get("elapsed", wall_time) if parsed else wall_time
 
-    if elapsed > LATENCY_THRESHOLD_S:
+    if elapsed > TIMEOUT_THRESHOLD_S:
+        findings.append(
+            VerificationFinding(
+                tier=2,
+                category="timeout",
+                severity=Severity.MEDIUM,
+                message=f"Tool execution took {elapsed:.2f}s (timeout threshold: {TIMEOUT_THRESHOLD_S}s)",
+                location="timeout",
+            )
+        )
+
+    return findings
+
+
+def _test_latency(
+    source_code: str, func_name: str, schema: dict[str, dict], _sandbox=sandbox_execute
+) -> list[VerificationFinding]:
+    """Detect mock-smell timing: very fast AND very uniform across varied inputs.
+
+    Real computation has timing that varies with input. Constant lookup tables /
+    hash tricks have near-zero variance and very low mean. We flag only when
+    BOTH conditions hold to keep false positives near zero (proposal: section 4).
+    """
+    findings: list[VerificationFinding] = []
+    if not schema:
+        return findings
+
+    # Collect 3 distinct input variants. Dedup by repr (dicts aren't hashable
+    # so we can't use a set directly).
+    candidates = [
+        _generate_boundary_inputs(schema),
+        _generate_negative_inputs(schema),
+        _generate_large_inputs(schema),
+    ]
+    seen: set[str] = set()
+    distinct_inputs: list[dict] = []
+    for c in candidates:
+        key = repr(sorted(c.items()))
+        if key not in seen:
+            seen.add(key)
+            distinct_inputs.append(c)
+
+    if len(distinct_inputs) < 2:
+        return findings  # Cannot compute variance with < 2 samples
+
+    elapsed_samples: list[float] = []
+    for inputs in distinct_inputs:
+        code = _build_sandbox_code(source_code, func_name, inputs)
+        result = _sandbox(code, timeout=15)
+        parsed = _parse_sandbox_output(result)
+        if parsed is None or parsed.get("error") is not None:
+            continue
+        elapsed = parsed.get("elapsed")
+        if isinstance(elapsed, (int, float)):
+            elapsed_samples.append(float(elapsed))
+
+    if len(elapsed_samples) < 2:
+        return findings  # Not enough successful runs to compute variance
+
+    mean = statistics.mean(elapsed_samples)
+    stdev = statistics.stdev(elapsed_samples)
+    cv = (stdev / mean) if mean > 0 else 0.0
+
+    # Two-condition gate: very fast AND very uniform.
+    if mean < 0.001 and cv < 0.10:
         findings.append(
             VerificationFinding(
                 tier=2,
                 category="latency",
                 severity=Severity.MEDIUM,
-                message=f"Tool execution took {elapsed:.2f}s (threshold: {LATENCY_THRESHOLD_S}s)",
+                message=(
+                    f"Tool execution is suspiciously fast and uniform: "
+                    f"mean={mean*1000:.3f}ms, cv={cv:.3f} across {len(elapsed_samples)} inputs "
+                    "— may be returning a constant lookup instead of computing"
+                ),
                 location="latency",
             )
         )
@@ -478,12 +638,25 @@ def _test_latency(
 # ---------------------------------------------------------------------------
 
 
-def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
-    """Run all five behavioral test categories on an MCP_TOOL artifact.
+def run(
+    artifact: GeneratedArtifact,
+    *,
+    allow_network: bool = False,
+) -> list[VerificationFinding]:
+    """Run all six behavioral test categories on an MCP_TOOL artifact.
 
-    Categories: nonexistent entity, consistency, boundary, latency,
-    and output variation.  SKILL/AGENT artifacts have no ``source_code``
-    and are skipped with an INFO finding.
+    Categories: nonexistent entity, consistency, boundary, timeout,
+    latency (variance), and output variation.  SKILL/AGENT artifacts
+    have no ``source_code`` and are skipped with an INFO finding.
+
+    Step 14.12: when ``allow_network=True``, every sandbox execution inside
+    this tier runs with ``--network bridge`` instead of ``--network none``
+    so artifacts that legitimately require network access can be behavior-
+    tested. Additionally, when ``artifact.needs_network=True``, a
+    differential disconnect test fires: the tool is invoked twice (network
+    on, network off) and flagged if the offline run returns a plausible
+    dict rather than a clean error — a direct detector for the F2
+    "silent fallback" failure mode.
 
     Returns a list of ``VerificationFinding`` objects (tier=2).
     """
@@ -509,9 +682,34 @@ def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
             )
         ]
 
-    # Resolve extra pip packages from imports so sandbox installs them dynamically.
-    extra_pkgs = resolve_extra_packages(source_code)
-    _sandbox = partial(sandbox_execute, extra_packages=extra_pkgs or None)
+    # Prefer generator-declared pip_packages (accurate PyPI names).
+    # Fall back to LLM-based import resolution for old artifacts.
+    declared_pkgs = artifact.pip_packages if artifact.pip_packages else None
+    extra_pkgs = declared_pkgs or resolve_extra_packages(source_code) or None
+
+    # Upfront dependency check: if the sandbox can't install the tool's
+    # packages, all behavioral tests will fail with the same error.
+    # Report once as HIGH and skip the rest.
+    if extra_pkgs:
+        dep_check = sandbox_execute(
+            'print("deps_ok")', timeout=60, extra_packages=extra_pkgs,
+            allow_network=allow_network,
+        )
+        if not dep_check.get("success"):
+            stderr = dep_check.get("stderr", "")
+            return [
+                VerificationFinding(
+                    tier=2,
+                    category="dependency",
+                    severity=Severity.HIGH,
+                    message=f"Cannot install declared dependencies: {stderr[:300]}",
+                    location="pip_packages",
+                )
+            ]
+
+    _sandbox = partial(
+        sandbox_execute, extra_packages=extra_pkgs, allow_network=allow_network,
+    )
 
     schema = extract_parameter_schema(source_code)
     if not schema:
@@ -522,7 +720,124 @@ def run(artifact: GeneratedArtifact) -> list[VerificationFinding]:
     findings.extend(_test_nonexistent_entity(source_code, func_name, schema, _sandbox))
     findings.extend(_test_consistency(source_code, func_name, schema, _sandbox))
     findings.extend(_test_boundary(source_code, func_name, schema, _sandbox))
+    findings.extend(_test_timeout(source_code, func_name, schema, _sandbox))
     findings.extend(_test_latency(source_code, func_name, schema, _sandbox))
     findings.extend(_test_output_variation(source_code, func_name, schema, _sandbox))
 
+    # Step 14.12: network-disconnect differential. Only fires when the
+    # generator declared the capability legitimately needs network AND the
+    # enclosing context allows network — otherwise the test is either
+    # vacuous (offline tool doesn't need network) or invalid (network
+    # should be blocked, so the on-comparison isn't meaningful).
+    if allow_network and getattr(artifact, "needs_network", False):
+        findings.extend(
+            _test_network_disconnect_differential(
+                source_code, func_name, schema, extra_pkgs,
+            )
+        )
+
     return findings
+
+
+def _test_network_disconnect_differential(
+    source_code: str,
+    func_name: str,
+    schema: dict[str, dict],
+    extra_pkgs: list[str] | None,
+) -> list[VerificationFinding]:
+    """Run the tool twice (network on, network off) and flag silent fallbacks.
+
+    Direct detector for proposal §Pillar 2 F2 (silent fallbacks). A tool that
+    claims to fetch live data but actually returns hardcoded values will
+    succeed identically under both network policies — that matches the
+    contaminated pattern. A legitimate network tool fails cleanly with a
+    socket-level error when network is disabled.
+
+    Flags:
+      * CRITICAL — offline run returned plausible-looking output (dict, no
+        error marker). Strong contamination signal.
+      * MEDIUM — both runs failed (can't distinguish: might be broken tool
+        rather than contaminated).
+      * INFO — offline run failed as expected and online run succeeded
+        (legitimate network tool).
+
+    Step 14.12.
+    """
+    # Use boundary inputs as the canonical "normal" invocation.
+    inputs = _generate_boundary_inputs(schema)
+    code = _build_sandbox_code(source_code, func_name, inputs)
+
+    on_result = sandbox_execute(
+        code, timeout=30, extra_packages=extra_pkgs, allow_network=True,
+    )
+    off_result = sandbox_execute(
+        code, timeout=30, extra_packages=extra_pkgs, allow_network=False,
+    )
+
+    def _parse(payload: dict) -> tuple[bool, dict | str]:
+        """Return (produced_plausible_dict, parsed_value)."""
+        if not payload.get("success"):
+            return False, payload.get("stderr", "")[:300]
+        stdout = (payload.get("stdout") or "").strip()
+        if not stdout:
+            return False, ""
+        try:
+            last_line = stdout.splitlines()[-1]
+            parsed = json.loads(last_line)
+        except (json.JSONDecodeError, IndexError):
+            return False, stdout[:300]
+        if not isinstance(parsed, dict):
+            return False, parsed
+        if "error" in parsed:
+            return False, parsed["error"]
+        return True, parsed.get("result", parsed)
+
+    on_ok, on_value = _parse(on_result)
+    off_ok, off_value = _parse(off_result)
+
+    if off_ok:
+        # Offline produced a plausible dict — strong silent-fallback signal.
+        return [
+            VerificationFinding(
+                tier=2,
+                category="network_silent_fallback",
+                severity=Severity.CRITICAL,
+                message=(
+                    "Tool declared needs_network=True but returned plausible "
+                    "output with network disabled. Likely hardcoded data or "
+                    "silent fallback (proposal §Pillar 2 F2)."
+                ),
+                location="network_disconnect_differential",
+            )
+        ]
+
+    if on_ok and not off_ok:
+        # Legitimate network tool.
+        return [
+            VerificationFinding(
+                tier=2,
+                category="network_disconnect_differential",
+                severity=Severity.INFO,
+                message=(
+                    "Network-disconnect differential passed: tool succeeds "
+                    "online and fails cleanly offline."
+                ),
+            )
+        ]
+
+    if not on_ok and not off_ok:
+        # Both failed — can't classify.
+        return [
+            VerificationFinding(
+                tier=2,
+                category="network_disconnect_differential",
+                severity=Severity.MEDIUM,
+                message=(
+                    "Tool failed under both network policies; cannot verify "
+                    "network-disconnect semantics."
+                ),
+            )
+        ]
+
+    # on_ok=False, off_ok=True already handled above — shouldn't reach here.
+    return []

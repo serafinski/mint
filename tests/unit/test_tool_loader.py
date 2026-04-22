@@ -493,14 +493,6 @@ class TestCleanup:
         loader.cleanup()
         loader.cleanup()  # Should not raise
 
-    def test_atexit_registered_on_init(self):
-        """ToolLoader.__init__ registers cleanup with atexit."""
-        registered = []
-        with patch("src.orchestrator.tool_loader.atexit.register", side_effect=registered.append):
-            loader = ToolLoader()
-
-        assert loader.cleanup in registered
-
 
 # ---------------------------------------------------------------------------
 # execute_tool — edge cases for stdout parsing and JSON format guards

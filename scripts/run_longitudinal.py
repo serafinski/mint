@@ -44,10 +44,10 @@ import random  # noqa: E402
 logger = logging.getLogger("run_longitudinal")
 
 DATA_DIR = ROOT / "data"
-CHROMA_DIR = DATA_DIR / "chroma"
+CHROMA_DIR = DATA_DIR / "eval" / "chroma"
 MCP_TOOLS_DIR = ROOT / "src" / "mcp_tools"
-SKILLS_DIR = ROOT / ".deepagents" / "skills"
-DEFAULT_DB = str(DATA_DIR / "longitudinal.duckdb")
+SKILLS_DIR = DATA_DIR / "eval" / "skills"
+DEFAULT_DB = str(DATA_DIR / "eval" / "longitudinal.duckdb")
 
 
 def main() -> None:
@@ -94,6 +94,7 @@ def main() -> None:
     from tests.evaluation.tasks import ALL_TASKS
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "eval").mkdir(parents=True, exist_ok=True)
 
     # --- Build task sequence ---
     rng = random.Random(args.seed)
@@ -141,11 +142,18 @@ def main() -> None:
     cumulative_success = 0
     cumulative_total = 0
 
+    from tests.evaluation.cycle_flush import flush_task_cycle_state, now_utc
+    from src.orchestrator.tracing import trace_context
+
     for i, task in enumerate(task_sequence):
         logger.info("=" * 60)
         logger.info("Task %d/%d: %s", i + 1, len(task_sequence), task.task_id)
         logger.info("=" * 60)
 
+        # Step 18.7 / 18.8 (2026-04-17): capture the pre-task timestamp so
+        # the post-task cycle_events flush can filter MetricsStore's
+        # capability_events to just this task's events.
+        task_events_cutoff = now_utc()
         t_start = time.monotonic()
 
         # Create pipeline with optimizer enabled
@@ -157,19 +165,31 @@ def main() -> None:
             verification_enabled=True,
         ).compile()
 
+        _file_fmts = list({fp.suffix.lower().lstrip(".") for fp in task.fixture_paths}) if task.fixture_paths else []
+        _lf_tags = [
+            "longitudinal",
+            # Treat longitudinal as its own "condition" so the
+            # condition filter semantics are consistent with the
+            # eval harness baselines.
+            "condition:longitudinal",
+            task.task_id,
+            f"tier:{task.tier}",
+            f"step:{i + 1}/{len(task_sequence)}",
+            f"static_coverage:{str(task.has_static_coverage).lower()}",
+            *(f"format:{fmt}" for fmt in sorted(_file_fmts)),
+        ]
+        _lf_session = f"longitudinal-{args.seed}"
+
         invoke_config: dict = {}
         if langfuse_handler is not None:
             invoke_config["callbacks"] = [langfuse_handler]
-            _file_fmts = list({fp.suffix.lower().lstrip(".") for fp in task.fixture_paths}) if task.fixture_paths else []
             invoke_config["metadata"] = {
-                "langfuse_session_id": f"longitudinal-{args.seed}",
-                "langfuse_tags": [
-                    "longitudinal",
-                    task.task_id,
-                    f"tier:{task.tier}",
-                    f"step:{i + 1}/{len(task_sequence)}",
-                    *(f"format:{fmt}" for fmt in sorted(_file_fmts)),
-                ],
+                "langfuse_session_id": _lf_session,
+                # Step 13.7 tagging audit (2026-04-18) — user_id
+                # differentiates longitudinal runs from CLI + eval-harness
+                # in per-user LangFuse dashboards.
+                "langfuse_user_id": "longitudinal-runner",
+                "langfuse_tags": _lf_tags,
                 "task_id": task.task_id,
                 "step": i + 1,
                 "total_steps": len(task_sequence),
@@ -177,40 +197,64 @@ def main() -> None:
             }
 
         initial_state = TaskState(task_description=task.task_prompt)
-        try:
-            final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
-            result = _extract_result(final_state, task, loader)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Pipeline raised for task %s: %s", task.task_id, exc)
-            result = {
-                "gate_passed": False,
-                "output_in_range": False,
-                "failure_reason": "generation_failed",
-                "attempt_count": 0,
-            }
+        # Step 13.7 tag-propagation fix (2026-04-19): wrap the pipeline
+        # invocation + post-task flush in trace_context so events from
+        # ThreadPool workers (verification, adversarial), LangChain @tool
+        # callbacks (sandbox_execute), and the flush itself inherit tags.
+        with trace_context(
+            tags=_lf_tags,
+            session_id=_lf_session,
+            user_id="longitudinal-runner",
+        ):
+            try:
+                final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
+                result = _extract_result(final_state, task, loader)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Pipeline raised for task %s: %s", task.task_id, exc)
+                result = {
+                    "gate_passed": False,
+                    "output_in_range": False,
+                    "failure_reason": "generation_failed",
+                    "attempt_count": 0,
+                }
 
-        elapsed_ms = int((time.monotonic() - t_start) * 1000)
+            elapsed_ms = int((time.monotonic() - t_start) * 1000)
 
-        record = EvaluationRecord(
-            run_id=run_id,
-            condition="longitudinal",
-            task_id=task.task_id,
-            task_tier=task.tier,
-            attempt_count=result.get("attempt_count", 0),
-            capability_type=result.get("capability_type"),
-            verification_tier_reached=result.get("verification_tier_reached"),
-            gate_passed=result.get("gate_passed", False),
-            output_in_range=result.get("output_in_range", False),
-            token_cost=0,
-            attempt_latency_ms=elapsed_ms,
-            failure_reason=result.get("failure_reason", "generation_failed"),
-            registry_snapshot_id=snap_id,
-            seed=args.seed,
-            is_pilot=False,
-        )
+            record = EvaluationRecord(
+                run_id=run_id,
+                condition="longitudinal",
+                task_id=task.task_id,
+                task_tier=task.tier,
+                attempt_count=result.get("attempt_count", 0),
+                capability_type=result.get("capability_type"),
+                verification_tier_reached=result.get("verification_tier_reached"),
+                gate_passed=result.get("gate_passed", False),
+                output_in_range=result.get("output_in_range", False),
+                token_cost=0,
+                attempt_latency_ms=elapsed_ms,
+                failure_reason=result.get("failure_reason", "generation_failed"),
+                registry_snapshot_id=snap_id,
+                seed=args.seed,
+                is_pilot=False,
+            )
 
-        eval_store.record_run(record)
-        records.append(record)
+            eval_store.record_run(record)
+            records.append(record)
+
+            # Step 18.7 / 18.8 (2026-04-17): persist per-task cycle state
+            # (invocation_events + cycle_utility_scores + cycle_events) for
+            # Chapter 6 KL convergence + per-type op-count analyses via
+            # scripts/analyze_longitudinal.py. Never-raises — flush failure
+            # must not break the longitudinal loop.
+            flush_task_cycle_state(
+                eval_store=eval_store,
+                metrics_store=metrics_store,
+                registry=registry,
+                run_id=run_id,
+                condition="longitudinal",
+                task_id=task.task_id,
+                task_events_cutoff=task_events_cutoff,
+            )
 
         cumulative_total += 1
         if record.success:
@@ -269,6 +313,7 @@ def main() -> None:
 
     # Save optimizer log
     log_path = DATA_DIR / "longitudinal_optimizer_log.json"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(json.dumps(optimizer_log, indent=2))
     print(f"\n  Optimizer log: {log_path}")
     print(f"  Results DB:    {args.db}")

@@ -392,7 +392,9 @@ def write_csv(results: dict[str, list[dict]], path: str) -> None:
     writer = csv.DictWriter(output, fieldnames=rows[0].keys())
     writer.writeheader()
     writer.writerows(rows)
-    Path(path).write_text(output.getvalue())
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(output.getvalue())
     print(f"\nCSV written to {path} ({len(rows)} rows)")
 
 

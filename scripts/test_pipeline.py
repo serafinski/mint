@@ -4,10 +4,12 @@ Runs tasks through the complete 9-node pipeline and verifies every
 intermediate state: decomposition -> gap detection -> classification
 -> generation -> verification -> loading -> registration.
 
-Tests all three capability types:
-- MCP_TOOL: T05 (dirty CSV cleaning)
-- SKILL: multi-source data integration (T11-like)
-- AGENT: anomaly investigation (T13-like)
+Tests all three capability types with inline prompts (not imported from
+`tests/evaluation/tasks.py`), so this script is independent of testbed
+changes. Representative shapes:
+- MCP_TOOL: dirty CSV cleaning
+- SKILL: multi-source data integration
+- AGENT: anomaly investigation
 
 Usage::
 
@@ -33,6 +35,13 @@ from typing import Any
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+
+# Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
+# to ``environment=test`` so they don't pollute Phase 4 eval's
+# ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
+# ambient .env values can't override. Same pattern as ``tests/conftest.py``.
+import os  # noqa: E402
+os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 
 from dotenv import load_dotenv  # noqa: E402
 

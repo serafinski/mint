@@ -34,3 +34,35 @@ class TestSlugifyGap:
         slug = slugify_gap_hyphen("fuzzy string matching")
         assert "_" not in slug
         assert "-" in slug
+
+    def test_no_double_underscore_when_truncating_mid_separator(self):
+        """Regression: old code stripped trailing underscores BEFORE truncating,
+        leaving a trailing underscore at position 40 that then got concatenated
+        with ``_<hash>`` — producing names like
+        ``parse_this_xml_report_data_and_find_the__6b415a`` (double underscore).
+
+        The fix strips trailing underscores AFTER truncation.
+        """
+        # A 46-char input where position 39 is an underscore
+        query = "parse-this-xml-report-data-and-find-the-95c8e9"
+        slug = slugify_gap(query)
+        # Verify no double underscore anywhere in the slug
+        assert "__" not in slug, f"Double underscore in slug: {slug}"
+        # Verify the base ends cleanly (no trailing underscore before suffix)
+        base = slug.rsplit("_", 1)[0]
+        assert not base.endswith("_"), f"Base has trailing underscore: {base}"
+
+    def test_no_double_hyphen_in_hyphen_variant(self):
+        """Same regression, applied to the hyphen variant."""
+        query = "parse-this-xml-report-data-and-find-the-95c8e9"
+        slug = slugify_gap_hyphen(query)
+        assert "--" not in slug, f"Double hyphen in slug: {slug}"
+        base = slug.rsplit("-", 1)[0]
+        assert not base.endswith("-"), f"Base has trailing hyphen: {base}"
+
+    def test_empty_query_falls_back_to_cap(self):
+        """Empty or punctuation-only queries fall back to 'cap' base."""
+        slug = slugify_gap("")
+        assert slug.startswith("cap_")
+        slug2 = slugify_gap("!!!")
+        assert slug2.startswith("cap_")

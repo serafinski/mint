@@ -30,6 +30,13 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
+# to ``environment=test`` so they don't pollute Phase 4 eval's
+# ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
+# ambient .env values can't override. Same pattern as ``tests/conftest.py``.
+import os  # noqa: E402
+os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
+
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -119,6 +126,20 @@ def _run_mint(
         verbose=False,
     )
 
+    if exit_code == 2:
+        # Soft failure: pipeline ran but decomposition fell back to the
+        # single-sentence path, so output is almost certainly wrong. Surface
+        # it as a FAIL in the smoke test so regressions are caught.
+        print("\n  FAIL: decomposition failed — output is fallback-only")
+        return False
+    if exit_code == 3:
+        # Step 14.6: pipeline ran to completion but the final output is
+        # missing keys / files the task asked for (output contract not
+        # satisfied). The CLI runner already printed the missing-keys /
+        # missing-files diagnostics to stderr; we surface it as a FAIL
+        # here so test_mint catches T16-style silent wrong-shape outputs.
+        print("\n  FAIL: output contract not satisfied — wrong-shape answer")
+        return False
     if exit_code != 0:
         print(f"\n  FAIL: exit code {exit_code}")
         return False
@@ -195,7 +216,12 @@ def test_mcp_tsv() -> bool:
 
 
 def test_skill_excel() -> bool:
-    """SKILL: Multi-source integration with Excel product catalog (new format)."""
+    """SKILL: Multi-source integration with Excel product catalog (new format).
+
+    Phase 3 Step 12 (Option B): also requests an Excel file output. Exercises
+    the decomposer Rule 15 / ``_ensure_file_writer_last_step`` path — the
+    chain should end in an appended MCP_TOOL writer that produces output.xlsx.
+    """
     return _run_mint(
         task=(
             "Build a data integration pipeline using these three data sources: "
@@ -204,7 +230,9 @@ def test_skill_excel() -> bool:
             "(2) Compute per-region revenue totals (quantity * unit_price). "
             "(3) Compare each region's revenue against its target. "
             "This requires a multi-step workflow integrating separate data sources "
-            "with intermediate outputs. Return a dict with 'summary_row_count' (int), "
+            "with intermediate outputs. "
+            "Write the per-region revenue vs. target summary to output.xlsx as Excel. "
+            "Also return a dict with 'summary_row_count' (int), "
             "'region_revenues' (dict), and 'regions_meeting_target' (int)."
         ),
         files=[
@@ -217,7 +245,16 @@ def test_skill_excel() -> bool:
 
 
 def test_agent_yaml_incident() -> bool:
-    """AGENT: Root cause diagnosis with YAML incident report (new format)."""
+    """AGENT: Root cause diagnosis with YAML incident report (new format).
+
+    Phase 3 Step 12 (Option B): requests TWO file outputs in different
+    formats (report.md + metrics.csv) — the only test_mint scenario that
+    exercises the multi-file path. Catches §12 finding #13 (chained-
+    writers bug) end-to-end: validator must append two MCP_TOOL writers
+    in PARALLEL off the original predecessor (each reading the AGENT's
+    structured output independently and serializing its own format),
+    NOT serially with writer-2 reading writer-1's filepath.
+    """
     return _run_mint(
         task=(
             "You are investigating a service degradation incident. "
@@ -226,7 +263,12 @@ def test_agent_yaml_incident() -> bool:
             "Identify which metric changed FIRST (the root cause) by comparing "
             "onset times across metrics. Determine the cascade chain. "
             "This requires adaptive investigation: examine data, form hypotheses, "
-            "test them, and revise. Return a dict with 'root_cause_metric' (str), "
+            "test them, and revise. "
+            "Write a markdown incident summary to report.md (one table with "
+            "metric name, onset time, and cascade position). "
+            "Also write the same per-metric data as a CSV to metrics.csv "
+            "(columns: metric_name, onset_time, cascade_position). "
+            "Also return a dict with 'root_cause_metric' (str), "
             "'cascade_chain' (list of str), and 'n_metrics_investigated' (int)."
         ),
         files=[
@@ -261,7 +303,7 @@ def main() -> int:
 
     log_dir = ROOT / "data" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / f"test_mint_{ts}.log"
 
     import re as _re
@@ -301,7 +343,11 @@ def main() -> int:
     sys.stderr = _Tee(sys.__stderr__, _log_file)
     print(f"Logging to {log_path}\n")
 
-    # Reset CLI state before pipeline tests (clean registry + metrics)
+    # Reset CLI state before pipeline tests (clean registry + metrics +
+    # taxonomy + skills + last_run). Mirrors `mint reset --force` from
+    # src/cli/app.py — kept as inline code here instead of invoking the
+    # CLI command directly because test_mint wants silent reset and
+    # doesn't need the confirmation prompt infrastructure.
     if not (args.quick or args.formats_only):
         print("\nResetting MINT CLI state (clean registry + metrics)...")
         import shutil
@@ -310,15 +356,27 @@ def main() -> int:
 
         _load_env()
         data = _data_dir()
-        chroma_path = data / "cli_chroma"
-        metrics_path = data / "cli_metrics.duckdb"
-        last_run_path = data / "last_run.json"
+        chroma_path = data / "cli" / "chroma"
+        metrics_path = data / "cli" / "metrics.duckdb"
+        metrics_wal_path = data / "cli" / "metrics.duckdb.wal"
+        # last_run.json lives at data/cli/last_run.json (written by
+        # runner.py::save_last_run). Earlier versions used data/last_run.json
+        # here, which silently failed to wipe the real file. Fixed 2026-04-14.
+        last_run_path = data / "cli" / "last_run.json"
+        taxonomy_path = data / "cli" / "domains.json"
+        skills_path = data / "cli" / "skills"
         if chroma_path.exists():
             shutil.rmtree(chroma_path)
         if metrics_path.exists():
             metrics_path.unlink()
+        if metrics_wal_path.exists():
+            metrics_wal_path.unlink()
         if last_run_path.exists():
             last_run_path.unlink()
+        if taxonomy_path.exists():
+            taxonomy_path.unlink()
+        if skills_path.exists():
+            shutil.rmtree(skills_path)
         _create_infra(seed=True)
         print("Done — clean registry with seeded capabilities.\n")
 

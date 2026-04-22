@@ -50,6 +50,7 @@ from src.orchestrator.tool_loader import ToolLoader
 from src.orchestrator.verification_node import verification_node
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
+from src.schemas.optimizer_config import OptimizerConfig
 from src.schemas.task import TaskState
 from src.verification.gate import verify as gate_verify
 
@@ -61,6 +62,7 @@ def create_pipeline(
     loader: ToolLoader,
     *,
     run_optimizer: bool = False,
+    optimizer_config: OptimizerConfig | None = None,
     metrics_store: MetricsStore | None = None,
     verification_enabled: bool = True,
 ) -> StateGraph:
@@ -71,10 +73,18 @@ def create_pipeline(
     Args:
         registry: Capability registry used for gap detection and MCP tool registration.
         loader: Tool loader used to dynamically load and register generated MCP tools.
-        run_optimizer: When ``True``, append the granularity optimizer loop after the
-            loading node.  Requires *metrics_store* to be provided.
-        metrics_store: DuckDB metrics store required when *run_optimizer* is ``True``.
-            Ignored when *run_optimizer* is ``False``.
+        run_optimizer: Legacy boolean — when ``True``, append the granularity
+            optimizer loop with all three operations forced on (backward-compat
+            alias for callers that haven't adopted ``optimizer_config``).
+            Ignored if ``optimizer_config`` is provided explicitly.
+        optimizer_config: Per-operation optimizer config (§12 finding #8). When
+            provided, supersedes ``run_optimizer``. Any operation resolved to
+            "off" is skipped at apply time; if all three are off for the current
+            ``invocation_count`` the optimizer subgraph is not wired. When
+            ``None`` and ``run_optimizer=True``, falls back to all-on; when
+            ``None`` and ``run_optimizer=False``, falls back to all-off.
+        metrics_store: DuckDB metrics store required when the optimizer is
+            enabled.  Ignored when the optimizer is disabled.
         verification_enabled: When ``False``, the verification gate is bypassed
             (``gate_fn=None`` → stub always passes).  Used for the no_verification
             evaluation baseline.
@@ -82,6 +92,23 @@ def create_pipeline(
     Returns:
         An uncompiled ``StateGraph[TaskState]`` ready to be compiled and invoked.
     """
+    # Normalize to an OptimizerConfig — callers pass either the legacy bool
+    # (eval harness, older tests) or the new config (CLI runner). The new
+    # config takes precedence when both are provided.
+    if optimizer_config is None:
+        optimizer_config = OptimizerConfig.from_run_optimizer_bool(run_optimizer)
+
+    # The pipeline only wires the optimizer subgraph when at least one
+    # operation would fire. We don't know the invocation_count at graph-
+    # build time, so we use a conservative "any non-off" check: if any
+    # operation is "auto" or "on", wire it. The loop itself re-checks
+    # per-operation at apply_operations_node time when it has the real
+    # count from metrics_store.
+    _any_op_enabled = any(
+        getattr(optimizer_config, op) != "off"
+        for op in ("prune", "split", "merge")
+    )
+    run_optimizer = _any_op_enabled
     builder = StateGraph(TaskState)
 
     # --- Nodes without injected dependencies ---
@@ -123,16 +150,59 @@ def create_pipeline(
         # KL divergence is meaningful after the first run.
         from src.optimizer.loop import OptimizerState, create_optimization_loop
 
-        _opt_loop = create_optimization_loop(registry, metrics_store)
+        _opt_loop = create_optimization_loop(
+            registry, metrics_store, optimizer_config=optimizer_config,
+        )
         _prev_optimizer_scores: dict[str, float] = {}
 
         def _optimizer_node(state: TaskState) -> Command:
             nonlocal _prev_optimizer_scores
             try:
+                # Step 14.12: carry the task's network policy into the
+                # optimizer subgraph so merge/split variant verification
+                # runs under the same policy the triggering task uses.
                 init_state = OptimizerState(
-                    previous_utility_scores=_prev_optimizer_scores
+                    previous_utility_scores=_prev_optimizer_scores,
+                    allow_network=bool(getattr(state, "allow_network", False)),
                 )
-                result = _opt_loop.invoke(init_state)
+                # Fix #4 (2026-04-19): wrap the optimizer sub-graph in
+                # trace_context(trace_id=...) so pillar3.* events and
+                # per-variant verification events emitted by operations.py
+                # attach to the parent pipeline trace as children rather
+                # than creating standalone wrapper traces. Prefer
+                # ``state.trace_id`` (set by verification_node from its
+                # own handler lookup); fall back to a fresh handler.last_
+                # trace_id lookup in case verification_node's mutation
+                # didn't persist (LangGraph reducers take the checkpoint,
+                # not the mutated state).
+                from src.orchestrator.tracing import trace_context as _trace_context
+
+                _opt_trace_id = getattr(state, "trace_id", None)
+                if not _opt_trace_id:
+                    try:
+                        from langgraph.config import get_config as _get_lg_config
+                        _cfg = _get_lg_config()
+                        _raw_cbs = (_cfg or {}).get("callbacks")
+                        if _raw_cbs is None:
+                            _cb_iter: list = []
+                        elif isinstance(_raw_cbs, list):
+                            _cb_iter = _raw_cbs
+                        elif hasattr(_raw_cbs, "handlers"):
+                            _cb_iter = list(_raw_cbs.handlers)
+                        elif hasattr(_raw_cbs, "inheritable_handlers"):
+                            _cb_iter = list(_raw_cbs.inheritable_handlers)
+                        else:
+                            _cb_iter = []
+                        for _cb in _cb_iter:
+                            _tid = getattr(_cb, "last_trace_id", None)
+                            if _tid:
+                                _opt_trace_id = _tid
+                                break
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                with _trace_context(trace_id=_opt_trace_id):
+                    result = _opt_loop.invoke(init_state)
                 # Carry current utility scores forward for the next pipeline run.
                 if isinstance(result, dict):
                     _prev_optimizer_scores = result.get("utility_scores", {})

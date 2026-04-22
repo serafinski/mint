@@ -10,14 +10,16 @@ from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import Severity
 from src.verification.behavioral import (
-    LATENCY_THRESHOLD_S,
+    TIMEOUT_THRESHOLD_S,
     _build_sandbox_code,
     _extract_function_name,
     _generate_boundary_inputs,
     _generate_large_inputs,
     _generate_negative_inputs,
+    _test_latency,
     _test_output_variation,
     _test_parameterless_smoke,
+    _test_timeout,
     extract_parameter_schema,
     run,
 )
@@ -168,6 +170,214 @@ class TestExtractFunctionName:
 
 
 # ---------------------------------------------------------------------------
+# Security audit finding #8 — decorator-aware entrypoint selection (2026-04-19)
+# ---------------------------------------------------------------------------
+
+
+class TestFindMcpToolFunction:
+    """Decorator-aware selection — the FastMCP ``@mcp.tool`` decorator is
+    the only unambiguous signal identifying the tool entrypoint. Pre-fix
+    call sites used ordering heuristics (``dir()`` alphabetical or
+    ``ast.walk`` source order) that picked the wrong function when a
+    helper was defined before the decorated entrypoint.
+    """
+
+    def test_helper_first_then_decorated_entrypoint(self):
+        """Reporter's repro: helper defined first in source, decorated
+        entrypoint second. Pre-fix picked ``helper_format_rows``; post-fix
+        must pick the decorated ``summarize_sales``."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+async def helper_format_rows(rows):
+    return [str(r) for r in rows]
+
+@mcp.tool()
+async def summarize_sales(data):
+    return {"total": sum(data)}
+"""
+        assert _find_mcp_tool_function(src) == "summarize_sales"
+
+    def test_entrypoint_first_then_helper(self):
+        """Same pair in reversed source order — decorator wins regardless."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+@mcp.tool()
+async def summarize_sales(data):
+    return {"total": sum(data)}
+
+async def helper_format_rows(rows):
+    return [str(r) for r in rows]
+"""
+        assert _find_mcp_tool_function(src) == "summarize_sales"
+
+    def test_alphabetical_before_decorator_selects_decorated(self):
+        """``apple_helper`` alphabetically first, ``zebra_tool`` decorated.
+        Regression guard for the ToolLoader ``dir()`` alphabetical bug."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+async def apple_helper():
+    return 1
+
+@mcp.tool()
+async def zebra_tool():
+    return 2
+"""
+        assert _find_mcp_tool_function(src) == "zebra_tool"
+
+    def test_bare_decorator_accepted(self):
+        """``@mcp.tool`` without call parens — must still match."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+@mcp.tool
+async def the_tool():
+    return 1
+"""
+        assert _find_mcp_tool_function(src) == "the_tool"
+
+    def test_ignores_unrelated_decorators(self):
+        """``@lru_cache``, ``@contextmanager`` etc. must not match."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+@lru_cache(maxsize=32)
+async def cached_helper():
+    return 1
+
+@mcp.tool()
+async def the_tool():
+    return 2
+"""
+        assert _find_mcp_tool_function(src) == "the_tool"
+
+    def test_no_decorator_returns_none(self):
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+async def undecorated():
+    return 1
+"""
+        assert _find_mcp_tool_function(src) is None
+
+    def test_multiple_decorated_ambiguous_returns_none(self):
+        """Two ``@mcp.tool`` functions — caller must surface as a failure,
+        not silently pick one."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+@mcp.tool()
+async def first():
+    return 1
+
+@mcp.tool()
+async def second():
+    return 2
+"""
+        assert _find_mcp_tool_function(src) is None
+
+    def test_nested_async_def_not_selected(self):
+        """Nested ``async def`` inside a helper must not count — only
+        top-level public async defs are considered."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+async def outer():
+    @mcp.tool()
+    async def inner():
+        return 1
+    return inner
+
+@mcp.tool()
+async def real_tool():
+    return 2
+"""
+        assert _find_mcp_tool_function(src) == "real_tool"
+
+    def test_private_decorated_ignored(self):
+        """Leading-underscore functions are private by convention and
+        must be skipped even if decorated."""
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        src = """
+@mcp.tool()
+async def _private_tool():
+    return 1
+
+@mcp.tool()
+async def public_tool():
+    return 2
+"""
+        assert _find_mcp_tool_function(src) == "public_tool"
+
+    def test_parse_error_returns_none(self):
+        from src.verification.behavioral import _find_mcp_tool_function
+
+        assert _find_mcp_tool_function("async def broken(:") is None
+
+
+class TestExtractFunctionNameFallbackChain:
+    """``_extract_function_name`` is the backwards-compatible entrypoint
+    that every MCP-tool caller already uses. Post-fix it resolves via a
+    fallback chain: decorator-first, then single-public-async with a
+    warning, then None for ambiguous cases."""
+
+    def test_decorator_takes_precedence_over_source_order(self):
+        """Pre-fix picked helper (first in source); post-fix picks decorated."""
+        src = """
+async def helper_format_rows(rows):
+    return rows
+
+@mcp.tool()
+async def summarize_sales(data):
+    return {}
+"""
+        assert _extract_function_name(src) == "summarize_sales"
+
+    def test_legacy_single_async_fallback_emits_warning(self, caplog):
+        """Legacy artifacts without @mcp.tool — fall back with a WARNING."""
+        import logging
+
+        src = """
+async def legacy_tool(x):
+    return x
+"""
+        with caplog.at_level(logging.WARNING, logger="src.verification.behavioral"):
+            result = _extract_function_name(src)
+        assert result == "legacy_tool"
+        assert any(
+            "no @mcp.tool-decorated function" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_ambiguous_no_decorator_multiple_public_returns_none(self):
+        """Two undecorated public async defs — cannot pick one safely."""
+        src = """
+async def first():
+    return 1
+
+async def second():
+    return 2
+"""
+        assert _extract_function_name(src) is None
+
+    def test_ambiguous_multiple_decorated_returns_none(self):
+        """Two decorated functions — caller must fail verification."""
+        src = """
+@mcp.tool()
+async def first():
+    return 1
+
+@mcp.tool()
+async def second():
+    return 2
+"""
+        assert _extract_function_name(src) is None
+
+
+# ---------------------------------------------------------------------------
 # Input generators
 # ---------------------------------------------------------------------------
 
@@ -225,6 +435,17 @@ class TestBuildSandboxCode:
         is True.  Without neutralization, mcp.run() would start a server loop
         and asyncio.run(_run()) would never execute — all behavioral tests silently
         no-op.  The __name__ override MUST appear before the inlined source.
+
+        NOTE: This is a cheap LEXICAL guard (string-position check). It is
+        DELIBERATELY PAIRED with ``test_main_guard_neutralized_end_to_end_subprocess``
+        below, which runs the same generated payload through a real Python
+        interpreter and asserts the override works at RUNTIME (not just
+        lexically). Do NOT delete either without the other — they form the
+        Step 14 Gap A two-layer safety net (see CLAUDE.md + MEMORY.md commit
+        ``1bae0da``). The lexical test guards against override-position
+        regressions; the subprocess test guards against override-line
+        mutations. A future cleanup sweep that drops one in isolation would
+        reopen the silent-no-op regression surface for Pillar 2 Tier 2.
         """
         src = 'async def my_tool(n: int): return n\nif __name__ == "__main__": raise RuntimeError("main fired")'
         code = _build_sandbox_code(src, "my_tool", {"n": 1})
@@ -233,6 +454,46 @@ class TestBuildSandboxCode:
         source_pos = code.find("my_tool")
         assert override_pos != -1, "__name__ override not found in sandbox code"
         assert override_pos < source_pos, "__name__ override must precede inlined source"
+
+    def test_main_guard_neutralized_end_to_end_subprocess(self):
+        """Execute the generated sandbox code in a real Python interpreter.
+
+        Complements the string-position check above: runs the payload via
+        ``python -c`` so the actual interpreter evaluates the ``__name__``
+        override. If the neutralization were ever broken (e.g. override
+        appears after the source, or the override line is mutated), the
+        inlined ``raise RuntimeError("main fired")`` would fire and the
+        subprocess would exit non-zero. A clean exit + well-formed JSON on
+        stdout proves the override works at runtime — not just lexically.
+        """
+        import subprocess
+        import sys
+
+        src = (
+            'async def my_tool(n: int):\n'
+            '    return n * 2\n'
+            'if __name__ == "__main__":\n'
+            '    raise RuntimeError("main fired")\n'
+        )
+        code = _build_sandbox_code(src, "my_tool", {"n": 21})
+
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert proc.returncode == 0, (
+            f"sandbox code exited non-zero — __name__ neutralization likely broken. "
+            f"stderr: {proc.stderr!r}"
+        )
+        assert "main fired" not in proc.stderr, (
+            "RuntimeError from __main__ guard fired — override did not take effect"
+        )
+        payload = json.loads(proc.stdout.strip())
+        assert payload["error"] is None
+        assert payload["result"] == "42"
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +585,8 @@ class TestRunInconsistentTool:
             # The consistency test calls sandbox twice for the same input.
             # Return different results on alternating calls within consistency test.
             # Calls: nonexistent(1), consistency_run1(2), consistency_run2(3),
-            # boundary_zero(4), boundary_neg(5), boundary_large(6), latency(7)
+            # boundary_zero(4), boundary_neg(5), boundary_large(6), timeout(7),
+            # latency_variance(8,9,10), output_variation(11,12)
             if call_count == 2:
                 return _sandbox_success("4", elapsed=0.05)
             elif call_count == 3:
@@ -339,17 +601,17 @@ class TestRunInconsistentTool:
         assert "different results" in consistency_findings[0].message
 
 
-class TestRunLatencyViolation:
-    """A tool that exceeds the latency threshold."""
+class TestRunTimeoutViolation:
+    """A tool that exceeds the timeout threshold (renamed from latency, 5s)."""
 
     @patch("src.verification.behavioral.sandbox_execute")
-    def test_slow_tool_produces_latency_finding(self, mock_sandbox):
-        mock_sandbox.return_value = _sandbox_success("1", elapsed=LATENCY_THRESHOLD_S + 1.0)
+    def test_slow_tool_produces_timeout_finding(self, mock_sandbox):
+        mock_sandbox.return_value = _sandbox_success("1", elapsed=TIMEOUT_THRESHOLD_S + 1.0)
         findings = run(_make_artifact(SLOW_TOOL))
-        latency_findings = [f for f in findings if f.category == "latency"]
-        assert len(latency_findings) == 1
-        assert latency_findings[0].severity == Severity.MEDIUM
-        assert "execution took" in latency_findings[0].message
+        timeout_findings = [f for f in findings if f.category == "timeout"]
+        assert len(timeout_findings) == 1
+        assert timeout_findings[0].severity == Severity.MEDIUM
+        assert "execution took" in timeout_findings[0].message
 
 
 class TestRunBoundaryTimeout:
@@ -364,7 +626,8 @@ class TestRunBoundaryTimeout:
             call_count += 1
             # Make the boundary "large" test (call 6) timeout.
             # Calls: nonexistent(1), consistency_run1(2), consistency_run2(3),
-            # boundary_zero(4), boundary_neg(5), boundary_large(6), latency(7)
+            # boundary_zero(4), boundary_neg(5), boundary_large(6), timeout(7),
+            # latency_variance(8,9,10), output_variation(11,12)
             if call_count == 6:
                 return _sandbox_timeout()
             return _sandbox_success("1", elapsed=0.05)
@@ -384,8 +647,24 @@ class TestRunSandboxFailure:
     def test_all_sandbox_failures_handled_gracefully(self, mock_sandbox):
         mock_sandbox.return_value = _sandbox_failure("Docker not found")
         findings = run(_make_artifact(CLEAN_TOOL))
-        # Should not raise; findings list may be empty or contain info-level items
+        # Should not raise, and must return a list (never-raises contract).
         assert isinstance(findings, list)
+        # With every sandbox call failing on a non-timeout, non-dep-install
+        # stderr, `_test_boundary` must surface one MEDIUM `boundary` finding
+        # per test case (zero/negative/large) via the else-branch at
+        # behavioral.py:439-451. The `dependency` branch specifically requires
+        # "pip install failed" / "No solution found" / "No matching
+        # distribution" in stderr, so generic "Docker not found" lands as
+        # `boundary`, not `dependency`. We assert on category presence rather
+        # than exact count to stay robust to future additions.
+        categories = {f.category for f in findings}
+        assert "boundary" in categories, (
+            f"Expected `boundary` category to surface on sandbox failure, "
+            f"got: {sorted(categories)}"
+        )
+        boundary_findings = [f for f in findings if f.category == "boundary"]
+        assert all(f.severity == Severity.MEDIUM for f in boundary_findings)
+        assert all(f.tier == 2 for f in boundary_findings)
 
 
 class TestRunNonexistentEntity:
@@ -498,3 +777,264 @@ class TestOutputVariation:
         mock_sandbox = MagicMock(return_value=_sandbox_success('"canned"', elapsed=0.05))
         findings = _test_output_variation(CLEAN_TOOL, "compute_sum", {"a": {"type": "int"}, "b": {"type": "int"}}, mock_sandbox)
         assert findings[0].tier == 2
+
+
+# ---------------------------------------------------------------------------
+# A2 — _test_timeout (renamed from old _test_latency, 5s threshold)
+# ---------------------------------------------------------------------------
+
+
+_SCHEMA_TWO_INT = {"a": {"type": "int"}, "b": {"type": "int"}}
+
+
+class TestTimeoutHelper:
+    """Unit tests for the _test_timeout helper (renamed from old _test_latency)."""
+
+    def test_slow_execution_flagged_as_timeout(self):
+        mock_sandbox = MagicMock(
+            return_value=_sandbox_success("3", elapsed=TIMEOUT_THRESHOLD_S + 1.0)
+        )
+        findings = _test_timeout(CLEAN_TOOL, "compute_sum", _SCHEMA_TWO_INT, mock_sandbox)
+        assert len(findings) == 1
+        assert findings[0].category == "timeout"
+        assert findings[0].location == "timeout"
+        assert findings[0].severity == Severity.MEDIUM
+        assert "timeout threshold" in findings[0].message
+
+    def test_fast_execution_no_finding(self):
+        mock_sandbox = MagicMock(return_value=_sandbox_success("3", elapsed=0.05))
+        findings = _test_timeout(CLEAN_TOOL, "compute_sum", _SCHEMA_TWO_INT, mock_sandbox)
+        assert findings == []
+
+    def test_empty_schema_returns_no_findings(self):
+        findings = _test_timeout(CLEAN_TOOL, "compute_sum", {})
+        assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# A2 — _test_latency (variance-based mock-smell detection)
+# ---------------------------------------------------------------------------
+
+
+class TestLatencyVariance:
+    """Unit tests for the new variance-based _test_latency helper.
+
+    Two-condition gate: mean < 1ms AND cv < 0.10. Both must hold.
+    """
+
+    def test_latency_flags_fast_uniform(self):
+        # All three runs return identical, very small elapsed.
+        mock_sandbox = MagicMock(return_value=_sandbox_success("42", elapsed=0.0001))
+        findings = _test_latency(CLEAN_TOOL, "compute_sum", _SCHEMA_TWO_INT, mock_sandbox)
+        assert len(findings) == 1
+        assert findings[0].category == "latency"
+        assert findings[0].location == "latency"
+        assert findings[0].severity == Severity.MEDIUM
+        assert findings[0].tier == 2
+        assert "suspiciously fast and uniform" in findings[0].message
+
+    def test_latency_ignores_slow(self):
+        # 5ms is above the 1ms mean threshold — fails first condition.
+        mock_sandbox = MagicMock(return_value=_sandbox_success("42", elapsed=0.005))
+        findings = _test_latency(CLEAN_TOOL, "compute_sum", _SCHEMA_TWO_INT, mock_sandbox)
+        assert findings == []
+
+    def test_latency_ignores_variable(self):
+        # High variance across runs — fails the cv < 0.10 condition.
+        elapsed_values = [0.0001, 0.0005, 0.0001]
+        call_count = 0
+
+        def side_effect(code, timeout=15, **kwargs):
+            nonlocal call_count
+            value = elapsed_values[call_count % len(elapsed_values)]
+            call_count += 1
+            return _sandbox_success("42", elapsed=value)
+
+        mock_sandbox = MagicMock(side_effect=side_effect)
+        findings = _test_latency(CLEAN_TOOL, "compute_sum", _SCHEMA_TWO_INT, mock_sandbox)
+        assert findings == []
+
+    def test_latency_handles_insufficient_samples(self):
+        # All sandbox calls fail to parse — no samples to compute variance.
+        mock_sandbox = MagicMock(return_value=_sandbox_failure("Docker not found"))
+        findings = _test_latency(CLEAN_TOOL, "compute_sum", _SCHEMA_TWO_INT, mock_sandbox)
+        assert findings == []
+
+    def test_latency_skips_empty_schema(self):
+        # Empty schema short-circuits before any sandbox call.
+        mock_sandbox = MagicMock()
+        findings = _test_latency(CLEAN_TOOL, "compute_sum", {}, mock_sandbox)
+        assert findings == []
+        assert mock_sandbox.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Step 14.12 — allow_network plumbing + network-disconnect differential
+# ---------------------------------------------------------------------------
+
+
+class TestAllowNetworkPropagates:
+    """``run(artifact, allow_network=True)`` must forward the flag to every
+    ``sandbox_execute`` call inside Tier 2.
+    """
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_allow_network_true_forwards_to_dep_check(self, mock_sandbox):
+        """Dependency pre-check receives allow_network=True."""
+        mock_sandbox.return_value = _sandbox_success("42")
+        artifact = GeneratedArtifact(
+            capability_name="net-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            pip_packages=["requests"],
+        )
+
+        run(artifact, allow_network=True)
+
+        # The dep_check call is the first one with extra_packages=...
+        dep_calls = [
+            c for c in mock_sandbox.call_args_list
+            if c.kwargs.get("extra_packages") == ["requests"]
+        ]
+        assert dep_calls
+        assert all(c.kwargs.get("allow_network") is True for c in dep_calls)
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_allow_network_false_by_default(self, mock_sandbox):
+        """Omitting the flag keeps offline-by-default."""
+        mock_sandbox.return_value = _sandbox_success("42")
+        artifact = GeneratedArtifact(
+            capability_name="offline-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+        )
+
+        run(artifact)
+
+        # The partial wraps sandbox_execute; the dep_check isn't present when
+        # extra_packages is empty. Instead assert the partial's keyword.
+        # The findings should run the behavioral tests via partial(sandbox_execute, ...)
+        # with allow_network=False keyword bound.
+        # This test passes iff run() returns without crashing and no call to
+        # sandbox_execute leaked an unexpected allow_network=True.
+        calls_with_true = [
+            c for c in mock_sandbox.call_args_list
+            if c.kwargs.get("allow_network") is True
+        ]
+        assert calls_with_true == []
+
+
+class TestNetworkDisconnectDifferential:
+    """Tier 2's new differential test fires only when needs_network=True AND
+    allow_network=True. It catches silent fallbacks (F2 in proposal §Pillar 2).
+    """
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_differential_flags_silent_fallback(self, mock_sandbox):
+        """Both on and off produce plausible dicts → CRITICAL silent fallback."""
+        # Both calls return plausible "result" payload.
+        mock_sandbox.return_value = {
+            "stdout": json.dumps({"result": "live data"}) + "\n",
+            "stderr": "",
+            "exit_code": 0,
+            "success": True,
+        }
+        artifact = GeneratedArtifact(
+            capability_name="fake-api-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            needs_network=True,
+        )
+
+        findings = run(artifact, allow_network=True)
+
+        silent_fallback = [
+            f for f in findings if f.category == "network_silent_fallback"
+        ]
+        assert len(silent_fallback) == 1
+        assert silent_fallback[0].severity == Severity.CRITICAL
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_differential_legitimate_network_tool_passes(self, mock_sandbox):
+        """Online succeeds, offline fails → INFO finding (legitimate)."""
+        call_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            # First few calls (standard behavioral tests) succeed;
+            # then the differential: allow_network=True → success,
+            # allow_network=False → failure.
+            if kwargs.get("allow_network") is True:
+                return {
+                    "stdout": json.dumps({"result": "live data"}) + "\n",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "success": True,
+                }
+            else:
+                return {
+                    "stdout": "",
+                    "stderr": "socket.gaierror",
+                    "exit_code": 1,
+                    "success": False,
+                }
+
+        mock_sandbox.side_effect = side_effect
+        artifact = GeneratedArtifact(
+            capability_name="legit-api-tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            needs_network=True,
+        )
+
+        findings = run(artifact, allow_network=True)
+        diffs = [
+            f for f in findings
+            if f.category == "network_disconnect_differential"
+        ]
+        assert len(diffs) == 1
+        assert diffs[0].severity == Severity.INFO
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_differential_skipped_when_needs_network_false(self, mock_sandbox):
+        """needs_network=False → differential never fires."""
+        mock_sandbox.return_value = _sandbox_success("42")
+        artifact = GeneratedArtifact(
+            capability_name="pure-compute",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            needs_network=False,
+        )
+
+        findings = run(artifact, allow_network=True)
+        diffs = [
+            f for f in findings
+            if f.category in (
+                "network_disconnect_differential",
+                "network_silent_fallback",
+            )
+        ]
+        assert diffs == []
+
+    @patch("src.verification.behavioral.sandbox_execute")
+    def test_differential_skipped_when_allow_network_false(self, mock_sandbox):
+        """Even with needs_network=True, if the run is offline the
+        differential is vacuous and doesn't fire.
+        """
+        mock_sandbox.return_value = _sandbox_success("42")
+        artifact = GeneratedArtifact(
+            capability_name="offline-run",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code=CLEAN_TOOL,
+            needs_network=True,
+        )
+
+        findings = run(artifact, allow_network=False)
+        diffs = [
+            f for f in findings
+            if f.category in (
+                "network_disconnect_differential",
+                "network_silent_fallback",
+            )
+        ]
+        assert diffs == []

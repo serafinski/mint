@@ -1,17 +1,37 @@
 """Unit tests for src/verification/gate.py.
 
-All external calls (behavioral.run, adversarial.probe) are mocked so these
-tests run without Docker or API keys.
+All external calls (behavioral.run, adversarial.probe, import_check.run_import_check)
+are mocked so these tests run without Docker or API keys.
 """
 
 from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import Severity, VerificationFinding, VerificationReport
 from src.verification.gate import verify
+
+
+@pytest.fixture(autouse=True)
+def _mock_import_check():
+    """Stub Tier 1.5 to a passing report by default — keeps these tests
+    Docker-independent. Tier-1.5-specific behavior is covered in
+    ``tests/unit/test_import_check.py``.
+    """
+    with patch(
+        "src.verification.gate.import_check.run_import_check",
+        return_value=VerificationReport(
+            capability_name="stub",
+            findings=[],
+            overall_passed=True,
+            tier_reached=1,
+        ),
+    ):
+        yield
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -135,8 +155,8 @@ def test_mcp_clean_passes_all_tiers(mock_behavioral, mock_adversarial):
 
     assert report.overall_passed is True
     assert report.tier_reached == 3
-    mock_behavioral.assert_called_once_with(artifact)
-    mock_adversarial.assert_called_once_with(artifact)
+    mock_behavioral.assert_called_once_with(artifact, allow_network=False)
+    mock_adversarial.assert_called_once_with(artifact, allow_network=False)
 
 
 # ---------------------------------------------------------------------------
@@ -382,8 +402,13 @@ def test_skill_syntax_error_not_reported_as_critical(mock_behavioral, mock_adver
 
 @patch("src.verification.gate.adversarial.probe")
 @patch("src.verification.gate.behavioral.run")
-def test_skill_mock_indicator_in_content_detected(mock_behavioral, mock_adversarial):
-    contaminated_skill = """\
+def test_skill_with_mock_word_in_prose_passes_tier1(mock_behavioral, mock_adversarial):
+    """Words like 'mock' inside SKILL.md prose must NOT block verification.
+    Skills are natural-language instructions where these words appear
+    legitimately. Mock-artifact detection is scoped to MCP_TOOL Python
+    source only — see static_scanner._check_mock_artifacts.
+    """
+    skill_with_mock_word = """\
 ---
 name: demo-skill
 description: A skill that uses mock data for demonstration
@@ -396,15 +421,14 @@ This skill uses mock_result to show sample data.
     artifact = _make_artifact(
         cap_type=CapabilityType.SKILL,
         source_code=None,
-        skill_content=contaminated_skill,
+        skill_content=skill_with_mock_word,
     )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
 
     report = verify(artifact)
 
-    assert report.overall_passed is False
-    assert any(f.category == "mock_artifact" for f in report.findings)
-    mock_behavioral.assert_not_called()
-    mock_adversarial.assert_not_called()
+    assert [f for f in report.findings if f.category == "mock_artifact"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -435,17 +459,21 @@ def test_agent_clean_config_passes(mock_behavioral, mock_adversarial):
 
 @patch("src.verification.gate.adversarial.probe")
 @patch("src.verification.gate.behavioral.run")
-def test_agent_mock_in_config_detected(mock_behavioral, mock_adversarial):
+def test_agent_with_mock_word_in_config_passes_tier1(mock_behavioral, mock_adversarial):
+    """Agent system prompts referencing 'mock' as a domain term must NOT
+    block verification. Mock-artifact detection is MCP_TOOL only.
+    """
     artifact = _make_artifact(
         cap_type=CapabilityType.AGENT,
         source_code=None,
         agent_config={"system_prompt": "You are a mock agent for testing purposes."},
     )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
 
     report = verify(artifact)
 
-    assert report.overall_passed is False
-    assert any(f.category == "mock_artifact" for f in report.findings)
+    assert [f for f in report.findings if f.category == "mock_artifact"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +497,250 @@ def test_empty_source_code_passes_tier1(mock_behavioral, mock_adversarial):
         if f.tier == 1 and f.severity == Severity.CRITICAL
     ]
     assert len(t1_criticals) == 0
+
+
+# ---------------------------------------------------------------------------
+# Layered Tier 1: Python code fences in SKILL/AGENT
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_skill_code_fence_flags_hardcoded_data(mock_behavioral, mock_adversarial):
+    """A SKILL.md with a Python code fence containing a hardcoded literal
+    list return must be rejected — the fenced code is scanned with the
+    same MCP_TOOL AST checks.
+    """
+    skill_with_bad_fence = '''\
+---
+name: bad-fence-skill
+description: A skill that embeds bad example code
+---
+
+## Example
+
+```python
+def get_items():
+    return ["alpha", "beta", "gamma", "delta"]
+```
+'''
+    artifact = _make_artifact(
+        cap_type=CapabilityType.SKILL,
+        source_code=None,
+        skill_content=skill_with_bad_fence,
+    )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact)
+
+    fence_findings = [
+        f for f in report.findings
+        if f.category == "hardcoded_data" and "code_fence" in (f.location or "")
+    ]
+    assert len(fence_findings) >= 1
+    assert report.overall_passed is False
+    mock_behavioral.assert_not_called()
+    mock_adversarial.assert_not_called()
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_skill_code_fence_flags_mock_import(mock_behavioral, mock_adversarial):
+    """A SKILL.md whose Python fence imports unittest.mock is rejected."""
+    skill = '''\
+---
+name: mock-fence-skill
+description: A skill that imports a mocking library in its example
+---
+
+## Example
+
+```python
+import unittest.mock
+def thing():
+    return unittest.mock.MagicMock()
+```
+'''
+    artifact = _make_artifact(
+        cap_type=CapabilityType.SKILL,
+        source_code=None,
+        skill_content=skill,
+    )
+
+    report = verify(artifact)
+
+    fence_findings = [
+        f for f in report.findings
+        if f.category == "mock_import" and "code_fence" in (f.location or "")
+    ]
+    assert len(fence_findings) >= 1
+    assert report.overall_passed is False
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_skill_prose_placeholder_not_flagged_t04_regression(
+    mock_behavioral, mock_adversarial
+):
+    """T04 regression: a SKILL.md with the word 'placeholder' in the prose
+    body but NO Python code fence must NOT be flagged. The layered scanner
+    must only run AST checks on fenced code, never on prose.
+    """
+    skill = '''\
+---
+name: clean-skill
+description: Build an inventory reorder pipeline
+---
+
+## Instructions
+
+Compute reorder quantities. Do not leave placeholder values in the output.
+Replace any placeholder fields with real computed values before returning.
+This is not a mock implementation — call the real database.
+'''
+    artifact = _make_artifact(
+        cap_type=CapabilityType.SKILL,
+        source_code=None,
+        skill_content=skill,
+    )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact)
+
+    criticals = [f for f in report.findings if f.severity == Severity.CRITICAL]
+    assert criticals == []
+    assert report.overall_passed is True
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_skill_clean_code_fence_passes(mock_behavioral, mock_adversarial):
+    """A SKILL.md with a benign Python code fence must pass."""
+    skill = '''\
+---
+name: benign-fence-skill
+description: A skill with a clean example
+---
+
+## Example
+
+```python
+def add(a: int, b: int) -> int:
+    return a + b
+```
+'''
+    artifact = _make_artifact(
+        cap_type=CapabilityType.SKILL,
+        source_code=None,
+        skill_content=skill,
+    )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact)
+
+    fence_criticals = [
+        f for f in report.findings
+        if f.severity == Severity.CRITICAL and "code_fence" in (f.location or "")
+    ]
+    assert fence_criticals == []
+    assert report.overall_passed is True
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_agent_system_prompt_fence_scanned(mock_behavioral, mock_adversarial):
+    """An AGENT whose system_prompt contains a Python code fence with a
+    hardcoded literal list must be rejected. Fence findings are tagged
+    with the system_prompt source label.
+    """
+    agent_config = {
+        "system_prompt": (
+            "You are an analyst. Use this helper:\n\n"
+            "```python\n"
+            "def get_items():\n"
+            "    return ['alpha', 'beta', 'gamma', 'delta']\n"
+            "```\n"
+        )
+    }
+    artifact = _make_artifact(
+        cap_type=CapabilityType.AGENT,
+        source_code=None,
+        agent_config=agent_config,
+    )
+
+    report = verify(artifact)
+
+    fence_findings = [
+        f for f in report.findings
+        if f.category == "hardcoded_data"
+        and "system_prompt" in (f.location or "")
+    ]
+    assert len(fence_findings) >= 1
+    assert report.overall_passed is False
+    mock_behavioral.assert_not_called()
+    mock_adversarial.assert_not_called()
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_agent_skill_content_fence_scanned(mock_behavioral, mock_adversarial):
+    """An AGENT whose agent_config['skill_content'] embeds a bad fence is rejected."""
+    agent_config = {
+        "system_prompt": "You are an analyst.",
+        "skill_content": (
+            "## Example\n\n"
+            "```python\n"
+            "import faker\n"
+            "def gen():\n"
+            "    return faker.Faker().name()\n"
+            "```\n"
+        ),
+    }
+    artifact = _make_artifact(
+        cap_type=CapabilityType.AGENT,
+        source_code=None,
+        agent_config=agent_config,
+    )
+
+    report = verify(artifact)
+
+    fence_findings = [
+        f for f in report.findings
+        if f.category == "mock_import"
+        and "skill_content" in (f.location or "")
+    ]
+    assert len(fence_findings) >= 1
+    assert report.overall_passed is False
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_agent_no_fence_prose_passes(mock_behavioral, mock_adversarial):
+    """An AGENT system prompt referencing 'placeholder' in prose with no
+    Python fence must pass — the layered scanner only inspects fenced code.
+    """
+    agent_config = {
+        "system_prompt": (
+            "You are a careful analyst. Do not leave placeholder values in "
+            "your output. This is not a mock — call the real API."
+        )
+    }
+    artifact = _make_artifact(
+        cap_type=CapabilityType.AGENT,
+        source_code=None,
+        agent_config=agent_config,
+    )
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact)
+
+    criticals = [f for f in report.findings if f.severity == Severity.CRITICAL]
+    assert criticals == []
+    assert report.overall_passed is True
 
 
 # ---------------------------------------------------------------------------
@@ -496,3 +768,41 @@ def test_verify_never_raises_on_unexpected_exception(mock_static_scan):
     gate_finding = next(f for f in report.findings if f.category == "gate_error")
     assert gate_finding.severity == Severity.MEDIUM
     assert report.overall_passed is True  # fail open
+
+
+# ---------------------------------------------------------------------------
+# Step 14.12 — allow_network plumbing
+# ---------------------------------------------------------------------------
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_verify_forwards_allow_network_true(mock_behavioral, mock_adversarial):
+    """verify(artifact, allow_network=True) must forward the kwarg to
+    both behavioral.run and adversarial.probe so Tier 2 / Tier 3 probe
+    under the same network policy the artifact will execute under.
+    """
+    artifact = _make_artifact(source_code=_CLEAN_MCP_CODE)
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    verify(artifact, allow_network=True)
+
+    mock_behavioral.assert_called_once_with(artifact, allow_network=True)
+    mock_adversarial.assert_called_once_with(artifact, allow_network=True)
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_verify_defaults_allow_network_false(mock_behavioral, mock_adversarial):
+    """Omitting allow_network keeps the offline-by-default posture."""
+    artifact = _make_artifact(source_code=_CLEAN_MCP_CODE)
+    mock_behavioral.return_value = []
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    verify(artifact)
+
+    _, kwargs_b = mock_behavioral.call_args
+    _, kwargs_a = mock_adversarial.call_args
+    assert kwargs_b.get("allow_network") is False
+    assert kwargs_a.get("allow_network") is False

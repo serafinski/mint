@@ -32,8 +32,31 @@ class CapabilityDescriptor(BaseModel):
     domain: str = Field(
         default="general", description="Domain category for hierarchical embeddings"
     )
+    is_generic: bool = Field(
+        default=False,
+        description=(
+            "True if this capability has no hardcoded business vocabulary "
+            "and should bypass the domain filter at gap detection time. "
+            "Set by the evolutionary taxonomy (B1 Step 3.5f). Generic caps "
+            "(e.g. parse_csv_and_return_stats, fibonacci) serve any "
+            "business sub-domain regardless of the query's inferred domain."
+        ),
+    )
     is_active: bool = Field(
         default=True, description="Whether capability is active in registry"
+    )
+    definition_token_cost: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Static token count of the capability's definition string as the "
+            "proposal's Pillar 3 M3 metric defines it — the MCP tool JSON "
+            "schema, the SKILL.md body, or the agent's system prompt. "
+            "Computed once at registration time by tokenizing the serialized "
+            "definition with tiktoken. Reported side-by-side with the runtime "
+            "per-invocation cost used by U(c); never feeds into the optimizer "
+            "formula. Step 18.6."
+        ),
     )
     metadata: dict[str, str] = Field(
         default_factory=dict, description="Additional key-value metadata"

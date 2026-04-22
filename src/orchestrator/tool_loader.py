@@ -28,6 +28,8 @@ from typing import Any
 from pydantic import BaseModel
 from pydantic import Field as PydanticField  # aliased; generated-tool code also imports Field
 
+from src.orchestrator.schema_extraction import extract_mcp_tool_signature
+from src.registry.token_count import count_definition_tokens
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import GeneratedArtifact
 
@@ -70,7 +72,28 @@ class ToolResult(BaseModel):
 
 
 class ToolLoader:
-    """Load generated MCP tools via importlib and execute in subprocesses."""
+    """Load generated MCP tools via importlib and execute in subprocesses.
+
+    .. note::
+        **Temp-dir cleanup contract.** Each :meth:`load_tool` appends a
+        fresh ``tempfile.mkdtemp`` to ``self._temp_dirs``; removal is
+        deferred to :meth:`cleanup`, which is registered at ``__init__``
+        time via ``atexit.register``. Temp dirs therefore accumulate for
+        the lifetime of the loader and are only reclaimed at process
+        exit.
+
+        Production loaders are bounded by process lifetime (CLI: one
+        task per ``mint run`` invocation, ``atexit`` fires immediately;
+        eval harness: one loader per run, bounded by task count). Pre-
+        eval telemetry at 400 tasks is ~400 small files — disk cost
+        is negligible.
+
+        Long-running drivers (daemon mode, future Chapter-7 hot-reload
+        surface) that want bounded disk use must call
+        :meth:`cleanup` explicitly at end of task. Security audit
+        finding #3 (2026-04-19) disposition: accept + document; revisit
+        with per-task ownership when daemon mode is added.
+    """
 
     def __init__(self) -> None:
         self._temp_dirs: list[Path] = []
@@ -78,6 +101,19 @@ class ToolLoader:
 
     def load_tool(self, artifact: GeneratedArtifact) -> LoadedTool:
         """Load a generated MCP tool from its source code.
+
+        .. warning::
+            **Not for production use.** This method calls
+            ``spec.loader.exec_module`` which runs the generated source
+            in the current Python process. Security audit finding #1
+            (2026-04-19) removed this path from ``loading_node`` — the
+            production registration flow calls only ``register_tool``,
+            which reads ``source_code`` without executing it.
+
+            This method remains for unit-test inspection of the
+            ``LoadedTool`` shape. Generated code executes exclusively
+            through the Docker sandbox backend (``sandbox_execute``) at
+            runtime.
 
         Args:
             artifact: A ``GeneratedArtifact`` with ``capability_type == MCP_TOOL``
@@ -156,7 +192,22 @@ class ToolLoader:
         *,
         timeout: int = _EXECUTE_TIMEOUT_S,
     ) -> ToolResult:
-        """Execute a loaded tool in a sandboxed subprocess.
+        """Execute a loaded tool in a subprocess.
+
+        .. warning::
+            **Not for production use.** This is a plain Python subprocess
+            (``subprocess.run([sys.executable, ...])``) with the same uid,
+            filesystem, and (before Step 14.12) network as the parent.
+            Not the Docker sandbox backend.
+
+            Security audit finding #1 (2026-04-19) removed all production
+            callers of this method. Generated capabilities execute
+            exclusively through ``src/cli/runner.py::_execute_mcp_tool``
+            (CLI) and ``tests/evaluation/execution.py`` (eval harness),
+            both of which invoke the Docker sandbox directly.
+
+            This method + ``load_tool`` are preserved for unit-test
+            inspection of the loader semantics.
 
         Writes a runner script that imports the tool module and calls the tool
         function with the given inputs, then captures the result as JSON.
@@ -307,17 +358,49 @@ class ToolLoader:
                 f"got {artifact.capability_type.value}"
             )
 
-        # NOTE: input_schema and output_schema are left as empty dicts (defaults).
-        # The Tier 2 behavioral tester (Iteration 3) will need input_schema to
-        # generate test inputs; this should be populated by parsing the generated
-        # source code's function signature or passed from the generator.
+        # Populate input_schema / output_schema for Pillar 3 Merge (B1).
+        # Priority order:
+        #   1. Prefer artifact-provided schemas if the generator set them.
+        #   2. Fall back to AST extraction from the generated source code,
+        #      which walks the @mcp.tool() decorated async def and pulls
+        #      parameter types + return-dict literal keys.
+        # Never raises — AST extraction returns ({}, {}) on parse failure.
+        input_schema: dict = dict(artifact.input_schema or {})
+        output_schema: dict = dict(artifact.output_schema or {})
+        if (not input_schema or not output_schema) and artifact.source_code:
+            ast_inputs, ast_outputs = extract_mcp_tool_signature(artifact.source_code)
+            if not input_schema:
+                input_schema = dict(ast_inputs)
+            if not output_schema:
+                output_schema = dict(ast_outputs)
+
+        # Forward domain / is_generic from artifact if populated (B1 Step 3.5f
+        # evolutionary taxonomy). If the generator hasn't set them yet (None),
+        # fall back to the caller-provided `domain` default and is_generic=False.
+        effective_domain = artifact.domain if artifact.domain is not None else domain
+        effective_is_generic = bool(artifact.is_generic)
+
         fallback_desc = artifact.capability_name.replace("-", " ").replace("_", " ")
+        resolved_description = description or artifact.description or fallback_desc
+        definition_token_cost = count_definition_tokens(
+            artifact.model_copy(
+                update={
+                    "description": resolved_description,
+                    "input_schema": input_schema,
+                    "output_schema": output_schema,
+                }
+            )
+        )
         descriptor = CapabilityDescriptor(
             name=artifact.capability_name,
-            description=description or artifact.description or fallback_desc,
+            description=resolved_description,
             capability_type=CapabilityType.MCP_TOOL,
-            domain=domain,
+            domain=effective_domain,
+            is_generic=effective_is_generic,
             tags=tags or [],
+            input_schema=input_schema,
+            output_schema=output_schema,
+            definition_token_cost=definition_token_cost,
             metadata={
                 "generated": "true",
                 "source": "jit_pipeline",
@@ -325,7 +408,15 @@ class ToolLoader:
             },
         )
         registry.add(descriptor)
-        logger.info("Registered MCP tool %r in registry", artifact.capability_name)
+        logger.info(
+            "Registered MCP tool %r in registry (domain=%s, is_generic=%s, "
+            "input_schema=%d keys, output_schema=%d keys)",
+            artifact.capability_name,
+            effective_domain,
+            effective_is_generic,
+            len(input_schema),
+            len(output_schema),
+        )
         return descriptor
 
     def cleanup(self) -> None:

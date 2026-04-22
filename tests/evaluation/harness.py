@@ -25,10 +25,10 @@ Usage::
     from tests.evaluation.tasks import ALL_TASKS, PILOT_TASKS
 
     config = HarnessConfig(
-        chroma_dir=Path("data/chroma"),
+        chroma_dir=Path("data/eval/chroma"),
         mcp_tools_dir=Path("src/mcp_tools"),
-        skills_dir=Path(".deepagents/skills"),
-        db_path="data/evaluation.duckdb",
+        skills_dir=Path("data/eval/skills"),
+        db_path="data/eval/metrics.duckdb",
         n_runs=8,
         base_seed=42,
     )
@@ -50,11 +50,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from src.orchestrator.output_contract_resolver import (
+    _extract_output_contract_llm,
+    resolve_output_contract,
+)
 from src.orchestrator.tool_loader import ToolLoader
 from src.registry.evaluation_store import EvaluationStore
 from src.registry.store import SkillRegistry, seed_registry
-from src.schemas.evaluation import EvaluationRecord
-from src.schemas.task import TaskState
+from src.schemas.evaluation import EvaluationRecord, GeneratedArtifactSnapshot
+from src.schemas.task import GeneratedArtifact, OutputContract, TaskState
 from tests.evaluation.snapshots import restore_clean_snapshot, take_clean_snapshot
 from tests.evaluation.tasks import TaskDefinition
 
@@ -81,6 +85,73 @@ class HarnessConfig:
 
     # Optional: LangFuse callback handler (passed to pipeline invocations)
     langfuse_handler: Any | None = None
+
+    # Step 14.12: when True, TaskState is initialised with
+    # ``allow_network=True`` for every task in the run; the 400-record
+    # core eval stays offline by default. Tasks that legitimately need
+    # network access (e.g. T21 fetch-and-summarize-public-api) run under
+    # this flag.
+    allow_network: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Step 18.10 Option B — capture generated artifact sources at record-write
+# time so the post-eval manual contamination audit can read full source
+# bodies even after snapshot isolation has wiped the registry.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_artifacts(
+    artifacts: list[GeneratedArtifact] | None,
+) -> list[GeneratedArtifactSnapshot]:
+    """Build M2-audit snapshots from the pipeline's generated artifacts.
+
+    Source body is polymorphic by type:
+        * MCP_TOOL -> source_code (raw Python)
+        * SKILL    -> skill_content (full SKILL.md)
+        * AGENT    -> json.dumps(agent_config) keeping system_prompt + subagents
+
+    Never raises — any artifact whose source body can't be extracted is
+    silently skipped so a single malformed artifact can't break
+    record_run. Empty list in / empty list out.
+    """
+    import json as _json
+    from src.schemas.capability import CapabilityType
+
+    if not artifacts:
+        return []
+
+    out: list[GeneratedArtifactSnapshot] = []
+    for art in artifacts:
+        try:
+            if art.capability_type == CapabilityType.MCP_TOOL:
+                body = art.source_code or ""
+            elif art.capability_type == CapabilityType.SKILL:
+                body = art.skill_content or ""
+            elif art.capability_type == CapabilityType.AGENT:
+                if art.agent_config is None:
+                    body = ""
+                elif isinstance(art.agent_config, dict):
+                    body = _json.dumps(art.agent_config, default=str)
+                else:
+                    body = str(art.agent_config)
+            else:
+                body = ""
+            if not body:
+                # Still snapshot the name/type so the audit can skip with
+                # a clear reason instead of silently missing an artifact.
+                body = ""
+            out.append(
+                GeneratedArtifactSnapshot(
+                    capability_name=art.capability_name,
+                    capability_type=art.capability_type,
+                    source_body=body,
+                    domain=art.domain,
+                )
+            )
+        except Exception:  # noqa: BLE001 — never-raises contract
+            continue
+    return out
 
 
 class EvaluationHarness:
@@ -265,22 +336,93 @@ class EvaluationHarness:
 
         # Step 5: execute each task
         records: list[EvaluationRecord] = []
-        for task in shuffled_tasks:
-            record = self._run_one_task(
-                task=task,
-                condition=condition,
-                run_id=run_id,
-                registry=registry,
-                loader=loader,
-                metrics_store=metrics_store,
-                seed=seed,
-                snap_id=snap_id,
-                is_pilot=is_pilot,
+        from datetime import UTC, datetime
+
+        from src.orchestrator.tracing import trace_context
+        for i, task in enumerate(shuffled_tasks):
+            logger.info(
+                "──── Task %d/%d: %s (%s) ────",
+                i + 1, len(shuffled_tasks), task.task_id, task.tier,
             )
-            self._store.record_run(record)
-            records.append(record)
+            # Step 18.7 follow-up: capture the pre-task timestamp so the
+            # post-task cycle_events flush (below) can filter MetricsStore's
+            # capability_events to just this task's events.
+            task_events_cutoff = datetime.now(UTC)
+            # Step 13.7 tag-propagation fix (2026-04-19): wrap BOTH
+            # pipeline.invoke AND the post-task flush in trace_context so
+            # events emitted from ThreadPool workers (gate.verify,
+            # adversarial) + LangChain @tool callbacks (sandbox_execute) +
+            # post-pipeline sites (cycle_flush.completed) all inherit
+            # tags/session/user. The pipeline's own config.metadata still
+            # drives the primary path (get_config() inside nodes); this
+            # wrap just closes the fallback for non-node emit sites.
+            _lf_tags = self._build_task_lf_tags(task, condition, is_pilot)
+            with trace_context(
+                tags=_lf_tags,
+                session_id=run_id,
+                user_id="eval-harness",
+            ):
+                record = self._run_one_task(
+                    task=task,
+                    condition=condition,
+                    run_id=run_id,
+                    registry=registry,
+                    loader=loader,
+                    metrics_store=metrics_store,
+                    seed=seed,
+                    snap_id=snap_id,
+                    is_pilot=is_pilot,
+                )
+                self._store.record_run(record)
+                records.append(record)
+
+                # Step 18.5 + 18.7 (2026-04-17): persist per-task cycle state
+                # (invocation_events + cycle_utility_scores + cycle_events) to
+                # the EvaluationStore for Chapter 6 Gini + KL convergence +
+                # per-type op-count analyses. Factored out to
+                # ``tests.evaluation.cycle_flush.flush_task_cycle_state`` so
+                # the longitudinal scripts (which inline their own task loops)
+                # call the same code path. Never-raises.
+                from tests.evaluation.cycle_flush import flush_task_cycle_state
+                flush_task_cycle_state(
+                    eval_store=self._store,
+                    metrics_store=metrics_store,
+                    registry=registry,
+                    run_id=run_id,
+                    condition=condition,
+                    task_id=task.task_id,
+                    task_events_cutoff=task_events_cutoff,
+                )
 
         return records
+
+    def _build_task_lf_tags(
+        self,
+        task: TaskDefinition,
+        condition: str,
+        is_pilot: bool,
+    ) -> list[str]:
+        """Build the per-task LangFuse tag list.
+
+        Extracted from ``_run_jit`` so the outer loop can also apply the
+        same tags to the ``trace_context`` wrap (Step 13.7 tag-propagation
+        fix). Kept in sync with the in-``_run_jit`` invoke_config.metadata
+        tag list — both call sites share this helper.
+        """
+        _file_formats = list({
+            fp.suffix.lower().lstrip(".") for fp in task.fixture_paths
+        }) if task.fixture_paths else []
+        _tags: list[str] = [
+            condition,
+            task.task_id,
+            f"tier:{task.tier}",
+            *(f"format:{fmt}" for fmt in sorted(_file_formats)),
+            f"allow_network:{str(self._config.allow_network).lower()}",
+            f"static_coverage:{str(task.has_static_coverage).lower()}",
+        ]
+        if is_pilot:
+            _tags.append("pilot")
+        return _tags
 
     def _run_one_task(
         self,
@@ -308,6 +450,7 @@ class EvaluationHarness:
                 loader,
                 metrics_store,
                 run_id=run_id,
+                is_pilot=is_pilot,
             )
 
         elapsed_ms = int((time.monotonic() - t_start) * 1000)
@@ -329,6 +472,21 @@ class EvaluationHarness:
             invocation_record_id=result.get("invocation_record_id"),
             seed=seed,
             is_pilot=is_pilot,
+            required_capability_count=result.get("required_capability_count", 0),
+            matched_in_registry_count=result.get("matched_in_registry_count", 0),
+            chain_length=result.get("chain_length", 1),
+            chain_success=result.get("chain_success", False),
+            matched_and_executed_count=result.get("matched_and_executed_count", 0),
+            generated_artifact_count=result.get("generated_artifact_count", 0),
+            capability_types=result.get("capability_types", []),
+            failed_step_index=result.get("failed_step_index"),
+            failed_step_name=result.get("failed_step_name"),
+            failed_step_reason=result.get("failed_step_reason"),
+            output_shape_mismatch=result.get("output_shape_mismatch", False),
+            output_shape_missing_keys=result.get("output_shape_missing_keys", []),
+            output_shape_missing_files=result.get("output_shape_missing_files", []),
+            generated_artifact_sources=result.get("generated_artifact_sources", []),
+            langfuse_trace_id=result.get("langfuse_trace_id"),
         )
 
     # -- condition implementations -------------------------------------------
@@ -388,6 +546,7 @@ class EvaluationHarness:
         metrics_store: Any,
         *,
         run_id: str = "",
+        is_pilot: bool = False,
     ) -> dict:
         """JIT conditions: invoke the pipeline, then validate output."""
         from src.orchestrator.pipeline import create_pipeline
@@ -413,23 +572,65 @@ class EvaluationHarness:
             _file_formats = list({
                 fp.suffix.lower().lstrip(".") for fp in task.fixture_paths
             }) if task.fixture_paths else []
+
+            # Step 13.7 tagging audit (2026-04-18) — build the tag list
+            # to maximize analysis-time filterability. Axes:
+            # - condition: which ablation (full / no_verification / ...)
+            # - task_id / tier: per-task + per-tier aggregation
+            # - format:X: per-file-format behavior
+            # - allow_network:{true|false}: network-policy consistency
+            #   with CLI (CLI also tags this)
+            # - pilot: fast exclusion of pilot runs from primary metrics
+            # - static_coverage:{true|false}: filter retrieval vs synthesis
+            #   tasks (the 6-of-20 that static can handle)
+            _tags = self._build_task_lf_tags(task, condition, is_pilot)
+
             invoke_config["metadata"] = {
                 "langfuse_session_id": run_id,
-                "langfuse_tags": [
-                    condition,
-                    task.task_id,
-                    f"tier:{task.tier}",
-                    *(f"format:{fmt}" for fmt in sorted(_file_formats)),
-                ],
+                # user_id differentiates eval-harness traces from
+                # interactive `mint` CLI traces (which set user_id="mint-cli").
+                # Per-user LangFuse dashboards show eval-aggregate vs
+                # ad-hoc-CLI-aggregate separately.
+                "langfuse_user_id": "eval-harness",
+                "langfuse_tags": _tags,
                 "task_id": task.task_id,
                 "condition": condition,
                 "run_id": run_id,
                 "tier": task.tier,
                 "has_static_coverage": task.has_static_coverage,
                 "file_formats": _file_formats,
+                "is_pilot": is_pilot,
+                "allow_network": self._config.allow_network,
             }
 
-        initial_state = TaskState(task_description=task.task_prompt)
+        # Step 14.6 — resolve the output contract via the shared boundary
+        # adapter. The harness path hits tier-1 (authored shortcut) by passing
+        # ``task_definition=task``; zero LLM calls. CLI free-form prompts go
+        # through the same function with ``task_definition=None`` and fall to
+        # the LLM extractor. Same code path, different inputs.
+        contract = resolve_output_contract(task.task_prompt, task_definition=task)
+
+        # Option 1 — token-cost honesty. The CLI's free-form path runs the
+        # LLM extractor at task entry, which costs tokens. The eval would
+        # under-count per-task token cost (one of the four thesis metrics)
+        # if the harness skipped this call. Run the extractor inside the
+        # LangFuse-tagged invocation context so its tokens count toward the
+        # per-task budget; discard the result. The authored ``contract``
+        # above remains the deterministic measurement instrument.
+        try:
+            _extract_output_contract_llm(task.task_prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Token-accounting extractor call failed for %s: %s",
+                task.task_id,
+                exc,
+            )
+
+        initial_state = TaskState(
+            task_description=task.task_prompt,
+            output_contract=contract,
+            allow_network=self._config.allow_network,
+        )
         try:
             final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
         except Exception as exc:  # noqa: BLE001
@@ -441,7 +642,265 @@ class EvaluationHarness:
                 "attempt_count": 0,
             }
 
-        return _extract_result(final_state, task, loader)
+        # Step 13.7 Batch B6 — capture LangFuse root trace ID for
+        # DuckDB↔LangFuse cross-reference. Read after pipeline.invoke
+        # completes; None when LangFuse is disabled. Never raises.
+        _lf_trace_id: str | None = None
+        if self._config.langfuse_handler is not None:
+            try:
+                _lf_trace_id = getattr(
+                    self._config.langfuse_handler, "last_trace_id", None,
+                )
+            except Exception:  # noqa: BLE001
+                _lf_trace_id = None
+
+        # Pass LangFuse tags to execution functions so sub-traces
+        # (skill/agent execution) are tagged consistently.
+        _lf_meta = invoke_config.get("metadata", {})
+        result = _extract_result(
+            final_state, task, loader,
+            metrics_store=metrics_store,
+            langfuse_tags=_lf_meta.get("langfuse_tags"),
+            langfuse_session_id=_lf_meta.get("langfuse_session_id"),
+        )
+        if _lf_trace_id is not None:
+            result["langfuse_trace_id"] = _lf_trace_id
+
+            # Step 13.7 Batch B5 — push M1 (success) + M5 (latency) as
+            # LangFuse scores attached to the trace so Chapter 6's
+            # per-metric dashboards are queryable natively. M3 (Gini)
+            # + M6 (KL) are per-aggregate and flow via cycle_utility_scores
+            # / invocation_events. M2 (contamination) is post-eval via
+            # the audit tool. M4 (token cost) already flows via
+            # GENERATION spans.
+            try:
+                from langfuse import get_client
+                lf = get_client()
+                success_val = (
+                    float(result.get("gate_passed", False))
+                    * float(result.get("output_in_range", False))
+                )
+                for method_name in ("create_score", "score"):
+                    _create = getattr(lf, method_name, None)
+                    if _create is None:
+                        continue
+                    try:
+                        _create(
+                            trace_id=_lf_trace_id,
+                            name="m1.success",
+                            value=success_val,
+                            data_type="NUMERIC",
+                        )
+                        # M5 only reported on successful runs (precondition
+                        # per proposal §M5; failed runs have no "first correct").
+                        if success_val > 0:
+                            _create(
+                                trace_id=_lf_trace_id,
+                                name="m5.latency_ms",
+                                value=float(
+                                    result.get("chain_result_attempt_latency_ms", 0)
+                                    or 0
+                                ),
+                                data_type="NUMERIC",
+                            )
+                        break
+                    except Exception:  # noqa: BLE001
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Compositional result extraction (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _extract_result_compositional(
+    subtasks: list,
+    artifacts: list,
+    matches: list,
+    classified_gaps: list,
+    required_capabilities: list[str],
+    verification_results: list,
+    attempt_count: int,
+    task: TaskDefinition,
+    *,
+    metrics_store: Any | None = None,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
+    allow_network: bool = False,
+) -> dict:
+    """Compositional execution path — run all artifacts in dependency order.
+
+    Used when the decomposition produced multiple subtasks with resolved
+    capabilities.  Builds a resolution map, creates a
+    :class:`CompositionalExecutor`, runs the chain, and maps
+    :class:`ChainResult` fields onto the ``EvaluationRecord`` dict.
+    """
+    from src.orchestrator.composition import CompositionalExecutor, build_resolution_map
+
+    # Check gate: all generated artifacts must have passed verification.
+    # If verification was enabled and any artifact failed, the pipeline
+    # would have retried up to MAX_ATTEMPTS.  We check the latest report
+    # for each artifact.
+    gate_passed = True
+    verification_tier_reached: int | None = None
+    if verification_results:
+        _latest_by_name: dict[str, Any] = {}
+        for report in verification_results:
+            _latest_by_name[report.capability_name] = report
+        for report in _latest_by_name.values():
+            if not report.overall_passed:
+                gate_passed = False
+            if verification_tier_reached is None or (
+                report.tier_reached is not None
+                and report.tier_reached > (verification_tier_reached or 0)
+            ):
+                verification_tier_reached = report.tier_reached
+    elif artifacts:
+        # No verification reports but artifacts exist = no_verification condition
+        gate_passed = True
+
+    # Build resolution map
+    resolution = build_resolution_map(
+        required_capabilities, matches, artifacts, classified_gaps,
+    )
+
+    # Determine primary capability type (highest priority in chain)
+    cap_types = []
+    for ref in resolution.values():
+        ct = str(ref.capability_type).split(".")[-1].lower()
+        if ct not in cap_types:
+            cap_types.append(ct)
+    # Primary type for the record: use most capable type present
+    _type_order = {"agent": 0, "skill": 1, "mcp_tool": 2}
+    capability_type = min(cap_types, key=lambda t: _type_order.get(t, 9)) if cap_types else None
+
+    if not gate_passed:
+        # Verification failed — don't attempt execution
+        tier_map = {1: "tier1", 2: "tier2", 3: "tier3"}
+        return {
+            "gate_passed": False,
+            "output_in_range": False,
+            "failure_reason": tier_map.get(verification_tier_reached, "tier1"),
+            "attempt_count": attempt_count,
+            "capability_type": capability_type,
+            "verification_tier_reached": verification_tier_reached,
+            "token_cost": 0,
+            "invocation_record_id": None,
+            "required_capability_count": len(required_capabilities),
+            "matched_in_registry_count": len(matches),
+            "chain_length": len(subtasks),
+            "chain_success": False,
+            "matched_and_executed_count": 0,
+            "generated_artifact_count": len(artifacts),
+            "capability_types": cap_types,
+            "failed_step_index": None,
+            "failed_step_name": None,
+            "failed_step_reason": None,
+            # Step 14.6: gate-blocked runs never reached terminal state, so
+            # the contract check is not meaningfully evaluated here.
+            "output_shape_mismatch": False,
+            "output_shape_missing_keys": [],
+            "output_shape_missing_files": [],
+            # Step 18.10: snapshot even gate-rejected artifacts — they're
+            # still relevant for an M2 audit (did the gate catch mocks?).
+            "generated_artifact_sources": _snapshot_artifacts(artifacts),
+        }
+
+    # Run the compositional chain
+    executor = CompositionalExecutor(
+        subtasks=subtasks,
+        resolution=resolution,
+        artifacts=artifacts,
+        matches=matches,
+        fixture_paths=task.fixture_paths or [],
+        task=task,
+        metrics_store=metrics_store,
+        langfuse_tags=langfuse_tags,
+        langfuse_session_id=langfuse_session_id,
+        allow_network=allow_network,
+    )
+
+    chain_result = executor.run(task_id=task.task_id)
+
+    # Validate final output
+    output_in_range = False
+    failure_reason = "generation_failed"
+    final_output: dict | None = None
+    if chain_result.chain_success and chain_result.step_results:
+        final_output = chain_result.step_results[-1]
+        try:
+            if chain_result.output_files and task.file_validator is not None:
+                output_in_range = task.file_validator(final_output, chain_result.output_files)
+            else:
+                output_in_range = task.validator(final_output)
+            failure_reason = "none" if output_in_range else "output_rejected"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Validator failed for compositional output of %s: %s",
+                task.task_id, exc,
+            )
+            failure_reason = "output_rejected"
+    elif not chain_result.chain_success:
+        # Step 13: prefer the structured reason from the execution
+        # backend (currently only AGENT) over the generic
+        # ``chain_step_failed`` so Phase 5 analytics can separate
+        # "agent timed out" from "agent crashed" from "everything
+        # else that can go wrong in a chain step".
+        if chain_result.failed_step_reason == "agent_execution_timeout":
+            failure_reason = "agent_execution_timeout"
+        elif chain_result.failed_step_reason == "agent_execution_error":
+            failure_reason = "agent_execution_error"
+        else:
+            failure_reason = "chain_step_failed"
+
+    # Step 14.6 — output contract check (orthogonal to validator).
+    # Set comparison on the typed contract; never raises.
+    shape_check = task.output_contract.check(
+        final_output, chain_result.output_files,
+    ) if task.output_contract else None
+
+    # Count how many registry matches vs generated artifacts were executed
+    matched_count = sum(
+        1 for ref in resolution.values() if ref.source == "registry"
+    )
+    generated_count = sum(
+        1 for ref in resolution.values() if ref.source == "generated"
+    )
+
+    return {
+        "gate_passed": gate_passed,
+        "output_in_range": output_in_range,
+        "failure_reason": failure_reason,
+        "attempt_count": attempt_count,
+        "capability_type": capability_type,
+        "verification_tier_reached": verification_tier_reached,
+        "token_cost": 0,
+        "invocation_record_id": None,
+        "required_capability_count": len(required_capabilities),
+        "matched_in_registry_count": len(matches),
+        "chain_length": chain_result.chain_length,
+        "chain_success": chain_result.chain_success,
+        "matched_and_executed_count": matched_count,
+        "generated_artifact_count": generated_count,
+        "capability_types": cap_types,
+        "failed_step_index": chain_result.failed_step_index,
+        "failed_step_name": chain_result.failed_step_name,
+        "failed_step_reason": chain_result.failed_step_reason,
+        "output_shape_mismatch": (
+            shape_check is not None and not shape_check.satisfied
+        ),
+        "output_shape_missing_keys": (
+            shape_check.missing_keys if shape_check is not None else []
+        ),
+        "output_shape_missing_files": (
+            shape_check.missing_files if shape_check is not None else []
+        ),
+        # Step 18.10 — snapshot every generated artifact for M2 audit.
+        "generated_artifact_sources": _snapshot_artifacts(artifacts),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -453,14 +912,48 @@ def _extract_result(
     state: TaskState,
     task: TaskDefinition,
     loader: ToolLoader,
+    *,
+    metrics_store: Any | None = None,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
 ) -> dict:
     """Extract EvaluationRecord fields from a completed TaskState."""
     # pipeline.invoke() returns a dict, not a TaskState instance
     _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
     artifacts = _get("generated_artifacts", []) or []
     matches = _get("matches", []) or []
+    required_capabilities = _get("required_capabilities", []) or []
     verification_results = _get("verification_results", []) or []
     attempt_count = _get("attempt_count", 0)
+    subtasks = _get("subtasks", []) or []
+    classified_gaps = _get("classified_gaps", []) or []
+    # Step 14.12 — preserve task-level network policy through execution.
+    allow_network = bool(_get("allow_network", False))
+
+    # ---------------------------------------------------------------
+    # Compositional execution path (Phase 3): when the task was
+    # decomposed into multiple subtasks, run all resolved artifacts
+    # in dependency order via the CompositionalExecutor.
+    # ---------------------------------------------------------------
+    if len(subtasks) > 1 and (len(artifacts) + len(matches) > 1):
+        return _extract_result_compositional(
+            subtasks=subtasks,
+            artifacts=artifacts,
+            matches=matches,
+            classified_gaps=classified_gaps,
+            required_capabilities=required_capabilities,
+            verification_results=verification_results,
+            attempt_count=attempt_count,
+            task=task,
+            metrics_store=metrics_store,
+            langfuse_tags=langfuse_tags,
+            langfuse_session_id=langfuse_session_id,
+            allow_network=allow_network,
+        )
+
+    # ---------------------------------------------------------------
+    # Single-artifact execution path (legacy, Phase 2 and earlier)
+    # ---------------------------------------------------------------
 
     # Determine verification outcome from the last VerificationReport
     gate_passed = False
@@ -471,10 +964,18 @@ def _extract_result(
     if artifacts:
         from src.schemas.capability import CapabilityType
 
-        # Sort by capability_name for deterministic selection when parallel
-        # generation produces multiple artifacts (as_completed ordering varies).
-        artifacts = sorted(artifacts, key=lambda a: a.capability_name or "")
-        artifact = artifacts[-1]
+        # When multiple artifacts exist (decomposition produced several gaps),
+        # prefer the most capable type: AGENT > SKILL > MCP_TOOL.
+        # Within the same type, sort by name for deterministic selection.
+        _TYPE_PRIORITY = {"AGENT": 0, "SKILL": 1, "MCP_TOOL": 2}
+        artifacts = sorted(
+            artifacts,
+            key=lambda a: (
+                _TYPE_PRIORITY.get(str(a.capability_type).split(".")[-1].upper(), 9),
+                a.capability_name or "",
+            ),
+        )
+        artifact = artifacts[0]
         capability_type = str(artifact.capability_type).split(".")[-1].lower()
 
         if verification_results:
@@ -526,10 +1027,16 @@ def _extract_result(
 
     # Execute the artifact against fixture data to check output_in_range
     output_in_range = False
+    output: dict | None = None
     if gate_passed and artifacts:
-        artifact = artifacts[-1]
+        # artifact already set by priority sort above (artifacts[0])
         try:
-            output = _execute_artifact(artifact, task, loader)
+            output = _execute_artifact(
+                artifact, task, loader,
+                langfuse_tags=langfuse_tags,
+                langfuse_session_id=langfuse_session_id,
+                allow_network=allow_network,
+            )
             output_in_range = task.validator(output)
             if gate_passed and not output_in_range:
                 failure_reason = "output_rejected"
@@ -570,14 +1077,37 @@ def _extract_result(
                 from src.schemas.capability import CapabilityType
                 from src.schemas.task import GeneratedArtifact
 
+                # Reconstruct skill_content / agent_config from metadata
+                # so SKILL/AGENT execution backends have original instructions.
+                matched_skill = meta.get("skill_content")
+                matched_agent_config = None
+                _ac_raw = meta.get("agent_config")
+                if _ac_raw:
+                    try:
+                        import json as _json
+                        matched_agent_config = (
+                            _json.loads(_ac_raw)
+                            if isinstance(_ac_raw, str)
+                            else _ac_raw
+                        )
+                    except (ValueError, TypeError):
+                        matched_agent_config = None
+
                 proxy_artifact = GeneratedArtifact(
                     capability_name=cap.name,
                     capability_type=CapabilityType(cap.capability_type)
                     if isinstance(cap.capability_type, str)
                     else cap.capability_type,
                     source_code=matched_source,
+                    skill_content=matched_skill,
+                    agent_config=matched_agent_config,
                 )
-                output = _execute_artifact(proxy_artifact, task, loader)
+                output = _execute_artifact(
+                    proxy_artifact, task, loader,
+                    langfuse_tags=langfuse_tags,
+                    langfuse_session_id=langfuse_session_id,
+                    allow_network=allow_network,
+                )
                 output_in_range = task.validator(output)
                 if not output_in_range:
                     failure_reason = "output_rejected"
@@ -603,6 +1133,29 @@ def _extract_result(
                 task.task_id,
             )
 
+    # Stage 1 compositional fields: defaults that match single-artifact behavior.
+    # Stage 3 CompositionalExecutor will populate these with real chain data.
+    chain_success = bool(gate_passed and output_in_range)
+    if artifacts:
+        # Generation path: one freshly-generated artifact was executed.
+        generated_artifact_count = 1
+        matched_and_executed_count = 0
+    elif matches:
+        # Registry-match path: one matched capability was executed.
+        generated_artifact_count = 0
+        matched_and_executed_count = 1
+    else:
+        generated_artifact_count = 0
+        matched_and_executed_count = 0
+    capability_types_list = [capability_type] if capability_type is not None else []
+
+    # Step 14.6 — output contract check on the single-artifact path.
+    # Single-artifact execution does not surface a separate output_files
+    # mapping (file outputs only appear in compositional chains today),
+    # so the file-presence check uses an empty dict here. T07/T11 — the
+    # only file-producing tasks — go through the compositional path.
+    shape_check = task.output_contract.check(output, {}) if task.output_contract else None
+
     return {
         "gate_passed": gate_passed,
         "output_in_range": output_in_range,
@@ -612,16 +1165,40 @@ def _extract_result(
         "verification_tier_reached": verification_tier_reached,
         "token_cost": 0,  # populated from LangFuse in Iteration 6
         "invocation_record_id": _get("trace_id", None),
+        "required_capability_count": len(required_capabilities),
+        "matched_in_registry_count": len(matches),
+        "chain_length": 1,
+        "chain_success": chain_success,
+        "matched_and_executed_count": matched_and_executed_count,
+        "generated_artifact_count": generated_artifact_count,
+        "capability_types": capability_types_list,
+        "failed_step_index": None,
+        "failed_step_name": None,
+        "failed_step_reason": None,
+        # Step 18.10 — snapshot generated artifacts for M2 audit.
+        "generated_artifact_sources": _snapshot_artifacts(artifacts),
+        "output_shape_mismatch": (
+            shape_check is not None and not shape_check.satisfied
+        ),
+        "output_shape_missing_keys": (
+            shape_check.missing_keys if shape_check is not None else []
+        ),
+        "output_shape_missing_files": (
+            shape_check.missing_files if shape_check is not None else []
+        ),
     }
 
 
-def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -> dict:
-    """Execute a generated MCP tool artifact with fixture data and return its output.
-
-    For SKILL/AGENT artifacts, returns a structural proxy (empty dict)
-    since these cannot be auto-executed — output_in_range will be False,
-    which is acceptable for thesis purposes (discussed in limitations).
-    """
+def _execute_artifact(
+    artifact: Any,
+    task: TaskDefinition,
+    loader: ToolLoader,
+    *,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
+    allow_network: bool = False,
+) -> dict:
+    """Execute a generated artifact with fixture data and return its output."""
     from src.schemas.capability import CapabilityType
 
     cap_type = artifact.capability_type
@@ -629,12 +1206,22 @@ def _execute_artifact(artifact: Any, task: TaskDefinition, loader: ToolLoader) -
         from tests.evaluation.execution import _read_fixture_contents, execute_skill_artifact
 
         fixture_contents = _read_fixture_contents(task)
-        return execute_skill_artifact(artifact, task, fixture_contents)
+        return execute_skill_artifact(
+            artifact, task, fixture_contents,
+            langfuse_tags=langfuse_tags,
+            langfuse_session_id=langfuse_session_id,
+            allow_network=allow_network,
+        )
     elif cap_type == CapabilityType.AGENT:
         from tests.evaluation.execution import _read_fixture_contents, execute_agent_artifact
 
         fixture_contents = _read_fixture_contents(task)
-        return execute_agent_artifact(artifact, task, fixture_contents)
+        return execute_agent_artifact(
+            artifact, task, fixture_contents,
+            langfuse_tags=langfuse_tags,
+            langfuse_session_id=langfuse_session_id,
+            allow_network=allow_network,
+        )
     elif cap_type != CapabilityType.MCP_TOOL:
         logger.debug("Unknown artifact type: %s", cap_type)
         return {}
@@ -736,7 +1323,12 @@ asyncio.run(_run())
     # Allow more time when dynamic deps need installation (Phase 1 pip + Phase 2 exec).
     exec_timeout = 60 if extra_pkgs else 30
     logger.debug("Sandbox extra_packages=%s timeout=%s", extra_pkgs, exec_timeout)
-    result = sandbox_execute(sandbox_code, timeout=exec_timeout, extra_packages=extra_pkgs or None)
+    result = sandbox_execute(
+        sandbox_code,
+        timeout=exec_timeout,
+        extra_packages=extra_pkgs or None,
+        allow_network=allow_network,
+    )
     if not result.get("success") or not result.get("stdout"):
         logger.warning(
             "Sandbox execution for %s failed: exit_code=%s success=%s stderr=%s",
@@ -756,7 +1348,10 @@ asyncio.run(_run())
                 str(parsed["error"])[:500],
             )
             return {}
-        output = parsed.get("result", {}) or {}
+        # Security audit finding #11 (2026-04-19): preserve falsy / non-dict
+        # results via the shared helper.
+        from src.cli.output_coerce import extract_tool_result
+        output = extract_tool_result(parsed)
         logger.info("Sandbox output for %s: %s", func_name, str(output)[:300])
         return output
     except (json.JSONDecodeError, KeyError, IndexError):

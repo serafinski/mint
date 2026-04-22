@@ -73,7 +73,12 @@ def _make_registry() -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
-def test_mcp_tool_is_loaded_and_registered():
+def test_mcp_tool_is_registered_without_host_import():
+    """Security audit finding #1 (2026-04-19): loading_node must NOT call
+    ``loader.load_tool`` or ``loader.execute_tool`` — those execute
+    generated code on the host. Only ``register_tool`` runs, reading
+    ``source_code`` without executing it. Downstream runtime uses the
+    Docker sandbox exclusively."""
     artifact = _mcp_artifact("my_tool")
     state = TaskState(
         task_description="t",
@@ -84,8 +89,10 @@ def test_mcp_tool_is_loaded_and_registered():
 
     cmd = loading_node(state, loader, registry)
 
-    loader.load_tool.assert_called_once_with(artifact)
-    loader.execute_tool.assert_called_once()
+    # The host-import path must NOT fire.
+    loader.load_tool.assert_not_called()
+    loader.execute_tool.assert_not_called()
+    # register_tool is the only side effect.
     loader.register_tool.assert_called_once_with(artifact, registry)
     assert cmd.update["status"] == TaskStatus.COMPLETED
     assert cmd.goto == "__end__"
@@ -99,7 +106,8 @@ def test_multiple_mcp_tools_all_registered():
 
     loading_node(state, loader, registry)
 
-    assert loader.load_tool.call_count == 3
+    # Host import still not called; register_tool for each.
+    loader.load_tool.assert_not_called()
     assert loader.register_tool.call_count == 3
 
 
@@ -146,9 +154,11 @@ def test_mixed_artifacts_only_mcp_tools_loaded():
 
     loading_node(state, loader, registry)
 
-    # Only the MCP tool should be loaded/registered
-    assert loader.load_tool.call_count == 1
-    assert loader.register_tool.call_count == 1
+    # Host import never fires (security audit finding #1).
+    loader.load_tool.assert_not_called()
+    # register_tool fires for the MCP artifact only; skills/agents register
+    # via their own path (see skill/agent branches further down).
+    loader.register_tool.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -156,37 +166,22 @@ def test_mixed_artifacts_only_mcp_tools_loaded():
 # ---------------------------------------------------------------------------
 
 
-def test_load_failure_still_registers_with_source_code():
+def test_all_mcp_tools_register_regardless_of_source_shape():
+    """Security audit finding #1 (2026-04-19): host-import path removed.
+    The pre-fix behavior — load_tool raises → register anyway with source
+    code only — is no longer relevant because load_tool is never called
+    in this node. Both artifacts should register cleanly."""
     artifacts = [_mcp_artifact("bad"), _mcp_artifact("good")]
     state = TaskState(task_description="t", generated_artifacts=artifacts)
 
     loader = MagicMock()
-    loaded = MagicMock(spec=LoadedTool)
-    # First call raises (host import fails), second succeeds
-    loader.load_tool.side_effect = [RuntimeError("import error"), loaded]
-    loader.execute_tool.return_value = ToolResult(success=True)
 
     cmd = loading_node(state, loader, _make_registry())
 
-    # Both tools registered — 'bad' with source_code only, 'good' with full load
+    # Host import path is dead code; register_tool is the only side effect.
+    loader.load_tool.assert_not_called()
+    loader.execute_tool.assert_not_called()
     assert loader.register_tool.call_count == 2
-    assert cmd.update["status"] == TaskStatus.COMPLETED
-
-
-# ---------------------------------------------------------------------------
-# Smoke test failure logs warning but registration still happens
-# ---------------------------------------------------------------------------
-
-
-def test_smoke_failure_does_not_prevent_registration():
-    artifact = _mcp_artifact()
-    state = TaskState(task_description="t", generated_artifacts=[artifact])
-    loader = _make_loader(smoke_success=False)
-
-    cmd = loading_node(state, loader, _make_registry())
-
-    # Registration still happens
-    loader.register_tool.assert_called_once()
     assert cmd.update["status"] == TaskStatus.COMPLETED
 
 
@@ -340,3 +335,51 @@ def test_existing_errors_are_preserved():
     )
     cmd = loading_node(state, _make_loader(), _make_registry())
     assert "prior error" in cmd.update["errors"]
+
+
+# ---------------------------------------------------------------------------
+# Security audit finding #1 end-to-end — malicious top-level side effect
+# ---------------------------------------------------------------------------
+
+
+def test_does_not_execute_module_top_level_on_host(tmp_path):
+    """Pre-fix, ``loading_node`` called ``loader.load_tool(artifact)`` which
+    ran ``spec.loader.exec_module(module)`` in the parent Python process.
+    A generated tool with a top-level side effect would fire during
+    registration. Post-fix, no host execution happens — the marker file
+    must NOT be created.
+
+    Uses a real ToolLoader (not a MagicMock) to ensure that if the code
+    path accidentally re-introduces ``load_tool``, the test catches it."""
+    from src.orchestrator.tool_loader import ToolLoader
+    from src.registry.store import SkillRegistry
+
+    marker = tmp_path / "pwned"
+    source = (
+        f"from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('fired at import')\n"
+        "async def benign_tool(x: int) -> int:\n"
+        "    return x + 1\n"
+    )
+
+    artifact = GeneratedArtifact(
+        capability_name="benign-tool",
+        capability_type=CapabilityType.MCP_TOOL,
+        source_code=source,
+    )
+    state = TaskState(task_description="t", generated_artifacts=[artifact])
+
+    real_loader = ToolLoader()
+    registry = MagicMock(spec=SkillRegistry)
+
+    cmd = loading_node(state, real_loader, registry)
+
+    # The decisive assertion: the malicious side effect did NOT fire.
+    assert not marker.exists(), (
+        f"Top-level code executed on host: {marker} was created. "
+        "Security audit finding #1 regression — loading_node must not "
+        "call load_tool (which runs exec_module) in production."
+    )
+    # Registration still succeeded.
+    registry.add.assert_called_once()
+    assert cmd.update["status"] == TaskStatus.COMPLETED

@@ -289,6 +289,81 @@ class TestExtractResult:
 
 
 # ---------------------------------------------------------------------------
+# Step 13 — _extract_result_compositional classifies agent timeouts
+# ---------------------------------------------------------------------------
+
+
+class TestExtractResultCompositionalAgentFailure:
+    """The harness must translate a ChainResult.failed_step_reason into the
+    matching FailureReason enum value so Phase 5 analytics can distinguish
+    agent timeouts from generic chain-step failures."""
+
+    def _subtasks(self):
+        from src.schemas.task import SubTask
+        return [
+            SubTask(
+                description="investigate",
+                required_capabilities=["investigate"],
+                depends_on=[],
+            ),
+        ]
+
+    def _make_fake_chain_result(self, *, failed_step_reason: str | None):
+        from src.schemas.task import ChainResult
+        return ChainResult(
+            chain_length=1,
+            chain_success=False,
+            step_results=[],
+            failed_step_index=0,
+            failed_step_name="investigate",
+            failed_step_reason=failed_step_reason,
+        )
+
+    def _extract(self, chain_result):
+        from tests.evaluation.harness import _extract_result_compositional
+        art = GeneratedArtifact(
+            capability_name="investigator",
+            capability_type=CapabilityType.AGENT,
+            agent_config={"system_prompt": "Investigate"},
+            gap_query="investigate",
+        )
+        with patch(
+            "src.orchestrator.composition.CompositionalExecutor"
+        ) as mock_exec_cls:
+            mock_exec_cls.return_value.run.return_value = chain_result
+            return _extract_result_compositional(
+                subtasks=self._subtasks(),
+                artifacts=[art],
+                matches=[],
+                classified_gaps=[],
+                required_capabilities=["investigate"],
+                verification_results=[],
+                attempt_count=1,
+                task=T04,
+            )
+
+    def test_timeout_classified_as_agent_execution_timeout(self):
+        result = self._extract(
+            self._make_fake_chain_result(failed_step_reason="agent_execution_timeout"),
+        )
+        assert result["failure_reason"] == "agent_execution_timeout"
+        assert result["chain_success"] is False
+        assert result["output_in_range"] is False
+
+    def test_error_classified_as_agent_execution_error(self):
+        result = self._extract(
+            self._make_fake_chain_result(failed_step_reason="agent_execution_error"),
+        )
+        assert result["failure_reason"] == "agent_execution_error"
+
+    def test_none_reason_falls_back_to_chain_step_failed(self):
+        result = self._extract(
+            self._make_fake_chain_result(failed_step_reason=None),
+        )
+        assert result["failure_reason"] == "chain_step_failed"
+
+
+# ---------------------------------------------------------------------------
 # EvaluationHarness.run_pilot
 # ---------------------------------------------------------------------------
 

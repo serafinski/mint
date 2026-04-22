@@ -14,12 +14,13 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 from scipy.stats import entropy
 
+from src.config import AUTO_OPTIMIZER_THRESHOLD
 from src.optimizer.operations import merge, prune, split
 from src.optimizer.utility import compute_all_utilities
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
-from src.schemas.capability import CapabilityType
 from src.schemas.metrics import GranularityMetrics
+from src.schemas.optimizer_config import OptimizerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,16 @@ class OptimizerState(BaseModel):
     )
     errors: list[str] = Field(
         default_factory=list, description="Errors encountered during optimization"
+    )
+    allow_network: bool = Field(
+        default=False,
+        description=(
+            "Network policy inherited from the enclosing TaskState (Step "
+            "14.12). When True, merge/split variant verification runs with "
+            "``--network bridge`` in Tier 2 / Tier 3, and MCP_TOOL coverage "
+            "replay honors the same policy. Offline-by-default preserves "
+            "the standard safety posture."
+        ),
     )
 
     model_config = {"extra": "forbid"}
@@ -105,6 +116,37 @@ def _compute_kl_divergence(
     return float(entropy(curr, prev))
 
 
+def _schema_jaccard(
+    cap_a: "CapabilityDescriptor", cap_b: "CapabilityDescriptor"
+) -> float:
+    """Jaccard similarity over the union of input+output schema key names.
+
+    Implements the proposal's second Merge conjunct: *"overlapping input
+    schemas"*. Computes |A ∩ B| / |A ∪ B| where A and B are the sets of
+    parameter names + output-key names from each capability's schemas.
+
+    Returns 0.0 if either side has no schema (which disables merge on
+    unpopulated capabilities — safe default, because merging two caps
+    with unknown contracts risks producing garbage).
+
+    Uses key-name overlap (not type overlap) because type tokens like
+    ``int``/``dict`` carry little semantic signal for clustering decisions;
+    the stronger signal is that two capabilities share parameter *names*
+    like ``file_path`` or ``row_count``.
+    """
+    a_keys = set((cap_a.input_schema or {}).keys()) | set(
+        (cap_a.output_schema or {}).keys()
+    )
+    b_keys = set((cap_b.input_schema or {}).keys()) | set(
+        (cap_b.output_schema or {}).keys()
+    )
+    if not a_keys or not b_keys:
+        return 0.0
+    intersection = a_keys & b_keys
+    union = a_keys | b_keys
+    return len(intersection) / len(union)
+
+
 def create_optimization_loop(
     registry: SkillRegistry,
     metrics_store: MetricsStore,
@@ -114,11 +156,27 @@ def create_optimization_loop(
     split_success_threshold: float = 0.7,
     merge_reuse_threshold: float = 0.05,
     llm_model: str = "",
+    optimizer_config: OptimizerConfig | None = None,
 ) -> Any:
     """Build the LangGraph optimization loop.
 
+    Args:
+        optimizer_config: Per-operation enable/disable config (§12 finding
+            #8). When ``None``, defaults to all-``"on"`` — preserves the
+            pre-finding-#8 semantic where the loop unconditionally ran
+            all three operations whenever invoked. Threshold gating
+            belongs to the caller (``create_pipeline`` decides whether to
+            invoke the loop at all based on invocation_count vs
+            ``AUTO_OPTIMIZER_THRESHOLD``); once invoked, each operation
+            honors its per-config setting.
+
     Returns a compiled StateGraph.
     """
+    # Default to all-"on" when caller doesn't specify — preserves the
+    # pre-finding-#8 loop semantic (operations always fire when invoked).
+    # The threshold gate is enforced upstream by create_pipeline / the CLI
+    # runner, not by this loop.
+    _config = optimizer_config or OptimizerConfig.all_on()
 
     def compute_metrics_node(state: OptimizerState) -> Command:
         """Compute utility scores for all active capabilities."""
@@ -133,6 +191,32 @@ def create_optimization_loop(
 
         # Compute KL divergence against previous cycle
         kl = _compute_kl_divergence(state.previous_utility_scores, scores)
+
+        # Step 13.7 Batch A4 — emit KL as a LangFuse score attached to
+        # the active trace so Chapter 5.4 convergence analysis is
+        # queryable via LangFuse dashboards (not just DuckDB
+        # cycle_utility_scores). Never raises.
+        try:
+            from langfuse import get_client
+            try:
+                lf = get_client()
+                lf.score_current_trace(
+                    name="m6.kl_divergence",
+                    value=float(kl),
+                    data_type="NUMERIC",
+                    comment=f"Optimizer cycle: {len(caps)} active capabilities",
+                )
+            except AttributeError:
+                # Older SDK — fall back to lf.score on current trace
+                lf.create_score(
+                    name="m6.kl_divergence",
+                    value=float(kl),
+                    data_type="NUMERIC",
+                    comment=f"Optimizer cycle: {len(caps)} active capabilities",
+                )
+        except Exception:  # noqa: BLE001
+            # Never-raises contract — if LangFuse is unavailable, skip.
+            pass
 
         return Command(
             update={
@@ -159,40 +243,49 @@ def create_optimization_loop(
                 if cap is None:
                     continue
 
-                # Split candidates: high reuse + mediocre success, non-MCP_TOOL
+                # Split candidates: high reuse + mediocre success. All three
+                # capability types eligible — per-type dispatch in operations.py
+                # split() + verify_coverage (MCP_TOOL) / three-tier gate per
+                # variant (SKILL/AGENT) enforce correctness downstream.
                 if (
                     m.reuse_rate > split_reuse_threshold
                     and m.success_rate < split_success_threshold
-                    and cap.capability_type != CapabilityType.MCP_TOOL
                 ):
                     split_cands.append(cap_id)
 
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to compute metrics for '%s': %s", cap_id, e)
 
-        # Build merge pairs: low-reuse SKILL pairs with high embedding similarity.
-        # Use registry.search() to find semantically similar partners rather than
-        # pairing consecutive skills (which would be arbitrary).
-        low_reuse_skills: list[str] = []
+        # Build merge pairs: low-reuse capability pairs with high embedding
+        # similarity AND overlapping I/O schemas (the second proposal conjunct).
+        # Use registry.search() to find semantically similar partners rather
+        # than pairing consecutive capabilities (which would be arbitrary).
+        #
+        # Type scoping: candidates are collected across all three capability
+        # types (MCP_TOOL, SKILL, AGENT). Pairing within the search loop
+        # enforces same-type pairs — cross-type merge is not supported
+        # because merge() dispatches on type and the combined executable
+        # content only makes sense within a type (Ch 7 future work).
+        low_reuse: list[str] = []
         for cap_id in state.capabilities_snapshot:
             cap = registry.get(cap_id)
-            if cap is None or cap.capability_type != CapabilityType.SKILL:
+            if cap is None:
                 continue
             m = metrics_cache.get(cap_id)
             if m is None:
                 continue
             if m.reuse_rate < merge_reuse_threshold:
-                low_reuse_skills.append(cap_id)
+                low_reuse.append(cap_id)
 
-        low_reuse_set = set(low_reuse_skills)
+        low_reuse_set = set(low_reuse)
         # Compute registry size once — registry.count hits ChromaDB on every call.
         total_caps = registry.count or 1
-        n_search = min(max(10, len(low_reuse_skills)), total_caps)
+        n_search = min(max(10, len(low_reuse)), total_caps)
         paired: set[str] = set()
-        for skill_id in low_reuse_skills:
-            if skill_id in paired:
+        for cap_id in low_reuse:
+            if cap_id in paired:
                 continue
-            cap = registry.get(skill_id)
+            cap = registry.get(cap_id)
             if cap is None:
                 continue
             try:
@@ -203,19 +296,30 @@ def create_optimization_loop(
                 )
                 for similar_cap, score in similar:
                     partner_id = similar_cap.name
+                    # First conjunct (proposal): description cosine >= 0.5
+                    # Second conjunct (proposal + user safety rule):
+                    #     schema Jaccard in [0.5, 1.0)
+                    # The exclusive upper bound preserves diversity — two
+                    # capabilities with identical schemas may hide different
+                    # internal logic, and merging them risks destroying that
+                    # diversity. Require some overlap (>= 0.5) but not full
+                    # identity (< 1.0).
                     if (
-                        partner_id != skill_id
-                        and partner_id in low_reuse_set  # only active caps are in low_reuse_set
+                        partner_id != cap_id
+                        and partner_id in low_reuse_set
                         and partner_id not in paired
                         and similar_cap.is_active
-                        and score >= 0.5  # meaningful semantic similarity
+                        and similar_cap.capability_type == cap.capability_type
+                        and score >= 0.5
                     ):
-                        merge_cands.append((skill_id, partner_id))
-                        paired.add(skill_id)
-                        paired.add(partner_id)
-                        break
+                        jaccard = _schema_jaccard(cap, similar_cap)
+                        if 0.5 <= jaccard < 1.0:
+                            merge_cands.append((cap_id, partner_id))
+                            paired.add(cap_id)
+                            paired.add(partner_id)
+                            break
             except Exception as e:  # noqa: BLE001
-                logger.warning("Failed similarity search for '%s' (merge): %s", skill_id, e)
+                logger.warning("Failed similarity search for '%s' (merge): %s", cap_id, e)
 
         return Command(
             update={
@@ -226,48 +330,87 @@ def create_optimization_loop(
         )
 
     def apply_operations_node(state: OptimizerState) -> Command:
-        """Apply prune, split, and merge operations."""
+        """Apply prune, split, and merge operations.
+
+        Each operation is gated independently against ``optimizer_config``
+        per §12 finding #8. The gate resolves ``"auto"`` against the
+        current ``AUTO_OPTIMIZER_THRESHOLD`` using ``invocation_count`` from
+        the metrics store; ``"on"`` always runs; ``"off"`` always skips.
+        """
         errors = list(state.errors)
         pruned: list[str] = []
         split_results: dict[str, list[str]] = {}
         merge_results: dict[str, str] = {}
 
-        # Prune
+        # Resolve the invocation_count once so all three gates see the
+        # same snapshot. Falling back to 0 on any error means "auto"
+        # effectively becomes "off" — safer than running an unbounded
+        # optimizer when the metrics store is broken.
         try:
-            pruned = prune(registry, metrics_store, window_days=prune_window_days)
+            invocation_count = metrics_store.invocation_count_total()
         except Exception as e:  # noqa: BLE001
-            errors.append(f"prune failed: {e}")
+            logger.warning(
+                "Optimizer: failed to read invocation_count_total (%s); "
+                "treating 'auto' as 'off'",
+                e,
+            )
+            invocation_count = 0
+
+        # Prune
+        if _config.is_enabled(
+            "prune", invocation_count=invocation_count, threshold=AUTO_OPTIMIZER_THRESHOLD,
+        ):
+            try:
+                pruned = prune(registry, metrics_store, window_days=prune_window_days)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"prune failed: {e}")
+        else:
+            logger.debug("Optimizer: prune skipped (config=%s)", _config.prune)
 
         # Filter out pruned capabilities so we don't attempt split/merge on
         # deactivated items (avoids wasted LLM calls and double-deactivation).
         pruned_set = set(pruned)
 
         # Split
-        for cap_id in state.split_candidates:
-            if cap_id in pruned_set:
-                logger.debug("Skipping split of pruned capability '%s'", cap_id)
-                continue
-            try:
-                new_ids = split(
-                    registry, metrics_store, cap_id, llm_model=llm_model
-                )
-                split_results[cap_id] = new_ids
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"split '{cap_id}' failed: {e}")
+        if _config.is_enabled(
+            "split", invocation_count=invocation_count, threshold=AUTO_OPTIMIZER_THRESHOLD,
+        ):
+            for cap_id in state.split_candidates:
+                if cap_id in pruned_set:
+                    logger.debug("Skipping split of pruned capability '%s'", cap_id)
+                    continue
+                try:
+                    new_ids = split(
+                        registry, metrics_store, cap_id,
+                        llm_model=llm_model,
+                        allow_network=state.allow_network,
+                    )
+                    split_results[cap_id] = new_ids
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"split '{cap_id}' failed: {e}")
+        else:
+            logger.debug("Optimizer: split skipped (config=%s)", _config.split)
 
         # Merge
-        for pair in state.merge_candidates:
-            if any(cid in pruned_set for cid in pair):
-                logger.debug("Skipping merge of pair %s (one or both pruned)", pair)
-                continue
-            try:
-                merged_id = merge(
-                    registry, metrics_store, list(pair), llm_model=llm_model
-                )
-                key = "+".join(pair)
-                merge_results[key] = merged_id
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"merge {pair} failed: {e}")
+        if _config.is_enabled(
+            "merge", invocation_count=invocation_count, threshold=AUTO_OPTIMIZER_THRESHOLD,
+        ):
+            for pair in state.merge_candidates:
+                if any(cid in pruned_set for cid in pair):
+                    logger.debug("Skipping merge of pair %s (one or both pruned)", pair)
+                    continue
+                try:
+                    merged_id = merge(
+                        registry, metrics_store, list(pair),
+                        llm_model=llm_model,
+                        allow_network=state.allow_network,
+                    )
+                    key = "+".join(pair)
+                    merge_results[key] = merged_id
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"merge {pair} failed: {e}")
+        else:
+            logger.debug("Optimizer: merge skipped (config=%s)", _config.merge)
 
         # Filter utility_scores to only include capabilities that are still
         # active after prune/split/merge, so pipeline.py carries accurate

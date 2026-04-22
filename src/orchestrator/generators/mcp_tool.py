@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field
 
 from src.orchestrator.generators.utils import build_task_context, slugify_gap
 from src.orchestrator.prompts.mcp_tool_generator import (
+    DOWNSTREAM_STEP_DIRECTIVE,
+    FIRST_STEP_DIRECTIVE,
     MCP_TOOL_REPAIR_PROMPT,
     MCP_TOOL_SYSTEM_PROMPT,
     MCP_TOOL_USER_PROMPT,
@@ -89,6 +91,15 @@ def _get_llm():
 # Validation
 # ---------------------------------------------------------------------------
 
+# NOTE: Intentional asymmetry with ``agent._SNAKE_CASE_RE`` (which is
+# ``r"^[a-z_][a-z0-9_]*$"`` — leading underscore allowed). MCP tool names are
+# used as Python module names by ``tool_loader.load_tool`` in the sandbox
+# runner script, so they must follow PyPI-/import-safe conventions and cannot
+# start with an underscore. Agent node names are LangGraph/DeepAgent
+# identifiers where ``_private_subagents``-style names are meaningful, hence
+# the looser rule there. Any future unifier should preserve this difference —
+# see ``tests/unit/test_mcp_tool_generator.py::TestValidateToolName::test_starts_with_underscore``
+# and ``tests/unit/test_agent_generator.py::test_node_name_with_leading_underscore_is_valid``.
 _SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
@@ -177,6 +188,75 @@ def _validate_code(source_code: str) -> str | None:
     return "; ".join(errors) if errors else None
 
 
+def _validate_step_signature(
+    source_code: str,
+    is_first_step: bool | None,
+) -> str | None:
+    """Validate the generated function's signature against its chain position.
+
+    Step 14.7 regression guard: catches step-0 functions that declare
+    ``upstream_data`` as a required parameter (the executor crashes with
+    ``missing 1 required positional argument: 'upstream_data'``), and
+    downstream functions that forget ``upstream_data`` entirely (the
+    executor falls through to per-key matching, which silently loses data).
+
+    Returns ``None`` when ``is_first_step`` is ``None`` (gap couldn't be
+    matched to a subtask — no position information available), when the
+    source is unparseable (``_validate_code`` will report the syntax error),
+    or when no public async function is found (``_validate_code`` will
+    report the missing function).
+    """
+    if is_first_step is None:
+        return None
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return None
+
+    func: ast.AsyncFunctionDef | None = None
+    for n in ast.iter_child_nodes(tree):
+        if isinstance(n, ast.AsyncFunctionDef) and not n.name.startswith("_"):
+            func = n
+            break
+    if func is None:
+        return None
+
+    args = func.args
+    positional = list(args.posonlyargs) + list(args.args)
+    n_required_positional = len(positional) - len(args.defaults)
+    required_names: list[str] = [a.arg for a in positional[:n_required_positional]]
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+        if default is None:
+            required_names.append(arg.arg)
+
+    has_required_upstream = "upstream_data" in required_names
+
+    if is_first_step and has_required_upstream:
+        return (
+            "step-0 function declares 'upstream_data' as a required parameter, "
+            "but the first step has no upstream data (executor will crash with "
+            "'missing 1 required positional argument: upstream_data'). Remove "
+            "upstream_data from the signature — step 0 takes only file-path "
+            "parameters."
+        )
+    if is_first_step is False and not has_required_upstream:
+        return (
+            "downstream step function is missing the required 'upstream_data: "
+            "Annotated[dict, Field(...)]' parameter. Downstream steps receive "
+            "parsed upstream outputs via upstream_data, not via file paths."
+        )
+    return None
+
+
+def _step_position_block(is_first_step: bool | None) -> str:
+    """Return the hard-constraint directive for the LLM prompt."""
+    if is_first_step is True:
+        return FIRST_STEP_DIRECTIVE
+    if is_first_step is False:
+        return DOWNSTREAM_STEP_DIRECTIVE
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Single tool generation
 # ---------------------------------------------------------------------------
@@ -185,8 +265,23 @@ def _validate_code(source_code: str) -> str | None:
 def generate_single_tool(
     gap: ClassifiedGap,
     task_context: str = "",
+    schema_context: str = "",
+    is_first_step: bool | None = None,
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate a single MCP tool from a classified gap.
+
+    Args:
+        gap: The classified capability gap to generate a tool for.
+        task_context: Full task description (with retry feedback appended
+            on attempt > 0).
+        schema_context: Per-step I/O schema contract derived from the
+            decomposer's ``output_schema`` fields.
+        is_first_step: ``True`` if the gap's subtask has no upstream
+            dependencies (``depends_on == []``), ``False`` for a downstream
+            step, ``None`` when the gap cannot be matched to a subtask. When
+            not ``None``, a hard-constraint step-position block is injected
+            into the user prompt AND a post-generation AST check validates
+            the function signature against the chain position.
 
     Returns:
         (artifact, None) on success, (None, error_message) on failure.
@@ -201,11 +296,19 @@ def generate_single_tool(
     # inherited via LangChain's contextvar-based callback propagation.  Creating an
     # additional handler here would generate duplicate traces.
 
+    # Build schema contract section — empty string if no schema available
+    _schema_section = ""
+    if schema_context:
+        _schema_section = (
+            "## Input/Output Schema Contract\n\n" + schema_context
+        )
+
     user_prompt = MCP_TOOL_USER_PROMPT.format(
-        description=gap.description,
-        query=gap.query,
-        task_context=task_context or "No additional context",
+        task_context=task_context or gap.description,
+        gap_description=gap.description or gap.query,
         forced_name=forced_name,
+        schema_context=_schema_section,
+        step_position=_step_position_block(is_first_step),
     )
 
     messages = [
@@ -221,10 +324,11 @@ def generate_single_tool(
         logger.warning(error_msg)
         return None, error_msg
 
-    # --- Validate source code and tool name (collect both so the repair prompt is complete) ---
+    # --- Validate source code and tool name (collect all so the repair prompt is complete) ---
     _code_err = _validate_code(result.source_code)
     _name_err = _validate_tool_name(result.tool_name)
-    validation_error = "; ".join(e for e in [_code_err, _name_err] if e) or None
+    _sig_err = _validate_step_signature(result.source_code, is_first_step)
+    validation_error = "; ".join(e for e in [_code_err, _name_err, _sig_err] if e) or None
     if validation_error is None:
         # Success on first attempt — override whatever name the LLM chose
         if result.tool_name != forced_name:
@@ -259,9 +363,8 @@ def generate_single_tool(
     )
 
     repair_prompt = MCP_TOOL_REPAIR_PROMPT.format(
-        gap_description=gap.description,
-        gap_query=gap.query,
-        task_context=task_context or "No additional context",
+        task_context=task_context or gap.description,
+        gap_description=gap.description or gap.query,
         tool_name=result.tool_name,
         description=result.description,
         source_code=result.source_code,
@@ -291,7 +394,11 @@ def generate_single_tool(
 
     _repair_code_err = _validate_code(repaired.source_code)
     _repair_name_err = _validate_tool_name(repaired.tool_name)
-    repair_validation = "; ".join(e for e in [_repair_code_err, _repair_name_err] if e) or None
+    _repair_sig_err = _validate_step_signature(repaired.source_code, is_first_step)
+    repair_validation = (
+        "; ".join(e for e in [_repair_code_err, _repair_name_err, _repair_sig_err] if e)
+        or None
+    )
     if repair_validation is not None:
         error_msg = (
             f"Repair pass failed for {gap.query!r}: {repair_validation}"
@@ -359,10 +466,22 @@ def generate_mcp_tool(
     logger.info("generate_mcp_tool: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(mcp_gaps) - len(gaps_to_generate))
     task_context = build_task_context(state)
 
+    # Build per-gap schema context from decomposer output_schema
+    from src.orchestrator.generators.utils import (
+        build_schema_context,
+        is_first_step_for_gap,
+    )
+    subtasks = list(state.subtasks) if state.subtasks else []
+
     # Parallel generation — collect results then merge sequentially
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
         futures = {
-            pool.submit(generate_single_tool, gap, task_context=task_context): gap
+            pool.submit(
+                generate_single_tool, gap,
+                task_context=task_context,
+                schema_context=build_schema_context(gap, subtasks),
+                is_first_step=is_first_step_for_gap(gap, subtasks),
+            ): gap
             for gap in gaps_to_generate
         }
         raw_results: list[tuple[GeneratedArtifact | None, str | None]] = []
@@ -390,6 +509,14 @@ def generate_mcp_tool(
             "generate_mcp_tool: %d/%d gaps failed generation: %s",
             len(failed_queries), len(gaps_to_generate), failed_queries,
         )
+
+    # Evolutionary taxonomy classification (B1 Step 3.5f). Tags each newly
+    # generated artifact with domain + is_generic so gap_detection can apply
+    # the domain filter with generic-cap bypass on subsequent runs. Never
+    # raises — failures leave artifact.domain=None and downstream code falls
+    # back to "generated".
+    from src.orchestrator.taxonomy import classify_and_tag_artifacts
+    classify_and_tag_artifacts(artifacts)
 
     return Command(
         update={

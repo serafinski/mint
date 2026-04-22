@@ -30,15 +30,80 @@ class SkillRegistry:
     # --- Private helpers ---
 
     @staticmethod
+    def _summarize_description(description: str, max_words: int = 50) -> str:
+        """Truncate description to *max_words* for embedding efficiency.
+
+        The full description is preserved in ChromaDB metadata
+        (``raw_description``); this summary is used only for the embedding
+        document so that search-time token costs stay bounded.
+
+        50-word cap keeps typical documents well under the 256-token
+        all-MiniLM-L6-v2 limit even with the B1 inputs/outputs lines.
+        Reducing the cap further (tried 30) measurably hurt Phase A
+        recall because it diluted the summary signal relative to the
+        added schema tokens.
+        """
+        words = description.split()
+        if len(words) <= max_words:
+            return description
+        return " ".join(words[:max_words]) + "…"
+
+    @staticmethod
+    def _format_signature(schema: dict | None) -> str:
+        """Format a schema dict as a comma-separated list of parameter names.
+
+        B1 (enriched hierarchical embedding): flattens an input or output
+        schema into a compact list of identifiers for inclusion in the
+        embedding document. **Only the parameter/output names are
+        emitted, not their types.** Type tokens like ``int``, ``str``,
+        ``list``, ``dict`` carry almost no semantic signal for realistic
+        caller queries (which rarely mention types explicitly) and their
+        inclusion measurably dilutes prose-query recall — an earlier
+        ``name:type`` format regressed Phase A recall by 6-12pp on
+        probes whose semantics aligned with the description.
+
+        Accepts:
+          - ``None`` or empty dict → returns ``""``
+          - ``{"file_path": "str"}`` → ``"file_path"``
+          - ``{"row_count": "int", "column_names": "list[str]"}``
+            → ``"row_count, column_names"``
+          - ``{"n": {"type": "int"}}`` → ``"n"`` (JSON-Schema-ish input)
+        """
+        if not schema:
+            return ""
+        return ", ".join(str(name) for name in schema.keys())
+
+    @staticmethod
     def _build_document(capability: CapabilityDescriptor) -> str:
         """Build hierarchical embedding document for richer semantic search.
 
-        Format: "{domain} > {capability_type} > {name}: {description}"
+        Format: "{domain} > {capability_type} > {name}: {summary}"
+
+        The description is truncated to ~50 words for embedding efficiency;
+        the full description is kept in metadata (``raw_description``).
+
+        **B1 design decision (2026-04-13):** the embedding document
+        remains prose-only. We tried three variants of enriching the
+        document with structural signatures (multi-line labeled,
+        single-line with ``||`` delimiter, and natural-prose
+        ``Parameters:`` / ``Returns:``) and all regressed Phase A
+        recall by 6-12pp because the added tokens dilute the prose
+        signal for borderline-threshold probes. Instead, the
+        structural signal is exposed through ``input_schema`` /
+        ``output_schema`` on ``CapabilityDescriptor`` (already
+        persisted in ChromaDB metadata), and consumed directly by
+        (a) Pillar 3 Merge's Jaccard similarity over schema keys,
+        and (b) gap detection's optional post-filter that cross-checks
+        query/capability schema overlap after embedding fires. This
+        preserves prose-query recall while still delivering the
+        proposal's "overlapping input schemas" Merge criterion and
+        catching silent-poisoning matches.
         """
         domain = getattr(capability, "domain", "general")
+        summary = SkillRegistry._summarize_description(capability.description)
         return (
             f"{domain} > {capability.capability_type.value} > "
-            f"{capability.name}: {capability.description}"
+            f"{capability.name}: {summary}"
         )
 
     @staticmethod
@@ -54,7 +119,11 @@ class SkillRegistry:
             "raw_description": capability.description,
             # New fields — use getattr for schema compatibility
             "domain": getattr(capability, "domain", "general"),
+            "is_generic": getattr(capability, "is_generic", False),
             "is_active": getattr(capability, "is_active", True),
+            "definition_token_cost": int(
+                getattr(capability, "definition_token_cost", 0)
+            ),
             "tags": ",".join(getattr(capability, "tags", [])),
             "input_schema": json.dumps(getattr(capability, "input_schema", {})),
             "output_schema": json.dumps(getattr(capability, "output_schema", {})),
@@ -88,8 +157,18 @@ class SkillRegistry:
         # Conditionally add fields the schema supports
         if "domain" in model_fields and "domain" in meta:
             kwargs["domain"] = meta["domain"]
+        if "is_generic" in model_fields and "is_generic" in meta:
+            kwargs["is_generic"] = meta["is_generic"]
         if "is_active" in model_fields and "is_active" in meta:
             kwargs["is_active"] = meta["is_active"]
+        if (
+            "definition_token_cost" in model_fields
+            and "definition_token_cost" in meta
+        ):
+            try:
+                kwargs["definition_token_cost"] = int(meta["definition_token_cost"])
+            except (ValueError, TypeError):
+                kwargs["definition_token_cost"] = 0
         if "tags" in model_fields and "tags" in meta:
             raw_tags = meta["tags"]
             kwargs["tags"] = [t for t in raw_tags.split(",") if t] if raw_tags else []
@@ -208,6 +287,8 @@ class SkillRegistry:
         *,
         min_confidence: float = 0.0,
         is_active: bool | None = True,
+        domain: str | None = None,
+        include_generic: bool = True,
     ) -> list[tuple[CapabilityDescriptor, float]]:
         """Semantic search. Returns (capability, score) pairs sorted by relevance.
 
@@ -220,8 +301,38 @@ class SkillRegistry:
             is_active: Filter by active status. ``True`` (default) returns only
                 active capabilities; ``False`` returns only inactive
                 capabilities; ``None`` returns all regardless of status.
+            domain: Optional domain filter. When set, restricts results to
+                capabilities whose ``domain`` metadata matches (with the
+                ``include_generic`` exception below). When ``None`` (default)
+                no domain filtering is applied — pre-B1 behaviour preserved.
+                Realises the proposal's "hierarchical embeddings (domain →
+                capability → specific skill)" criterion as a cheap pre-filter.
+            include_generic: When ``True`` (default), capabilities flagged
+                ``is_generic=True`` are always included in results regardless
+                of the ``domain`` filter. This handles the generic-capability
+                edge case surfaced by Phase E (B1 Step 3.5b): a genuinely
+                generic cap like ``parse_csv_and_return_stats`` would be
+                falsely rejected by strict domain-equality filtering on
+                queries inferred as ``inventory`` / ``operations`` / etc.,
+                even though the cap's implementation has zero hardcoded
+                business assumptions. Set ``False`` to disable the bypass
+                (useful for diagnostic measurements). Has no effect when
+                ``domain`` is ``None``.
         """
-        results = self._collection.query(query_texts=[query], n_results=n_results)
+        query_kwargs: dict = {"query_texts": [query], "n_results": n_results}
+        if domain is not None:
+            if include_generic:
+                # Include caps matching the domain OR flagged as generic.
+                # ChromaDB's where clause supports $or over equality checks.
+                query_kwargs["where"] = {
+                    "$or": [
+                        {"domain": {"$eq": domain}},
+                        {"is_generic": {"$eq": True}},
+                    ]
+                }
+            else:
+                query_kwargs["where"] = {"domain": {"$eq": domain}}
+        results = self._collection.query(**query_kwargs)
 
         pairs: list[tuple[CapabilityDescriptor, float]] = []
         if not results["ids"] or not results["ids"][0]:
@@ -242,37 +353,129 @@ class SkillRegistry:
         return pairs
 
     def detect_gaps(
-        self, queries: list[str], *, threshold: float = 0.5
+        self,
+        queries: list[str],
+        *,
+        auxiliary_queries: list[str | None] | None = None,
+        threshold: float = 0.6,
+        domain: str | None = None,
+        include_generic: bool = True,
     ) -> tuple[list[tuple[CapabilityDescriptor, float, str]], list[tuple[str, str]]]:
         """For each query, search the registry and classify as match or gap.
 
+        Args:
+            queries: Required-capability query strings (typically short
+                hyphen-case slugs produced by the decomposer).
+            auxiliary_queries: Optional per-query auxiliary search strings
+                (typically the natural-language ``SubTask.description``
+                produced alongside each slug). When provided, ``detect_gaps``
+                runs TWO searches per gap — one on the primary slug, one on
+                the auxiliary description — and takes the MAX score for the
+                threshold check. Strictly additive: setting an auxiliary to
+                None or passing ``auxiliary_queries=None`` reproduces the
+                pre-fix single-query behaviour exactly. Use this to work
+                around the short-slug-vs-prose-document embedding asymmetry
+                where short slugs systematically fall below the 0.6
+                threshold against prose-style ``_build_document()`` output
+                even when semantically equivalent. See
+                ``docs/registry_retrieval_fix_plan.md`` Part A.
+            threshold: Minimum similarity score to count as a match.
+            domain: Optional domain filter threaded through to :meth:`search`.
+                When ``None`` (default) the search is unrestricted. See
+                :meth:`search` for rationale.
+            include_generic: Threaded through to :meth:`search`. When True
+                (default), capabilities flagged ``is_generic=True`` bypass
+                the domain filter. See :meth:`search` docstring for the
+                Phase E rationale.
+
         Returns:
-            matches: list of (capability, score, original_query) above threshold
-            gaps: list of (query, reason) below threshold
+            matches: list of (capability, score, original_query) above threshold.
+                The score reflects whichever of primary/auxiliary won the
+                max comparison; ``original_query`` is always the primary
+                (slug) for attribution continuity with metrics and traces.
+            gaps: list of (query, reason) below threshold. The reason string
+                shows both primary and auxiliary scores for debugging.
         """
         matches: list[tuple[CapabilityDescriptor, float, str]] = []
         gaps: list[tuple[str, str]] = []
 
-        for query in queries:
-            # search() filters out is_active=False, so also query unfiltered
-            # to detect deactivated capabilities and produce accurate gap reasons.
-            results = self.search(query, n_results=1)
-            unfiltered = self.search(query, n_results=1, is_active=None)
+        # Normalise auxiliary_queries to the same length as queries. None
+        # entries are treated as "no auxiliary — single-query behaviour".
+        if auxiliary_queries is None:
+            aux_list: list[str | None] = [None] * len(queries)
+        else:
+            if len(auxiliary_queries) != len(queries):
+                raise ValueError(
+                    f"auxiliary_queries length ({len(auxiliary_queries)}) "
+                    f"must match queries length ({len(queries)})"
+                )
+            aux_list = list(auxiliary_queries)
 
-            if results and results[0][1] >= threshold:
-                cap, score = results[0]
-                matches.append((cap, score, query))
+        for query, auxiliary in zip(queries, aux_list):
+            # Primary search on the slug — search() filters out is_active=False,
+            # so also query unfiltered to detect deactivated capabilities and
+            # produce accurate gap reasons.
+            primary_results = self.search(
+                query, n_results=1, domain=domain, include_generic=include_generic
+            )
+            unfiltered = self.search(
+                query,
+                n_results=1,
+                is_active=None,
+                domain=domain,
+                include_generic=include_generic,
+            )
+            best_primary_score = primary_results[0][1] if primary_results else 0.0
+            best_primary_cap = primary_results[0][0] if primary_results else None
+
+            # Auxiliary search on the description (if provided) — same filter
+            # semantics, independent search.
+            best_aux_score = 0.0
+            best_aux_cap: CapabilityDescriptor | None = None
+            if auxiliary and auxiliary.strip():
+                aux_results = self.search(
+                    auxiliary,
+                    n_results=1,
+                    domain=domain,
+                    include_generic=include_generic,
+                )
+                if aux_results:
+                    best_aux_cap, best_aux_score = aux_results[0]
+
+            # Take the max-scoring hit. On ties, primary wins (slug
+            # attribution preserved in the match tuple for metrics continuity).
+            if best_primary_score >= best_aux_score:
+                best_cap = best_primary_cap
+                best_score = best_primary_score
             else:
-                # Check whether a deactivated capability would have matched.
+                best_cap = best_aux_cap
+                best_score = best_aux_score
+
+            if best_cap is not None and best_score >= threshold:
+                matches.append((best_cap, best_score, query))
+            else:
+                # Check whether a deactivated capability would have matched on
+                # the primary (slug) query. The deactivated-check intentionally
+                # only considers the primary for consistency with existing
+                # behaviour — augmenting it with auxiliary searches for
+                # deactivated caps would add noise without changing outcomes.
                 if (
                     unfiltered
                     and unfiltered[0][1] >= threshold
                     and not unfiltered[0][0].is_active
                 ):
                     reason = f"capability '{unfiltered[0][0].name}' is deactivated"
+                elif auxiliary and auxiliary.strip():
+                    reason = (
+                        f"best score {best_score:.2f} below threshold "
+                        f"{threshold:.2f} (primary {best_primary_score:.2f}, "
+                        f"auxiliary {best_aux_score:.2f})"
+                    )
                 else:
-                    best_score = results[0][1] if results else 0.0
-                    reason = f"best score {best_score:.2f} below threshold {threshold:.2f}"
+                    reason = (
+                        f"best score {best_primary_score:.2f} below threshold "
+                        f"{threshold:.2f}"
+                    )
                 gaps.append((query, reason))
 
         return matches, gaps
@@ -284,6 +487,10 @@ class SkillRegistry:
 
 def seed_registry(registry: SkillRegistry) -> None:
     """Seed with diverse capabilities spanning all three types."""
+    # Local imports to avoid circular deps at module import time.
+    from src.registry.token_count import count_definition_tokens
+    from src.schemas.task import GeneratedArtifact
+
     # Build kwargs for optional fields — only include if schema supports them
     model_fields = CapabilityDescriptor.model_fields
     has_domain = "domain" in model_fields
@@ -298,6 +505,8 @@ def seed_registry(registry: SkillRegistry) -> None:
         source_code: str | None = None,
         skill_content: str | None = None,
         agent_config: str | None = None,
+        input_schema: dict | None = None,
+        output_schema: dict | None = None,
     ) -> CapabilityDescriptor:
         metadata: dict = {"pinned": "true"}  # all seeded caps are pinned
         if source_code is not None:
@@ -306,16 +515,51 @@ def seed_registry(registry: SkillRegistry) -> None:
             metadata["skill_content"] = skill_content
         if agent_config is not None:
             metadata["agent_config"] = agent_config
+
+        # Compute Pillar 3 M3 definition-string token cost (Step 18.6).
+        # Build a throwaway GeneratedArtifact snapshot so the same tokenizer
+        # helper the JIT / optimizer paths use also runs on seeded caps —
+        # keeps seeded-vs-evolved Chapter-5 comparisons apples-to-apples.
+        # Security audit finding #9 (2026-04-19): use the shared
+        # ``decode_agent_config_metadata`` helper.
+        from src.schemas.task import decode_agent_config_metadata
+
+        agent_config_dict = decode_agent_config_metadata(agent_config)
+        if agent_config_dict is None and isinstance(agent_config, str) and agent_config:
+            # Preserve the pre-fix behaviour at THIS site: when the string
+            # isn't valid JSON, wrap it as a bare system_prompt so the
+            # tokenizer still sees something. (Other sites prefer None —
+            # they're reconstruction paths that need a proper dict or
+            # nothing; this site is a tokenization snapshot that's fine
+            # with a best-effort wrapper.)
+            agent_config_dict = {"system_prompt": agent_config}
+        snapshot = GeneratedArtifact(
+            capability_name=name,
+            capability_type=capability_type,
+            description=description,
+            source_code=source_code,
+            skill_content=skill_content,
+            agent_config=agent_config_dict,
+            input_schema=dict(input_schema or {}),
+            output_schema=dict(output_schema or {}),
+        )
+        definition_token_cost = count_definition_tokens(snapshot)
+
         kwargs: dict = {
             "name": name,
             "description": description,
             "capability_type": capability_type,
+            "definition_token_cost": definition_token_cost,
             "metadata": metadata,
         }
         if has_domain:
             kwargs["domain"] = domain
         if has_tags and tags:
             kwargs["tags"] = tags
+        if input_schema:
+            kwargs["input_schema"] = input_schema
+        if output_schema:
+            kwargs["output_schema"] = output_schema
         return CapabilityDescriptor(**kwargs)
 
     seeds = [
@@ -325,7 +569,8 @@ def seed_registry(registry: SkillRegistry) -> None:
             "Compute the nth Fibonacci number",
             CapabilityType.MCP_TOOL,
             domain="mathematics",
-            tags=["math", "computation", "sequence"],
+            input_schema={"n": "int"},
+            output_schema={"result": "int"},
             source_code=(
                 "from typing import Annotated\n"
                 "from mcp.server.fastmcp import FastMCP\n"
@@ -347,10 +592,16 @@ def seed_registry(registry: SkillRegistry) -> None:
         ),
         _cap(
             "csv-parser",
-            "Parse a CSV file and return structured rows with headers and typed values",
+            (
+                "Parse a CSV file (comma-delimited, default csv.DictReader "
+                "dialect) and return the row count and the list of column "
+                "header names. Does not return row data and does not perform "
+                "type coercion."
+            ),
             CapabilityType.MCP_TOOL,
             domain="data-processing",
-            tags=["csv", "parsing", "data-ingestion"],
+            input_schema={"file_path": "str"},
+            output_schema={"row_count": "int", "column_names": "list[str]"},
             source_code=(
                 'from typing import Annotated\n'
                 'from mcp.server.fastmcp import FastMCP\n'
@@ -370,19 +621,49 @@ def seed_registry(registry: SkillRegistry) -> None:
         _cap(
             "date-formatter",
             (
-                "Format a date string between different date formats"
-                " such as ISO-8601, RFC-2822, and custom patterns"
+                "Reformat a date string from one strptime-compatible format "
+                "to another strftime-compatible format. Input and output "
+                "format strings are required parameters."
             ),
             CapabilityType.MCP_TOOL,
             domain="data-processing",
-            tags=["date", "formatting", "conversion"],
+            input_schema={
+                "date_string": "str",
+                "input_format": "str",
+                "output_format": "str",
+            },
+            output_schema={"formatted_date": "str"},
+            source_code=(
+                'from typing import Annotated\n'
+                'from datetime import datetime\n'
+                'from mcp.server.fastmcp import FastMCP\n'
+                'mcp = FastMCP("date-formatter")\n'
+                '@mcp.tool()\n'
+                'async def date_formatter(\n'
+                '    date_string: Annotated[str, "Input date string"],\n'
+                '    input_format: Annotated[str, "strptime-compatible input format"],\n'
+                '    output_format: Annotated[str, "strftime-compatible output format"],\n'
+                ') -> dict:\n'
+                '    """Reformat a date string from one strptime format to another."""\n'
+                '    dt = datetime.strptime(date_string, input_format)\n'
+                '    return {"formatted_date": dt.strftime(output_format)}\n'
+                'if __name__ == "__main__":\n'
+                '    mcp.run()\n'
+            ),
         ),
         _cap(
             "json-validator",
-            "Validate JSON data against a JSON Schema and return detailed validation errors",
+            (
+                "Validate a JSON config file against a JSON Schema file "
+                "(both provided as paths) using Draft-7, and return a dict "
+                "with an `errors` key containing a list of error message "
+                "strings. Does not return structured error paths or schema "
+                "locations — only the message strings."
+            ),
             CapabilityType.MCP_TOOL,
             domain="data-processing",
-            tags=["json", "validation", "schema"],
+            input_schema={"config_path": "str", "schema_path": "str"},
+            output_schema={"errors": "list[str]"},
             source_code=(
                 "from typing import Annotated\n"
                 "from mcp.server.fastmcp import FastMCP\n"
@@ -406,12 +687,14 @@ def seed_registry(registry: SkillRegistry) -> None:
         _cap(
             "text-statistics",
             (
-                "Compute word count, sentence count, readability score,"
-                " and other text metrics for a given document"
+                "Compute the word count and Flesch reading-ease score for a "
+                "plain-text document. Returns only `word_count` and "
+                "`readability_score`."
             ),
             CapabilityType.MCP_TOOL,
             domain="text-analysis",
-            tags=["text", "statistics", "nlp", "readability"],
+            input_schema={"file_path": "str"},
+            output_schema={"word_count": "int", "readability_score": "float"},
             source_code=(
                 'from typing import Annotated\n'
                 'from mcp.server.fastmcp import FastMCP\n'
@@ -444,7 +727,13 @@ def seed_registry(registry: SkillRegistry) -> None:
             ),
             CapabilityType.SKILL,
             domain="data-processing",
-            tags=["data-cleaning", "etl", "workflow", "preprocessing"],
+            input_schema={"data": "list[dict]"},
+            output_schema={
+                "clean_row_count": "int",
+                "removed_nulls": "int",
+                "removed_duplicates": "int",
+                "outliers_flagged": "int",
+            },
             skill_content=(
                 "---\n"
                 "name: data-cleaning-workflow\n"
@@ -470,13 +759,20 @@ def seed_registry(registry: SkillRegistry) -> None:
         _cap(
             "report-generation",
             (
-                "Generate formatted analysis reports from structured"
-                " data with tables, charts descriptions,"
-                " and executive summaries"
+                "Generate an analysis report from a numeric dataset: "
+                "compute summary statistics, identify the top 5 outlier "
+                "records by z-score on a primary metric, and produce a "
+                "one-paragraph executive summary. Returns a dict with "
+                "`summary`, `stats_table`, and `anomalies`."
             ),
             CapabilityType.SKILL,
             domain="reporting",
-            tags=["report", "visualization", "summary", "documentation"],
+            input_schema={"data": "list[dict]"},
+            output_schema={
+                "summary": "str",
+                "stats_table": "dict",
+                "anomalies": "list[dict]",
+            },
             skill_content=(
                 "---\n"
                 "name: report-generation\n"
@@ -508,7 +804,12 @@ def seed_registry(registry: SkillRegistry) -> None:
             ),
             CapabilityType.AGENT,
             domain="analytics",
-            tags=["analysis", "eda", "profiling", "insights", "autonomous"],
+            input_schema={"dataset_path": "str"},
+            output_schema={
+                "profile": "dict",
+                "correlations": "dict",
+                "insights": "list[str]",
+            },
             agent_config=(
                 '{"system_prompt": "You are a data analysis agent. '
                 "Given a dataset, perform exploratory data analysis:\\n"

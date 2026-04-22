@@ -2,7 +2,7 @@
 
 A plain LangGraph node (no DeepAgent) that generates SKILL.md files for each
 gap classified as ``CapabilityType.SKILL``.  Each generated skill is validated
-with ``tools/quick_validate.py`` and written to ``.deepagents/skills/<name>/``.
+with ``tools/quick_validate.py`` and written to ``data/eval/skills/<name>/``.
 """
 
 from __future__ import annotations
@@ -32,7 +32,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SKILLS_OUTPUT_DIR = _PROJECT_ROOT / ".deepagents" / "skills"
+SKILLS_OUTPUT_DIR = _PROJECT_ROOT / "data" / "eval" / "skills"
+
+
+def set_skills_output_dir(path: Path) -> None:
+    """Override the directory where generated skills are written.
+
+    Used by the CLI to separate its skill storage (``data/cli/skills/``)
+    from the evaluation harness (``data/eval/skills/``).
+    Also updates ``agent.py``'s ``SKILLS_OUTPUT_DIR`` to stay in sync.
+    """
+    global SKILLS_OUTPUT_DIR  # noqa: PLW0603
+    SKILLS_OUTPUT_DIR = path
+    # Keep agent generator in sync (it mirrors this value).
+    from src.orchestrator.generators import agent as _agent_mod
+    _agent_mod.SKILLS_OUTPUT_DIR = path
 
 # ---------------------------------------------------------------------------
 # Import validate_skill from tools/quick_validate.py
@@ -208,6 +222,7 @@ def _generate_single_skill(
     gap: ClassifiedGap,
     task_context: str,
     output_dir: Path | None = None,
+    schema_context: str = "",
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate a single SKILL.md for a classified gap.
 
@@ -221,11 +236,17 @@ def _generate_single_skill(
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
     # handler propagates automatically via LangChain's contextvar inheritance.
 
+    _schema_section = ""
+    if schema_context:
+        _schema_section = (
+            "## Input/Output Schema Contract\n\n" + schema_context
+        )
+
     prompt = SKILL_GENERATOR_PROMPT.format(
-        description=gap.description,
-        query=gap.query,
-        task_context=task_context,
+        task_context=task_context or gap.description,
+        gap_description=gap.description or gap.query,
         forced_name=forced_name,
+        schema_context=_schema_section,
     )
 
     # --- First attempt ---
@@ -261,9 +282,8 @@ def _generate_single_skill(
         repair_prompt = SKILL_REPAIR_PROMPT.format(
             validation_error=message,
             skill_content=content,
-            gap_description=gap.description,
-            gap_query=gap.query,
-            task_context=task_context,
+            task_context=task_context or gap.description,
+            gap_description=gap.description or gap.query,
         )
         try:
             repair_response = llm.invoke(repair_prompt)
@@ -355,9 +375,15 @@ def generate_skill(
     logger.info("generate_skill: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(skill_gaps) - len(gaps_to_generate))
     task_context = build_task_context(state)
 
+    from src.orchestrator.generators.utils import build_schema_context
+    subtasks = list(state.subtasks) if state.subtasks else []
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
         futures = {
-            pool.submit(_generate_single_skill, gap, task_context): gap
+            pool.submit(
+                _generate_single_skill, gap, task_context,
+                schema_context=build_schema_context(gap, subtasks),
+            ): gap
             for gap in gaps_to_generate
         }
         raw_results: list[tuple[GeneratedArtifact | None, str | None]] = []
@@ -382,6 +408,11 @@ def generate_skill(
             "generate_skill: %d/%d gaps failed generation: %s",
             len(failed_queries), len(gaps_to_generate), failed_queries,
         )
+
+    # Evolutionary taxonomy classification (B1 Step 3.5f). Tags each newly
+    # generated artifact with domain + is_generic. Never raises.
+    from src.orchestrator.taxonomy import classify_and_tag_artifacts
+    classify_and_tag_artifacts(artifacts)
 
     return Command(
         update={

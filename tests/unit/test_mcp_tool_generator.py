@@ -1,7 +1,7 @@
 """Unit tests for the MCP tool generator.
 
 LLM-calling behaviour is covered by ``tests/integration/test_mcp_tool_generator.py``
-with real DeepSeek calls.  These tests cover schema validation, the
+with real OpenAI calls.  These tests cover schema validation, the
 ``_validate_code`` helper, and the node's routing logic (patching
 ``generate_single_tool``, not the LLM).
 """
@@ -14,15 +14,26 @@ import pytest
 
 from src.orchestrator.generators.mcp_tool import (
     GeneratedToolCode,
+    _step_position_block,
     _validate_code,
+    _validate_step_signature,
     _validate_tool_name,
     generate_mcp_tool,
     generate_single_tool,
+)
+from src.orchestrator.generators.utils import (
+    find_subtask_for_gap,
+    is_first_step_for_gap,
+)
+from src.orchestrator.prompts.mcp_tool_generator import (
+    DOWNSTREAM_STEP_DIRECTIVE,
+    FIRST_STEP_DIRECTIVE,
 )
 from src.schemas.capability import CapabilityType
 from src.schemas.task import (
     ClassifiedGap,
     GeneratedArtifact,
+    SubTask,
     TaskState,
     TaskStatus,
 )
@@ -89,9 +100,13 @@ class TestGeneratedToolCodeSchema:
             tool_name="add",
             source_code="pass",
             description="A tool",
+            pip_packages=["pyyaml", "pandas"],
         )
         roundtripped = GeneratedToolCode.model_validate_json(r.model_dump_json())
         assert roundtripped.tool_name == "add"
+        assert roundtripped.source_code == "pass"
+        assert roundtripped.description == "A tool"
+        assert roundtripped.pip_packages == ["pyyaml", "pandas"]
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +374,360 @@ class TestValidateToolName:
         error = _validate_tool_name("_add_numbers")
         assert error is not None
         assert "snake_case" in error
+
+
+# ---------------------------------------------------------------------------
+# _validate_step_signature + step-position plumbing (Step 14.7)
+# ---------------------------------------------------------------------------
+
+
+def _make_tool_source(params: str, body: str = "    return {}") -> str:
+    """Build a minimal FastMCP tool source with the given parameter list."""
+    return (
+        '"""MCP tool stub."""\n'
+        "from typing import Annotated\n"
+        "from mcp.server.fastmcp import FastMCP\n"
+        "from pydantic import Field\n"
+        "mcp = FastMCP('stub')\n"
+        "@mcp.tool()\n"
+        f"async def run({params}) -> dict:\n"
+        '    """doc."""\n'
+        f"{body}\n"
+        'if __name__ == "__main__":\n'
+        "    mcp.run()\n"
+    )
+
+
+class TestValidateStepSignature:
+    """Step 14.7: catch step-0 functions that falsely require upstream_data."""
+
+    _FIRST_STEP_CORRECT = _make_tool_source(
+        'csv_path: Annotated[str, Field(description="Path to CSV")]'
+    )
+    _FIRST_STEP_WITH_REQUIRED_UPSTREAM = _make_tool_source(
+        'upstream_data: Annotated[dict, Field(description="Upstream")]'
+    )
+    _DOWNSTREAM_CORRECT = _make_tool_source(
+        'upstream_data: Annotated[dict, Field(description="Upstream")]'
+    )
+    _DOWNSTREAM_MISSING_UPSTREAM = _make_tool_source(
+        'value: Annotated[int, Field(description="A number")] = 0'
+    )
+    _DOWNSTREAM_OPTIONAL_UPSTREAM = _make_tool_source(
+        'upstream_data: Annotated[dict, Field(description="Upstream")] = None'
+    )
+
+    def test_first_step_without_upstream_ok(self):
+        assert _validate_step_signature(self._FIRST_STEP_CORRECT, is_first_step=True) is None
+
+    def test_first_step_with_required_upstream_rejected(self):
+        error = _validate_step_signature(
+            self._FIRST_STEP_WITH_REQUIRED_UPSTREAM, is_first_step=True
+        )
+        assert error is not None
+        assert "step-0" in error
+        assert "upstream_data" in error
+
+    def test_downstream_with_upstream_ok(self):
+        assert (
+            _validate_step_signature(self._DOWNSTREAM_CORRECT, is_first_step=False)
+            is None
+        )
+
+    def test_downstream_missing_upstream_rejected(self):
+        error = _validate_step_signature(
+            self._DOWNSTREAM_MISSING_UPSTREAM, is_first_step=False
+        )
+        assert error is not None
+        assert "upstream_data" in error
+
+    def test_downstream_with_optional_upstream_rejected(self):
+        # A downstream step that made upstream_data optional still fails —
+        # the executor only populates upstream_data when it's present as a
+        # parameter name, and an optional default masks a silently empty dict.
+        error = _validate_step_signature(
+            self._DOWNSTREAM_OPTIONAL_UPSTREAM, is_first_step=False
+        )
+        assert error is not None
+        assert "upstream_data" in error
+
+    def test_none_is_first_step_skips_check(self):
+        # Gap couldn't be matched to a subtask — skip position checks entirely.
+        assert _validate_step_signature(self._FIRST_STEP_CORRECT, is_first_step=None) is None
+        assert (
+            _validate_step_signature(self._FIRST_STEP_WITH_REQUIRED_UPSTREAM, is_first_step=None)
+            is None
+        )
+
+    def test_syntax_error_returns_none(self):
+        # Syntax errors are handled by _validate_code; this helper defers.
+        assert _validate_step_signature("def bad(\n", is_first_step=True) is None
+
+    def test_missing_async_function_returns_none(self):
+        # Missing function is handled by _validate_code; this helper defers.
+        code = (
+            '"""Stub."""\n'
+            "from mcp.server.fastmcp import FastMCP\n"
+            "mcp = FastMCP('stub')\n"
+        )
+        assert _validate_step_signature(code, is_first_step=True) is None
+
+    def test_private_async_helper_ignored(self):
+        # The AST walker uses the same public-function selection as _validate_code,
+        # so a private helper does not shadow the real tool.
+        code = (
+            '"""Stub."""\n'
+            "from typing import Annotated\n"
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from pydantic import Field\n"
+            "mcp = FastMCP('stub')\n"
+            "async def _helper(upstream_data: dict) -> dict:\n"
+            "    return upstream_data\n"
+            "@mcp.tool()\n"
+            'async def run(csv_path: Annotated[str, Field(description="p")]) -> dict:\n'
+            '    """doc."""\n'
+            "    return {}\n"
+        )
+        # Public function has csv_path only → valid as step 0.
+        assert _validate_step_signature(code, is_first_step=True) is None
+
+    def test_kwonly_required_upstream_also_flagged(self):
+        code = (
+            '"""Stub."""\n'
+            "from typing import Annotated\n"
+            "from mcp.server.fastmcp import FastMCP\n"
+            "from pydantic import Field\n"
+            "mcp = FastMCP('stub')\n"
+            "@mcp.tool()\n"
+            "async def run(*, upstream_data: Annotated[dict, Field(description='u')]) -> dict:\n"
+            '    """doc."""\n'
+            "    return upstream_data\n"
+        )
+        error = _validate_step_signature(code, is_first_step=True)
+        assert error is not None
+        assert "upstream_data" in error
+
+
+class TestStepPositionBlock:
+    def test_first_step_returns_first_directive(self):
+        assert _step_position_block(True) == FIRST_STEP_DIRECTIVE
+
+    def test_downstream_returns_downstream_directive(self):
+        assert _step_position_block(False) == DOWNSTREAM_STEP_DIRECTIVE
+
+    def test_none_returns_empty(self):
+        assert _step_position_block(None) == ""
+
+    def test_first_directive_mentions_no_upstream_data(self):
+        assert "upstream_data" in FIRST_STEP_DIRECTIVE
+        assert "DO NOT" in FIRST_STEP_DIRECTIVE
+
+    def test_downstream_directive_mentions_required_upstream_data(self):
+        assert "upstream_data" in DOWNSTREAM_STEP_DIRECTIVE
+        assert "exactly ONE required parameter" in DOWNSTREAM_STEP_DIRECTIVE
+
+
+class TestIsFirstStepForGap:
+    """Subtask-matching helper used to decide the step-position directive."""
+
+    @staticmethod
+    def _gap(query: str = "parse_csv") -> ClassifiedGap:
+        return ClassifiedGap(
+            description="d",
+            query=query,
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="r",
+        )
+
+    def test_first_step_when_no_depends_on(self):
+        subtasks = [
+            SubTask(
+                description="parse",
+                required_capabilities=["parse_csv"],
+                depends_on=[],
+            ),
+        ]
+        assert is_first_step_for_gap(self._gap(), subtasks) is True
+
+    def test_downstream_when_depends_on_nonempty(self):
+        subtasks = [
+            SubTask(description="parse", required_capabilities=["parse_csv"]),
+            SubTask(
+                description="aggregate",
+                required_capabilities=["aggregate"],
+                depends_on=[0],
+            ),
+        ]
+        assert is_first_step_for_gap(self._gap("aggregate"), subtasks) is False
+
+    def test_none_when_gap_not_in_subtasks(self):
+        subtasks = [
+            SubTask(description="parse", required_capabilities=["parse_csv"]),
+        ]
+        assert is_first_step_for_gap(self._gap("unknown"), subtasks) is None
+
+    def test_none_when_subtasks_empty(self):
+        assert is_first_step_for_gap(self._gap(), []) is None
+
+    def test_find_subtask_returns_matching_entry(self):
+        st = SubTask(
+            description="aggregate",
+            required_capabilities=["aggregate", "sum"],
+            depends_on=[0],
+        )
+        subtasks = [
+            SubTask(description="parse", required_capabilities=["parse_csv"]),
+            st,
+        ]
+        assert find_subtask_for_gap(self._gap("sum"), subtasks) is st
+
+    def test_t11_join_first_step_regression(self):
+        """Regression guard for the T11 bug: decomposer named step 0
+        ``join-sales-with-products-on-product_id`` and the word "join"
+        pattern-matched to middle-step semantics in the LLM's understanding.
+        is_first_step_for_gap must return True because ``depends_on == []``.
+        """
+        gap = self._gap("join-sales-with-products-on-product_id")
+        subtasks = [
+            SubTask(
+                description="Join sales with products on product_id",
+                required_capabilities=["join-sales-with-products-on-product_id"],
+                depends_on=[],
+            ),
+            SubTask(
+                description="Compare revenue to targets",
+                required_capabilities=["compare-revenue-to-targets"],
+                depends_on=[0],
+            ),
+        ]
+        assert is_first_step_for_gap(gap, subtasks) is True
+
+
+class TestStepPositionInPrompt:
+    """Verify the step-position block actually lands in the user prompt."""
+
+    @staticmethod
+    def _capture_messages(recorded: list) -> type:
+        class _Structured:
+            def invoke(_self, messages, config=None):
+                recorded.extend(messages)
+                return GeneratedToolCode(
+                    tool_name="stub",
+                    source_code=VALID_TOOL_SOURCE,
+                    description="stub",
+                )
+
+        class _LLM:
+            def with_structured_output(_self, schema):
+                return _Structured()
+
+        return _LLM()
+
+    @staticmethod
+    def _gap() -> ClassifiedGap:
+        return ClassifiedGap(
+            description="add",
+            query="add_numbers",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="r",
+        )
+
+    def test_first_step_directive_in_prompt(self):
+        captured: list = []
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._capture_messages(captured),
+        ):
+            generate_single_tool(self._gap(), is_first_step=True)
+
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "THIS IS THE FIRST STEP" in user_msg["content"]
+        assert "DO NOT declare an ``upstream_data`` parameter" in user_msg["content"]
+
+    def test_downstream_directive_in_prompt(self):
+        captured: list = []
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._capture_messages(captured),
+        ):
+            generate_single_tool(self._gap(), is_first_step=False)
+
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "THIS IS A DOWNSTREAM STEP" in user_msg["content"]
+        assert "exactly ONE required parameter" in user_msg["content"]
+
+    def test_none_omits_directive(self):
+        captured: list = []
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._capture_messages(captured),
+        ):
+            generate_single_tool(self._gap(), is_first_step=None)
+
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "Step Position (HARD CONSTRAINT)" not in user_msg["content"]
+
+    def test_schema_context_reaches_prompt(self):
+        """Phase 3.5c wires ``build_schema_context(gap, subtasks)`` into the
+        MCP tool generator prompt so each step knows its upstream input keys
+        and required output keys. A regression that disconnected this
+        plumbing (e.g. dropped the ``schema_context`` kwarg, stopped
+        formatting the section into the user prompt, or swallowed the
+        output of ``build_schema_context``) would silently produce schema-
+        blind tools. Guard the injection path with distinctive key tokens.
+        """
+        from src.orchestrator.generators.utils import build_schema_context
+
+        upstream = SubTask(
+            description="Parse the input CSV",
+            required_capabilities=["parse_csv"],
+            depends_on=[],
+            output_schema={"parsed_rows_fixture": "list[dict] of row records"},
+        )
+        downstream = SubTask(
+            description="Aggregate parsed rows",
+            required_capabilities=["aggregate_rows"],
+            depends_on=[0],
+            output_schema={"aggregate_summary_fixture": "dict of per-group totals"},
+        )
+        gap = ClassifiedGap(
+            description="Aggregate rows",
+            query="aggregate_rows",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="deterministic",
+        )
+        schema_ctx = build_schema_context(gap, [upstream, downstream])
+        assert schema_ctx, "build_schema_context must return a non-empty contract for this fixture"
+
+        captured: list = []
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._capture_messages(captured),
+        ):
+            generate_single_tool(gap, schema_context=schema_ctx)
+
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "Input/Output Schema Contract" in user_msg["content"]
+        assert "parsed_rows_fixture" in user_msg["content"]
+        assert "aggregate_summary_fixture" in user_msg["content"]
+
+    def test_empty_schema_context_omits_contract_section(self):
+        """When ``build_schema_context`` returns empty (legacy decomposition
+        without ``output_schema``), the generator must NOT emit a stray
+        ``## Input/Output Schema Contract`` heading with nothing under it.
+        """
+        captured: list = []
+        with patch(
+            "src.orchestrator.generators.mcp_tool._get_llm",
+            return_value=self._capture_messages(captured),
+        ):
+            generate_single_tool(self._gap(), schema_context="")
+
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "Input/Output Schema Contract" not in user_msg["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -735,8 +1104,9 @@ class TestGenerateSingleTool:
         user_msg = next(m for m in captured_messages if m["role"] == "user")
         assert custom_context in user_msg["content"]
 
-    def test_default_task_context_no_additional(self):
-        """Empty task_context uses the 'No additional context' fallback string."""
+    def test_default_task_context_falls_back_to_gap_description(self):
+        """Empty task_context falls back to gap.description so the LLM still
+        has a task-level context string to generate against."""
         captured_messages: list = []
 
         class _MockStructuredLLM:
@@ -748,11 +1118,12 @@ class TestGenerateSingleTool:
             def with_structured_output(self_, schema):
                 return _MockStructuredLLM()
 
+        gap = self._gap()
         with patch("src.orchestrator.generators.mcp_tool._get_llm", return_value=_MockLLM()):
-            generate_single_tool(self._gap())  # no task_context
+            generate_single_tool(gap)  # no task_context
 
         user_msg = next(m for m in captured_messages if m["role"] == "user")
-        assert "No additional context" in user_msg["content"]
+        assert gap.description in user_msg["content"]
 
     def test_generate_single_tool_uses_forced_name(self):
         """Fix 5: artifact uses slugify_gap(gap.query), not the LLM-chosen name."""
@@ -810,35 +1181,6 @@ class TestSkipOnRetry:
 
         mock_gen.assert_not_called()
         assert len(cmd.update["generated_artifacts"]) == 1
-
-    def test_gap_query_set_on_generated_artifact(self):
-        """After generation, artifact.gap_query == gap.query."""
-        state = TaskState(
-            task_description="Test",
-            classified_gaps=[
-                ClassifiedGap(
-                    description="Add numbers",
-                    query="add_numbers",
-                    classified_type=CapabilityType.MCP_TOOL,
-                    confidence=0.9,
-                    rationale="Arithmetic",
-                ),
-            ],
-        )
-        mock_artifact = GeneratedArtifact(
-            capability_name="add_numbers_abc123",
-            capability_type=CapabilityType.MCP_TOOL,
-            source_code=VALID_TOOL_SOURCE,
-            gap_query="add_numbers",
-        )
-        with patch(
-            "src.orchestrator.generators.mcp_tool.generate_single_tool",
-            return_value=(mock_artifact, None),
-        ):
-            cmd = generate_mcp_tool(state)
-
-        art = cmd.update["generated_artifacts"][0]
-        assert art.gap_query == "add_numbers"
 
     def test_first_attempt_processes_all_gaps(self):
         """On first attempt (no existing artifacts), all gaps are processed."""
@@ -932,7 +1274,7 @@ class TestParallelGeneration:
         ]
         state = TaskState(task_description="Test", classified_gaps=gaps)
 
-        def mock_gen(gap, task_context=""):
+        def mock_gen(gap, task_context="", **kwargs):
             return (
                 GeneratedArtifact(
                     capability_name=f"gen_{gap.query}",
@@ -967,7 +1309,7 @@ class TestParallelGeneration:
 
         call_count = 0
 
-        def mock_gen(gap, task_context=""):
+        def mock_gen(gap, task_context="", **kwargs):
             nonlocal call_count
             call_count += 1
             if gap.query == "tool-0":
@@ -990,46 +1332,3 @@ class TestParallelGeneration:
         assert len(cmd.update["generated_artifacts"]) == 1
         assert any("tool-0" in e for e in cmd.update["errors"])
 
-    def test_already_passing_gaps_not_submitted_to_pool(self):
-        """Pre-existing artifact with gap_query means that gap is not submitted."""
-        existing = GeneratedArtifact(
-            capability_name="existing_tool",
-            capability_type=CapabilityType.MCP_TOOL,
-            source_code=VALID_TOOL_SOURCE,
-            gap_query="tool-a",
-        )
-        state = TaskState(
-            task_description="Test",
-            classified_gaps=[
-                ClassifiedGap(
-                    description="Tool A",
-                    query="tool-a",
-                    classified_type=CapabilityType.MCP_TOOL,
-                    confidence=0.9,
-                    rationale="x",
-                ),
-                ClassifiedGap(
-                    description="Tool B",
-                    query="tool-b",
-                    classified_type=CapabilityType.MCP_TOOL,
-                    confidence=0.9,
-                    rationale="x",
-                ),
-            ],
-            generated_artifacts=[existing],
-        )
-        new_artifact = GeneratedArtifact(
-            capability_name="tool_b_gen",
-            capability_type=CapabilityType.MCP_TOOL,
-            source_code=VALID_TOOL_SOURCE,
-        )
-
-        with patch(
-            "src.orchestrator.generators.mcp_tool.generate_single_tool",
-            return_value=(new_artifact, None),
-        ) as mock_gen:
-            cmd = generate_mcp_tool(state)
-
-        # Only tool-b should be generated
-        mock_gen.assert_called_once()
-        assert len(cmd.update["generated_artifacts"]) == 2

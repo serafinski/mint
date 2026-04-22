@@ -125,15 +125,22 @@ def test_pipeline_no_gaps_path_completes(seeded_registry, mock_loader):
 # ---------------------------------------------------------------------------
 
 
-def test_create_pipeline_accepts_registry_and_loader(seeded_registry, mock_loader):
-    """create_pipeline must accept (registry, loader) as positional args."""
-    import inspect
+def test_create_pipeline_compiles_with_positional_args(seeded_registry, mock_loader):
+    """create_pipeline accepts (registry, loader) positionally and compiles.
 
-    sig = inspect.signature(create_pipeline)
-    params = list(sig.parameters.keys())
-    # registry and loader are required positional args; run_optimizer and
-    # metrics_store are optional keyword-only args added in Iteration 4.
-    assert params[:2] == ["registry", "loader"]
+    Exercises the public-API contract by calling ``create_pipeline`` with
+    exactly two positional arguments and compiling the result, instead of
+    introspecting the signature. A compiled ``CompiledStateGraph`` with an
+    ``invoke`` method is the real guarantee callers rely on.
+    """
+    from langgraph.graph.state import CompiledStateGraph
+
+    # Two positional args — the load-bearing contract other modules use
+    # (CLI runner, evaluation harness, scripts).
+    builder = create_pipeline(seeded_registry, mock_loader)
+    graph = builder.compile()
+    assert isinstance(graph, CompiledStateGraph)
+    assert callable(getattr(graph, "invoke", None))
 
 
 def test_create_pipeline_run_optimizer_flag(seeded_registry, mock_loader):
@@ -150,6 +157,76 @@ def test_create_pipeline_run_optimizer_flag(seeded_registry, mock_loader):
         seeded_registry, mock_loader, run_optimizer=True, metrics_store=ms
     )
     assert "optimizer_node" in builder.nodes
+
+
+def test_classifier_produces_one_classified_gap_per_unmatched(seeded_registry, mock_loader):
+    """Under per-gap classification, classifier_node emits N classified_gaps.
+
+    Runs gap_detection + classifier in sequence with a mocked classify_gap so
+    no LLM call is made. The assertion is that the classifier produces one
+    ClassifiedGap per unmatched required capability, and that distinct types
+    can be assigned across gaps in the same task (mixed-type workflow).
+    """
+    from unittest.mock import patch
+
+    from src.orchestrator.classifier import classifier_node
+    from src.orchestrator.gap_detection import gap_detection_node
+    from src.schemas.capability import CapabilityType
+    from src.schemas.task import ClassifiedGap, TaskState
+
+    # Registry with no matches for three required capabilities → three raw gaps
+    with patch.object(
+        seeded_registry,
+        "detect_gaps",
+        return_value=([], [
+            ("cap-a", "below threshold"),
+            ("cap-b", "below threshold"),
+            ("cap-c", "below threshold"),
+        ]),
+    ):
+        state = TaskState(
+            task_description="Task needing three capabilities",
+            required_capabilities=["cap-a", "cap-b", "cap-c"],
+        )
+        cmd = gap_detection_node(state, seeded_registry)
+
+    # One enumerated gap per unmatched required capability
+    assert len(cmd.update["gaps"]) == 3
+
+    # Hand the state through the classifier with a mocked classify_gap
+    next_state = TaskState(
+        task_description="Task needing three capabilities",
+        required_capabilities=["cap-a", "cap-b", "cap-c"],
+        matches=cmd.update["matches"],
+        gaps=cmd.update["gaps"],
+    )
+
+    # Mix types across gaps: MCP_TOOL, SKILL, AGENT (one of each)
+    type_by_query = {
+        "cap-a": CapabilityType.MCP_TOOL,
+        "cap-b": CapabilityType.SKILL,
+        "cap-c": CapabilityType.AGENT,
+    }
+
+    def _mock_classify(gap, task_description, required_capabilities):
+        return ClassifiedGap(
+            description=gap.description,
+            query=f"{gap.query}-abcdef",
+            classified_type=type_by_query[gap.query],
+            confidence=0.9,
+            rationale="test mock",
+        )
+
+    with patch(
+        "src.orchestrator.classifier.classify_gap",
+        side_effect=_mock_classify,
+    ):
+        cmd = classifier_node(next_state)
+
+    classified = cmd.update["classified_gaps"]
+    assert len(classified) == 3
+    types = {c.classified_type for c in classified}
+    assert types == {CapabilityType.MCP_TOOL, CapabilityType.SKILL, CapabilityType.AGENT}
 
 
 def test_loading_then_optimize_preserves_non_end_goto():

@@ -43,7 +43,7 @@ import httpx  # noqa: E402
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-DB_PATH = str(ROOT / "data" / "evaluation.duckdb")
+DB_PATH = str(ROOT / "data" / "eval" / "metrics.duckdb")
 RETRIEVAL_TASKS = {"T01", "T02", "T03"}
 
 

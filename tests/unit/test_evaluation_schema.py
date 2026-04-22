@@ -122,6 +122,32 @@ class TestStrEnums:
         assert BaselineCondition.NO_VERIFICATION == "no_verification"
         assert BaselineCondition.NO_OPTIMIZATION == "no_optimization"
         assert BaselineCondition.STATIC == "static"
+        # Step 18.7 (2026-04-17): LONGITUDINAL added for run_longitudinal.py.
+        # Not one of the four proposal ablation conditions — it's a separate
+        # sequencing protocol. Analyzers filter by condition explicitly.
+        assert BaselineCondition.LONGITUDINAL == "longitudinal"
+
+    def test_longitudinal_accepted_on_evaluation_record(self):
+        """run_longitudinal.py writes condition='longitudinal'; this pins
+        that the schema accepts the value without raising. Pre-Step-18.7
+        this would raise ValidationError and run_longitudinal.py would
+        crash on first record_run — a latent bug surfaced by Step 18.7's
+        sanity check."""
+        rec = EvaluationRecord(
+            run_id="longitudinal_test",
+            condition="longitudinal",
+            task_id="T01",
+            task_tier="trivial",
+            attempt_count=1,
+            gate_passed=True,
+            output_in_range=True,
+            token_cost=0,
+            attempt_latency_ms=100,
+            failure_reason="none",
+            registry_snapshot_id="snap",
+            seed=42,
+        )
+        assert rec.condition == "longitudinal"
 
     def test_task_tier_values(self):
         assert TaskTier.TRIVIAL == "trivial"
@@ -136,6 +162,11 @@ class TestStrEnums:
         assert FailureReason.TIER3 == "tier3"
         assert FailureReason.OUTPUT_REJECTED == "output_rejected"
         assert FailureReason.NO_SOURCE_CODE == "no_source_code"
+        # Post-Step-13 additions (2026-04-15): chain-step / agent-execution failure reasons
+        # surfaced by the compositional executor's sticky failure meta.
+        assert FailureReason.CHAIN_STEP_FAILED == "chain_step_failed"
+        assert FailureReason.AGENT_EXECUTION_TIMEOUT == "agent_execution_timeout"
+        assert FailureReason.AGENT_EXECUTION_ERROR == "agent_execution_error"
 
     def test_human_label_values(self):
         assert HumanLabel.CORRECT == "correct"

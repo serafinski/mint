@@ -1,7 +1,7 @@
 """Unit tests for the agent generator module.
 
 LLM-calling behaviour is covered by ``tests/integration/test_agent_generator.py``
-with real DeepSeek calls.  These tests cover the pure-Python validation logic
+with real OpenAI calls.  These tests cover the pure-Python validation logic
 and the node's routing behaviour without any LLM mocking.
 """
 
@@ -13,7 +13,11 @@ from langgraph.types import Command
 
 from src.orchestrator.generators.agent import (
     AgentGenerationResult,
+    LeadWithSubagentsResult,
+    SubAgentConfig,
+    _generate_lead_with_subagents,
     _generate_single_agent,
+    _validate_lead_result,
     _validate_result,
     generate_agent,
 )
@@ -348,7 +352,7 @@ class TestGenerateAgentNode:
         assert cmd.update["status"] == TaskStatus.GENERATING
 
     def test_mixed_success_and_failure(self):
-        """Some generations succeed, some fail → partial artifacts + errors."""
+        """Lead-with-subagents fails → fallback to standalone; one succeeds, one fails."""
         state = TaskState(
             task_description="Two agents needed",
             classified_gaps=[
@@ -378,22 +382,29 @@ class TestGenerateAgentNode:
                                 "description": "Monitors data quality."},
                 "is_deep_agent": False,
             },
+            gap_query="data-quality-monitor",
         )
 
-        side_effects = [
+        standalone_side_effects = [
             (artifact, None),
             (None, "Generation failed for anomaly-detector"),
         ]
 
+        # ≥2 AGENT gaps → lead mode first, then fallback to standalone
         with patch(
+            "src.orchestrator.generators.agent._generate_lead_with_subagents",
+            return_value=(None, "Lead generation failed"),
+        ), patch(
             "src.orchestrator.generators.agent._generate_single_agent",
-            side_effect=side_effects,
+            side_effect=standalone_side_effects,
         ):
             cmd = generate_agent(state)
 
         assert len(cmd.update["generated_artifacts"]) == 1
-        assert len(cmd.update["errors"]) == 1
-        assert "anomaly-detector" in cmd.update["errors"][0]
+        # Errors: lead failure + standalone failure for anomaly-detector
+        assert len(cmd.update["errors"]) >= 2
+        assert any("Lead generation failed" in e for e in cmd.update["errors"])
+        assert any("anomaly-detector" in e for e in cmd.update["errors"])
 
     def test_deep_agent_disk_write_failure_returned_as_error(self, tmp_path):
         """OSError during DeepAgent skill disk write is caught and returned as a soft error.
@@ -619,6 +630,84 @@ class TestGenerateSingleAgent:
         assert len(captured_prompts) >= 1
         assert custom_context in captured_prompts[0]
 
+    def test_schema_context_reaches_prompt(self, tmp_path):
+        """Phase 3.5c wires ``build_schema_context(gap, subtasks)`` into the
+        AGENT generator prompt so each agent's system prompt knows its
+        upstream input keys and required output keys. Guard the injection
+        path with distinctive key tokens so a future refactor that drops
+        the plumbing is caught immediately.
+        """
+        from src.orchestrator.generators.utils import build_schema_context
+        from src.schemas.task import SubTask
+
+        upstream = SubTask(
+            description="Collect raw incident logs",
+            required_capabilities=["collect_logs"],
+            depends_on=[],
+            output_schema={"raw_incident_fixture": "list of log records"},
+        )
+        downstream = SubTask(
+            description="Monitor data quality on collected logs",
+            required_capabilities=["data-quality-monitor"],
+            depends_on=[0],
+            output_schema={"quality_verdict_fixture": "dict with pass/fail + findings"},
+        )
+        schema_ctx = build_schema_context(self._gap(), [upstream, downstream])
+        assert schema_ctx, "build_schema_context must return a non-empty contract for this fixture"
+
+        captured_prompts: list = []
+        valid_result = self._VALID_RESULT
+
+        class _MockStructuredLLM:
+            def invoke(self_, prompt, config=None):
+                captured_prompts.append(prompt)
+                return valid_result
+
+        class _MockLLM:
+            def with_structured_output(self_, schema):
+                return _MockStructuredLLM()
+
+        with patch("src.orchestrator.generators.agent._get_llm", return_value=_MockLLM()):
+            _generate_single_agent(
+                self._gap(),
+                task_context="context",
+                output_dir=tmp_path,
+                schema_context=schema_ctx,
+            )
+
+        assert len(captured_prompts) >= 1
+        prompt = captured_prompts[0]
+        assert "Input/Output Schema Contract" in prompt
+        assert "raw_incident_fixture" in prompt
+        assert "quality_verdict_fixture" in prompt
+
+    def test_empty_schema_context_omits_contract_section(self, tmp_path):
+        """Legacy decompositions without output_schema produce an empty
+        contract string — the generator must not emit a dangling heading.
+        """
+        captured_prompts: list = []
+        valid_result = self._VALID_RESULT
+
+        class _MockStructuredLLM:
+            def invoke(self_, prompt, config=None):
+                captured_prompts.append(prompt)
+                return valid_result
+
+        class _MockLLM:
+            def with_structured_output(self_, schema):
+                return _MockStructuredLLM()
+
+        with patch("src.orchestrator.generators.agent._get_llm", return_value=_MockLLM()):
+            _generate_single_agent(
+                self._gap(),
+                task_context="context",
+                output_dir=tmp_path,
+                schema_context="",
+            )
+
+        assert len(captured_prompts) >= 1
+        assert "Input/Output Schema Contract" not in captured_prompts[0]
+
     def test_repair_prompt_includes_validation_errors(self, tmp_path):
         """When first attempt fails validation, the repair LLM call receives the error messages."""
         captured_prompts: list = []
@@ -685,3 +774,249 @@ class TestGenerateSingleAgent:
         # SKILL.md name field match (DeepAgents requires this).
         written = skill_path.read_text()
         assert f"name: {forced_name}" in written
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.5b: Lead-with-subagents validation
+# ---------------------------------------------------------------------------
+
+VALID_LEAD_SKILL = """\
+---
+name: lead-investigator
+description: >
+  Lead agent that coordinates investigation via subagents.
+---
+
+# Lead Investigator
+
+This skill coordinates multi-step investigation.
+"""
+
+
+def _valid_lead_result() -> LeadWithSubagentsResult:
+    return LeadWithSubagentsResult(
+        agent_name="lead-investigator",
+        system_prompt="# Lead\n\nYou coordinate via task() tool.",
+        node_name="lead_investigator_node",
+        model="openai:gpt-5-mini",
+        description="Coordinates investigation via subagents.",
+        is_deep_agent=True,
+        skill_content=VALID_LEAD_SKILL,
+        subagents=[
+            SubAgentConfig(
+                name="data-profiler",
+                description="Profile datasets for quality issues.",
+                system_prompt="You profile data using sandbox_execute.",
+                tools=["sandbox_execute"],
+            ),
+            SubAgentConfig(
+                name="anomaly-detector",
+                description="Detect anomalies in profiled data.",
+                system_prompt="You detect anomalies using sandbox_execute.",
+                tools=["sandbox_execute"],
+            ),
+        ],
+    )
+
+
+class TestValidateLeadResult:
+    def test_valid_lead_with_subagents(self):
+        errors = _validate_lead_result(_valid_lead_result())
+        assert errors == []
+
+    def test_empty_subagents_list(self):
+        result = _valid_lead_result()
+        result.subagents = []
+        errors = _validate_lead_result(result)
+        assert any("subagents" in e for e in errors)
+
+    def test_duplicate_subagent_names(self):
+        result = _valid_lead_result()
+        result.subagents[1].name = result.subagents[0].name
+        errors = _validate_lead_result(result)
+        assert any("duplicated" in e for e in errors)
+
+    def test_invalid_subagent_name(self):
+        result = _valid_lead_result()
+        result.subagents[0].name = "Invalid_Name"
+        errors = _validate_lead_result(result)
+        assert any("hyphen-case" in e for e in errors)
+
+    def test_empty_subagent_system_prompt(self):
+        result = _valid_lead_result()
+        result.subagents[0].system_prompt = "  "
+        errors = _validate_lead_result(result)
+        assert any("system_prompt" in e for e in errors)
+
+    def test_is_deep_agent_must_be_true(self):
+        result = _valid_lead_result()
+        result.is_deep_agent = False
+        errors = _validate_lead_result(result)
+        assert any("is_deep_agent" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.5b: generate_agent mode selection
+# ---------------------------------------------------------------------------
+
+
+class TestLeadWithSubagentsModeSelection:
+    """Verify that generate_agent selects lead-with-subagents mode for ≥2 AGENT gaps."""
+
+    def test_single_agent_gap_uses_standalone_mode(self):
+        """1 AGENT gap → standalone generation (no subagents)."""
+        state = TaskState(
+            task_description="Single agent task",
+            classified_gaps=[
+                ClassifiedGap(
+                    description="Investigate root cause",
+                    query="root-cause-investigator",
+                    classified_type=CapabilityType.AGENT,
+                    confidence=0.9,
+                    rationale="Adaptive reasoning",
+                ),
+            ],
+        )
+        mock_artifact = GeneratedArtifact(
+            capability_name="root-cause-investigator",
+            capability_type=CapabilityType.AGENT,
+            agent_config={"system_prompt": "test", "is_deep_agent": True,
+                          "node_config": {"name": "n", "model": "", "description": "d"}},
+        )
+        with patch(
+            "src.orchestrator.generators.agent._generate_single_agent",
+            return_value=(mock_artifact, None),
+        ) as mock_single, patch(
+            "src.orchestrator.generators.agent._generate_lead_with_subagents",
+        ) as mock_lead:
+            cmd = generate_agent(state)
+
+        mock_single.assert_called_once()
+        mock_lead.assert_not_called()
+        assert len(cmd.update["generated_artifacts"]) == 1
+
+    def test_multiple_agent_gaps_uses_lead_mode(self):
+        """≥2 AGENT gaps → lead-with-subagents mode."""
+        state = TaskState(
+            task_description="Multi-agent task",
+            classified_gaps=[
+                ClassifiedGap(
+                    description="Profile data",
+                    query="data-profiler",
+                    classified_type=CapabilityType.AGENT,
+                    confidence=0.9,
+                    rationale="Adaptive",
+                ),
+                ClassifiedGap(
+                    description="Detect anomalies",
+                    query="anomaly-detector",
+                    classified_type=CapabilityType.AGENT,
+                    confidence=0.85,
+                    rationale="Adaptive",
+                ),
+            ],
+        )
+        mock_artifact = GeneratedArtifact(
+            capability_name="data-profiler",
+            capability_type=CapabilityType.AGENT,
+            agent_config={
+                "system_prompt": "lead",
+                "is_deep_agent": True,
+                "node_config": {"name": "n", "model": "", "description": "d"},
+                "subagents": [{"name": "sub-1", "description": "d", "system_prompt": "s", "tools": []}],
+                "subagent_gap_queries": ["data-profiler", "anomaly-detector"],
+            },
+            gap_query="data-profiler",
+        )
+        with patch(
+            "src.orchestrator.generators.agent._generate_lead_with_subagents",
+            return_value=(mock_artifact, None),
+        ) as mock_lead, patch(
+            "src.orchestrator.generators.agent._generate_single_agent",
+        ) as mock_single:
+            cmd = generate_agent(state)
+
+        mock_lead.assert_called_once()
+        mock_single.assert_not_called()
+        assert len(cmd.update["generated_artifacts"]) == 1
+
+    def test_lead_failure_falls_back_to_standalone(self):
+        """If lead-with-subagents fails, falls back to standalone generation."""
+        state = TaskState(
+            task_description="Multi-agent task",
+            classified_gaps=[
+                ClassifiedGap(
+                    description="Profile data",
+                    query="data-profiler",
+                    classified_type=CapabilityType.AGENT,
+                    confidence=0.9,
+                    rationale="Adaptive",
+                ),
+                ClassifiedGap(
+                    description="Detect anomalies",
+                    query="anomaly-detector",
+                    classified_type=CapabilityType.AGENT,
+                    confidence=0.85,
+                    rationale="Adaptive",
+                ),
+            ],
+        )
+        standalone_artifact = GeneratedArtifact(
+            capability_name="data-profiler",
+            capability_type=CapabilityType.AGENT,
+            agent_config={"system_prompt": "test", "is_deep_agent": True,
+                          "node_config": {"name": "n", "model": "", "description": "d"}},
+            gap_query="data-profiler",
+        )
+        with patch(
+            "src.orchestrator.generators.agent._generate_lead_with_subagents",
+            return_value=(None, "LLM error"),
+        ), patch(
+            "src.orchestrator.generators.agent._generate_single_agent",
+            return_value=(standalone_artifact, None),
+        ) as mock_single:
+            cmd = generate_agent(state)
+
+        # Lead failed → fell back to standalone for each gap
+        assert mock_single.call_count == 2
+        # Should have the error from lead + artifacts from fallback
+        assert any("LLM error" in e for e in cmd.update["errors"])
+
+    def test_mixed_types_only_agent_gaps_counted(self):
+        """Only AGENT gaps count for mode selection; MCP_TOOL/SKILL gaps are ignored."""
+        state = TaskState(
+            task_description="Mixed type task",
+            classified_gaps=[
+                ClassifiedGap(
+                    description="Parse CSV",
+                    query="csv-parser",
+                    classified_type=CapabilityType.MCP_TOOL,
+                    confidence=0.95,
+                    rationale="Deterministic",
+                ),
+                ClassifiedGap(
+                    description="Investigate issue",
+                    query="issue-investigator",
+                    classified_type=CapabilityType.AGENT,
+                    confidence=0.9,
+                    rationale="Adaptive",
+                ),
+            ],
+        )
+        mock_artifact = GeneratedArtifact(
+            capability_name="issue-investigator",
+            capability_type=CapabilityType.AGENT,
+            agent_config={"system_prompt": "test", "is_deep_agent": True,
+                          "node_config": {"name": "n", "model": "", "description": "d"}},
+        )
+        with patch(
+            "src.orchestrator.generators.agent._generate_single_agent",
+            return_value=(mock_artifact, None),
+        ) as mock_single, patch(
+            "src.orchestrator.generators.agent._generate_lead_with_subagents",
+        ) as mock_lead:
+            cmd = generate_agent(state)
+
+        # Only 1 AGENT gap → standalone mode
+        mock_single.assert_called_once()
+        mock_lead.assert_not_called()

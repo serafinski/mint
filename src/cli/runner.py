@@ -53,6 +53,7 @@ def _save_last_run(
     no_optimizer: bool,
     enable_optimizer: bool,
     timeout: int | None,
+    allow_network: bool = False,
 ) -> None:
     """Persist last run config for `mint retry`."""
     data = {
@@ -63,20 +64,71 @@ def _save_last_run(
         "no_optimizer": no_optimizer,
         "enable_optimizer": enable_optimizer,
         "timeout": timeout,
+        "allow_network": allow_network,
     }
-    path = _data_dir() / _LAST_RUN_FILE
+    path = _data_dir() / "cli" / _LAST_RUN_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2))
 
 
 def load_last_run() -> dict | None:
     """Load last run config. Returns None if no previous run."""
-    path = _data_dir() / _LAST_RUN_FILE
+    path = _data_dir() / "cli" / _LAST_RUN_FILE
     if not path.exists():
         return None
     try:
         return json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def _format_json(state: Any, artifact: Any | None, output: dict | None, elapsed_ms: int) -> str:
+    _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
+    verification_results = _get("verification_results", []) or []
+
+    verification: dict[str, Any] | None = None
+    if verification_results:
+        artifact_name = getattr(artifact, "capability_name", None) if artifact else None
+        report = None
+        if artifact_name:
+            for r in reversed(verification_results):
+                if r.capability_name == artifact_name:
+                    report = r
+                    break
+        if report is None:
+            report = verification_results[-1]
+
+        findings_list = []
+        for f in getattr(report, "findings", []) or []:
+            findings_list.append({
+                "severity": str(getattr(f, "severity", "")).upper(),
+                "category": getattr(f, "category", ""),
+                "message": getattr(f, "message", ""),
+                "location": getattr(f, "location", None),
+            })
+
+        verification = {
+            "passed": getattr(report, "overall_passed", None),
+            "tier_reached": getattr(report, "tier_reached", None),
+            "findings": findings_list,
+        }
+
+    result: dict[str, Any] = {
+        "success": artifact is not None and bool(output),
+        "elapsed_ms": elapsed_ms,
+        "capability_name": getattr(artifact, "capability_name", None) if artifact else None,
+        "capability_type": (
+            str(artifact.capability_type).split(".")[-1].lower() if artifact else None
+        ),
+        "subtask_count": len(_get("subtasks", []) or []),
+        "match_count": len(_get("matches", []) or []),
+        "gap_count": len(_get("gaps", []) or []),
+        "artifact_count": len(_get("generated_artifacts", []) or []),
+        "attempt_count": _get("attempt_count", 0),
+        "verification": verification,
+        "output": output,
+    }
+    return json.dumps(result, indent=2, default=str)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -305,6 +357,137 @@ def _build_task_prompt(task: str, file_paths: list[Path], params: dict[str, str]
     return prompt
 
 
+def _evaluate_output_contract(
+    final_state: Any,
+    artifact: Any,
+    output: dict | None,
+    chain_output_files: dict[str, bytes],
+    *,
+    err_console_ref: Any = None,
+) -> int | None:
+    """Step 14.6 — terminal-state output contract check.
+
+    Pure set comparison on the typed ``OutputContract`` carried on
+    ``TaskState.output_contract``; never raises. Returns the new CLI
+    exit code 3 when:
+
+    1. The pipeline state has a non-empty contract (authored shortcut at
+       task entry, or successful LLM extraction at task entry), AND
+    2. The pipeline produced an artifact AND a non-None output dict
+       (so the failure mode is "wrong shape", not "hard crash"), AND
+    3. The contract check finds at least one missing key or file.
+
+    Returns ``None`` in all other cases — caller falls through to its
+    legacy success / hard-fail exit logic. This gating is intentional:
+
+    - **Empty / missing contract** → fall through. Free-form CLI prompts
+      where the LLM extractor failed (or returned an empty contract) get
+      legacy exit-code-only behavior; we never block them with shape
+      complaints we can't justify.
+    - **Hard crash (output is None)** → fall through to exit 1. Step 14.6
+      catches "ran to completion with wrong shape" (the T16 motivator);
+      hard crashes are a different failure mode and get exit 1 from the
+      caller's existing logic.
+    - **No artifact** → fall through. Registry-match-without-execution
+      paths (seeded descriptors with no source code) take the legacy
+      success branch.
+
+    On a genuine contract violation, prints a distinct magenta warning
+    listing missing keys + files + produced keys so the user can see
+    what happened, then returns 3.
+
+    Extracted from ``execute_task`` so the exit-3 path is testable
+    end-to-end without standing up the full pipeline. See
+    ``tests/unit/test_output_contract.py::test_evaluate_output_contract_*``
+    for the integration tests that exercise it.
+    """
+    if isinstance(final_state, dict):
+        contract = final_state.get("output_contract")
+    else:
+        contract = getattr(final_state, "output_contract", None)
+
+    if contract is None or contract.is_empty():
+        return None
+    if artifact is None or output is None:
+        return None
+
+    check = contract.check(output, chain_output_files)
+    if check.satisfied:
+        return None
+
+    target = err_console_ref if err_console_ref is not None else err_console
+    target.print(
+        "\n[bold magenta]⚠ OUTPUT CONTRACT NOT SATISFIED — "
+        "wrong-shape answer[/bold magenta]"
+    )
+    target.print(
+        "[magenta]The pipeline ran to completion but the final "
+        "output is missing keys or files the task asked for. "
+        "This usually means the decomposer produced a plan that "
+        "doesn't deliver the requested shape — the artifacts ran, "
+        "but the assembly is wrong. Treat this as a failure.[/magenta]"
+    )
+    if check.missing_keys:
+        target.print(
+            f"[magenta]Missing keys:[/magenta] {', '.join(check.missing_keys)}"
+        )
+    if check.missing_files:
+        target.print(
+            f"[magenta]Missing files:[/magenta] {', '.join(check.missing_files)}"
+        )
+    target.print(
+        f"[dim]Produced keys: {', '.join(check.produced_keys) or '(none)'}[/dim]"
+    )
+    if check.produced_files:
+        target.print(
+            f"[dim]Produced files: {', '.join(check.produced_files)}[/dim]"
+        )
+    return 3  # distinct from 0/success, 1/hard-fail, 2/decomposition-fail
+
+
+def _match_known_task(raw_task: str, full_prompt: str) -> Any | None:
+    """Match the user's CLI task against the testbed catalogue (Step 14.6).
+
+    Cheap zero-LLM matcher used by the CLI boundary adapter to re-use an
+    authored ``TaskDefinition.output_contract`` when the user is running a
+    known T-task. Two match modes:
+
+    1. **Task ID** (most common): ``mint run T16`` → match T16. Case-insensitive
+       and tolerant of surrounding whitespace.
+    2. **Exact prompt copy-paste**: if the user's raw task string equals a
+       known task's ``task_prompt`` verbatim, match that task. Useful for
+       reproducing a specific eval run from the CLI.
+
+    Returns ``None`` for genuinely free-form prompts, in which case the
+    resolver falls through to its LLM extractor.
+    """
+    raw = raw_task.strip()
+    if not raw:
+        return None
+
+    # Lazy import so the CLI module doesn't pay the test-package import cost
+    # unless the matcher is actually called. Also avoids circulars in test
+    # collection — tests/evaluation/tasks.py imports from src/, and src/cli
+    # importing back at module load would create a cycle.
+    try:
+        from tests.evaluation.tasks import ALL_TASKS
+    except Exception:  # noqa: BLE001
+        return None
+
+    upper = raw.upper()
+    for task_def in ALL_TASKS:
+        if upper == task_def.task_id.upper():
+            return task_def
+
+    for task_def in ALL_TASKS:
+        if raw == task_def.task_prompt.strip():
+            return task_def
+        if full_prompt.strip() == task_def.task_prompt.strip():
+            return task_def
+
+    return None
+
+
 def _check_docker() -> bool:
     """Check if Docker is running. Returns True if available."""
     import subprocess
@@ -377,12 +560,100 @@ def _create_infra(*, seed: bool = True) -> tuple[Any, Any, Any]:
     from src.registry.store import SkillRegistry, seed_registry
 
     data = _data_dir()
-    registry = SkillRegistry(persist_directory=str(data / "cli_chroma"))
+    (data / "cli").mkdir(parents=True, exist_ok=True)
+    registry = SkillRegistry(persist_directory=str(data / "cli" / "chroma"))
     if seed:
         seed_registry(registry)
     loader = ToolLoader()
-    metrics_store = MetricsStore(db_path=str(data / "cli_metrics.duckdb"))
+    metrics_store = MetricsStore(db_path=str(data / "cli" / "metrics.duckdb"))
+
+    # CLI uses its own skill directory (separate from evaluation's data/eval/skills/)
+    cli_skills_dir = data / "cli" / "skills"
+    cli_skills_dir.mkdir(parents=True, exist_ok=True)
+    from src.orchestrator.generators.skill import set_skills_output_dir
+    set_skills_output_dir(cli_skills_dir)
+
+    # CLI uses its own evolutionary-taxonomy file for the same reason:
+    # keep CLI vocabulary separate from eval vocabulary so the harness's
+    # snapshot/restore cycle doesn't stomp on CLI state. Default in
+    # get_taxonomy_path() is data/eval/domains.json; the CLI flips it.
+    cli_taxonomy_path = data / "cli" / "domains.json"
+    cli_taxonomy_path.parent.mkdir(parents=True, exist_ok=True)
+    from src.orchestrator.taxonomy import set_taxonomy_path
+    set_taxonomy_path(cli_taxonomy_path)
+
     return registry, loader, metrics_store
+
+
+# ---------------------------------------------------------------------------
+# Generator stage diff — progress display helper
+# ---------------------------------------------------------------------------
+
+
+_GEN_STAGE_TYPE_LABELS: dict[str, str] = {
+    "mcp_tool": "Generating MCP tool",
+    "skill": "Generating skill",
+    "agent": "Generating agent",
+}
+
+
+def _compute_gen_stage_diff(
+    artifacts: list[Any],
+    prev_artifact_count: int,
+) -> tuple[int, int, str | None, str | None]:
+    """Compute the progress-line fields for a generator stage.
+
+    Given the current ``generated_artifacts`` list and the artifact count at
+    the end of the previous printed generator stage, returns:
+
+    * ``new_count`` — how many fresh artifacts this stage produced
+    * ``new_prev`` — the updated baseline to carry into the next stage
+      (always ``len(artifacts)``, even on resets/retries — see below)
+    * ``detail`` — the text to append to the stage line, or ``None`` to
+      skip printing this stage entirely
+    * ``label_override`` — the "Generating skill/agent/MCP tool" label to
+      use, or ``None`` to fall back to the node-name label
+
+    **Retry semantics**: when ``verification_node`` fails all artifacts, it
+    resets ``generated_artifacts`` to the passing subset (often empty) and
+    routes back to the first generator. On the next pass, ``cur`` can be
+    less than ``prev_artifact_count``. The old logic only updated the
+    baseline when ``new != 0``, so a drop from 1 → 0 between stages produced
+    a negative ``new = -1`` that got printed as ``-1 artifact(s)``. The fix
+    refreshes the baseline unconditionally and skips the stage when
+    ``new <= 0``.
+
+    This is a pure function so it can be unit-tested without running the CLI.
+    """
+    cur = len(artifacts)
+    new = cur - prev_artifact_count
+    new_prev = cur
+    if new <= 0:
+        return new, new_prev, None, None
+
+    new_arts = artifacts[-new:]
+    types = {
+        str(a.capability_type).split(".")[-1].lower()
+        for a in new_arts
+        if hasattr(a, "capability_type")
+    }
+    label_override = None
+    if len(types) == 1:
+        label_override = _GEN_STAGE_TYPE_LABELS.get(next(iter(types)))
+
+    # Check for lead-with-subagents artifacts
+    subagent_count = 0
+    for a in new_arts:
+        config = getattr(a, "agent_config", None) or {}
+        subs = config.get("subagents", [])
+        if subs:
+            subagent_count += len(subs)
+
+    if subagent_count > 0:
+        detail = f"{new} lead + {subagent_count} subagent(s)"
+    else:
+        detail = f"{new} artifact(s)"
+    return new, new_prev, detail, label_override
 
 
 # ---------------------------------------------------------------------------
@@ -398,12 +669,26 @@ def _select_artifact(state: Any) -> Any | None:
     if not artifacts:
         return None
 
-    for art in artifacts:
-        for report in verification_results:
-            if report.capability_name == art.capability_name and report.overall_passed:
-                return art
+    # Filter to artifacts that passed verification
+    passed_names = {
+        report.capability_name
+        for report in verification_results
+        if report.overall_passed
+    }
+    passed = [a for a in artifacts if a.capability_name in passed_names]
+    if not passed:
+        passed = artifacts  # fallback: nothing passed, try anyway
 
-    return artifacts[-1]
+    # Prefer AGENT > SKILL > MCP_TOOL — matches harness behavior.
+    # More capable types are better when decomposition over-splits.
+    _TYPE_PRIORITY = {"AGENT": 0, "SKILL": 1, "MCP_TOOL": 2}
+    passed.sort(
+        key=lambda a: (
+            _TYPE_PRIORITY.get(str(a.capability_type).split(".")[-1].upper(), 9),
+            a.capability_name or "",
+        ),
+    )
+    return passed[0]
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +757,13 @@ def _match_files_to_params(
     return inputs
 
 
-def _execute_mcp_tool(artifact: Any, file_paths: list[Path], params: dict) -> dict:
+def _execute_mcp_tool(
+    artifact: Any,
+    file_paths: list[Path],
+    params: dict,
+    *,
+    allow_network: bool = False,
+) -> dict:
     """Execute an MCP tool artifact inside the Docker sandbox.
 
     Binary files (Excel, Parquet, Pickle, etc.) are base64-encoded before
@@ -480,6 +771,10 @@ def _execute_mcp_tool(artifact: Any, file_paths: list[Path], params: dict) -> di
     extensions count as binary is governed by ``BINARY_EXTENSIONS`` in
     ``src/config.py`` — the business-analytics testbed commonly uses
     ``.xlsx``, ``.parquet``, and ``.pkl`` files.
+
+    When ``allow_network`` is True, the sandbox runs with ``--network bridge``
+    so tools that legitimately need outbound HTTP (APIs, web scraping) can
+    reach the network. Default is offline-by-default for safety (Step 14.12).
     """
     from src.verification.behavioral import _extract_function_name
     from src.verification.sandbox_tool import resolve_extra_packages, sandbox_execute
@@ -570,7 +865,12 @@ asyncio.run(_run())
     else:
         extra_pkgs = resolve_extra_packages(source_code)
     exec_timeout = 60 if extra_pkgs else 30
-    result = sandbox_execute(sandbox_code, timeout=exec_timeout, extra_packages=extra_pkgs or None)
+    result = sandbox_execute(
+        sandbox_code,
+        timeout=exec_timeout,
+        extra_packages=extra_pkgs or None,
+        allow_network=allow_network,
+    )
 
     if not result.get("success") or not result.get("stdout"):
         stderr = (result.get("stderr") or "")[:300]
@@ -585,7 +885,13 @@ asyncio.run(_run())
         if "error" in parsed:
             err_console.print(f"[yellow]Tool error: {str(parsed['error'])[:300]}[/yellow]")
             return {}
-        return parsed.get("result", {}) or {}
+        # Security audit finding #11 (2026-04-19): preserve falsy / non-dict
+        # results. ``parsed.get("result", {}) or {}`` dropped legitimate
+        # zero-valued answers and passed non-dict truthy values through
+        # unchanged (crashing downstream ``.items()`` scans). The helper
+        # distinguishes "no result key" from "falsy result".
+        from src.cli.output_coerce import extract_tool_result
+        return extract_tool_result(parsed)
     except (json.JSONDecodeError, KeyError, IndexError):
         err_console.print("[yellow]Could not parse tool output.[/yellow]")
         return {}
@@ -597,7 +903,14 @@ asyncio.run(_run())
 
 
 def _execute_skill_or_agent(
-    artifact: Any, task_desc: str, file_paths: list[Path], *, timeout_s: int | None = None
+    artifact: Any,
+    task_desc: str,
+    file_paths: list[Path],
+    *,
+    timeout_s: int | None = None,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
+    allow_network: bool = False,
 ) -> dict:
     # Minimal task-like object for execution.py compatibility
     from dataclasses import dataclass, field
@@ -625,12 +938,27 @@ def _execute_skill_or_agent(
         if fp.exists():
             fixture_contents[fp.name] = fp.read_text(encoding="utf-8", errors="replace")
 
+    agent_meta: Any | None = None
     try:
         cap_type = artifact.capability_type
         if cap_type == CapabilityType.SKILL:
-            raw = _exec_mod.execute_skill_artifact(artifact, cli_task, fixture_contents)
+            raw = _exec_mod.execute_skill_artifact(
+                artifact, cli_task, fixture_contents,
+                langfuse_tags=langfuse_tags,
+                langfuse_session_id=langfuse_session_id,
+                allow_network=allow_network,
+            )
         else:
-            raw = _exec_mod.execute_agent_artifact(artifact, cli_task, fixture_contents)
+            raw = _exec_mod.execute_agent_artifact(
+                artifact, cli_task, fixture_contents,
+                langfuse_tags=langfuse_tags,
+                langfuse_session_id=langfuse_session_id,
+                allow_network=allow_network,
+            )
+            # Step 13: read the sticky meta immediately so a later
+            # agent call can't overwrite it before we surface the
+            # failure reason.
+            agent_meta = _exec_mod.get_last_agent_execution_meta()
     finally:
         _exec_mod.SKILL_EXECUTION_TIMEOUT_S = _orig_skill_timeout
         _exec_mod.AGENT_EXECUTION_TIMEOUT_S = _orig_agent_timeout
@@ -641,11 +969,31 @@ def _execute_skill_or_agent(
             if artifact.capability_type == CapabilityType.SKILL
             else _orig_agent_timeout
         )
-        err_console.print(
-            f"[yellow]SKILL/AGENT execution returned no output "
-            f"(likely timed out after {effective_timeout}s). "
-            "Try --timeout with a higher value.[/yellow]"
-        )
+        # Step 13: prefer the structured reason from the thread-local
+        # meta over the old "likely timed out" guess. Only available
+        # for AGENT calls — SKILL still falls back to the guess.
+        if agent_meta is not None and not agent_meta.succeeded:
+            if agent_meta.failure_reason == "timeout":
+                ts = agent_meta.timeout_seconds or effective_timeout
+                err_console.print(
+                    f"[yellow]AGENT execution timed out after {ts}s. "
+                    "Try --timeout with a higher value.[/yellow]"
+                )
+            elif agent_meta.failure_reason == "error":
+                err_console.print(
+                    "[yellow]AGENT execution crashed before returning "
+                    "output (see logs for the exception).[/yellow]"
+                )
+            else:
+                err_console.print(
+                    "[yellow]AGENT execution returned empty output.[/yellow]"
+                )
+        else:
+            err_console.print(
+                f"[yellow]SKILL/AGENT execution returned no output "
+                f"(likely timed out after {effective_timeout}s). "
+                "Try --timeout with a higher value.[/yellow]"
+            )
         return {}
 
     if (
@@ -655,6 +1003,167 @@ def _execute_skill_or_agent(
     ):
         return raw["result"]
     return raw
+
+
+# ---------------------------------------------------------------------------
+# Compositional chain execution (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _execute_compositional_chain(
+    final_state: Any,
+    file_paths: list[Path],
+    task_prompt: str,
+    json_output: bool,
+    console: Any,
+    *,
+    invoke_config: dict | None = None,
+    metrics_store: Any | None = None,
+    allow_network: bool = False,
+) -> tuple[dict | None, Any | None, str | None, dict[str, bytes], list[dict]]:
+    """Run a compositional chain when multiple subtasks are present.
+
+    Returns ``(output, artifact_for_display, exec_error, output_files, step_timings)``.
+    """
+    from src.orchestrator.composition import CompositionalExecutor, build_resolution_map
+
+    _get = (
+        final_state.get
+        if isinstance(final_state, dict)
+        else lambda k, d=None: getattr(final_state, k, d)
+    )
+    subtasks = _get("subtasks", []) or []
+    artifacts = _get("generated_artifacts", []) or []
+    matches = _get("matches", []) or []
+    required_capabilities = _get("required_capabilities", []) or []
+    classified_gaps = _get("classified_gaps", []) or []
+
+    resolution = build_resolution_map(
+        required_capabilities, matches, artifacts, classified_gaps,
+    )
+
+    # Minimal task-like object for execute_skill_artifact / execute_agent_artifact
+    from dataclasses import dataclass, field as dc_field
+
+    @dataclass
+    class _CliChainTask:
+        task_id: str = ""
+        task_prompt: str = ""
+        fixture_paths: list = dc_field(default_factory=list)
+
+    cli_task = _CliChainTask(
+        task_prompt=task_prompt,
+        fixture_paths=[str(p) for p in file_paths],
+    )
+
+    _lf_meta = (invoke_config or {}).get("metadata", {})
+
+    executor = CompositionalExecutor(
+        subtasks=subtasks,
+        resolution=resolution,
+        artifacts=artifacts,
+        matches=matches,
+        fixture_paths=file_paths,
+        task=cli_task,
+        metrics_store=metrics_store,
+        langfuse_tags=_lf_meta.get("langfuse_tags"),
+        langfuse_session_id=_lf_meta.get("langfuse_session_id"),
+        allow_network=allow_network,
+    )
+
+    exec_error: str | None = None
+    chain_result = None
+
+    if json_output:
+        try:
+            chain_result = executor.run()
+        except Exception as exc:
+            exec_error = f"{type(exc).__name__}: {exc}"
+    else:
+        import threading
+
+        console.print()
+
+        chain_start = time.monotonic()
+        status_text = f"[cyan]Chain step 1/{len(subtasks)}...[/cyan] [dim](0s)[/dim]"
+        chain_stop = threading.Event()
+
+        def _subagent_label(ref: Any) -> str:
+            """Return ' (lead + N subagents)' suffix if applicable."""
+            for a in artifacts:
+                if a.capability_name == ref.capability_name:
+                    config = getattr(a, "agent_config", None) or {}
+                    subs = config.get("subagents", [])
+                    if subs:
+                        return f" (lead + {len(subs)} subagents)"
+            return ""
+
+        def _on_step_start(position: int, total: int, ref: Any) -> None:
+            cap_type = str(ref.capability_type).split(".")[-1].upper()
+            sub_label = _subagent_label(ref)
+            nonlocal status_text
+            status_text = (
+                f"[cyan]Chain step {position + 1}/{total}: "
+                f"{ref.capability_name} ({cap_type}{sub_label}, {ref.source})[/cyan]"
+            )
+
+        def _on_step_end(
+            position: int, total: int, ref: Any, success: bool, step_ms: float = 0,
+        ) -> None:
+            marker = "[green]✓[/green]" if success else "[red]✗[/red]"
+            cap_type = str(ref.capability_type).split(".")[-1].upper()
+            sub_label = _subagent_label(ref)
+            elapsed = f" [dim]({step_ms / 1000:.1f}s)[/dim]" if step_ms > 0 else ""
+            console.print(
+                f"  {marker} Step {position + 1}/{total}: "
+                f"{ref.capability_name} ([cyan]{cap_type}{sub_label}[/cyan], {ref.source})"
+                f"{elapsed}"
+            )
+
+        def _timer(status_ref: Any) -> None:
+            while not chain_stop.is_set():
+                sec = int(time.monotonic() - chain_start)
+                status_ref.update(f"{status_text} [dim]({sec}s)[/dim]")
+                chain_stop.wait(1)
+
+        with console.status(status_text, spinner="dots") as chain_status:
+            t = threading.Thread(target=_timer, args=(chain_status,), daemon=True)
+            t.start()
+            try:
+                chain_result = executor.run(
+                    on_step_start=_on_step_start,
+                    on_step_end=_on_step_end,
+                )
+            except Exception as exc:
+                exec_error = f"{type(exc).__name__}: {exc}"
+            finally:
+                chain_stop.set()
+                t.join(timeout=1)
+
+        if chain_result and not chain_result.chain_success:
+            step_info = ""
+            if chain_result.failed_step_name:
+                step_info = (
+                    f" at step {chain_result.failed_step_index}: "
+                    f"{chain_result.failed_step_name}"
+                )
+            console.print(f"[yellow]Chain failed{step_info}[/yellow]")
+
+    output: dict | None = None
+    output_files: dict[str, bytes] = {}
+    step_timings_data: list[dict] = []
+    if chain_result is not None:
+        if chain_result.chain_success and chain_result.step_results:
+            output = chain_result.step_results[-1] or None
+            output_files = chain_result.output_files
+        step_timings_data = [
+            t.model_dump(mode="json") for t in chain_result.step_timings
+        ]
+
+    # Use first artifact for display / save metadata
+    artifact_for_display = artifacts[0] if artifacts else None
+
+    return output, artifact_for_display, exec_error, output_files, step_timings_data
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +1177,10 @@ def _try_registry_match(
     params: dict[str, str],
     task_prompt: str,
     timeout_s: int | None,
+    *,
+    langfuse_tags: list[str] | None = None,
+    langfuse_session_id: str | None = None,
+    allow_network: bool = False,
 ) -> tuple[Any | None, dict | None]:
     """Attempt to execute a registry-matched capability."""
     _get = state.get if isinstance(state, dict) else lambda k, d=None: getattr(state, k, d)
@@ -695,18 +1208,38 @@ def _try_registry_match(
     if isinstance(cap_type_val, str):
         cap_type_val = CapabilityType(cap_type_val)
 
+    # Reconstruct skill_content / agent_config from registry metadata
+    # so SKILL/AGENT execution backends have the original instructions.
+    # Security audit finding #9 (2026-04-19): use the shared
+    # ``decode_agent_config_metadata`` helper so this path and
+    # ``composition.py::_match_to_artifact`` follow identical semantics.
+    from src.schemas.task import decode_agent_config_metadata
+
+    skill_content = meta.get("skill_content")
+    agent_config = decode_agent_config_metadata(meta.get("agent_config"))
+
     proxy = GeneratedArtifact(
         capability_name=getattr(cap, "name", "registry-match"),
         capability_type=cap_type_val or CapabilityType.MCP_TOOL,
         source_code=source_code,
+        skill_content=skill_content,
+        agent_config=agent_config,
     )
 
     try:
         if proxy.capability_type == CapabilityType.MCP_TOOL:
-            output = _execute_mcp_tool(proxy, file_paths, params) or None
+            output = _execute_mcp_tool(
+                proxy, file_paths, params, allow_network=allow_network,
+            ) or None
         else:
             output = (
-                _execute_skill_or_agent(proxy, task_prompt, file_paths, timeout_s=timeout_s) or None
+                _execute_skill_or_agent(
+                    proxy, task_prompt, file_paths,
+                    timeout_s=timeout_s,
+                    langfuse_tags=langfuse_tags,
+                    langfuse_session_id=langfuse_session_id,
+                    allow_network=allow_network,
+                ) or None
             )
     except Exception as exc:
         err_console.print(f"[yellow]Execution error: {exc}[/yellow]")
@@ -727,17 +1260,40 @@ def _record_invocation(
     output: dict | None,
     elapsed_ms: int,
 ) -> None:
+    # Populate input_args / actual_output / error_message so the row survives
+    # MetricsStore.get_recent_failures (WHERE input_args IS NOT NULL) and
+    # reaches the Pillar 3 Split coverage verifier + failure-informed prompt.
+    # See docs/invocation_recording_gap_2026_04_19.md for the drift history.
     if artifact is None:
         return
     try:
+        from src.registry.metrics import (
+            extract_error_message,
+            looks_like_error,
+            serialize_for_invocation,
+        )
         from src.schemas.metrics import InvocationRecord
+
+        # CLI layer records the top-level task invocation. The task prompt
+        # is the closest replayable input at this granularity; structured
+        # kwargs (if any) live inside the compositional executor, which
+        # records its own per-step rows via composition._record_step_invocation.
+        input_args_json = serialize_for_invocation({"task_prompt": task_prompt})
+
+        is_error_shape = looks_like_error(output)
+        success = output is not None and bool(output) and not is_error_shape
+        actual_output_json = serialize_for_invocation(output)
+        error_message = extract_error_message(output) if is_error_shape else None
 
         record = InvocationRecord(
             capability_id=getattr(artifact, "capability_name", "unknown"),
             task_id=task_prompt[:64],
-            success=output is not None and bool(output),
+            success=success,
             token_cost=0,
             latency_ms=float(elapsed_ms),
+            input_args=input_args_json,
+            actual_output=actual_output_json,
+            error_message=error_message,
         )
         metrics_store.record_invocation(record)
     except Exception:
@@ -749,24 +1305,73 @@ def _record_invocation(
 # ---------------------------------------------------------------------------
 
 
-def _save_output(output_dir: Path, output: dict, artifact: Any | None) -> None:
-    """Save output to files in the specified directory."""
+def _save_output(
+    output_dir: Path,
+    output: dict,
+    artifact: Any | None,
+    verification_reports: list[Any] | None = None,
+    *,
+    final_state: Any | None = None,
+    task: str | None = None,
+    file_paths: list[Path] | None = None,
+    exec_error: str | None = None,
+    output_files: dict[str, bytes] | None = None,
+    step_timings: list[dict] | None = None,
+    pipeline_metrics: dict | None = None,
+) -> None:
+    """Save output to files in the specified directory.
+
+    Always writes:
+        - ``<cap_name>_<ts>.json`` — the executed capability's output (or
+          an ``_empty`` placeholder including ``_error`` if execution failed)
+
+    When ``verification_reports`` is provided:
+        - ``<cap_name>_<ts>.verification.json`` — Tier 1/2/3 findings sidecar
+          so verification notes are inspectable without going to LangFuse
+
+    When ``final_state`` is provided:
+        - ``<cap_name>_<ts>.run.json`` — per-run manifest listing the task,
+          input files, ALL generated capabilities (with type + gap_query +
+          executed flag), and the execution outcome. This makes a multi-cap
+          run inspectable as a single file, which matters because Phase 2's
+          per-gap restoration produces N artifacts per task even though only
+          one is currently executed (priority sort).
+    """
     from datetime import UTC, datetime
 
+    cap_name = getattr(artifact, "capability_name", "output") if artifact else "output"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Security audit finding #13 (2026-04-20): sanitise cap_name before
+    # joining — LLM-generated artifacts can carry arbitrary names,
+    # including ``../escape`` which would write outside mint_output/.
+    # ``contained_join`` rewrites path-unsafe components to the fallback
+    # and refuses to escape the base directory.
+    from src.cli.output_coerce import _sanitise_component, contained_join
+
+    safe_cap_name = _sanitise_component(cap_name, fallback="output")
+    run_dir = output_dir / f"{safe_cap_name}_{ts}"
     try:
-        output_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         logging.getLogger(__name__).warning(
-            "Cannot create output directory %s: %s", output_dir, exc
+            "Cannot create run directory %s: %s", run_dir, exc
         )
         return
 
-    cap_name = getattr(artifact, "capability_name", "output") if artifact else "output"
-    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    saved: list[str] = []
+    saved: list[tuple[str, str]] = []  # (label, path)
+
+    # Security audit finding #11 (2026-04-19): ``output`` may be any JSON-
+    # deserialized shape (scalar / list / string / dict). Non-dict
+    # outputs crash ``.items()``; wrap via ``as_dict_for_save`` so the
+    # per-key scan handles them uniformly. The full-result JSON dump
+    # below still serializes the original shape — only the per-key
+    # inspection needs the coercion.
+    from src.cli.output_coerce import as_dict_for_save
+    scan_dict = as_dict_for_save(output)
 
     # Scan output for file-like content and save separately
-    for key, value in output.items():
+    for key, value in scan_dict.items():
         if isinstance(value, str) and len(value) > 500:
             # Detect CSV content
             first_line = value.split("\n")[0]
@@ -780,17 +1385,124 @@ def _save_output(output_dir: Path, output: dict, artifact: Any | None) -> None:
                 ext = ".md"
             else:
                 ext = ".txt"
-            file_path = output_dir / f"{key}_{ts}{ext}"
+            # Security audit finding #13: per-key output-file writes
+            # must not escape run_dir via crafted ``key`` values like
+            # ``"../escape"``. ``contained_join`` sanitises the key
+            # and asserts containment post-resolve.
+            file_path = contained_join(
+                run_dir, f"{key}{ext}", fallback=f"output{ext}"
+            )
             file_path.write_text(value, encoding="utf-8")
-            saved.append(str(file_path))
+            saved.append((f"Data ({key})", str(file_path)))
 
     # Always save the full result as JSON
-    result_path = output_dir / f"{cap_name}_{ts}.json"
+    result_path = run_dir / "output.json"
     result_path.write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
-    saved.append(str(result_path))
+    saved.append(("Output", str(result_path)))
 
-    for path in saved:
-        console.print(f"  [green]\u2713[/green] Saved: [dim]{path}[/dim]")
+    # Save chain output files (CSV, Excel, Markdown, etc.)
+    if output_files:
+        for fname, content in output_files.items():
+            # Security audit finding #13: ``output_files`` filenames come
+            # from chain-step outputs — LLM-generated, potentially carrying
+            # ``../escape.bin``. Sanitise-then-contain like the per-key
+            # scan above.
+            file_dest = contained_join(run_dir, fname, fallback="output.bin")
+            file_dest.write_bytes(content)
+            saved.append((f"File ({fname})", str(file_dest)))
+
+    # Save verification report sidecar
+    if verification_reports:
+        verification_payload = [
+            r.model_dump(mode="json") if hasattr(r, "model_dump") else r
+            for r in verification_reports
+        ]
+        verification_path = run_dir / "verification.json"
+        verification_path.write_text(
+            json.dumps(verification_payload, indent=2, default=str),
+            encoding="utf-8",
+        )
+        saved.append(("Verification", str(verification_path)))
+
+    # Save per-run manifest so multi-capability runs are inspectable as
+    # a single file. Phase 2 produces N artifacts per task; this manifest
+    # lists all of them with their types, source gap, and which one was
+    # executed. Phase 3's compositional executor will eventually run them
+    # all and the manifest will report chain execution status instead.
+    if final_state is not None:
+        _state_get = (
+            final_state.get
+            if isinstance(final_state, dict)
+            else lambda k, d=None: getattr(final_state, k, d)
+        )
+        all_artifacts = _state_get("generated_artifacts", []) or []
+        matches = _state_get("matches", []) or []
+        classified_gaps = _state_get("classified_gaps", []) or []
+
+        # Check if this was a compositional chain run (all artifacts executed)
+        subtasks = _state_get("subtasks", []) or []
+        _all_executed = len(subtasks) > 1 and (
+            len(all_artifacts) + len(matches) > 1
+        )
+
+        def _artifact_summary(art: Any) -> dict:
+            art_name = getattr(art, "capability_name", None)
+            return {
+                "capability_name": art_name,
+                "capability_type": str(
+                    getattr(art, "capability_type", "")
+                ).split(".")[-1].lower(),
+                "gap_query": getattr(art, "gap_query", None),
+                "description": getattr(art, "description", None),
+                "executed": True if _all_executed else art_name == cap_name,
+            }
+
+        manifest = {
+            "timestamp": ts,
+            "task": task,
+            "files": [str(fp) for fp in file_paths] if file_paths else [],
+            "executed_capability": cap_name if artifact else None,
+            "execution_outcome": (
+                "error"
+                if exec_error
+                else ("output" if not output.get("_empty") else "empty")
+            ),
+            "execution_error": exec_error,
+            "generated_capabilities": [_artifact_summary(a) for a in all_artifacts],
+            "registry_matches": [
+                {
+                    "capability_name": getattr(
+                        getattr(m, "capability", None), "name", None
+                    ),
+                    "score": getattr(m, "score", None),
+                }
+                for m in matches
+            ],
+            "classified_gaps": [
+                {
+                    "query": getattr(cg, "query", None),
+                    "description": getattr(cg, "description", None),
+                    "classified_type": str(
+                        getattr(cg, "classified_type", "")
+                    ).split(".")[-1].lower(),
+                    "confidence": getattr(cg, "confidence", None),
+                }
+                for cg in classified_gaps
+            ],
+        }
+        if step_timings:
+            manifest["step_timings"] = step_timings
+        if pipeline_metrics:
+            manifest["pipeline_metrics"] = pipeline_metrics
+        manifest_path = run_dir / "run.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, default=str),
+            encoding="utf-8",
+        )
+        saved.append(("Run manifest", str(manifest_path)))
+
+    for label, path in saved:
+        console.print(f"  [green]\u2713[/green] {label}: [dim]{path}[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -816,16 +1528,40 @@ def _extract_stage_detail(node_name: str, state_update: Any) -> str:
         classified = _get("classified_gaps", []) or []
         if classified:
             types = [str(g.classified_type).split(".")[-1] for g in classified]
+            # When ≥2 AGENT gaps, indicate they'll be consolidated into lead + subagents
+            agent_count = sum(1 for t in types if t == "agent")
+            if agent_count >= 2:
+                non_agent = [t for t in types if t != "agent"]
+                agent_label = f"agent x{agent_count} (→ 1 lead + {agent_count} subagents)"
+                parts = non_agent + [agent_label]
+                return ", ".join(parts)
             return ", ".join(types)
         return ""
     elif node_name == "verification_node":
         results = _get("verification_results", []) or []
         if results:
-            last = results[-1]
-            if getattr(last, "overall_passed", False):
-                return f"[green]\u2713 Tier {last.tier_reached}[/green]"
+            # Deduplicate: keep only the latest report per capability_name.
+            # verification_results accumulates across retries; without this,
+            # the display would show inflated counts (e.g., "9 passed" when
+            # only 4 artifacts exist but 3 verification passes ran).
+            latest_by_name: dict[str, Any] = {}
+            for r in results:
+                cap = getattr(r, "capability_name", None)
+                if cap:
+                    latest_by_name[cap] = r
+            deduped = list(latest_by_name.values())
+            passed = sum(1 for r in deduped if getattr(r, "overall_passed", False))
+            failed = len(deduped) - passed
+            max_tier = max(
+                (getattr(r, "tier_reached", 0) or 0 for r in deduped), default=0
+            )
+            if failed > 0:
+                return (
+                    f"[red]\u2717 {failed} failed[/red], "
+                    f"[green]{passed} passed[/green] (Tier {max_tier})"
+                )
             else:
-                return f"[red]\u2717 Tier {last.tier_reached}[/red]"
+                return f"[green]\u2713 Tier {max_tier}[/green]"
         return ""
     elif node_name.startswith("generate_"):
         artifacts = _get("generated_artifacts", []) or []
@@ -852,6 +1588,8 @@ def execute_task(
     output_dir: Path | None = None,
     json_output: bool = False,
     verbose: bool = False,
+    allow_network: bool = False,
+    allow_network_source: str | None = None,
 ) -> int:
     """Run a task through the full JIT pipeline with live progress."""
     _load_env()
@@ -866,6 +1604,7 @@ def execute_task(
         no_optimizer,
         enable_optimizer,
         timeout,
+        allow_network=allow_network,
     )
 
     file_paths = _resolve_files(files)
@@ -891,29 +1630,63 @@ def execute_task(
         )
         return 1
 
-    # Determine optimizer state
-    if no_optimizer:
-        run_optimizer = False
-    elif enable_optimizer:
-        run_optimizer = True
-    else:
-        count = metrics_store.invocation_count_total()
-        run_optimizer = count >= _AUTO_OPTIMIZER_THRESHOLD
-        if run_optimizer:
-            err_console.print(f"[dim]Optimizer auto-enabled ({count} invocations recorded).[/dim]")
+    # §12 finding #8: build per-operation optimizer config from (priority
+    # order): per-invocation flags > persistent settings > defaults.
+    # - `--no-optimizer` overrides everything to all-off.
+    # - `--enable-optimizer` overrides everything to all-on.
+    # - Otherwise, read persistent settings from `data/cli/settings.json`
+    #   (via `mint config set optimizer.<op> <value>`); fall through to
+    #   defaults (all-"auto", threshold-gated).
+    from src.cli.settings import get_optimizer_config_from_settings, load_settings
+    from src.schemas.optimizer_config import OptimizerConfig
 
+    count = metrics_store.invocation_count_total()
+    if no_optimizer:
+        optimizer_config = OptimizerConfig.all_off()
+    elif enable_optimizer:
+        optimizer_config = OptimizerConfig.all_on()
+    else:
+        _settings_path = _data_dir() / "cli" / "settings.json"
+        _settings_opt = get_optimizer_config_from_settings(load_settings(_settings_path))
+        optimizer_config = OptimizerConfig(**_settings_opt) if _settings_opt else OptimizerConfig()
+        if optimizer_config.any_enabled(
+            invocation_count=count, threshold=_AUTO_OPTIMIZER_THRESHOLD,
+        ):
+            _auto_ops = [
+                op for op in ("prune", "split", "merge")
+                if optimizer_config.is_enabled(
+                    op, invocation_count=count, threshold=_AUTO_OPTIMIZER_THRESHOLD,
+                )
+            ]
+            err_console.print(
+                f"[dim]Optimizer enabled: {', '.join(_auto_ops)} "
+                f"({count} invocations recorded).[/dim]"
+            )
+
+    from src.orchestrator.output_contract_resolver import resolve_output_contract
     from src.orchestrator.pipeline import create_pipeline
     from src.schemas.task import TaskState
 
     pipeline = create_pipeline(
         registry,
         loader,
-        run_optimizer=run_optimizer,
+        optimizer_config=optimizer_config,
         metrics_store=metrics_store,
         verification_enabled=not skip_verification,
     ).compile()
 
-    initial_state = TaskState(task_description=task_prompt)
+    # Step 14.6 — resolve the output contract via the shared boundary adapter.
+    # CLI re-runs of T-tasks hit the known-task shortcut (0 LLM calls); free-
+    # form prompts fall to the LLM extractor inside resolve_output_contract.
+    # Same code path as the harness, just driven by different inputs.
+    _known_task = _match_known_task(task, task_prompt)
+    output_contract = resolve_output_contract(task_prompt, task_definition=_known_task)
+
+    initial_state = TaskState(
+        task_description=task_prompt,
+        output_contract=output_contract,
+        allow_network=allow_network,
+    )
 
     # Build rich LangFuse tracing config
     import uuid as _uuid
@@ -921,21 +1694,41 @@ def execute_task(
     _run_id = _uuid.uuid4().hex[:12]
     _file_formats = list({fp.suffix.lower().lstrip(".") for fp in file_paths}) if file_paths else []
     _trace_tags = ["mint-cli", *(f"format:{fmt}" for fmt in sorted(_file_formats))]
+    # §12 finding #8: derive trace tag / metadata from the resolved
+    # OptimizerConfig. "optimizer-on" fires if any operation would run
+    # at the current invocation_count; individual operation states are
+    # recorded in metadata for Chapter 6 analytics.
+    _optimizer_any = optimizer_config.any_enabled(
+        invocation_count=count, threshold=_AUTO_OPTIMIZER_THRESHOLD,
+    )
     if skip_verification:
         _trace_tags.append("no-verification")
-    if run_optimizer:
+    if _optimizer_any:
         _trace_tags.append("optimizer-on")
+    if allow_network:
+        _trace_tags.append("allow-network")
+    _lf_session_id = f"mint-run-{_run_id}"
     invoke_config = _langfuse_config(
-        session_id=f"mint-run-{_run_id}",
+        session_id=_lf_session_id,
         tags=_trace_tags,
         metadata={
             "task": task[:200],
             "files": [fp.name for fp in file_paths],
             "params": parsed_params,
-            "optimizer": run_optimizer,
+            "optimizer": _optimizer_any,
+            "optimizer_config": optimizer_config.model_dump(),
             "verification": not skip_verification,
+            "allow_network": allow_network,
         },
     )
+
+    # Step 13.7 tag-propagation fix (2026-04-19): set fallback trace
+    # context so events emitted from ThreadPool workers (verification,
+    # adversarial) + LangChain @tool callbacks (sandbox_execute) + any
+    # post-pipeline composition/execution emit sites still inherit
+    # tags/session/user. Primary path (langgraph.config.get_config()
+    # inside pipeline nodes) is unchanged.
+    from src.orchestrator.tracing import trace_context as _trace_context
 
     t_start = time.monotonic()
 
@@ -953,7 +1746,12 @@ def execute_task(
     if json_output:
         # No live display for JSON mode
         try:
-            final_state = pipeline.invoke(initial_state, config=invoke_config)
+            with _trace_context(
+                tags=_trace_tags,
+                session_id=_lf_session_id,
+                user_id="mint-cli",
+            ):
+                final_state = pipeline.invoke(initial_state, config=invoke_config)
         except Exception as exc:
             err_console.print(f"[red]Pipeline failed: {exc}[/red]")
             return 1
@@ -967,6 +1765,18 @@ def execute_task(
                 expand=False,
             )
         )
+        # Step 14.12: loud opt-in disclosure — offline-by-default paths stay
+        # silent, opt-in paths always print the warning so users can see the
+        # posture change at a glance. The ``allow_network_source`` string
+        # is resolved in ``src/cli/app.py`` before ``execute_task`` is
+        # called (flag vs. persistent setting).
+        if allow_network:
+            source_label = allow_network_source or "enabled"
+            console.print(
+                f"[yellow]⚠ Network access enabled[/yellow] — "
+                "generated tools can make outbound requests\n"
+                f"[dim]  source: {source_label}[/dim]"
+            )
         console.print()
 
         # Accumulate partial state updates into full state
@@ -1002,6 +1812,7 @@ def execute_task(
         current_label = _STAGE_LABEL.get(first_node, "Starting") + "..."
         printed_nodes: set[str] = set()
         prev_artifact_count = 0
+        node_visit_count: dict[str, int] = {}  # track retries
 
         def _print_completed(node_name: str) -> bool:
             """Print a completed stage line. Returns True if printed."""
@@ -1017,30 +1828,18 @@ def execute_task(
                 "generate_skill",
                 "generate_agent",
             }
-            _type_labels = {
-                "mcp_tool": "Generating MCP tool",
-                "skill": "Generating skill",
-                "agent": "Generating agent",
-            }
             gen_label_override: str | None = None
             if node_name in _gen_nodes:
                 arts = accumulated.get("generated_artifacts") or []
-                cur = len(arts)
-                new = cur - prev_artifact_count
-                if new == 0:
+                new, prev_artifact_count, gen_detail, gen_label_override = (
+                    _compute_gen_stage_diff(arts, prev_artifact_count)
+                )
+                if gen_detail is None:
+                    # No new artifacts this stage — skip printing entirely.
+                    # Covers both `new == 0` and `new < 0` (retry resets).
                     printed_nodes.add(node_name)
                     return False
-                new_arts = arts[prev_artifact_count:]
-                prev_artifact_count = cur
-                # Use the actual type of the new artifact(s)
-                types = {
-                    str(a.capability_type).split(".")[-1].lower()
-                    for a in new_arts
-                    if hasattr(a, "capability_type")
-                }
-                if len(types) == 1:
-                    gen_label_override = _type_labels.get(next(iter(types)))
-                detail = f"{new} artifact(s)"
+                detail = gen_detail
 
             label = gen_label_override or _STAGE_LABEL.get(node_name, node_name)
             detail_str = f" — {detail}" if detail else ""
@@ -1061,36 +1860,83 @@ def execute_task(
             with console.status(
                 f"[cyan]{current_label}[/cyan] [dim](0s)[/dim]",
                 spinner="dots",
-            ) as status:
+            ) as status, _trace_context(
+                tags=_trace_tags,
+                session_id=_lf_session_id,
+                user_id="mint-cli",
+            ):
                 timer_thread = threading.Thread(target=_timer_loop, args=(status,), daemon=True)
                 timer_thread.start()
 
+                _GEN_NODES = {"generate_mcp_tool", "generate_skill", "generate_agent"}
+                # Track when each event arrives so we can compute per-node
+                # elapsed time as the delta between consecutive events.
+                # LangGraph streams events AFTER nodes complete, so the
+                # delta between consecutive events = wall time of the node
+                # whose event arrived second.
+                _prev_event_time = stage_start
+
                 for event in pipeline.stream(initial_state, config=invoke_config):
+                    event_time = time.monotonic()
                     node_name = list(event.keys())[0]
                     update = event[node_name]
 
-                    # Merge this node's update into accumulated state
+                    # Track how many times each node has been visited
+                    # (retry loop causes generators + verification to repeat)
+                    node_visit_count[node_name] = node_visit_count.get(node_name, 0) + 1
+
+                    # On retry, allow nodes to be re-printed by removing
+                    # them from printed_nodes. Do NOT reset _prev_event_time —
+                    # the delta from the previous event (the failed
+                    # verification) is exactly the retried node's wall time.
+                    if node_visit_count[node_name] > 1:
+                        printed_nodes.discard(node_name)
+
+                    # Capture timing for this node IMMEDIATELY — even if
+                    # printing is deferred (generator nodes). This is the
+                    # delta between this event and the previous one, which
+                    # equals the wall time this node spent executing.
+                    timings[node_name] = event_time - _prev_event_time
+
+                    # When a NEW node's event arrives, print the previous
+                    # node if it was deferred (generator nodes wait for
+                    # artifact diff attribution).  Timing was already
+                    # captured when the deferred node's event arrived.
+                    if active_node and active_node != node_name and active_node not in printed_nodes:
+                        completed.add(active_node)
+                        _print_completed(active_node)
+
+                    # Merge this event's update into accumulated state
                     if isinstance(update, dict):
                         accumulated.update(update)
-
-                    # Mark previous node as done
-                    if active_node and active_node != node_name:
-                        completed.add(active_node)
-                        timings[active_node] = time.monotonic() - stage_start
-                        printed = _print_completed(active_node)
-                        # Only reset timer if the stage was visible;
-                        # skipped stages fold their time into the next
-                        if printed:
-                            stage_start = time.monotonic()
 
                     active_node = node_name
                     detail = _extract_stage_detail(node_name, update)
                     if detail:
                         stage_details[node_name] = detail
 
+                    # For non-generator nodes, print completion immediately
+                    # so the checkmark line appears BEFORE the next spinner.
+                    # Generator nodes are deferred because their artifact
+                    # diff needs to be computed against state that doesn't
+                    # yet include the next generator's artifacts.
+                    if node_name not in _GEN_NODES and node_name not in printed_nodes:
+                        completed.add(node_name)
+                        _print_completed(node_name)
+
+                    # This event's arrival time becomes the baseline for
+                    # the next node's elapsed time calculation.
+                    _prev_event_time = event_time
+                    stage_start = event_time
+
                     # Update spinner to show what's running NEXT
-                    # (this event means node_name just completed)
-                    current_label = _NEXT_STAGE_LABEL.get(node_name, "Processing...")
+                    next_label = _NEXT_STAGE_LABEL.get(node_name, "Processing...")
+                    # Enrich verification spinner with artifact count
+                    if "Verifying" in next_label:
+                        n_arts = len(accumulated.get("generated_artifacts") or [])
+                        if n_arts:
+                            next_label = f"Verifying {n_arts} artifact(s)..."
+                    current_label = next_label
 
                 # Mark last node as done
                 if active_node:
@@ -1119,11 +1965,40 @@ def execute_task(
 
     elapsed_ms = int((time.monotonic() - t_start) * 1000)
 
-    # Select artifact and execute
-    artifact = _select_artifact(final_state)
-    output: dict | None = None
+    # ---------------------------------------------------------------
+    # Compositional execution: if the task was decomposed into
+    # multiple subtasks with resolved capabilities, run the chain.
+    # ---------------------------------------------------------------
+    _state_get_early = (
+        final_state.get
+        if isinstance(final_state, dict)
+        else lambda k, d=None: getattr(final_state, k, d)
+    )
+    _subtasks = _state_get_early("subtasks", []) or []
+    _artifacts_all = _state_get_early("generated_artifacts", []) or []
+    _matches_all = _state_get_early("matches", []) or []
+    _use_compositional = len(_subtasks) > 1 and (len(_artifacts_all) + len(_matches_all) > 1)
 
-    if artifact:
+    artifact: Any = None
+    output: dict | None = None
+    exec_error: str | None = None
+    chain_output_files: dict[str, bytes] = {}
+    chain_step_timings: list[dict] = []
+
+    if _use_compositional:
+        output, artifact, exec_error, chain_output_files, chain_step_timings = _execute_compositional_chain(
+            final_state, file_paths, task_prompt, json_output, console,
+            invoke_config=invoke_config,
+            metrics_store=metrics_store,
+            allow_network=allow_network,
+        )
+    else:
+        # ---------------------------------------------------------------
+        # Single-artifact execution (legacy path)
+        # ---------------------------------------------------------------
+        artifact = _select_artifact(final_state)
+
+    if not _use_compositional and artifact:
         from src.schemas.capability import CapabilityType
 
         cap_type = artifact.capability_type
@@ -1133,8 +2008,32 @@ def execute_task(
             if cap_type == CapabilityType.MCP_TOOL:
                 if not json_output:
                     console.print(f"\n[dim]Executing {artifact.capability_name}...[/dim]")
-                output = _execute_mcp_tool(artifact, file_paths, parsed_params) or None
+                output = _execute_mcp_tool(
+                    artifact, file_paths, parsed_params, allow_network=allow_network,
+                ) or None
             elif cap_type in (CapabilityType.SKILL, CapabilityType.AGENT):
+                # Single call site for SKILL/AGENT execution so no kwarg can
+                # drift between the spinner and JSON branches. Security audit
+                # finding #7 (2026-04-19) was exactly this class of bug:
+                # allow_network was missing in the JSON branch only, silently
+                # demoting --allow-network to --network none for scriptable
+                # callers. Conditional UI wrapper replaces the duplicate call.
+                _lf_meta = invoke_config.get("metadata", {})
+
+                def _invoke_skill_or_agent() -> dict | None:
+                    return (
+                        _execute_skill_or_agent(
+                            artifact,
+                            task_prompt,
+                            file_paths,
+                            timeout_s=timeout,
+                            langfuse_tags=_lf_meta.get("langfuse_tags"),
+                            langfuse_session_id=_lf_meta.get("langfuse_session_id"),
+                            allow_network=allow_network,
+                        )
+                        or None
+                    )
+
                 if not json_output:
                     exec_label = f"Executing {cap_type_label}: {artifact.capability_name}"
                     exec_stop = threading.Event()
@@ -1156,42 +2055,31 @@ def execute_task(
                             daemon=True,
                         )
                         t.start()
-                        output = (
-                            _execute_skill_or_agent(
-                                artifact,
-                                task_prompt,
-                                file_paths,
-                                timeout_s=timeout,
-                            )
-                            or None
-                        )
+                        output = _invoke_skill_or_agent()
                         exec_stop.set()
                         t.join(timeout=1)
                 else:
-                    output = (
-                        _execute_skill_or_agent(
-                            artifact,
-                            task_prompt,
-                            file_paths,
-                            timeout_s=timeout,
-                        )
-                        or None
-                    )
+                    output = _invoke_skill_or_agent()
         except Exception as exc:
-            err_console.print(f"[yellow]Execution error: {exc}[/yellow]")
+            exec_error = f"{type(exc).__name__}: {exc}"
+            err_console.print(f"[yellow]Execution error: {exec_error}[/yellow]")
             output = None
 
     # Registry match fallback
     if artifact is None and not output:
+        _lf_meta_match = invoke_config.get("metadata", {})
         proxy, match_output = _try_registry_match(
-            final_state, file_paths, parsed_params, task_prompt, timeout
+            final_state, file_paths, parsed_params, task_prompt, timeout,
+            langfuse_tags=_lf_meta_match.get("langfuse_tags"),
+            langfuse_session_id=_lf_meta_match.get("langfuse_session_id"),
+            allow_network=allow_network,
         )
         if proxy:
             artifact = proxy
             output = match_output
 
-    # Report optimizer actions (if it ran)
-    if run_optimizer and not json_output:
+    # Report optimizer actions (if any operation ran).
+    if _optimizer_any and not json_output:
         try:
             events = metrics_store._conn.execute(
                 "SELECT event_type, COUNT(*) FROM capability_events "
@@ -1216,32 +2104,218 @@ def execute_task(
 
     # Output
     if json_output:
-        from scripts.run_task import _format_json
-
         print(_format_json(final_state, artifact, output, elapsed_ms))
     else:
         show_pipeline_result(final_state, artifact, output, elapsed_ms, verbose=verbose)
 
     # Always save output (default: data/output/, override with --output-dir)
-    save_dir = output_dir or _data_dir() / "mint_output"
-    if output:
-        _save_output(save_dir, output, artifact)
+    save_dir = output_dir or _data_dir() / "cli" / "mint_output"
+    # final_state is a dict (LangGraph's pipeline.invoke/.stream returns dicts),
+    # so we need the dict-aware accessor — getattr on a dict always returns the
+    # default. This bug previously caused the verification sidecar to never fire.
+    _state_get = (
+        final_state.get
+        if isinstance(final_state, dict)
+        else lambda k, d=None: getattr(final_state, k, d)
+    )
+    verification_reports = _state_get("verification_results", None) or None
+
+    # Build pipeline metrics for run.json — structured stage timings
+    # so the thesis can aggregate without querying LangFuse.
+    _subtask_count = len(_state_get("subtasks", []) or [])
+    _attempt_count = _state_get("attempt_count", 0) or 0
+    _pmx: dict = {
+        "total_elapsed_ms": elapsed_ms,
+        "attempt_count": _attempt_count,
+        "subtask_count": _subtask_count,
+        "stage_timings_s": {k: round(v, 1) for k, v in timings.items()},
+        "stage_details": stage_details,
+    }
+
+    # Security audit finding #11 (2026-04-19): use ``is not None`` rather
+    # than truthy-check so legitimate falsy outputs (0, False, "", []) are
+    # persisted and not routed to the ``_empty`` placeholder branch. Half-B
+    # of the ``or {}`` coercion pattern — same class of bug at a higher
+    # frame than the executor-return sites.
+    if output is not None:
+        _save_output(
+            save_dir,
+            output,
+            artifact,
+            verification_reports,
+            final_state=final_state,
+            task=task,
+            file_paths=file_paths,
+            exec_error=exec_error,
+            output_files=chain_output_files or None,
+            step_timings=chain_step_timings or None,
+            pipeline_metrics=_pmx,
+        )
     elif artifact is not None:
-        # Save metadata even for empty outputs so the attempt is recorded
+        # Save metadata even for empty outputs so the attempt is recorded.
+        # Include the captured execution error so failures are inspectable
+        # without going to LangFuse — previously the error was printed to
+        # stderr and lost.
         cap_name = getattr(artifact, "capability_name", "unknown")
-        _save_output(save_dir, {"_empty": True, "_capability": cap_name}, artifact)
+        placeholder: dict = {"_empty": True, "_capability": cap_name}
+        if exec_error:
+            placeholder["_error"] = exec_error
+        _save_output(
+            save_dir,
+            placeholder,
+            artifact,
+            verification_reports,
+            final_state=final_state,
+            task=task,
+            file_paths=file_paths,
+            exec_error=exec_error,
+            pipeline_metrics=_pmx,
+        )
+
+    # Sticky decomposition-failure flag: if decomposition_node bailed out
+    # (timeout / exception / empty subtasks), the fallback path still produced
+    # whatever it could — but the output is unreliable because the pipeline
+    # ran on a single-sentence fallback query instead of a real decomposition.
+    # Surface this to the user distinctly AND return a non-zero exit code so
+    # scripts like test_mint and run_pilot classify the run as a failure.
+    # See docs/perf_fixes_2026_04_14.md §2b.
+    if isinstance(final_state, dict):
+        _get_final = final_state.get
+    else:
+        _get_final = lambda k, d=None: getattr(final_state, k, d)  # noqa: E731
+
+    decomposition_ok = _get_final("decomposition_succeeded", True)
+    if not decomposition_ok:
+        err_console.print(
+            "\n[bold yellow]⚠ DECOMPOSITION FAILED — "
+            "partial output only[/bold yellow]"
+        )
+        err_console.print(
+            "[yellow]The task decomposer hit its timeout or errored. "
+            "The pipeline ran through a single-sentence fallback path, so "
+            "the output above is almost certainly incomplete. "
+            "Results should be treated as a diagnostic, not a successful "
+            "run.[/yellow]"
+        )
+        _errs = _get_final("errors", []) or []
+        if _errs:
+            err_console.print(f"[dim]Errors: {'; '.join(_errs[:3])}[/dim]")
+        return 2  # distinct from 1 (hard failure) and 0 (success)
+
+    # §12 finding #16 — proposal-strict Pillar 1.3 fail-closed.
+    # classifier_node sets this sticky flag to False when any gap fails
+    # classification after MAX_CLASSIFICATION_ATTEMPTS retries. No
+    # silent MCP_TOOL default.
+    classification_ok = _get_final("classification_succeeded", True)
+    if not classification_ok:
+        err_console.print(
+            "\n[bold red]✗ CLASSIFICATION FAILED — gap could not be typed[/bold red]"
+        )
+        err_console.print(
+            "[red]One or more capability gaps could not be classified as "
+            "MCP_TOOL / SKILL / AGENT after 3 attempts. Per Pillar 1.3 of the "
+            "thesis proposal, a mis-classified capability produces the wrong "
+            "artifact shape (e.g., 'an MCP tool that should have been a "
+            "skill will be too rigid'). The task is classified as "
+            "CLASSIFICATION_FAILED rather than defaulting to MCP_TOOL.[/red]"
+        )
+        _errs = _get_final("errors", []) or []
+        _class_errs = [
+            e for e in _errs if "Classification failed" in e or "CLASSIFICATION_FAILED" in e
+        ]
+        if _class_errs:
+            err_console.print(f"[dim]Last error: {_class_errs[-1]}[/dim]")
+        err_console.print(
+            "[dim]Run `mint retry --hint \"...\"` with guidance. Common "
+            "causes: rate limiting, model provider transient errors.[/dim]"
+        )
+        return 5  # distinct from 0/1/2/3/4
+
+    # §12 finding #14 — proposal-strict Pillar 2 fail-closed. The
+    # verification_node sets this sticky flag to False when MAX_ATTEMPTS
+    # retries exhaust with at least one artifact still failing the gate.
+    # The failed artifact is already dropped from generated_artifacts, so
+    # the chain likely either produced no output or skipped the failing
+    # step. Surface the failure explicitly rather than treating the
+    # fallthrough as success.
+    verification_ok = _get_final("verification_succeeded", True)
+    if not verification_ok:
+        err_console.print(
+            "\n[bold red]✗ VERIFICATION FAILED — no usable capability produced[/bold red]"
+        )
+        err_console.print(
+            "[red]The three-tier verification gate rejected the generated "
+            "capability on 3 consecutive attempts. Per Pillar 2 of the thesis "
+            "proposal ('Only verified capabilities enter production'), the "
+            "failed artifact was dropped from the registry and the task is "
+            "classified as VERIFICATION_FAILED.[/red]"
+        )
+        _errs = _get_final("errors", []) or []
+        _verify_errs = [e for e in _errs if "Verification failed" in e or "VERIFICATION_FAILED" in e]
+        if _verify_errs:
+            err_console.print(f"[dim]Last error: {_verify_errs[-1]}[/dim]")
+        err_console.print(
+            "[dim]Run `mint retry --hint \"...\"` with guidance on what "
+            "the generator keeps getting wrong.[/dim]"
+        )
+        return 4  # distinct from 0 / 1 / 2 / 3 — new exit code for verification-exhaustion
+
+    # Step 14.6 — output contract check. Delegated to a small testable
+    # helper so the exit-3 wiring can be exercised end-to-end without
+    # standing up a live pipeline. Returns 3 if the check fires, None
+    # otherwise (in which case the legacy success / hard-fail logic below
+    # decides the exit code).
+    _contract_exit = _evaluate_output_contract(
+        final_state,
+        artifact,
+        output,
+        chain_output_files,
+    )
+    if _contract_exit is not None:
+        return _contract_exit
 
     # Success: artifact executed with output, or registry matched (even
     # without source_code — the system found a relevant capability)
     if artifact is not None and output:
+        # §12 finding #6b: nudge the user toward `mint feedback --wrong`
+        # so non-crashing but semantically-wrong outputs can feed back
+        # into the Pillar 3 optimizer. Without this loop CLI runs only
+        # ever produce success=False on crashes, not on user-judgment
+        # wrong answers.
+        console.print(
+            "[dim]Was this output wrong? Run "
+            "[bold]mint feedback --wrong --reason \"...\"[/bold] "
+            "to flag it for the optimizer.[/dim]"
+        )
         return 0
-    # Registry matched but couldn't execute (seeded descriptor without
-    # source code) — still a valid match, not a pipeline failure
-    if isinstance(final_state, dict):
-        _get = final_state.get
-    else:
-        _get = lambda k, d=None: getattr(final_state, k, d)  # noqa: E731
-    if (_get("matches", None) or []) and not (_get("gaps", None) or []):
+
+    # Security audit finding #10 (2026-04-19): distinguish "non-executable
+    # seeded descriptor — nothing to execute" from "tried and failed." The
+    # pre-fix exit-0 fallback matched on ``matches and not gaps`` regardless
+    # of whether execution was attempted. That let Docker-down / AGENT-
+    # timeout / sandbox-OOM failures silently exit 0 via the registry-match
+    # path, contaminating scripted-caller success rates and contradicting
+    # the §12 strict-gate "no silent fallback" contract.
+    if artifact is not None:
+        # Something WAS attempted (we know output is falsy from above).
+        # If the artifact has an executable payload, this is a real
+        # failure — exit 6 (execution failure after successful pipeline).
+        has_payload = (
+            getattr(artifact, "source_code", None)
+            or getattr(artifact, "skill_content", None)
+            or getattr(artifact, "agent_config", None)
+        )
+        if has_payload:
+            return 6
+        # No payload — genuine seeded-descriptor case (e.g., CapabilityDescriptor
+        # from the registry without attached source_code). Still a valid
+        # match, not a pipeline failure.
+        return 0
+
+    # No artifact at all — pure registry lookup with no single winner chosen.
+    # Legacy path kept for pre-composition flows where matches are reported
+    # but never resolved to a single artifact.
+    if (_get_final("matches", None) or []) and not (_get_final("gaps", None) or []):
         return 0
     return 1
 
@@ -1292,10 +2366,16 @@ def plan_task(
     plan_pipeline = plan_builder.compile()
 
     initial_state = TaskState(task_description=task_prompt)
+    _plan_tags = ["mint-cli", "plan"]
     invoke_config = _langfuse_config(
-        tags=["mint-cli", "plan"],
+        tags=_plan_tags,
         metadata={"task": task[:200], "files": [fp.name for fp in file_paths]},
     )
+    # Step 13.7 tag-propagation fix (2026-04-19): same rationale as
+    # execute_task — wrap the plan pipeline so downstream emit sites
+    # (classifier events, decomposition events, ThreadPool-born events)
+    # inherit tags even when get_config() can't reach them.
+    from src.orchestrator.tracing import trace_context as _trace_context
     t_start = time.monotonic()
 
     console.print(
@@ -1309,7 +2389,8 @@ def plan_task(
     )
 
     try:
-        final_state = plan_pipeline.invoke(initial_state, config=invoke_config)
+        with _trace_context(tags=_plan_tags, user_id="mint-cli"):
+            final_state = plan_pipeline.invoke(initial_state, config=invoke_config)
     except Exception as exc:
         err_console.print(f"[red]Planning pipeline failed: {exc}[/red]")
         return 1
