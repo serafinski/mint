@@ -208,11 +208,18 @@ class TestUpdateHumanLabel:
         assert len(got) == 1
         assert got[0].human_label == "contaminated"
 
-    def test_update_to_different_label_overwrites(self):
+    def test_update_to_different_label_requires_allow_overwrite(self):
+        # tmp.md P1 (2026-04-22): default is optimistic-concurrency —
+        # re-labeling a labeled row requires allow_overwrite=True.
         store = EvaluationStore()
         rid = _seed_eval_run(store)
-        store.update_human_label(rid, "correct")
-        store.update_human_label(rid, "partial")
+        assert store.update_human_label(rid, "correct") is True
+        # Second write without override must return False (conflict).
+        assert store.update_human_label(rid, "partial") is False
+        got = store.get_runs()
+        assert got[0].human_label == "correct"
+        # With explicit override, re-label succeeds.
+        assert store.update_human_label(rid, "partial", allow_overwrite=True) is True
         got = store.get_runs()
         assert got[0].human_label == "partial"
 

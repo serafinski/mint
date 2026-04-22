@@ -47,8 +47,46 @@ import httpx  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-# GPT-5-mini context window (tokens)
+# ext16 #183 (2026-04-22): per-model context-window lookup. Pre-fix, the
+# single 128k constant was applied to every trace regardless of model,
+# so Row 13 percentages were silently wrong under JIT_LLM_MODEL override
+# (e.g., gpt-5 200k, claude-sonnet-4-6 200k, claude-opus-4-7-1m 1M).
 MODEL_CONTEXT_WINDOW = 128_000
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "gpt-5-mini": 128_000,
+    "gpt-5": 200_000,
+    "gpt-4o-mini": 128_000,
+    "gpt-4o": 128_000,
+    "claude-opus-4-7": 200_000,
+    "claude-opus-4-7-1m": 1_000_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-haiku-4-5": 200_000,
+}
+_UNKNOWN_MODELS_WARNED: set[str] = set()
+
+
+def _context_window_for(model: str | None) -> int:
+    """ext16 #183: resolve a model string to its context window.
+
+    Strips provider prefix (``openai:``, ``anthropic:``). Returns the
+    default 128k on unknown model with a deduplicated stderr warning.
+    """
+    import sys as _sys
+    if not model:
+        return MODEL_CONTEXT_WINDOW
+    key = model.split(":", 1)[1] if ":" in model else model
+    if key in MODEL_CONTEXT_WINDOWS:
+        return MODEL_CONTEXT_WINDOWS[key]
+    if key not in _UNKNOWN_MODELS_WARNED:
+        _UNKNOWN_MODELS_WARNED.add(key)
+        print(
+            f"WARNING: unknown model '{model}' — defaulting context window "
+            f"to {MODEL_CONTEXT_WINDOW:,} (ext16 #183). Add the model to "
+            f"MODEL_CONTEXT_WINDOWS to silence.",
+            file=_sys.stderr,
+        )
+    return MODEL_CONTEXT_WINDOW
 
 # Agent types we care about (trace names from DeepAgent invocations)
 AGENT_TRACE_NAMES = {
@@ -291,7 +329,16 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
         # "trace had observations but none were GENERATION-typed" —
         # without the flag, downstream aggregation pools both cases as
         # zero-util and deflates Chapter 6's Context Economy headline.
-        fetch_degraded = n_attempted > 0 and n_failed == n_attempted
+        #
+        # ext16 #184 (2026-04-22): empty ``observation_ids`` list
+        # (n_attempted == 0) also flagged as degraded. Pre-fix, the
+        # condition required ``n_attempted > 0``, so an ingest-incomplete
+        # envelope (no observations fetched at all) entered aggregates as
+        # a legitimate zero-util data point and silently biased Chapter 6
+        # Context Economy downward.
+        fetch_degraded = (n_attempted == 0) or (
+            n_attempted > 0 and n_failed == n_attempted
+        )
         return {
             "step_count": 0,
             "peak_input_tokens": 0,
@@ -304,6 +351,9 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
             "context_utilization_pct": 0.0,
             "context_utilization_chain_pct": 0.0,
             "_fetch_degraded": fetch_degraded,
+            "_empty_observation_ids": n_attempted == 0,  # ext16 #184
+            "_fetch_partial": False,
+            "_fetch_coverage_pct": 0.0,
             "_obs_attempted": n_attempted,
             "_obs_failed": n_failed,
             "steps": [],
@@ -325,6 +375,17 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
     total_reasoning = sum(s["reasoning_tokens"] for s in steps)
     total_cache = sum(s["cache_read_tokens"] for s in steps)
 
+    # ext16 #183 (2026-04-22): resolve per-step context window so
+    # utilization percentages are correct under mixed-model traces /
+    # JIT_LLM_MODEL override. Peak window = max across steps.
+    step_windows = [_context_window_for(s.get("model")) for s in steps]
+    peak_window = max(step_windows) if step_windows else MODEL_CONTEXT_WINDOW
+
+    # ext16 #179 (2026-04-22): partial-fetch coverage. Pre-fix, traces
+    # with ``n_failed > 0 < n_attempted`` were treated as complete;
+    # aggregates (peak = max, total = sum) silently undercounted.
+    fetch_coverage = 1.0 - (n_failed / n_attempted) if n_attempted > 0 else 1.0
+
     return {
         "step_count": len(steps),
         "peak_input_tokens": peak_input,
@@ -334,14 +395,19 @@ def extract_trace_context(client: httpx.Client, trace: dict) -> dict:
         "total_tokens_consumed": total_consumed,
         "total_reasoning_tokens": total_reasoning,
         "total_cache_read_tokens": total_cache,
-        "context_utilization_pct": round(peak_input / MODEL_CONTEXT_WINDOW * 100, 1),
+        "context_utilization_pct": round(peak_input / peak_window * 100, 1),
         "context_utilization_chain_pct": round(
-            total_chain_input / MODEL_CONTEXT_WINDOW * 100, 1
+            total_chain_input / peak_window * 100, 1
         ),
+        "_context_window_used": peak_window,  # ext16 #183
         # ext12 #120: a trace with usable GENERATION observations is never
         # fetch-degraded (some fetches may have failed, but enough landed
         # to produce real metrics — aggregating these is correct).
         "_fetch_degraded": False,
+        "_empty_observation_ids": False,  # ext16 #184
+        # ext16 #179: distinguish partial from complete.
+        "_fetch_partial": n_failed > 0,
+        "_fetch_coverage_pct": round(fetch_coverage * 100, 1),
         "_obs_attempted": n_attempted,
         "_obs_failed": n_failed,
         "steps": steps,

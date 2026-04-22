@@ -122,9 +122,34 @@ def test_resume_with_shrunk_pool_returns_plan_intersection(tmp_path):
     assert len(second) == 3
 
 
-def test_corrupt_plan_file_falls_back_with_warning(tmp_path, capsys):
-    """An unreadable plan file triggers a WARN + fresh draw. The fix
-    prioritizes making progress + loud-signaling rather than crashing.
+def test_corrupt_plan_file_loud_fails(tmp_path, capsys):
+    """tmp.md P1 (2026-04-22): an unreadable plan file now exits 9 loudly
+    rather than silently redrawing. Redrawing violates the M2 CI
+    assumption that the sample was chosen once before labeling.
+    """
+    import pytest
+    db_path = tmp_path / "metrics.duckdb"
+    db_path.touch()
+    plan_path = _sample_plan_path(db_path, **_DEFAULT_SCOPE)
+    plan_path.write_text("not valid json {")
+
+    rows = [_row(f"r{i}") for i in range(10)]
+    with pytest.raises(SystemExit) as exc_info:
+        get_or_create_sample_plan(
+            rows, db_path=db_path, **_DEFAULT_SCOPE,
+        )
+    assert exc_info.value.code == 9
+    captured = capsys.readouterr()
+    assert (
+        "unreadable" in captured.err.lower()
+        or "unreadable" in captured.out.lower()
+    )
+
+
+def test_corrupt_plan_with_force_fresh_plan_redraws(tmp_path, capsys):
+    """With --force-fresh-plan, a corrupt plan file is wiped and replaced
+    with a fresh draw — the explicit override is the sanctioned escape
+    hatch from the loud-fail default.
     """
     db_path = tmp_path / "metrics.duckdb"
     db_path.touch()
@@ -133,12 +158,9 @@ def test_corrupt_plan_file_falls_back_with_warning(tmp_path, capsys):
 
     rows = [_row(f"r{i}") for i in range(10)]
     sample = get_or_create_sample_plan(
-        rows, db_path=db_path, **_DEFAULT_SCOPE,
+        rows, db_path=db_path, force_fresh_plan=True, **_DEFAULT_SCOPE,
     )
     assert len(sample) == 5
-    captured = capsys.readouterr()
-    assert "WARNING" in captured.err or "WARNING" in captured.out
-    assert "plan" in captured.err.lower() or "plan" in captured.out.lower()
 
 
 def test_plan_path_is_db_scoped(tmp_path):

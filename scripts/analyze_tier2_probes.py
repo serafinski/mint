@@ -131,6 +131,12 @@ class ProbeBreakdown:
     events_total: int = 0
     events_pass: int = 0
     events_reject: int = 0
+    # ext16 #180 (2026-04-22): count events whose metadata.categories was
+    # not a list. Pre-fix, these were silently ``continue``d out of the
+    # category aggregation — producing the contradictory "50 events,
+    # 12 rejects, No findings observed" rendering that Chapter 4.3
+    # readers can't interpret.
+    events_malformed_categories: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +271,8 @@ def aggregate(events: list[dict]) -> ProbeBreakdown:
         severity_dist = metadata.get("severity_distribution") or {}
 
         if not isinstance(categories, list):
+            # ext16 #180 (2026-04-22): surface shape drift loudly.
+            bd.events_malformed_categories += 1
             continue
 
         # ext8 #60: record each event's severity distribution ONCE
@@ -304,8 +312,13 @@ def aggregate(events: list[dict]) -> ProbeBreakdown:
 # ---------------------------------------------------------------------------
 
 
-def render_table(bd: ProbeBreakdown, *, include_pass: bool) -> None:
-    """Pretty-print the breakdown to stdout."""
+def render_table(bd: ProbeBreakdown, *, include_pass: bool) -> int:
+    """Pretty-print the breakdown to stdout.
+
+    Returns an exit code: 0 for healthy/normal rendering, 7 when every
+    event was malformed and the per-category breakdown is structurally
+    empty because of metadata shape drift (ext16 #180).
+    """
     print("=" * 70)
     print("  TIER 2 BEHAVIORAL PROBE-TYPE BREAKDOWN")
     print("=" * 70)
@@ -313,9 +326,25 @@ def render_table(bd: ProbeBreakdown, *, include_pass: bool) -> None:
     print(f"  verification.tier_2.reject  {bd.events_reject}")
     if include_pass:
         print(f"  verification.tier_2.pass    {bd.events_pass}")
+    if bd.events_malformed_categories:
+        print(
+            f"  malformed metadata.categories: {bd.events_malformed_categories} "
+            f"(ext16 #180 — event dropped from per-category aggregation)"
+        )
     print()
 
     if not bd.categories:
+        # ext16 #180 (2026-04-22): distinguish "no events" from "all events
+        # malformed" from "events all passed (no rejects)". Pre-fix, all
+        # three rendered the same "No tier-2 findings observed" narrative.
+        if bd.events_malformed_categories > 0 and bd.events_total > 0:
+            print(
+                f"ERROR: per-category breakdown is empty because all "
+                f"{bd.events_malformed_categories} events had non-list "
+                f"metadata.categories. Chapter 4.3 evidence erased by "
+                f"metadata shape drift. ext16 #180. Exit 7."
+            )
+            return 7
         print(
             "No tier-2 findings observed in the time window. "
             "Expected sources:\n"
@@ -323,7 +352,7 @@ def render_table(bd: ProbeBreakdown, *, include_pass: bool) -> None:
             "  - scripts/run_pilot.py --all-conditions (Phase 4 eval, full)\n"
             "Check the --days window and --environment filter."
         )
-        return
+        return 0
 
     total_findings = sum(bd.categories.values())
     print(f"Total finding-category hits: {total_findings}")
@@ -391,6 +420,8 @@ def render_table(bd: ProbeBreakdown, *, include_pass: bool) -> None:
                 continue
             hits = ", ".join(f"{s}:{c}" for s, c in row.most_common())
             print(f"  {cat:<22s} {hits}")
+
+    return 0
 
 
 def render_csv(bd: ProbeBreakdown, output_dir: Path) -> None:
@@ -604,12 +635,14 @@ def main() -> int:
             )
 
     bd = aggregate(events)
-    render_table(bd, include_pass=args.include_pass)
+    rc = render_table(bd, include_pass=args.include_pass)
 
     if args.csv:
         render_csv(bd, args.output_dir)
 
-    return 0
+    # ext16 #180: propagate render_table's exit code so a DB of only
+    # malformed-category events exits 7 instead of silent 0.
+    return rc
 
 
 if __name__ == "__main__":

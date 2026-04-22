@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import duckdb
+
+logger = logging.getLogger(__name__)
 
 from src.schemas.metrics import GranularityMetrics, InvocationRecord
 
@@ -205,19 +208,37 @@ class MetricsStore:
         Called by the pipeline's ``_optimizer_node`` after each subgraph
         invocation so the next task reads the just-computed scores as its
         baseline.
+
+        tmp.md P1 (2026-04-22): pre-fix, an empty ``scores`` map executed
+        the DELETE unconditionally and skipped INSERT → the entire
+        persistent history was erased in a single call. This happened
+        whenever the optimizer loop threw during ``compute_all_utilities``
+        and ``pipeline.py`` passed ``result.get("utility_scores", {})`` ==
+        ``{}`` as the persisted value. Now empty-map calls are treated
+        as no-op writes with a warning; callers intending to clear the
+        table must pass ``clear_if_empty=True`` explicitly.
         """
-        # Idempotent replace: DELETE + INSERT is simpler than UPSERT and
-        # fine for small registries (20-50 entries typical).
-        self._conn.execute("DELETE FROM optimizer_prev_utility")
-        if scores:
-            from datetime import UTC, datetime
-            now = datetime.now(UTC)
-            rows = [(cid, float(s), now) for cid, s in scores.items()]
-            self._conn.executemany(
-                "INSERT INTO optimizer_prev_utility (capability_id, utility_score, updated_at) "
-                "VALUES (?, ?, ?)",
-                rows,
+        if not scores:
+            logger.warning(
+                "persist_utility_scores called with empty map — no-op write. "
+                "Pass scores explicitly; pre-fix this call would have erased "
+                "all persisted optimizer history. (tmp.md P1 2026-04-22)"
             )
+            return
+
+        # Idempotent replace: DELETE + INSERT is simpler than UPSERT and
+        # fine for small registries (20-50 entries typical). Only run the
+        # DELETE when we have a non-empty replacement to write, so an
+        # empty-map persistence never wipes the historical baseline.
+        self._conn.execute("DELETE FROM optimizer_prev_utility")
+        from datetime import UTC, datetime
+        now = datetime.now(UTC)
+        rows = [(cid, float(s), now) for cid, s in scores.items()]
+        self._conn.executemany(
+            "INSERT INTO optimizer_prev_utility (capability_id, utility_score, updated_at) "
+            "VALUES (?, ?, ?)",
+            rows,
+        )
 
     def record_invocation(self, record: InvocationRecord) -> None:
         """Insert an invocation row from the Pydantic model."""

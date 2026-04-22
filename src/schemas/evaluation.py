@@ -32,6 +32,16 @@ class BaselineCondition(StrEnum):
     NO_OPTIMIZATION = "no_optimization"
     STATIC = "static"
     LONGITUDINAL = "longitudinal"
+    # ext17 #188 (2026-04-22): distinct condition for the distribution-
+    # shift protocol. Pre-fix, run_longitudinal_shift.py wrote
+    # condition="longitudinal" identical to the plain runner. Under any
+    # DB-boundary slip (#175 / #176 freshness-guard gap, ext7 #49
+    # contract violation, accidental cross-DB append), plain + shift
+    # populations became indistinguishable at the row level, corrupting
+    # Chapter 6 RQ #2 (convergence on stable workload) vs RQ #3
+    # (adaptation to distribution shift). Row-level first-class labeling
+    # closes the architectural gap.
+    LONGITUDINAL_SHIFT = "longitudinal_shift"
 
 
 class TaskTier(StrEnum):
@@ -60,6 +70,12 @@ class FailureReason(StrEnum):
     # execute_agent_artifact on the concurrent.futures TimeoutError path.
     AGENT_EXECUTION_TIMEOUT = "agent_execution_timeout"
     AGENT_EXECUTION_ERROR = "agent_execution_error"
+    # ext16 #185 (2026-04-22): harness writer sites (lines 647, 1054, 1369)
+    # assign failure_reason="output_shape_mismatch" when the task's
+    # OutputContract detects missing keys/files. Pre-fix that string was
+    # NOT in this enum → Pydantic ValidationError crashed the campaign
+    # mid-run. Now a first-class enum member.
+    OUTPUT_SHAPE_MISMATCH = "output_shape_mismatch"
     # ext12 #119 (2026-04-21): distinct failure class for per-task
     # SIGALRM watchdog aborts in longitudinal runners. Semantically
     # distinct from ``agent_execution_timeout`` (that's a chain-step

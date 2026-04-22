@@ -99,7 +99,48 @@ def main(argv: list[str] | None = None) -> int:
              "12h for --n-tasks 40). 0 disables the campaign-level deadline. "
              "ext12 #119.",
     )
+    # ext15 #175 (2026-04-22): freshness guard. Pre-fix, successive
+    # invocations with the default ``--db`` silently accumulated in the
+    # same DB → #174 selector stale-fallback risk and cross-campaign
+    # pollution. Match run_pilot.py's ext7 #49 contract.
+    parser.add_argument(
+        "--fresh-db", action="store_true",
+        help=(
+            "Refuse to run if the --db target already exists with rows. "
+            "Use --append to explicitly allow appending to an existing DB. "
+            "ext15 #175: one DB = one campaign."
+        ),
+    )
+    parser.add_argument(
+        "--append", action="store_true",
+        help=(
+            "Explicitly allow writing into an existing non-empty DB. "
+            "Default: refuse to append; require either --append or a fresh "
+            "--db path. ext15 #175."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    # ext15 #175: freshness guard.
+    db_path = Path(args.db)
+    if db_path.exists() and db_path.stat().st_size > 0 and not args.append:
+        # Check whether the DB has evaluation_runs rows.
+        try:
+            import duckdb as _duckdb
+            with _duckdb.connect(str(db_path), read_only=True) as _conn:
+                existing = _conn.execute(
+                    "SELECT COUNT(*) FROM evaluation_runs"
+                ).fetchone()[0]
+        except Exception:  # noqa: BLE001
+            existing = 1  # file exists; err on the side of blocking
+        if existing > 0:
+            logger.error(
+                "ext15 #175: --db %s already contains %d evaluation_runs rows. "
+                "Refusing to append silently. Pass --append to acknowledge, "
+                "or use a fresh path. Each longitudinal run must be one campaign.",
+                db_path, existing,
+            )
+            return 2
 
     # --- Logging ---
     log_format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
@@ -148,7 +189,10 @@ def main(argv: list[str] | None = None) -> int:
         task_sequence.extend(batch)
     task_sequence = task_sequence[: args.n_tasks]
 
-    run_id = f"longitudinal_{uuid.uuid4().hex[:8]}"
+    # tmp.md P2 (2026-04-22): use full uuid4 entropy (128 bits) instead
+    # of truncated 8-hex (32 bits). No uniqueness constraint on run_id
+    # in the schema; collision would silently merge distinct campaigns.
+    run_id = f"longitudinal_{uuid.uuid4().hex}"
     # Security audit finding #87 (2026-04-19, ext9): per-invocation
     # timestamp threaded into the LangFuse session_id so two runs with
     # the same ``--seed`` don't pool their traces into one session in
@@ -402,6 +446,15 @@ def main(argv: list[str] | None = None) -> int:
 
             elapsed_ms = int((time.monotonic() - t_start) * 1000)
 
+            # tmp.md P0 (2026-04-22): thread every key _extract_result
+            # returns through EvaluationRecord. Pre-fix, compositional /
+            # artifact / contract / snapshot fields were silently defaulted
+            # (chain_length=1, chain_success=False, generated_artifact_count=0,
+            # output_shape_mismatch=False, generated_artifact_sources=[]),
+            # which (a) excluded every longitudinal run from the M2 audit
+            # pool (audit_contamination.py filters on
+            # generated_artifact_count > 0) and (b) dumped output-contract
+            # violations into the generic bucket in analyze_compression_loss.
             record = EvaluationRecord(
                 run_id=run_id,
                 condition="longitudinal",
@@ -418,6 +471,22 @@ def main(argv: list[str] | None = None) -> int:
                 registry_snapshot_id=snap_id,
                 seed=args.seed,
                 is_pilot=False,
+                # Compositional + artifact + contract metadata from _extract_result:
+                required_capability_count=result.get("required_capability_count", 0),
+                matched_in_registry_count=result.get("matched_in_registry_count", 0),
+                chain_length=result.get("chain_length", 1),
+                chain_success=result.get("chain_success", False),
+                matched_and_executed_count=result.get("matched_and_executed_count", 0),
+                generated_artifact_count=result.get("generated_artifact_count", 0),
+                capability_types=result.get("capability_types", []),
+                failed_step_index=result.get("failed_step_index"),
+                failed_step_name=result.get("failed_step_name"),
+                failed_step_reason=result.get("failed_step_reason"),
+                output_shape_mismatch=result.get("output_shape_mismatch", False),
+                output_shape_missing_keys=result.get("output_shape_missing_keys", []),
+                output_shape_missing_files=result.get("output_shape_missing_files", []),
+                generated_artifact_sources=result.get("generated_artifact_sources", []),
+                langfuse_trace_id=result.get("langfuse_trace_id"),
             )
 
             eval_store.record_run(record)

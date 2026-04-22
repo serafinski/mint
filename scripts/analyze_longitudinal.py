@@ -169,11 +169,16 @@ def _resolve_longitudinal_run_id(
     Returns ``None`` if the DB has no longitudinal runs at all.
     """
     # Enumerate available longitudinal runs (newest first).
+    # ext17 #188 (2026-04-22): accept both 'longitudinal' (plain runner)
+    # and 'longitudinal_shift' (shift runner). Row 18/19 already scope
+    # by --db filesystem path; this expansion keeps the analyzer
+    # backwards-compatible with pre-#188 shift DBs (condition=longitudinal)
+    # while also recognizing the new condition label.
     available = conn.execute(
         """
         SELECT run_id, MAX(timestamp) AS last_ts
         FROM evaluation_runs
-        WHERE condition = 'longitudinal'
+        WHERE condition IN ('longitudinal', 'longitudinal_shift')
         GROUP BY run_id
         ORDER BY last_ts DESC
         """
@@ -491,9 +496,26 @@ def _detect_stable_convergence(
 
     final_ref = _average_distributions(snapshots[-window_size:])
 
+    # tmp.md P0 (2026-04-22): if the final-window attractor is empty,
+    # the system collapsed to an empty registry. "Converging to nothing"
+    # is not convergence — return None. Pre-fix: kl_fn({}, non_empty)
+    # hit the first-cycle sentinel in _kl_divergence_between_snapshots
+    # and returned 0.0, causing the detector to falsely report
+    # instantaneous convergence at the first non-empty cycle.
+    if not final_ref:
+        return None
+
     run_len = 0
     for i, snap in enumerate(snapshots):
+        # Guard the per-cycle call too: if snap is empty but final_ref
+        # is non-empty, the distance is catastrophic (inf), not 0. The
+        # underlying kl function already returns inf for this case; we
+        # must NOT let NaN (both-empty; dead cycle) count as sub-threshold.
         kl = kl_fn(final_ref, snap)
+        import math as _math
+        if _math.isnan(kl):
+            run_len = 0
+            continue
         if kl < threshold:
             run_len += 1
             if run_len >= min_consecutive:
@@ -740,27 +762,38 @@ def main() -> int:
         conn.close()
         return 1
 
-    # ext12 #116: completeness guard. A 5-cycle stub from an aborted
-    # campaign must not silently pass as a complete run.
+    # ext12 #116 + ext15 #172 (2026-04-22): completeness guard. Fires
+    # on BOTH underfull and overfull cycle counts. Pre-ext15-#172 the
+    # check was ``len(cycles) < expected``, so merged/duplicated
+    # timelines (from #153 collision, --append run_id reuse, duplicate
+    # writes) silently passed while producing invalid convergence
+    # curves across interleaved runs.
     incomplete_banner: str | None = None
-    if len(cycles) < args.expected_cycles:
+    if len(cycles) != args.expected_cycles:
+        direction = (
+            "overfull — possible run_id collision, duplicate writes, or "
+            "merged timelines"
+            if len(cycles) > args.expected_cycles
+            else "incomplete/aborted run"
+        )
         if not args.allow_incomplete:
             print(
                 f"ERROR: longitudinal run has {len(cycles)} cycles, expected "
-                f"{args.expected_cycles}. Pass --allow-incomplete to proceed "
-                f"with an [INCOMPLETE] banner, or --expected-cycles N to "
+                f"{args.expected_cycles} ({direction}). Pass --allow-incomplete "
+                f"to proceed with a banner, or --expected-cycles N to "
                 f"override the expected count.",
                 file=sys.stderr,
             )
             conn.close()
             return 3
+        tag = "OVERFULL" if len(cycles) > args.expected_cycles else "INCOMPLETE"
         incomplete_banner = (
-            f"[INCOMPLETE: {len(cycles)}/{args.expected_cycles} cycles]"
+            f"[{tag}: {len(cycles)}/{args.expected_cycles} cycles]"
         )
         print(
             f"WARNING: {incomplete_banner} — Chapter 6 consumers must cite "
-            f"the shortfall; downstream convergence / adaptation claims are "
-            f"not directly comparable to complete-campaign numbers.",
+            f"the shortfall/overrun; downstream convergence / adaptation "
+            f"claims are not directly comparable to complete-campaign numbers.",
             file=sys.stderr,
         )
 

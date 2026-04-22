@@ -1,7 +1,9 @@
 """Statistical analysis of evaluation results for thesis Chapter 6.
 
 Produces:
-- Disaggregated success rates (all tasks vs synthesis-only T04-T13)
+- Disaggregated success rates (all tasks vs synthesis-only T04-T20)
+  (ext15 #163: labels derived from ALL_TASKS; T01-T03 retrieval tasks,
+  T04-T20 synthesis tasks as of 2026-04-22)
 - Exact binomial 95% confidence intervals
 - gate_passed and output_in_range as separate columns
 - Fisher's exact test (each JIT condition vs static, per task)
@@ -631,7 +633,12 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
     jit_max = max(jit_rates) * 100
     static_rate = static["successes"] / static["n"] * 100 if static["n"] > 0 else 0
 
-    lines.append("  Synthesis tasks only (T04-T13):")
+    # ext15 #163 (2026-04-22): derive range from ALL_TASKS, not hardcoded literal.
+    _synth_range = (
+        f"{SYNTHESIS_TASK_IDS[0]}-{SYNTHESIS_TASK_IDS[-1]}"
+        if SYNTHESIS_TASK_IDS else "none"
+    )
+    lines.append(f"  Synthesis tasks only ({_synth_range}):")
     lines.append(f"    JIT cluster:  {jit_min:.1f}% – {jit_max:.1f}%")
     lines.append(f"    Static:       {static_rate:.1f}%")
     lines.append(
@@ -789,14 +796,20 @@ def print_token_cost_summary(conn: duckdb.DuckDBPyConnection) -> bool:
         nonzero, total = by_cond.get(cond, (0, 0))
         if total > 0:
             jit_ratios.append(nonzero / total)
-    if not jit_ratios or max(jit_ratios) < 0.5:
+    # ext15 #160 (2026-04-22): per-condition gate, not max-pooled. A single
+    # healthy JIT condition must NOT mask two broken ones. Pre-fix,
+    # ``max(jit_ratios) < 0.5`` fired only when every JIT condition was
+    # below threshold — one healthy ratio (1.0) hid catastrophic
+    # Row-11 partial-failure on the other two. Post-fix the gate fires
+    # when ANY JIT condition is below threshold.
+    if not jit_ratios or any(r < 0.5 for r in jit_ratios):
         ratios_str = ", ".join(f"{r:.2f}" for r in jit_ratios) or "(no JIT rows)"
         print(
             f"\n  ⚠ M4 silent zero: JIT conditions have non-zero ratios "
-            f"[{ratios_str}] (max < 0.5). Likely cause: Row 11 not run, "
+            f"[{ratios_str}] (any < 0.5). Likely cause: Row 11 not run, "
             f"or ext14 #141 pagination truncation / ext12 #122 partial-runs "
             f"/ ext14 #145 partial CAMPAIGN_RUN_IDS silently zeroed this "
-            f"campaign's costs. ext14 #149.",
+            f"campaign's costs. ext14 #149 + ext15 #160.",
             file=sys.stderr,
         )
         return False
@@ -930,13 +943,22 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
     # Group by (condition, run_id) → counts keyed by capability, so we
     # can zero-pad against the per-condition active-registry proxy
     # below. Also collect the per-condition union of capability ids.
+    #
+    # ext15 #162 (2026-04-22): ``by_condition`` is now a dict keyed by
+    # capability_id that sums across runs, so the Aggregate column is
+    # computed on ``[capA_total, capB_total, ...]`` as the proposal-
+    # intended "pooled distribution over capabilities" — not on the raw
+    # per-(run, capability) list that would treat a permutation-
+    # symmetric workload (capA-only run + capB-only run) as inequality.
     from collections import defaultdict
     by_run: dict[tuple[str, str], dict[str, int]] = defaultdict(dict)
-    by_condition: dict[str, list[int]] = defaultdict(list)
+    by_condition_capsum: dict[str, dict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
     condition_caps: dict[str, set[str]] = defaultdict(set)
     for cond, run_id, cap_id, inv_count in per_run_rows:
         by_run[(cond, run_id)][cap_id] = int(inv_count)
-        by_condition[cond].append(int(inv_count))
+        by_condition_capsum[cond][cap_id] += int(inv_count)
         condition_caps[cond].add(cap_id)
 
     # Security audit finding #96 (2026-04-19, ext9): zero-pad the
@@ -978,7 +1000,9 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
             print(f"  {CONDITION_LABELS.get(cond, cond):<22} {'—':>8} {'—':>10} {'—':>7} {'—':>7} {'—':>10}")
             continue
         mean = sum(run_ginis) / len(run_ginis)
-        aggregate = _gini_coefficient(by_condition[cond])
+        # ext15 #162: aggregate over capability totals (pooled by capability
+        # across runs), not over raw per-(run,cap) counts.
+        aggregate = _gini_coefficient(list(by_condition_capsum[cond].values()))
         label = CONDITION_LABELS.get(cond, cond)
         print(
             f"  {label:<22} {len(run_ginis):>8d} {mean:>10.3f} "
@@ -1044,8 +1068,13 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
     return True
 
 
-def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> None:
+def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
     """Core-Work Classification Accuracy — task-level primary-type match.
+
+    ext15 #164 (2026-04-22): returns ``bool`` — True on success, False on
+    skip — so Row 17 can accumulate into ``missing_metrics`` and exit 7.
+    Sibling retrofit to M2 (ext13 #126), M3 (ext13 #128), M4 (ext14 #149).
+
 
     Operational proxy for proposal Pillar 1 RQ #1:
         *"How accurately can an LLM classify capability gaps into the
@@ -1116,7 +1145,7 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> None:
         print("  (operational proxy for Pillar 1 RQ #1; see docstring for framing)")
         print(f"{'='*80}")
         print(f"  (skipped: couldn't import ALL_TASKS — {exc.__class__.__name__})")
-        return
+        return False  # ext15 #164
 
     expected_map: dict[str, str | None] = {t.task_id: t.expected_type for t in ALL_TASKS}
     scorable = {tid for tid, et in expected_map.items() if et is not None}
@@ -1126,23 +1155,44 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> None:
         print("  (operational proxy for Pillar 1 RQ #1; see docstring for framing)")
         print(f"{'='*80}")
         print("  (skipped: no tasks have expected_type assigned)")
-        return
+        return False  # ext15 #164
 
+    # ext15 #166 (2026-04-22): explicit JIT whitelist, not blacklist.
+    # Pre-fix ``condition != 'static'`` silently admitted non-baseline
+    # labels (longitudinal, longitudinal_shift, future ablations, enum
+    # drift) into the pooled confusion matrix.
+    # ext15 #181 (2026-04-22): filter on ``generated_artifact_count > 0``.
+    # Pure registry-match rows (classifier never ran; capability_type
+    # carries the pre-registered descriptor) must NOT be scored as
+    # classifier judgment. Two-layer defense: SQL filter + footer.
+    total_rows_before_filter = conn.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM evaluation_runs
+        WHERE is_pilot = FALSE
+          AND condition IN ('full', 'no_verification', 'no_optimization')
+          {_SCOPE_SQL}
+        """
+    ).fetchone()[0] or 0
     rows = conn.execute(
         f"""
         SELECT task_id, condition, capability_type
         FROM evaluation_runs
-        WHERE is_pilot = FALSE AND condition != 'static'{_SCOPE_SQL}
+        WHERE is_pilot = FALSE
+          AND condition IN ('full', 'no_verification', 'no_optimization')
+          AND COALESCE(generated_artifact_count, 0) > 0
+          {_SCOPE_SQL}
         """
     ).fetchall()
+    excluded_registry_only = total_rows_before_filter - len(rows)
 
     if not rows:
         print(f"\n{'='*80}")
         print("  Core-Work Classification Accuracy — task-level primary-type match")
         print("  (operational proxy for Pillar 1 RQ #1; see docstring for framing)")
         print(f"{'='*80}")
-        print("  (skipped: no non-pilot JIT-condition rows in evaluation_runs)")
-        return
+        print("  (skipped: no non-pilot JIT-condition rows with generated_artifact_count > 0)")
+        return False  # ext15 #164
 
     # Per-condition accuracy
     from collections import defaultdict
@@ -1204,9 +1254,26 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> None:
             f"  {exp:<11} | {cells} | {row_total:>9}   {row_acc:>7.1f}%"
         )
 
+    # ext15 #181 (2026-04-22): disclosure footer for excluded registry-match rows.
+    if excluded_registry_only > 0:
+        print(
+            f"\n  Note: {excluded_registry_only} row(s) excluded from the "
+            f"classification-accuracy denominator — pure registry-match rows "
+            f"where the classifier didn't run. Chapter 4.5 disclosure: the "
+            f"Pillar 1 RQ #1 proxy is scored over classifier-invoked rows only."
+        )
 
-def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> None:
+    return True  # ext15 #164
+
+
+def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> bool:
     """M5 time-to-first-correct execution per condition (Step 18.9).
+
+    ext16 #177 (2026-04-22): returns ``bool`` — True if at least one JIT
+    condition had a successful run to report on, False when no successful
+    runs exist in scope OR JIT-condition coverage is incomplete. Retrofit
+    to the M2/M3/M4 gate pattern.
+
 
     Per proposal §Evaluation Strategy M5: *"Latency from task input to
     verified correct output, including any JIT generation time."* The
@@ -1294,6 +1361,19 @@ def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> None:
 
     for line in lines:
         print(line)
+
+    # ext16 #177: M5 completeness gate. No successful runs → M5 evidence
+    # is structurally absent → signal missing_metrics up the chain. Also
+    # flag partial per-JIT-condition coverage (one JIT condition with
+    # zero successful runs while others have coverage).
+    if not rows:
+        return False
+    jit_conditions = {"full", "no_verification", "no_optimization"}
+    present_jit = {r[0] for r in rows} & jit_conditions
+    if jit_conditions - present_jit:
+        # At least one JIT condition absent from successful-run set.
+        return False
+    return True
 
 
 def _clopper_pearson_ci(
@@ -1625,6 +1705,60 @@ def main() -> int:
             f"expected {expected_runs}"
         )
 
+    # ext15 #152 (2026-04-22): task-identity check. Row-count passes but
+    # task_id set can be drifted (e.g., T21..T25 after cross-iteration
+    # append, or a manually-modified harness). Assert canonical identity.
+    canonical_task_ids = set(ALL_TASK_IDS)
+    per_cond_observed_tasks = conn.execute(
+        f"SELECT condition, task_id FROM evaluation_runs "
+        f"WHERE is_pilot = FALSE{_SCOPE_SQL} "
+        f"GROUP BY condition, task_id"
+    ).fetchall()
+    observed_by_cond: dict[str, set[str]] = {}
+    for cond, tid in per_cond_observed_tasks:
+        observed_by_cond.setdefault(cond, set()).add(tid)
+    for cond, observed in observed_by_cond.items():
+        extra = observed - canonical_task_ids
+        missing = canonical_task_ids - observed
+        if extra:
+            issues.append(
+                f"condition '{cond}': non-canonical task_ids "
+                f"{sorted(extra)} (ext15 #152)"
+            )
+        if missing:
+            issues.append(
+                f"condition '{cond}': missing canonical task_ids "
+                f"{sorted(missing)} (ext15 #152)"
+            )
+
+    # ext15 #157 (2026-04-22): condition-identity check. Symmetric to
+    # #152 on the condition axis.
+    canonical_conditions = set(CONDITIONS)
+    observed_conditions = set(condition_map)
+    extra_conditions = observed_conditions - canonical_conditions
+    if extra_conditions:
+        issues.append(
+            f"extra non-canonical conditions: {sorted(extra_conditions)} "
+            f"(ext15 #157)"
+        )
+
+    # ext15 #171 (2026-04-22): distinct-run-id cardinality per condition.
+    # Protects Fisher/Holm/CI independence assumptions against pseudo-
+    # replicated data (single run_id per condition with duplicated rows
+    # passing the per-(condition, task_id) uniformity gate).
+    per_cond_distinct_runs = conn.execute(
+        f"SELECT condition, COUNT(DISTINCT run_id) "
+        f"FROM evaluation_runs WHERE is_pilot = FALSE{_SCOPE_SQL} "
+        f"GROUP BY condition"
+    ).fetchall()
+    for cond, n_runs in per_cond_distinct_runs:
+        if n_runs != expected_runs:
+            issues.append(
+                f"condition '{cond}': {n_runs} distinct run_ids, "
+                f"expected {expected_runs} — pseudo-replication risk "
+                f"(ext15 #171)"
+            )
+
     if issues and not args.allow_incomplete:
         print(
             "\nERROR: dataset appears incomplete — refusing to produce Chapter-6 output.\n"
@@ -1647,14 +1781,24 @@ def main() -> int:
         print(f"\nWARNING: proceeding with partial data:{_COMPLETENESS_BANNER}", file=sys.stderr)
 
     # ── Table 1: All tasks ───────────────────────────────────────────────
+    # ext15 #163 (2026-04-22): derive ranges from ALL_TASKS.
+    _all_range = (
+        f"{ALL_TASK_IDS[0]}-{ALL_TASK_IDS[-1]}" if ALL_TASK_IDS else "none"
+    )
+    _synth_range = (
+        f"{SYNTHESIS_TASK_IDS[0]}-{SYNTHESIS_TASK_IDS[-1]}"
+        if SYNTHESIS_TASK_IDS else "none"
+    )
     all_data = query_condition_summary(conn)
-    csv_all = print_condition_table("Table 1: Success Rates — All Tasks (T01-T18)", all_data)
+    csv_all = print_condition_table(
+        f"Table 1: Success Rates — All Tasks ({_all_range})", all_data
+    )
 
-    # ── Table 2: Synthesis tasks only (T04-T13) ──────────────────────────
+    # ── Table 2: Synthesis tasks only ────────────────────────────────────
     task_filter = " OR ".join(f"task_id = '{t}'" for t in SYNTHESIS_TASK_IDS)
     synth_data = query_condition_summary(conn, task_filter)
     csv_synth = print_condition_table(
-        "Table 2: Success Rates — Synthesis Tasks Only (T04-T18)", synth_data
+        f"Table 2: Success Rates — Synthesis Tasks Only ({_synth_range})", synth_data
     )
 
     # ── Table 3: Retrieval tasks only (T01-T03) ─────────────────────────
@@ -1688,12 +1832,15 @@ def main() -> int:
     m4_ok = print_token_cost_summary(conn)
 
     # ── Latency summary ──────────────────────────────────────────────────
-    print_latency_summary(conn)
+    # ext16 #177 (2026-04-22): capture return value for missing_metrics
+    # accumulation (retrofit to the M2/M3/M4 gate pattern).
+    m5_ok = print_latency_summary(conn)
 
     # ── Core-work classification accuracy (Step 18.5) ────────────────────
     # Task-level primary-type match as operational proxy for Pillar 1 RQ #1.
     # See print_classification_accuracy docstring for framing rationale.
-    print_classification_accuracy(conn)
+    # ext15 #164 (2026-04-22): capture return value for missing_metrics.
+    classification_ok = print_classification_accuracy(conn)
 
     # ext13 #126 / #128 / #132 + ext14 #149: accumulate thesis-critical
     # metric absences so we can exit 7 at the bottom rather than silently
@@ -1716,6 +1863,14 @@ def main() -> int:
     # gate (pre-fix behaviour).
     if not m4_ok:
         missing_metrics.append("M4 (Token Cost / Pillar 3 Context Economy)")
+
+    # ext16 #177: M5 latency — fifth instance of the retrofit gap.
+    if not m5_ok:
+        missing_metrics.append("M5 (Latency / Chapter 6 time-to-correct)")
+
+    # ext15 #164: Classification Accuracy retrofitted into the gate family.
+    if not classification_ok:
+        missing_metrics.append("Classification Accuracy / Pillar 1 RQ #1")
 
     conn.close()
 

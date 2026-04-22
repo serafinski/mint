@@ -299,7 +299,12 @@ class EvaluationHarness:
         condition_seeds = [rng.randint(0, 2**31) for _ in range(self._config.n_runs)]
 
         for run_idx, seed in enumerate(condition_seeds):
-            run_id = f"{condition}_{run_idx:02d}_{uuid.uuid4().hex[:6]}"
+            # ext15 #153 (2026-04-22): use full 128-bit entropy; pre-fix
+            # the 6-char truncation carried only 24 bits, giving
+            # birthday-collision reach under --append-chained campaigns
+            # (~0.15% upper bound across 10 campaigns). Full hex makes
+            # structural collision negligible.
+            run_id = f"{condition}_{run_idx:02d}_{uuid.uuid4().hex}"
             logger.info("Starting run %s (%s, seed=%d)", run_id, condition, seed)
             records = self._execute_run(
                 run_id=run_id,
@@ -1026,9 +1031,22 @@ def _extract_result_compositional(
 
     # Step 14.6 — output contract check (orthogonal to validator).
     # Set comparison on the typed contract; never raises.
-    shape_check = task.output_contract.check(
-        final_output, chain_result.output_files,
-    ) if task.output_contract else None
+    #
+    # tmp.md P0 (2026-04-22): only evaluate the contract when the chain
+    # actually reached terminal state. Pre-fix, a crashed chain (AGENT
+    # timeout, sandbox exception, generation_failed) left
+    # ``final_output=None`` but the contract check still ran — naturally
+    # failed against None → ``output_shape_mismatch=True`` →
+    # ``analyze_compression_loss.classify_failure`` priority 2 bucket
+    # (``compression_loss_task``) fired before priorities 3/4/7/8, silently
+    # misclassifying infrastructure/execution failures as Pillar 2 T3
+    # aggressive-compression evidence.
+    if chain_result.chain_success and final_output is not None:
+        shape_check = task.output_contract.check(
+            final_output, chain_result.output_files,
+        ) if task.output_contract else None
+    else:
+        shape_check = None
 
     # Security audit finding #32 (2026-04-20): promote
     # output_shape_mismatch into the failure_reason when the validator
@@ -1355,7 +1373,16 @@ def _extract_result(
     # mapping (file outputs only appear in compositional chains today),
     # so the file-presence check uses an empty dict here. T07/T11 — the
     # only file-producing tasks — go through the compositional path.
-    shape_check = task.output_contract.check(output, {}) if task.output_contract else None
+    #
+    # tmp.md P0 (2026-04-22): only evaluate the contract when execution
+    # reached terminal state with a non-None output. A crashed single
+    # artifact (generation_failed / output is None) must not be evaluated
+    # against the contract — the check would fail against None and
+    # misclassify the row as compression_loss_task downstream.
+    if output is not None:
+        shape_check = task.output_contract.check(output, {}) if task.output_contract else None
+    else:
+        shape_check = None
 
     # ext8 #64 (2026-04-20): promote output_shape_mismatch + flip
     # output_in_range=False on the single-artifact path too (symmetric

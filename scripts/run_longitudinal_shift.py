@@ -192,6 +192,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Total wall-clock budget for the full sequence (default: 12h). "
              "0 disables. ext12 #119.",
     )
+    # ext15 #176 (2026-04-22): freshness guard; symmetric to #175 on the
+    # shift runner. Pre-fix, successive shift invocations silently
+    # accumulated in ``data/eval/longitudinal_shifted.duckdb`` → Row 19
+    # selector stale-fallback risk.
+    parser.add_argument(
+        "--fresh-db", action="store_true",
+        help=(
+            "Refuse to run if --db target already contains rows. "
+            "Use --append to explicitly allow. ext15 #176."
+        ),
+    )
+    parser.add_argument(
+        "--append", action="store_true",
+        help=(
+            "Explicitly allow appending into an existing non-empty DB. "
+            "Default: refuse. ext15 #176."
+        ),
+    )
     args = parser.parse_args(argv)
 
     # --- Validation ---
@@ -199,6 +217,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: --shift-at must satisfy 0 < shift_at < total. "
               f"Got shift_at={args.shift_at}, total={args.total}")
         return 1
+
+    # ext15 #176: freshness guard.
+    db_path = Path(args.db)
+    if db_path.exists() and db_path.stat().st_size > 0 and not args.append:
+        try:
+            import duckdb as _duckdb
+            with _duckdb.connect(str(db_path), read_only=True) as _conn:
+                existing = _conn.execute(
+                    "SELECT COUNT(*) FROM evaluation_runs"
+                ).fetchone()[0]
+        except Exception:  # noqa: BLE001
+            existing = 1
+        if existing > 0:
+            logger.error(
+                "ext15 #176: --db %s already contains %d evaluation_runs rows. "
+                "Refusing to append silently. Pass --append to acknowledge, "
+                "or use a fresh path.",
+                db_path, existing,
+            )
+            return 2
 
     # --- Logging ---
     log_format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
@@ -257,7 +295,8 @@ def main(argv: list[str] | None = None) -> int:
         phase_a_tasks, phase_b_tasks, args.shift_at, args.total, rng,
     )
 
-    run_id = f"longitudinal_shift_{uuid.uuid4().hex[:8]}"
+    # tmp.md P2 (2026-04-22): full uuid4 entropy (symmetric to run_longitudinal.py).
+    run_id = f"longitudinal_shift_{uuid.uuid4().hex}"
     # Security audit finding #87 (2026-04-19, ext9): add a per-invocation
     # timestamp suffix to the LangFuse session_id so two runs with the
     # same ``--seed`` don't pool their traces into one session.
@@ -484,9 +523,17 @@ def main(argv: list[str] | None = None) -> int:
 
             elapsed_ms = int((time.monotonic() - t_start) * 1000)
 
+            # ext17 #188 (2026-04-22): shift runner writes a DISTINCT
+            # condition label (``longitudinal_shift``) from the plain
+            # longitudinal runner. Row-level defense against DB-boundary
+            # slip under #175/#176 no-freshness-guard, ext7 #49 contract
+            # violation, and accidental cross-DB append. Pre-fix,
+            # condition="longitudinal" was identical across both runners.
+            # tmp.md P0 (2026-04-22): thread all _extract_result fields
+            # — see run_longitudinal.py comment for rationale.
             record = EvaluationRecord(
                 run_id=run_id,
-                condition="longitudinal",
+                condition="longitudinal_shift",
                 task_id=task.task_id,
                 task_tier=task.tier,
                 attempt_count=result.get("attempt_count", 0),
@@ -500,6 +547,21 @@ def main(argv: list[str] | None = None) -> int:
                 registry_snapshot_id=snap_id,
                 seed=args.seed,
                 is_pilot=False,
+                required_capability_count=result.get("required_capability_count", 0),
+                matched_in_registry_count=result.get("matched_in_registry_count", 0),
+                chain_length=result.get("chain_length", 1),
+                chain_success=result.get("chain_success", False),
+                matched_and_executed_count=result.get("matched_and_executed_count", 0),
+                generated_artifact_count=result.get("generated_artifact_count", 0),
+                capability_types=result.get("capability_types", []),
+                failed_step_index=result.get("failed_step_index"),
+                failed_step_name=result.get("failed_step_name"),
+                failed_step_reason=result.get("failed_step_reason"),
+                output_shape_mismatch=result.get("output_shape_mismatch", False),
+                output_shape_missing_keys=result.get("output_shape_missing_keys", []),
+                output_shape_missing_files=result.get("output_shape_missing_files", []),
+                generated_artifact_sources=result.get("generated_artifact_sources", []),
+                langfuse_trace_id=result.get("langfuse_trace_id"),
             )
 
             eval_store.record_run(record)
@@ -516,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
                 metrics_store=metrics_store,
                 registry=registry,
                 run_id=run_id,
-                condition="longitudinal",
+                condition="longitudinal_shift",
                 task_id=task.task_id,
                 task_events_cutoff=task_events_cutoff,
                 is_pilot=False,  # ext7 #50 — longitudinal is always non-pilot
@@ -554,7 +616,7 @@ def main(argv: list[str] | None = None) -> int:
                     try:
                         eval_store.record_cycle_events(
                             run_id=run_id,
-                            condition="longitudinal",
+                            condition="longitudinal_shift",
                             task_id=task.task_id,  # the LAST Phase A task
                             events=[{
                                 "capability_id": "__system__",

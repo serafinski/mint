@@ -274,19 +274,31 @@ class EvaluationStore:
         )
         return row_id
 
-    def update_human_label(self, row_id: str, label: str | None) -> bool:
+    def update_human_label(
+        self,
+        row_id: str,
+        label: str | None,
+        *,
+        allow_overwrite: bool = False,
+    ) -> bool:
         """Set ``human_label`` on one evaluation_runs row. Step 18.10.
 
-        Returns True if a row was updated, False if ``row_id`` did not exist.
-        Label must be one of ``HumanLabel`` enum values (correct /
-        contaminated / partial) or None to clear. Idempotent — re-labeling
-        the same row with the same value is a no-op from the caller's
-        perspective.
+        Returns True iff the row existed AND was either unlabeled or
+        ``allow_overwrite=True``. Returns False when the row is missing
+        OR when another audit session already labeled it (optimistic
+        concurrency check).
+
+        tmp.md P1 (2026-04-22): pre-fix, the UPDATE ran unconditionally
+        (``WHERE id = ?``), letting two concurrent audit sessions
+        last-write-wins the same row. Now the UPDATE is guarded by
+        ``AND human_label IS NULL`` by default, and the caller can
+        detect the conflict from the False return. ``allow_overwrite``
+        keeps the ability to clear / relabel when explicitly invoked
+        (e.g., fixing a mislabel).
 
         Raises ``ValueError`` if ``label`` is not a known HumanLabel
-        value and not None; this catches typos in the audit tool before
-        a bad value hits the DB (the column is VARCHAR and would accept
-        anything otherwise).
+        value and not None; this catches typos before a bad value hits
+        the DB (the column is VARCHAR and would accept anything).
         """
         valid = {"correct", "contaminated", "partial", None}
         if label not in valid:
@@ -294,17 +306,33 @@ class EvaluationStore:
                 f"label must be one of {sorted(v for v in valid if v)} "
                 f"or None; got {label!r}"
             )
-        cursor = self._conn.execute(
-            "UPDATE evaluation_runs SET human_label = ? WHERE id = ?",
-            [label, row_id],
-        )
-        # DuckDB's execute returns the connection, not an affected-rows
-        # count. We check whether the row existed by doing a SELECT after.
+        # Check existence first.
         existed = self._conn.execute(
-            "SELECT 1 FROM evaluation_runs WHERE id = ? LIMIT 1",
+            "SELECT human_label FROM evaluation_runs WHERE id = ? LIMIT 1",
             [row_id],
         ).fetchone()
-        return existed is not None
+        if existed is None:
+            return False
+        prior_label = existed[0]
+        if (
+            prior_label is not None
+            and label is not None
+            and not allow_overwrite
+        ):
+            # Optimistic concurrency: another session already labeled.
+            return False
+        if allow_overwrite:
+            self._conn.execute(
+                "UPDATE evaluation_runs SET human_label = ? WHERE id = ?",
+                [label, row_id],
+            )
+        else:
+            self._conn.execute(
+                "UPDATE evaluation_runs SET human_label = ? "
+                "WHERE id = ? AND (human_label IS NULL OR ? IS NULL)",
+                [label, row_id, label],
+            )
+        return True
 
     def record_invocation_events(
         self,

@@ -49,10 +49,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -149,6 +152,11 @@ def fetch_unlabeled_rows(
         where_parts.append("timestamp >= ?")
         params.append(since)
     where = "WHERE " + " AND ".join(where_parts)
+    # tmp.md P1 (2026-04-22): narrow the except to the schema-absence
+    # case (CatalogException / BinderException from DuckDB for a missing
+    # column). Transient SQL / runtime faults previously silently
+    # downgraded to legacy mode, changing audit data semantics. Non-
+    # schema errors must propagate.
     try:
         rows = conn.execute(
             f"""
@@ -160,7 +168,13 @@ def fetch_unlabeled_rows(
             params,
         ).fetchall()
         has_snapshot_col = True
-    except Exception:  # noqa: BLE001 — column missing on legacy DB
+    except (duckdb.CatalogException, duckdb.BinderException) as exc:
+        logger.info(
+            "audit_contamination: generated_artifact_sources column "
+            "missing on this DB (%s) — falling back to legacy audit shape. "
+            "tmp.md P1.",
+            exc.__class__.__name__,
+        )
         rows = conn.execute(
             f"""
             SELECT id, run_id, condition, task_id, capability_type
@@ -328,14 +342,23 @@ def get_or_create_sample_plan(
         try:
             plan_ids = json.loads(plan_path.read_text())
         except (OSError, ValueError) as exc:
+            # tmp.md P1 (2026-04-22): unreadable plan file is a LOUD
+            # failure, not a silent redraw. A corrupted plan means the
+            # pre-committed sample is lost; redrawing violates the M2
+            # CI assumption that the sample was chosen once before
+            # labeling. Force the operator to resolve: either repair
+            # the plan file, pass --force-fresh-plan explicitly, or
+            # delete the plan and accept a fresh draw.
             print(
-                f"WARNING: sample plan at {plan_path} unreadable "
-                f"({exc}) — falling back to fresh draw. M2 CI assumption "
-                "may be violated across this resume.",
+                f"ERROR: sample plan at {plan_path} unreadable ({exc}). "
+                f"Refusing to silently redraw — that would violate the M2 "
+                f"CI assumption. Options: (a) repair the file; "
+                f"(b) pass --force-fresh-plan to discard intentionally; "
+                f"(c) delete the file manually. Exit 9. tmp.md P1.",
                 file=sys.stderr,
             )
-            plan_ids = None
-        if plan_ids is not None:
+            raise SystemExit(9)
+        if True:
             # Filter to rows still unlabeled (rows currently in the pool).
             resumed = [id_to_row[rid] for rid in plan_ids if rid in id_to_row]
             # ext12 #121: zero-intersection → loud fail. Even with the
@@ -400,11 +423,17 @@ def resolve_capability_name(
     that matches the run's (run_id, task_id, capability_type). The
     registry can then be queried by that name.
     """
+    # tmp.md P1 (2026-04-22): ORDER BY occurred_at so multi-invocation
+    # chains (two SKILL invocations in the same (run, task)) resolve
+    # deterministically to the EARLIEST invocation's capability. Pre-fix,
+    # ``LIMIT 1`` with no ORDER BY gave non-deterministic results, and
+    # the human auditor could review the wrong source artifact.
     result = conn.execute(
         """
         SELECT capability_id
         FROM invocation_events
         WHERE run_id = ? AND task_id = ? AND capability_type = ?
+        ORDER BY occurred_at ASC, capability_id ASC
         LIMIT 1
         """,
         [row.run_id, row.task_id, row.capability_type],
@@ -672,32 +701,49 @@ def run_audit(
             return 0
 
         if not sample:
-            # ext14 #143 (2026-04-21): distinguish "all already labeled" (a
-            # legitimate resume state) from "filter matched zero rows" (a
-            # misconfiguration). When --run-ids is scoped, check whether
-            # the scope contains any rows at all. Zero in-scope rows →
-            # exit 3 (filter wrong); non-zero in-scope rows → exit 0
-            # (genuinely all labeled).
+            # ext14 #143 (2026-04-21) + ext15 #158 + tmp.md P1 (2026-04-22):
+            # distinguish "all already labeled" (legitimate resume state)
+            # from "filter matched zero rows" (misconfiguration) across
+            # ALL active filters, not just ``run_ids``.
+            # Build the same filter clause the main pool query uses so
+            # a typo'd --conditions / --types / --since is caught rather
+            # than false-green.
+            ext15_filter_clauses: list[str] = ["NOT is_pilot"]
+            ext15_filter_params: list[object] = []
             if run_ids:
-                total_in_scope = store._conn.execute(  # noqa: SLF001
-                    "SELECT COUNT(*) FROM evaluation_runs "
-                    "WHERE run_id IN ({}) AND NOT is_pilot".format(
-                        ", ".join("?" * len(run_ids))
-                    ),
-                    run_ids,
-                ).fetchone()[0]
-                if total_in_scope == 0:
-                    print(
-                        f"\nERROR: --run-ids {run_ids} matched zero rows in "
-                        f"DB. Filter dropped everything — verify spelling / "
-                        f"scope. ext14 #143. Exit 3.",
-                        file=sys.stderr,
-                    )
-                    return 3
+                ext15_filter_clauses.append(
+                    "run_id IN ({})".format(", ".join("?" * len(run_ids)))
+                )
+                ext15_filter_params.extend(run_ids)
+            if conditions:
+                ext15_filter_clauses.append(
+                    "condition IN ({})".format(", ".join("?" * len(conditions)))
+                )
+                ext15_filter_params.extend(conditions)
+            if types:
+                ext15_filter_clauses.append(
+                    "capability_type IN ({})".format(", ".join("?" * len(types)))
+                )
+                ext15_filter_params.extend(types)
+            if since is not None:
+                ext15_filter_clauses.append("timestamp >= ?")
+                ext15_filter_params.append(since)
+            full_filter_sql = " AND ".join(ext15_filter_clauses)
+            total_in_scope = store._conn.execute(  # noqa: SLF001
+                f"SELECT COUNT(*) FROM evaluation_runs WHERE {full_filter_sql}",
+                ext15_filter_params,
+            ).fetchone()[0]
+            if total_in_scope == 0:
                 print(
-                    "\nNothing to audit — all in-scope rows already labeled.")
-                return 0
-            print("\nNothing to audit — all strata empty or already labeled.")
+                    f"\nERROR: filters matched ZERO rows in DB "
+                    f"(run_ids={run_ids}, conditions={conditions}, "
+                    f"types={types}, since={since}). Verify spelling / "
+                    f"scope. ext15 #158 + tmp.md P1. Exit 3.",
+                    file=sys.stderr,
+                )
+                return 3
+            print(
+                "\nNothing to audit — all in-scope rows already labeled.")
             return 0
 
         print(f"\n{_KEYPRESS_HELP}\n")
@@ -766,12 +812,31 @@ def run_audit(
 
             choice = _prompt_label()
             if choice == "quit":
+                # tmp.md P0 (2026-04-22): exit non-zero on early quit so
+                # orchestrators distinguish "audit complete" from "user
+                # aborted mid-session". Pre-fix, quit returned 0 → any
+                # partial-labeling state was treated as successful
+                # completion by Row 17's consumers.
                 print(f"\nQuitting. Progress saved. Summary so far: {counts}")
-                return 0
+                return 8
             if choice == "skip":
                 counts["skip"] += 1
                 continue
-            store.update_human_label(row.row_id, choice)
+            # tmp.md P1/P2 (2026-04-22): check write-success + detect
+            # concurrent-audit race. ``update_human_label`` returns True
+            # only if the row was both present AND had human_label NULL
+            # at write time (optimistic concurrency check added in
+            # evaluation_store.py). A False return means another auditor
+            # already labeled the same row — log, skip, count.
+            ok = store.update_human_label(row.row_id, choice)
+            if not ok:
+                print(
+                    f"  ⚠ write rejected (row already labeled by concurrent "
+                    f"audit or missing) — not counted."
+                )
+                counts.setdefault("write_conflict", 0)
+                counts["write_conflict"] += 1
+                continue
             counts[choice] += 1
             print(f"  → labeled: {choice}")
 
@@ -817,6 +882,23 @@ def run_audit(
                 file=sys.stderr,
             )
             return 3
+
+        # tmp.md P1 (2026-04-22): loud-fail when the labeled/unlabeled
+        # ratio is below a completeness threshold. Pre-fix, partial
+        # coverage (some rows labeled, many rows user-/auto-skipped)
+        # passed the ``total_labeled > 0`` gate and exited 0 → downstream
+        # M2 compute proceeded on an incomplete sample.
+        labeled_ratio = total_labeled / len(sample) if sample else 0.0
+        if labeled_ratio < 0.5:
+            print(
+                f"\nERROR: partial coverage — only {total_labeled}/{len(sample)} "
+                f"({labeled_ratio:.1%}) sampled rows got a correct/contaminated/partial "
+                f"label; the rest were skipped (user) or auto-skipped. Pass "
+                f"--allow-partial-coverage to override. tmp.md P1. Exit 7.",
+                file=sys.stderr,
+            )
+            if not getattr(args, "allow_partial_coverage", False):
+                return 7
         return 0
     finally:
         store.close()
@@ -858,6 +940,13 @@ def main() -> int:
     parser.add_argument(
         "--since", default=None,
         help="Include only rows with timestamp >= SINCE.",
+    )
+    # tmp.md P1 (2026-04-22): allow override of the new 50% labeled-ratio
+    # completeness gate.
+    parser.add_argument(
+        "--allow-partial-coverage", action="store_true",
+        help="tmp.md P1: proceed when fewer than 50%% of sampled rows "
+             "were labeled. Default: refuse with exit 7.",
     )
     # ext12 #121 (2026-04-21): escape hatch when the user has changed the
     # audit scope in a way the plan-file scope hash may not capture

@@ -73,6 +73,8 @@ def fetch_all_generations(
     end: datetime,
     *,
     max_pages: int = 500,
+    environment: str | None = "default",
+    session_ids: list[str] | None = None,
 ) -> tuple[list[dict], bool]:
     """Fetch all GENERATION observations within the time window via REST API.
 
@@ -96,18 +98,21 @@ def fetch_all_generations(
     page = 1
     with httpx.Client(base_url=base_url, auth=auth, timeout=30.0) as client:
         while True:
+            # ext15 #170 (2026-04-22): add environment filter. Runner
+            # emits on environment="default"; dev scripts typically on
+            # "test". Foreign traces would otherwise silently inflate M4.
+            params: dict[str, object] = {
+                "type": "GENERATION",
+                "limit": 100,
+                "page": page,
+                "fromStartTime": start.isoformat(),
+                "toStartTime": end.isoformat(),
+            }
+            if environment:
+                params["environment"] = environment
             resp = client.get(
                 "/api/public/observations",
-                params={
-                    "type": "GENERATION",
-                    "limit": 100,
-                    "page": page,
-                    # ext14 #141: server-side time scoping — reduces false-
-                    # positive truncation by whatever fraction of the haystack
-                    # is out-of-window.
-                    "fromStartTime": start.isoformat(),
-                    "toStartTime": end.isoformat(),
-                },
+                params=params,
             )
             resp.raise_for_status()
             data = resp.json().get("data", [])
@@ -117,17 +122,31 @@ def fetch_all_generations(
             for obs in data:
                 ts = _parse_dt(obs.get("startTime"))
                 if ts and start <= ts <= end:
+                    # ext15 #170: post-fetch session whitelist (defensive —
+                    # server-side environment filter is the primary defense).
+                    if session_ids is not None and obs.get("sessionId") not in session_ids:
+                        continue
                     usage = obs.get("usage") or {}
+                    # tmp.md P0 (2026-04-22): token extraction must NOT
+                    # trust usage.total alone. Some providers emit
+                    # input+output but omit total; pre-fix those generations
+                    # landed as zero-token rows, silently undercounting M4.
+                    prompt_tokens = int(usage.get("input", 0) or 0)
+                    completion_tokens = int(usage.get("output", 0) or 0)
+                    total_tokens = int(usage.get("total", 0) or 0)
+                    if total_tokens == 0 and (prompt_tokens + completion_tokens) > 0:
+                        total_tokens = prompt_tokens + completion_tokens
                     generations.append({
                         "id": obs.get("id", ""),
                         "trace_id": obs.get("traceId", ""),
+                        "session_id": obs.get("sessionId", ""),
                         "name": obs.get("name", ""),
                         "model": obs.get("model", ""),
                         "start_time": ts,
                         "end_time": _parse_dt(obs.get("endTime")),
-                        "prompt_tokens": usage.get("input", 0) or 0,
-                        "completion_tokens": usage.get("output", 0) or 0,
-                        "total_tokens": usage.get("total", 0) or 0,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens,
                         "calculated_total_cost": obs.get("calculatedTotalCost", 0.0) or 0.0,
                         "usage_details": obs.get("usageDetails") or {},
                     })
@@ -150,32 +169,54 @@ def fetch_all_generations(
 # ── Evaluation DB queries ────────────────────────────────────────────────────
 
 
-def get_run_windows(conn: duckdb.DuckDBPyConnection) -> list[dict]:
+def get_run_windows(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    run_ids: list[str] | None = None,
+    since: str | None = None,
+) -> list[dict]:
     """Get per-run_id time windows from the evaluation DB.
 
     ext8 #58 Bug B (2026-04-20): also fetches the set of distinct task_ids
     actually present in each run. ``n_jit_tasks`` needs the real set, not
     blind ``n_distinct_tasks - 3`` (which collapses partial runs without
     the 3 retrieval tasks to 0).
+
+    ext15 #167 (2026-04-22): accepts ``run_ids`` and ``since`` to honor
+    the run-sheet contract that Row 11 scope by campaign run_ids. Pre-fix,
+    the script had no accepting parameter for scope — default-workflow
+    was structurally unsatisfiable under ``--append`` DBs.
     """
+    clauses = ["is_pilot = FALSE"]
+    params: list[object] = []
+    if run_ids:
+        clauses.append(
+            "run_id IN ({})".format(", ".join("?" * len(run_ids)))
+        )
+        params.extend(run_ids)
+    if since is not None:
+        clauses.append("timestamp >= ?")
+        params.append(since)
+    where = " AND ".join(clauses)
     rows = conn.execute(
-        """
+        f"""
         SELECT run_id, condition,
                MIN(timestamp) AS start_ts,
                MAX(timestamp) AS end_ts,
                COUNT(*) AS n_tasks,
                COUNT(DISTINCT task_id) AS n_distinct_tasks
         FROM evaluation_runs
-        WHERE is_pilot = FALSE
+        WHERE {where}
         GROUP BY run_id, condition
         ORDER BY MIN(timestamp)
-        """
+        """,
+        params,
     ).fetchall()
 
     # ext8 #58 Bug B: per-run task_id sets (one query, then bucket by run_id).
     task_rows = conn.execute(
-        "SELECT DISTINCT run_id, task_id FROM evaluation_runs "
-        "WHERE is_pilot = FALSE"
+        f"SELECT DISTINCT run_id, task_id FROM evaluation_runs WHERE {where}",
+        params,
     ).fetchall()
     actual_task_ids_by_run: dict[str, set[str]] = {}
     for rid, tid in task_rows:
@@ -195,15 +236,34 @@ def get_run_windows(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     ]
 
 
-def get_per_record_info(conn: duckdb.DuckDBPyConnection) -> list[dict]:
-    """Get all non-pilot records for backfill."""
+def get_per_record_info(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    run_ids: list[str] | None = None,
+    since: str | None = None,
+) -> list[dict]:
+    """Get all non-pilot records for backfill.
+
+    ext15 #167 (2026-04-22): honors ``--run-ids`` / ``--since`` scope.
+    """
+    clauses = ["is_pilot = FALSE"]
+    params: list[object] = []
+    if run_ids:
+        clauses.append(
+            "run_id IN ({})".format(", ".join("?" * len(run_ids)))
+        )
+        params.extend(run_ids)
+    if since is not None:
+        clauses.append("timestamp >= ?")
+        params.append(since)
     rows = conn.execute(
-        """
+        f"""
         SELECT id, run_id, condition, task_id, token_cost, timestamp
         FROM evaluation_runs
-        WHERE is_pilot = FALSE
+        WHERE {" AND ".join(clauses)}
         ORDER BY timestamp
-        """
+        """,
+        params,
     ).fetchall()
     return [
         {
@@ -222,13 +282,22 @@ def get_per_record_info(conn: duckdb.DuckDBPyConnection) -> list[dict]:
 
 
 def map_generations_to_runs(
-    generations: list[dict], run_windows: list[dict]
+    generations: list[dict], run_windows: list[dict],
+    *,
+    buffer_seconds: int = 1800,
 ) -> tuple[dict[str, list[dict]], int]:
     """Map each generation to the best-matching run_id.
 
     Strategy: for each generation, find the run window that contains it
     (with a small buffer). When multiple windows overlap, pick the one
     whose midpoint is closest to the generation timestamp.
+
+    tmp.md P0 (2026-04-22): ``buffer_seconds`` default widened from 120
+    to 1800 (30 min). EvaluationRecord.timestamp is set at task-END time,
+    so early generations of a long first task (AGENT tasks can take 10+
+    minutes on first attempt) were dropped as unmatched under the old
+    buffer. Overlap-guard clipping (finding #105 below) still applies
+    between adjacent runs, so the wider buffer can't reintroduce overlap.
     """
     run_to_gens: dict[str, list[dict]] = defaultdict(list)
     unmatched = 0
@@ -237,21 +306,12 @@ def map_generations_to_runs(
     sorted_rws = sorted(run_windows, key=lambda rw: rw["start_ts"])
 
     # Security audit finding #105 (2026-04-19, ext10): pre-fix every
-    # run got an unconditional ±120s buffer, so two runs started
-    # within 4 minutes of each other had OVERLAPPING buffer windows.
-    # Generations in the overlap zone matched both runs; the first-
-    # match-wins attribution depended on iteration order rather than
-    # truth. Clip each run's buffer by the adjacent run's
-    # end/start (with a 30s no-man's-land between adjacent runs) so
-    # boundary-zone generations are unambiguously attributed to the
-    # closest run by midpoint distance — exactly the policy the
-    # tie-break below documents but couldn't enforce when boundaries
-    # overlapped. The 30s gap is half the upper-bound clock skew
-    # the buffer was originally meant to absorb (60s of LangFuse-vs-
-    # harness drift split symmetrically between adjacent runs).
+    # run got an unconditional buffer, so two runs started within its
+    # span had OVERLAPPING buffer windows. Clip each run's buffer by
+    # adjacent run boundaries (with a 30s no-man's-land between).
     NON_STATIC_RWS = [rw for rw in sorted_rws if rw["condition"] != "static"]
     OVERLAP_GUARD = timedelta(seconds=30)
-    BUFFER = timedelta(seconds=120)
+    BUFFER = timedelta(seconds=buffer_seconds)
     clipped_buffers: dict[str, tuple] = {}
     for i, rw in enumerate(NON_STATIC_RWS):
         lo = rw["start_ts"] - BUFFER
@@ -575,7 +635,14 @@ def fetch_observations_for_trace(
 
             for obs in data:
                 usage = obs.get("usage") or {}
-                total_tokens += usage.get("total", 0) or 0
+                # tmp.md P0 (2026-04-22): total may be missing even when
+                # input+output are present. Fall back to input+output.
+                obs_total = int(usage.get("total", 0) or 0)
+                if obs_total == 0:
+                    obs_total = int(usage.get("input", 0) or 0) + int(
+                        usage.get("output", 0) or 0
+                    )
+                total_tokens += obs_total
 
             if len(data) < 100:
                 break
@@ -702,15 +769,26 @@ def compute_per_task_costs(
 
         # ext8 #58 Bug A (2026-04-20): zero retrieval tasks regardless of
         # whether this run is tagged or falls through to the untagged
-        # fallback. Pre-fix the fallback at line 575 skipped the
-        # retrieval-zero check that ``compute_backfill_values`` applies,
-        # inflating T01/T02/T03 cost with a share of JIT tokens those
-        # tasks never incurred.
+        # fallback, UNLESS LangFuse actually shows non-zero tokens for
+        # them (via per-task tags). Pre-fix the fallback at line 575
+        # skipped the retrieval-zero check that ``compute_backfill_values``
+        # applies, inflating T01/T02/T03 cost with a share of JIT tokens.
+        #
+        # tmp.md P1 (2026-04-22): retrieval tasks CAN incur real
+        # generation tokens (classifier invocation on cache hits, etc.).
+        # If per-task tagging found real tokens for this (run, retrieval
+        # task), respect the measured value rather than forcing zero.
         if (
-            rec["condition"] != "longitudinal"
+            rec["condition"] not in ("longitudinal", "longitudinal_shift")
             and rec["task_id"] in RETRIEVAL_TASKS
         ):
-            updates.append((rec["id"], 0))
+            rid = rec["run_id"]
+            measured = run_task_tokens.get((rid, rec["task_id"]), 0) if rid in tagged_run_ids else 0
+            if measured > 0:
+                n_cycles = cycle_counts.get((rid, rec["task_id"]), 1) or 1
+                updates.append((rec["id"], measured // n_cycles))
+            else:
+                updates.append((rec["id"], 0))
             continue
 
         rid = rec["run_id"]
@@ -813,6 +891,45 @@ def main() -> int:
              "ceiling was hit. Default: refuse with exit 5. Chapter 4.5 "
              "disclosure REQUIRED.",
     )
+    # ext15 #167 (2026-04-22): scope flags to honor the run-sheet contract.
+    parser.add_argument(
+        "--run-ids", nargs="+",
+        help="ext15 #167: scope backfill to specific campaign run_ids. "
+             "Required for --append DBs to avoid fetching foreign windows.",
+    )
+    parser.add_argument(
+        "--since",
+        help="ext15 #167: scope to runs with timestamp >= ISO8601 value.",
+    )
+    # ext15 #165 (2026-04-22): unmatched-rate gate.
+    parser.add_argument(
+        "--allow-unmatched", action="store_true",
+        help="ext15 #165: proceed when a non-trivial fraction of LangFuse "
+             "generations match no run window (biases M4 downward). "
+             "Default: refuse with exit 4.",
+    )
+    parser.add_argument(
+        "--allow-unmatched-fraction", type=float, default=0.25,
+        help="ext15 #165: threshold for unmatched-generation fraction "
+             "(default 0.25 = 25%%). Set lower for stricter gating.",
+    )
+    # ext15 #170 (2026-04-22): environment filter.
+    parser.add_argument(
+        "--environment", default="default",
+        help="ext15 #170: LangFuse environment filter (default: 'default'). "
+             "Set to '' to disable. Prevents foreign dev-script traces "
+             "(environment='test') from inflating M4.",
+    )
+    # tmp.md P0 (2026-04-22): widen run window. Pre-fix, a single run window
+    # buffer was ±120s. Long first tasks can emit generations more than 120s
+    # before the first EvaluationRecord.timestamp (which is task-end).
+    parser.add_argument(
+        "--run-window-buffer-seconds", type=int, default=1800,
+        help="tmp.md P0: seconds of buffer on each side of the [MIN(timestamp), "
+             "MAX(timestamp)] window when matching generations to runs. "
+             "Default raised from 120 to 1800s so early generations of a "
+             "long first task are not dropped.",
+    )
     args = parser.parse_args()
 
     print("Connecting to LangFuse REST API...")
@@ -832,20 +949,39 @@ def main() -> int:
 
     # Get evaluation time window from DuckDB
     conn = duckdb.connect(args.db, read_only=not args.write)
-    run_windows = get_run_windows(conn)
+    run_windows = get_run_windows(conn, run_ids=args.run_ids, since=args.since)
     if not run_windows:
-        print("No evaluation runs found in DB.")
+        # tmp.md P1 (2026-04-22): empty run set was previously an exit-0
+        # path, allowing Row 11 to claim success without writing anything.
+        # That left stale/missing token_cost values for Chapter 6 M4 while
+        # the orchestrator thought the script ran cleanly. Exit 6 now.
+        print(
+            "ERROR: No evaluation runs found in DB (possibly wrong --db "
+            "path, scope filter that matched nothing, or eval not yet "
+            "populated). Exit 6. tmp.md P1.",
+            file=sys.stderr,
+        )
         conn.close()
-        return 0
+        return 6
 
-    start = min(rw["start_ts"] for rw in run_windows) - timedelta(minutes=5)
-    end = max(rw["end_ts"] for rw in run_windows) + timedelta(minutes=5)
+    # tmp.md P0 (2026-04-22): widen the outer fetch window as well. A
+    # 30-minute buffer on the outside is proportional to the widened
+    # per-run buffer and tolerates LangFuse clock skew.
+    start = min(rw["start_ts"] for rw in run_windows) - timedelta(minutes=30)
+    end = max(rw["end_ts"] for rw in run_windows) + timedelta(minutes=30)
     print(f"  Evaluation window: {start} → {end}")
 
     # Fetch LangFuse data
     print("Fetching GENERATION observations from LangFuse...")
+    # ext15 #170: pass environment + campaign run_ids as session whitelist
+    # (harness emits session_id=run_id).
+    session_whitelist = args.run_ids if args.run_ids else None
+    environment_filter = args.environment or None
     generations, truncated = fetch_all_generations(
-        base_url, auth, start, end, max_pages=args.max_pages,
+        base_url, auth, start, end,
+        max_pages=args.max_pages,
+        environment=environment_filter,
+        session_ids=session_whitelist,
     )
     print(f"  Found {len(generations)} generations in evaluation window.")
 
@@ -904,8 +1040,32 @@ def main() -> int:
 
     # Map generations to runs
     print("Mapping generations to evaluation runs...")
-    run_to_gens, unmatched = map_generations_to_runs(generations, run_windows)
+    run_to_gens, unmatched = map_generations_to_runs(
+        generations, run_windows,
+        buffer_seconds=args.run_window_buffer_seconds,
+    )
     print(f"  Mapped to {len(run_to_gens)} runs, {unmatched} unmatched generations.")
+
+    # ext15 #165 (2026-04-22): unmatched-fraction gate. Pre-fix, high
+    # unmatched counts were logged but never gated — foreign / out-of-window
+    # generations silently biased M4 (they never landed in any run, so
+    # their tokens were discarded from per-run totals).
+    n_total_gens = len(generations)
+    unmatched_rate = unmatched / n_total_gens if n_total_gens else 0.0
+    if unmatched_rate > args.allow_unmatched_fraction:
+        msg = (
+            f"\nERROR: {unmatched}/{n_total_gens} generations ({unmatched_rate:.1%}) "
+            f"did not match any run window (threshold "
+            f"{args.allow_unmatched_fraction:.1%}). This biases M4 downward. "
+            f"Causes: (a) windows too narrow; (b) foreign traces in window; "
+            f"(c) ext15 #170 environment filter needed. Pass --allow-unmatched "
+            f"to proceed with disclosure. ext15 #165. Exit 4."
+        )
+        print(msg, file=sys.stderr)
+        if not args.allow_unmatched:
+            conn.close()
+            return 4
+        print("  --allow-unmatched passed: proceeding.", file=sys.stderr)
 
     # Compute per-run costs
     run_summaries = compute_run_costs(run_to_gens, run_windows)
@@ -972,7 +1132,7 @@ def main() -> int:
         )
 
     # Compute backfill values — try per-task attribution first, then run-level
-    records = get_per_record_info(conn)
+    records = get_per_record_info(conn, run_ids=args.run_ids, since=args.since)
 
     # ext13 #130: quantitative coverage gate — per-run generations-per-
     # JIT-record ratio. ext12 #122's binary zero-vs-nonzero gate lets a
@@ -1120,11 +1280,26 @@ def main() -> int:
         # Need a read-write connection
         conn.close()
         conn = duckdb.connect(args.db)
-        for record_id, token_cost in updates:
-            conn.execute(
-                "UPDATE evaluation_runs SET token_cost = ? WHERE id = ?",
-                [token_cost, record_id],
+        # tmp.md P1 (2026-04-22): wrap in an explicit transaction so a
+        # crash mid-loop doesn't leave mixed old/new token_cost values
+        # in the same campaign. Pre-fix each UPDATE auto-committed.
+        try:
+            conn.execute("BEGIN TRANSACTION")
+            for record_id, token_cost in updates:
+                conn.execute(
+                    "UPDATE evaluation_runs SET token_cost = ? WHERE id = ?",
+                    [token_cost, record_id],
+                )
+            conn.execute("COMMIT")
+        except Exception as exc:  # noqa: BLE001
+            conn.execute("ROLLBACK")
+            conn.close()
+            print(
+                f"\nERROR: write loop failed mid-batch: {exc}. "
+                f"All updates rolled back. tmp.md P1.",
+                file=sys.stderr,
             )
+            return 1
         conn.close()
         print(f"  Updated {len(updates)} records.")
     else:

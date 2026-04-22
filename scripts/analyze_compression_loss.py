@@ -55,7 +55,7 @@ import csv
 import json
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -97,6 +97,15 @@ class FailureRow:
     gate_passed: bool
     chain_success: bool
     failure_reason: str  # enum value — "chain_step_failed" / "output_rejected" / ...
+    # ext16 #182 (2026-04-22): file-only contract violations were dropped
+    # from the compression_loss_task bucket because the classifier
+    # required ``output_shape_missing_keys`` truthy; a task with
+    # ``required_files=["out.csv"]`` and ``required_keys=[]`` that
+    # satisfies the keys but drops the writer step had non-empty
+    # ``output_shape_missing_files`` but empty ``output_shape_missing_keys``.
+    # Kept with a default so pre-existing callers/tests that don't pass
+    # the field continue to work (field added 2026-04-22).
+    output_shape_missing_files: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -112,12 +121,42 @@ def classify_failure(row: FailureRow) -> str:
     violation (class 1). Similarly, task-boundary compression loss (class
     2) takes precedence over the generic chain-step failure enum (class 8).
     """
+    # tmp.md P0 (2026-04-22): crashed runs (chain_success=False AND an
+    # infrastructure/execution failure reason) must route to their
+    # taxonomy-correct bucket before the priority-2 compression-loss
+    # bucket catches them. Pre-fix, the harness evaluated the
+    # output contract against None on crashed runs and set
+    # output_shape_mismatch=True — this then matched bucket 2 before
+    # buckets 3/4/7/8 could see the crash.
+    _INFRA_FAILURE_REASONS = {
+        "agent_execution_timeout",
+        "agent_execution_error",
+        "generation_failed",
+        "watchdog_abort",
+    }
+    if (
+        not row.chain_success
+        and row.failure_reason in _INFRA_FAILURE_REASONS
+    ):
+        # Route to the specific bucket below; fall through via explicit checks.
+        if row.failure_reason == "agent_execution_timeout":
+            return "agent_execution_timeout"
+        if row.failure_reason == "agent_execution_error":
+            return "agent_execution_error"
+        if row.failure_reason == "generation_failed":
+            return "generation_failed"
+        # watchdog_abort isn't in _ALL_CATEGORIES today; fall to "other".
+        return "other"
+
     # 1. Subtask-level schema violation (the T3 signal)
     if row.failed_step_reason and _SCHEMA_VIOLATION_MARKER in row.failed_step_reason:
         return "compression_loss_subtask"
 
     # 2. Task-boundary contract violation (Step 14.6)
-    if row.output_shape_mismatch and row.output_shape_missing_keys:
+    # ext16 #182 (2026-04-22): file-only violations are also compression_loss_task.
+    if row.output_shape_mismatch and (
+        row.output_shape_missing_keys or row.output_shape_missing_files
+    ):
         return "compression_loss_task"
 
     # 3-4. AGENT-specific sticky-meta reasons
@@ -238,29 +277,64 @@ def load_failures(
         clauses.append("timestamp >= ?")
         params.append(since)
     where = " AND ".join(clauses)
-    rows = conn.execute(
-        f"""
-        SELECT condition, capability_type, failed_step_reason,
-               output_shape_mismatch, output_shape_missing_keys,
-               output_in_range, gate_passed, chain_success, failure_reason
-        FROM evaluation_runs
-        WHERE {where}
-        """,
-        params,
-    ).fetchall()
+    # ext16 #182: also read output_shape_missing_files. Older DBs may
+    # not have the column populated — we fall back to [] on decode error.
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT condition, capability_type, failed_step_reason,
+                   output_shape_mismatch, output_shape_missing_keys,
+                   output_shape_missing_files,
+                   output_in_range, gate_passed, chain_success, failure_reason
+            FROM evaluation_runs
+            WHERE {where}
+            """,
+            params,
+        ).fetchall()
+        has_files_column = True
+    except duckdb.Error:
+        # Legacy DB without the column — fall back to older shape.
+        rows = conn.execute(
+            f"""
+            SELECT condition, capability_type, failed_step_reason,
+                   output_shape_mismatch, output_shape_missing_keys,
+                   output_in_range, gate_passed, chain_success, failure_reason
+            FROM evaluation_runs
+            WHERE {where}
+            """,
+            params,
+        ).fetchall()
+        has_files_column = False
 
     out: list[FailureRow] = []
-    for (
-        condition_,
-        capability_type,
-        failed_step_reason,
-        output_shape_mismatch,
-        output_shape_missing_keys_blob,
-        output_in_range,
-        gate_passed,
-        chain_success,
-        failure_reason,
-    ) in rows:
+    for row_tuple in rows:
+        if has_files_column:
+            (
+                condition_,
+                capability_type,
+                failed_step_reason,
+                output_shape_mismatch,
+                output_shape_missing_keys_blob,
+                output_shape_missing_files_blob,
+                output_in_range,
+                gate_passed,
+                chain_success,
+                failure_reason,
+            ) = row_tuple
+        else:
+            (
+                condition_,
+                capability_type,
+                failed_step_reason,
+                output_shape_mismatch,
+                output_shape_missing_keys_blob,
+                output_in_range,
+                gate_passed,
+                chain_success,
+                failure_reason,
+            ) = row_tuple
+            output_shape_missing_files_blob = None
+
         try:
             keys = (
                 json.loads(output_shape_missing_keys_blob)
@@ -269,6 +343,14 @@ def load_failures(
             )
         except (ValueError, TypeError):
             keys = []
+        try:
+            files = (
+                json.loads(output_shape_missing_files_blob)
+                if output_shape_missing_files_blob
+                else []
+            )
+        except (ValueError, TypeError):
+            files = []
         out.append(
             FailureRow(
                 condition=condition_,
@@ -277,6 +359,9 @@ def load_failures(
                 output_shape_mismatch=bool(output_shape_mismatch),
                 output_shape_missing_keys=[str(k) for k in keys]
                 if isinstance(keys, list)
+                else [],
+                output_shape_missing_files=[str(f) for f in files]
+                if isinstance(files, list)
                 else [],
                 output_in_range=bool(output_in_range),
                 gate_passed=bool(gate_passed),
