@@ -421,6 +421,20 @@ def main(argv: list[str] | None = None) -> int:
                     final_state, task, loader,
                     metrics_store=metrics_store,
                 )
+                # Step 13.7 Batch B6 parity with harness.py:815-834 —
+                # capture LangFuse root trace ID so
+                # ``evaluation_runs.langfuse_trace_id`` is populated and
+                # Stage 6 trace audits can fetch by ID instead of
+                # session-scan. Never raises.
+                if langfuse_handler is not None:
+                    try:
+                        _lf_trace_id = getattr(
+                            langfuse_handler, "last_trace_id", None,
+                        )
+                        if _lf_trace_id is not None:
+                            result["langfuse_trace_id"] = _lf_trace_id
+                    except Exception:  # noqa: BLE001
+                        pass
             except BudgetExceeded as exc:
                 logger.error(
                     "ext12 #119: task %s aborted by per-task watchdog: %s. "
