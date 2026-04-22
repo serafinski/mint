@@ -136,6 +136,31 @@ def test_budget_watchdog_does_not_fire_on_fast_block():
         pass  # completes instantly — no alarm fires
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGALRM is unix-only")
+def test_budget_watchdog_not_swallowed_by_broad_exception_handler():
+    """Regression for the 2026-04-22 longitudinal smoke failure.
+
+    If the SIGALRM fires while control is inside third-party code that does
+    ``except Exception:``, the watchdog abort must still escape. Pre-fix,
+    BudgetExceeded inherited from RuntimeError and broad handlers could
+    swallow it, turning a supposed hard timeout into a logged warning while
+    the task continued past budget.
+    """
+    import time
+
+    from scripts._budget_watchdog import BudgetExceeded, budget_watchdog
+
+    logger_ = logging.getLogger("test_budget_watchdog")
+    swallowed = False
+    with pytest.raises(BudgetExceeded, match="exceeded 1s budget"):
+        with budget_watchdog(1, name="swallow-guard", logger_=logger_):
+            try:
+                time.sleep(2)
+            except Exception:  # noqa: BLE001
+                swallowed = True
+    assert swallowed is False
+
+
 # ---------------------------------------------------------------------------
 # #120 — analyze_context_utilization fetch-degraded flag
 # ---------------------------------------------------------------------------

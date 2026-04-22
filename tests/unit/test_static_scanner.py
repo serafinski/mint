@@ -125,6 +125,25 @@ def get_config():
         assert len(findings) >= 1
         assert findings[0].severity == Severity.CRITICAL
 
+    def test_constant_fallback_summary_dict_not_flagged(self):
+        """Allow constant empty/default summaries when the main path is dynamic."""
+        code = '''\
+def summarize(rows):
+    if not rows:
+        return {"total_rows": 0, "unique_count": 0, "duplicate_count": 0}
+    total_rows = len(rows)
+    unique_count = len(set(rows))
+    duplicate_count = total_rows - unique_count
+    return {
+        "total_rows": total_rows,
+        "unique_count": unique_count,
+        "duplicate_count": duplicate_count,
+    }
+'''
+        report = scan(code, "summary-tool")
+        findings = [f for f in report.findings if f.category == "hardcoded_data"]
+        assert len(findings) == 0
+
     def test_small_variable_list_not_flagged(self):
         """B1.2: small indirect lists (< 3 items) should not be flagged."""
         code = '''\

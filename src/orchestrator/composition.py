@@ -540,6 +540,7 @@ class CompositionalExecutor:
         ref: CapabilityReference,
         workspace: Path,
         upstream_outputs: dict[int, dict],
+        subtask: SubTask | None = None,
     ) -> dict:
         from tests.evaluation.execution import execute_skill_artifact
 
@@ -549,6 +550,9 @@ class CompositionalExecutor:
             if ref.source == "generated"
             else self._match_to_artifact(artifact_or_match, ref)
         )
+        output_schema = self._collect_union_output_schema(
+            artifact=artifact, current_ref=ref,
+        ) if subtask else None
 
         return execute_skill_artifact(
             artifact,
@@ -556,6 +560,7 @@ class CompositionalExecutor:
             fixture_contents,
             langfuse_tags=self.langfuse_tags,
             langfuse_session_id=self.langfuse_session_id,
+            output_schema=output_schema,
             allow_network=self.allow_network,
         )
 
@@ -674,7 +679,8 @@ class CompositionalExecutor:
             )
         elif cap_type == CapabilityType.SKILL:
             output = self._execute_skill_step(
-                artifact_or_match, ref, workspace, upstream_outputs
+                artifact_or_match, ref, workspace, upstream_outputs,
+                subtask=subtask,
             )
         elif cap_type == CapabilityType.AGENT:
             output = self._execute_agent_step(

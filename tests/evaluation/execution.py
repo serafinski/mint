@@ -18,6 +18,9 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import multiprocessing
+import queue
+import sys
 import threading
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple
@@ -38,6 +41,11 @@ SKILL_EXECUTION_TIMEOUT_S = 240
 # ceiling killed it 118s before completion. 900s matches the observed
 # tail of the distribution with comfortable headroom.
 AGENT_EXECUTION_TIMEOUT_S = 900
+# Langfuse traces for T16 on 2026-04-22 showed the lead-with-subagents
+# variant legitimately taking ~1532s on first pass while the non-subagent
+# agent tasks stayed well below the base 900s ceiling. Give that specific
+# topology more headroom without globally inflating every agent run.
+LEAD_WITH_SUBAGENTS_TIMEOUT_S = 1800
 _RECURSION_LIMIT = 100
 
 
@@ -68,11 +76,11 @@ class AgentExecutionMeta(NamedTuple):
 
     ``succeeded=True`` means the DeepAgent returned a structured response
     (possibly empty). ``succeeded=False`` with ``failure_reason="timeout"``
-    means the thread-pool ``future.result(timeout=...)`` tripped the
-    ``AGENT_EXECUTION_TIMEOUT_S`` ceiling. ``failure_reason="error"``
-    covers every other exception path (including LLM provider errors,
-    DeepAgents invocation crashes, and LangFuse handler failures that
-    propagate out of the inner loop).
+    means the outer process-level guard hit the execution ceiling and
+    terminated the worker. ``failure_reason="error"`` covers every other
+    exception path (including LLM provider errors, DeepAgents invocation
+    crashes, and LangFuse handler failures that propagate out of the
+    inner loop).
     """
 
     succeeded: bool
@@ -111,6 +119,82 @@ def get_last_agent_execution_meta() -> AgentExecutionMeta | None:
 def clear_last_agent_execution_meta() -> None:
     """Reset the thread-local meta (used by tests and chain callers)."""
     _agent_exec_state.last = None
+
+
+def _agent_timeout_seconds(artifact: Any) -> int:
+    """Return the runtime timeout budget for this AGENT artifact."""
+    agent_config = getattr(artifact, "agent_config", None) or {}
+    return (
+        LEAD_WITH_SUBAGENTS_TIMEOUT_S
+        if agent_config.get("subagents")
+        else AGENT_EXECUTION_TIMEOUT_S
+    )
+
+
+def _agent_process_context():
+    """Choose a multiprocessing context suitable for AGENT workers.
+
+    On macOS, ``fork`` is unsafe once the parent has initialized OpenTelemetry,
+    HTTP clients, or other native-threaded runtimes; the child can die with a
+    hard SIGSEGV before Python-level exception handling runs. Prefer ``spawn``
+    there. Other platforms keep ``fork`` first because it's cheaper and lets
+    tests inherit monkeypatches naturally.
+    """
+    methods = ("spawn", "fork") if sys.platform == "darwin" else ("fork", "spawn")
+    for method in methods:
+        try:
+            return multiprocessing.get_context(method)
+        except ValueError:
+            continue
+    return multiprocessing.get_context()
+
+
+def _execute_agent_inner_child(
+    result_queue: Any,
+    artifact: Any,
+    task: Any,
+    fixture_contents: dict[str, str],
+    *,
+    langfuse_tags: list[str] | None,
+    langfuse_session_id: str | None,
+    output_schema: dict[str, str] | None,
+    allow_network: bool,
+) -> None:
+    """Run ``_execute_agent_inner`` in an isolated process and report the result."""
+    clear_last_agent_execution_meta()
+    try:
+        output = _execute_agent_inner(
+            artifact,
+            task,
+            fixture_contents,
+            langfuse_tags=langfuse_tags,
+            langfuse_session_id=langfuse_session_id,
+            output_schema=output_schema,
+            allow_network=allow_network,
+        )
+        meta = get_last_agent_execution_meta()
+        result_queue.put(
+            {
+                "output": output,
+                "meta": meta._asdict() if meta is not None else None,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Agent child execution failed for %s: %s",
+            getattr(task, "task_id", "?"),
+            exc,
+        )
+        result_queue.put(
+            {
+                "output": {},
+                "meta": {
+                    "succeeded": False,
+                    "failure_reason": "error",
+                    "timeout_seconds": None,
+                },
+            }
+        )
 
 # ---------------------------------------------------------------------------
 # Response models (harness-internal, not pipeline state)
@@ -180,6 +264,12 @@ class T17Result(BaseModel):
     fraud_customer_ids: list
 
 
+class T19Result(BaseModel):
+    n_rows: int
+    n_categories: int
+    categories: list[str]
+
+
 class GenericResult(BaseModel):
     """Fallback for tasks without a dedicated response model."""
     model_config = {"extra": "allow"}
@@ -244,6 +334,29 @@ def _build_dynamic_result_model(
     )
 
 
+def _select_result_model(
+    task: Any,
+    *,
+    output_schema: dict[str, str] | None = None,
+    prefer_output_schema: bool = False,
+) -> type[BaseModel]:
+    """Choose the response model for a SKILL/AGENT execution.
+
+    Direct task executions prefer the authored task model where one exists.
+    Compositional chain steps are different: the downstream consumer needs
+    the decomposer-declared handoff keys, not the final task answer shape.
+    For those callers, ``prefer_output_schema=True`` makes the dynamic model
+    built from ``output_schema`` override the task-level model.
+    """
+    task_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
+    dynamic_model = _build_dynamic_result_model(output_schema)
+    if dynamic_model is None:
+        return task_model
+    if prefer_output_schema or task_model is GenericResult:
+        return dynamic_model
+    return task_model
+
+
 TASK_RESULT_MODELS: dict[str, type[BaseModel]] = {
     "T04": T04Result,
     "T08": T08Result,
@@ -255,6 +368,7 @@ TASK_RESULT_MODELS: dict[str, type[BaseModel]] = {
     "T15": T15Result,
     "T16": T16Result,
     "T17": T17Result,
+    "T19": T19Result,
 }
 
 
@@ -536,6 +650,7 @@ def execute_skill_artifact(
     *,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    output_schema: dict[str, str] | None = None,
     allow_network: bool = False,
 ) -> dict:
     """Execute a SKILL artifact via constrained LLM with tool calling.
@@ -550,6 +665,7 @@ def execute_skill_artifact(
             artifact, task, fixture_contents,
             langfuse_tags=langfuse_tags,
             langfuse_session_id=langfuse_session_id,
+            output_schema=output_schema,
             allow_network=allow_network,
         )
     except Exception as exc:  # noqa: BLE001
@@ -564,6 +680,7 @@ def _execute_skill_inner(
     *,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    output_schema: dict[str, str] | None = None,
     allow_network: bool = False,
 ) -> dict:
     from langchain.chat_models import init_chat_model
@@ -578,7 +695,11 @@ def _execute_skill_inner(
     sandbox_execute = _make_network_scoped_sandbox(allow_network)
 
     skill_content = getattr(artifact, "skill_content", None) or ""
-    result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
+    result_model = _select_result_model(
+        task,
+        output_schema=output_schema,
+        prefer_output_schema=bool(output_schema),
+    )
 
     system_prompt = (
         _SKILL_EXECUTION_SYSTEM_PROMPT
@@ -1086,26 +1207,61 @@ def execute_agent_artifact(
     the same thread through :func:`get_last_agent_execution_meta`.
     """
     clear_last_agent_execution_meta()
-    try:
-        output = _execute_agent_inner(
-            artifact, task, fixture_contents,
-            langfuse_tags=langfuse_tags,
-            langfuse_session_id=langfuse_session_id,
-            output_schema=output_schema,
-            allow_network=allow_network,
+    timeout_seconds = _agent_timeout_seconds(artifact)
+    ctx = _agent_process_context()
+    result_queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_execute_agent_inner_child,
+        args=(result_queue, artifact, task, fixture_contents),
+        kwargs={
+            "langfuse_tags": langfuse_tags,
+            "langfuse_session_id": langfuse_session_id,
+            "output_schema": output_schema,
+            "allow_network": allow_network,
+        },
+    )
+    proc.start()
+    proc.join(timeout_seconds)
+
+    if proc.is_alive():
+        task_id = getattr(task, "task_id", "?")
+        logger.error(
+            "Agent execution timed out after %ds for %s; terminating worker process",
+            timeout_seconds,
+            task_id,
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Agent execution failed for %s: %s", getattr(task, "task_id", "?"), exc)
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(5)
+        _record_agent_execution_meta(
+            succeeded=False,
+            failure_reason="timeout",
+            timeout_seconds=timeout_seconds,
+        )
+        return {}
+
+    try:
+        payload = result_queue.get_nowait()
+    except queue.Empty:
+        payload = None
+
+    if payload is None:
+        logger.error(
+            "Agent execution failed for %s: worker exited without a payload (exit code=%s)",
+            getattr(task, "task_id", "?"),
+            proc.exitcode,
+        )
         _record_agent_execution_meta(succeeded=False, failure_reason="error")
         return {}
 
-    # _execute_agent_inner sets the meta on its timeout and exception
-    # branches itself; if none of those fired, it reached the structured-
-    # response return path, which counts as success regardless of whether
-    # the payload is empty.
-    if get_last_agent_execution_meta() is None:
+    meta_payload = payload.get("meta")
+    if meta_payload is not None:
+        _record_agent_execution_meta(**meta_payload)
+    elif get_last_agent_execution_meta() is None:
         _record_agent_execution_meta(succeeded=True)
-    return output
+    return payload.get("output", {})
 
 
 def _execute_agent_inner(
@@ -1165,26 +1321,17 @@ def _execute_agent_inner(
     skills_prefix = str(skills_dir).rstrip("/") + "/"
     skills_param = [skills_prefix] if skill_files else None
 
-    result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
-
-    # §12 finding #12 (2026-04-16): when the decomposer carries a per-gap
-    # output_schema, use it to build a dynamic Pydantic model that forces
-    # the LLM's structured-output call to produce exactly the declared
-    # keys. Prevents the T16 second-run failure mode where the AGENT
-    # returned task-level keys only and downstream MCP_TOOL writers
-    # crashed on missing upstream keys. The authored-task models in
-    # TASK_RESULT_MODELS still win for named eval tasks (T04, T11, T16,
-    # etc.) — this only activates on CLI free-form tasks that fall
-    # through to GenericResult.
-    if result_model is GenericResult:
-        dynamic_model = _build_dynamic_result_model(output_schema)
-        if dynamic_model is not None:
-            result_model = dynamic_model
-            logger.info(
-                "Agent executor: using dynamic response_format from decomposer "
-                "output_schema with keys %s",
-                sorted(output_schema.keys()),
-            )
+    result_model = _select_result_model(
+        task,
+        output_schema=output_schema,
+        prefer_output_schema=bool(output_schema),
+    )
+    if output_schema:
+        logger.info(
+            "Agent executor: using response_format derived from output_schema "
+            "with keys %s",
+            sorted(output_schema.keys()),
+        )
 
     # Build subagents list if this is a lead-with-subagents artifact.
     # Each subagent config is a dict with name, description, system_prompt, tools.
@@ -1285,10 +1432,11 @@ def _execute_agent_inner(
     if workspace_files:
         invoke_input["files"] = workspace_files
 
+    timeout_seconds = _agent_timeout_seconds(artifact)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         future = pool.submit(agent.invoke, invoke_input, config)
-        result = future.result(timeout=AGENT_EXECUTION_TIMEOUT_S)
+        result = future.result(timeout=timeout_seconds)
         pool.shutdown(wait=False)
 
         task_id = getattr(task, "task_id", "?")
@@ -1310,12 +1458,12 @@ def _execute_agent_inner(
         task_id = getattr(task, "task_id", "?")
         logger.error(
             "Agent execution timed out after %ds for %s",
-            AGENT_EXECUTION_TIMEOUT_S, task_id,
+            timeout_seconds, task_id,
         )
         _record_agent_execution_meta(
             succeeded=False,
             failure_reason="timeout",
-            timeout_seconds=AGENT_EXECUTION_TIMEOUT_S,
+            timeout_seconds=timeout_seconds,
         )
         return {}
 

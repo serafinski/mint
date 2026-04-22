@@ -65,7 +65,7 @@ ALL_CONDITIONS = ["full", "no_verification", "no_optimization", "static"]
 # unavailable on Windows). On budget exhaustion, raises BudgetExceeded
 # in the main thread — the caller is expected to log the partial
 # results recorded so far and skip the remaining work.
-class BudgetExceeded(RuntimeError):
+class BudgetExceeded(BaseException):
     """Raised by the run-condition watchdog when the budget elapses."""
 
 

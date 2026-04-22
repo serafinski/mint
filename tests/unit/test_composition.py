@@ -1532,6 +1532,39 @@ class TestAgentOutputSchemaRuntimeCheck:
         assert "summary" in (result.failed_step_reason or "")
         assert "counts" in (result.failed_step_reason or "")
 
+    @patch("tests.evaluation.execution.execute_skill_artifact")
+    def test_skill_executor_receives_subtask_output_schema(self, mock_skill):
+        """Chain SKILL steps must be shaped by the subtask handoff schema."""
+        mock_skill.return_value = {"summary": "ok", "counts": {"x": 1}}
+
+        subtask = SubTask(
+            description="Apply workflow",
+            required_capabilities=["apply"],
+            depends_on=[],
+            output_schema={"summary": "str", "counts": "dict"},
+        )
+        art = _make_artifact(
+            "applier", CapabilityType.SKILL,
+            gap_query="apply",
+            skill_content="# applier SKILL",
+        )
+        ex = CompositionalExecutor(
+            subtasks=[subtask],
+            resolution={"apply": CapabilityReference(
+                source="generated", capability_name="applier",
+                capability_type=CapabilityType.SKILL,
+            )},
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(),
+        )
+
+        result = ex.run()
+        assert result.chain_success is True
+        _, kwargs = mock_skill.call_args
+        assert kwargs["output_schema"] == {"summary": "str", "counts": "dict"}
+
 
 class TestRecordStepInvocationPopulatesFields:
     """Regression guards for docs/invocation_recording_gap_2026_04_19.md.

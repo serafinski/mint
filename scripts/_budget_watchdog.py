@@ -28,7 +28,7 @@ import time
 from collections.abc import Iterator
 
 
-class BudgetExceeded(RuntimeError):
+class BudgetExceeded(BaseException):
     """Raised by ``budget_watchdog`` when the wrapped block exceeds the budget.
 
     Named to match ``scripts.run_pilot.BudgetExceeded`` (ext10 #103) so
@@ -36,6 +36,14 @@ class BudgetExceeded(RuntimeError):
     intentionally distinct (not a re-export) because ``run_pilot.py`` still
     carries its own definition for backwards compat with any in-tree test
     that imports from there.
+
+    Inherits from ``BaseException`` rather than ``Exception`` so a watchdog
+    abort cannot be silently swallowed by broad third-party ``except
+    Exception:`` handlers. This exact failure mode occurred in the
+    longitudinal smoke on 2026-04-22: the SIGALRM fired while OpenTelemetry
+    export code was running, OTLP export caught the timeout as a generic
+    Exception, logged it, and the task kept going past the supposed hard
+    budget.
     """
 
 

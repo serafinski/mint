@@ -189,6 +189,8 @@ Read the IMPLEMENTATION carefully (not just the description — generic descript
 
 If this capability fits any of the existing categories in the taxonomy above, pick that category name and set is_new=False. Prefer an existing category whenever reasonable — the taxonomy stays coherent only when we avoid creating near-duplicate categories (e.g., don't create "sales-data" if "sales" already exists).
 
+Important guardrail: shared FILE FORMATS or generic OPERATIONS are NOT enough to reuse a category. Do NOT reuse an existing category just because both capabilities mention CSV/JSON/XLSX/files or verbs like parse/write/join/aggregate. Reuse an existing category only when the underlying BUSINESS OBJECTS overlap materially (e.g., orders with orders, eligibility with eligibility, monitoring metrics with monitoring metrics). If the only overlap is file format or generic data-processing mechanics, create a new category.
+
 If NO existing category fits — this capability is from a business vertical or sub-domain not yet represented in the taxonomy — propose a new category name (hyphen-case, 1-3 words) and set is_new=True with a one-sentence new_description. Only do this when no existing category is a reasonable fit.
 
 Special case: if the taxonomy is empty (no categories yet), always set is_new=True and propose the first category.
@@ -630,7 +632,17 @@ def classify_and_tag_artifacts(artifacts: list[GeneratedArtifact]) -> None:
     """
     # Filter to artifacts that need classification — skip anything already
     # tagged (e.g. on retry when verification_node replaces some but not all).
-    pending = [a for a in artifacts if a.domain is None]
+    #
+    # Order matters. If one artifact proposes a new category, later siblings
+    # should see that expanded taxonomy and reuse it when appropriate. Prefer
+    # domain-defining transforms (aggregate/join/analyze/apply) before parsers,
+    # and push format-only writers to the end so they do not seed the taxonomy
+    # with shallow file-format buckets.
+    pending = sorted(
+        (a for a in artifacts if a.domain is None),
+        key=_taxonomy_priority,
+        reverse=True,
+    )
     if not pending:
         return
 
@@ -668,55 +680,37 @@ def classify_and_tag_artifacts(artifacts: list[GeneratedArtifact]) -> None:
         )
         return
 
-    # Parallelize classification with a thread pool so N artifacts don't
-    # stack N × per-call latency serially. ChatOpenAI is thread-safe — each
-    # .invoke() fires an independent HTTP request. The mild race on
-    # _commit_new_category (two threads proposing different names for the
-    # same concept with an empty taxonomy) is acceptable: the first writer
-    # wins and later calls see the committed category. Worst case is a few
-    # near-duplicate categories which is inherent to any evolutionary
-    # taxonomy.
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    def _classify_one(artifact: GeneratedArtifact) -> tuple[GeneratedArtifact, Any]:
-        return artifact, taxonomy.get_or_create_for_capability(
-            artifact, structured_llm
-        )
-
-    max_workers = min(len(pending), 4)
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(_classify_one, a) for a in pending]
-        for future in as_completed(futures):
-            try:
-                artifact, result = future.result()
-                artifact.domain = result.domain
-                # ext8 #76 (2026-04-20): defense-in-depth. If the LLM
-                # said is_generic=True but the artifact's source contains
-                # hardcoded domain-specific string literals, force
-                # is_generic=False. A mis-classified hardcoded tool
-                # flagged is_generic=True pollutes every domain's search
-                # results via the `$or` clause in registry.search —
-                # single LLM decision shouldn't have cascading effects.
-                is_generic = bool(result.is_generic)
-                if is_generic and _contains_domain_specific_literals(artifact):
-                    logger.warning(
-                        "ext8 #76: classifier said is_generic=True for '%s' but "
-                        "code contains domain-specific literals — forcing "
-                        "is_generic=False (defense-in-depth).",
-                        artifact.capability_name,
-                    )
-                    is_generic = False
-                artifact.is_generic = is_generic
-                logger.info(
-                    "classify_and_tag_artifacts: %s -> domain=%s is_generic=%s",
-                    artifact.capability_name, result.domain, is_generic,
-                )
-            except Exception as exc:  # noqa: BLE001
+    for artifact in pending:
+        try:
+            result = taxonomy.get_or_create_for_capability(artifact, structured_llm)
+            artifact.domain = result.domain
+            # ext8 #76 (2026-04-20): defense-in-depth. If the LLM
+            # said is_generic=True but the artifact's source contains
+            # hardcoded domain-specific string literals, force
+            # is_generic=False. A mis-classified hardcoded tool
+            # flagged is_generic=True pollutes every domain's search
+            # results via the `$or` clause in registry.search —
+            # single LLM decision shouldn't have cascading effects.
+            is_generic = bool(result.is_generic)
+            if is_generic and _contains_domain_specific_literals(artifact):
                 logger.warning(
-                    "classify_and_tag_artifacts: classification failed: %s "
-                    "— artifact left with domain=None",
-                    exc,
+                    "ext8 #76: classifier said is_generic=True for '%s' but "
+                    "code contains domain-specific literals — forcing "
+                    "is_generic=False (defense-in-depth).",
+                    artifact.capability_name,
                 )
+                is_generic = False
+            artifact.is_generic = is_generic
+            logger.info(
+                "classify_and_tag_artifacts: %s -> domain=%s is_generic=%s",
+                artifact.capability_name, result.domain, is_generic,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "classify_and_tag_artifacts: classification failed: %s "
+                "— artifact left with domain=None",
+                exc,
+            )
 
 
 # ext8 #76 (2026-04-20): literals that mark a capability as domain-specific.
@@ -753,3 +747,46 @@ def _contains_domain_specific_literals(artifact: GeneratedArtifact) -> bool:
             if f'"{term}"' in text or f"'{term}'" in text:
                 return True
     return False
+
+
+_GENERIC_TAXONOMY_TOKENS = {
+    "and", "apply", "build", "compare", "compute", "config", "csv", "data",
+    "daily", "export", "file", "hourly", "json", "load", "metrics", "monitoring",
+    "parse", "parser", "parsing", "per", "policy", "report", "save", "summarize",
+    "summary", "targets", "tool", "write", "writer", "xlsx",
+}
+
+_DOMAIN_SEED_VERBS = (
+    "aggregate", "analyze", "analyse", "apply", "classify", "compare",
+    "compute", "enrich", "evaluate", "investigate", "join", "merge",
+)
+
+_FORMAT_ONLY_VERBS = ("export", "format", "save", "serialize", "write")
+
+
+def _taxonomy_priority(artifact: GeneratedArtifact) -> tuple[int, int, int]:
+    """Return a deterministic priority for within-batch taxonomy classification.
+
+    Higher values classify earlier. The goal is not semantic perfection; it is
+    to let domain-defining transforms seed the taxonomy before file-format-only
+    helpers are classified.
+    """
+    import re
+
+    name = artifact.capability_name.lower()
+    description = (artifact.description or "").lower()
+    text = f"{name} {description}"
+    tokens = set(re.findall(r"[a-z0-9]+", text))
+
+    verb_score = 0
+    if any(name.startswith(f"{verb}-") or name.startswith(f"{verb}_") for verb in _DOMAIN_SEED_VERBS):
+        verb_score += 3
+    if any(name.startswith(f"{verb}-") or name.startswith(f"{verb}_") for verb in _FORMAT_ONLY_VERBS):
+        verb_score -= 3
+
+    domain_token_score = sum(
+        1 for token in tokens
+        if len(token) >= 4 and token not in _GENERIC_TAXONOMY_TOKENS
+    )
+    implementation_len = len(artifact.source_code or artifact.skill_content or "")
+    return (verb_score, domain_token_score, implementation_len)

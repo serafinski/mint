@@ -17,6 +17,7 @@ from src.orchestrator.taxonomy import (
     CapabilityDomainClassification,
     DomainTaxonomy,
     QueryDomainChoice,
+    classify_and_tag_artifacts,
 )
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
@@ -441,3 +442,87 @@ class TestImplementationExtraction:
     def test_empty_artifact_returns_empty(self):
         artifact = _make_artifact(source_code=None, skill_content=None, agent_config=None)
         assert DomainTaxonomy._extract_implementation(artifact) == ""
+
+
+class _FakeStructuredTaxonomyLLM:
+    def __init__(self):
+        self.prompts: list[str] = []
+
+    def invoke(self, prompt: str) -> CapabilityDomainClassification:
+        self.prompts.append(prompt)
+        if "NAME: aggregate-eligibility-counts" in prompt:
+            return CapabilityDomainClassification(
+                domain="eligibility-aggregation",
+                is_new=True,
+                new_description="Eligibility decisions and rollups.",
+                is_generic=False,
+                rationale="Aggregates eligibility outcomes.",
+            )
+        if "NAME: parse-eligibility-policy-and-applications-csv" in prompt:
+            if "- eligibility-aggregation:" in prompt:
+                return CapabilityDomainClassification(
+                    domain="eligibility-aggregation",
+                    is_new=False,
+                    new_description="",
+                    is_generic=False,
+                    rationale="Same eligibility workflow as the seeded aggregate step.",
+                )
+            return CapabilityDomainClassification(
+                domain="orders-csv-processing",
+                is_new=False,
+                new_description="",
+                is_generic=False,
+                rationale="Fallback to the only existing category.",
+            )
+        raise AssertionError(f"Unexpected prompt:\n{prompt}")
+
+
+class _FakeTaxonomyModel:
+    def __init__(self, structured_llm: _FakeStructuredTaxonomyLLM):
+        self._structured_llm = structured_llm
+
+    def with_structured_output(self, *_args, **_kwargs):
+        return self._structured_llm
+
+
+class TestClassifyAndTagArtifacts:
+    def test_domain_defining_artifact_seeds_taxonomy_before_parser(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import src.orchestrator.taxonomy as taxonomy_mod
+
+        taxonomy_path = tmp_path / "domains.json"
+        taxonomy_path.write_text(json.dumps({
+            "version": 1,
+            "categories": {
+                "orders-csv-processing": {
+                    "description": "Tools that process orders-related CSV files.",
+                    "created_at": "2026-04-22T00:00:00+00:00",
+                }
+            },
+        }))
+        monkeypatch.setattr(taxonomy_mod, "_TAXONOMY_PATH", taxonomy_path)
+
+        structured_llm = _FakeStructuredTaxonomyLLM()
+        fake_model = _FakeTaxonomyModel(structured_llm)
+        monkeypatch.setattr("langchain.chat_models.init_chat_model", lambda *a, **k: fake_model)
+
+        parse_artifact = _make_artifact(
+            name="parse-eligibility-policy-and-applications-csv",
+            description="Parse eligibility policy JSON and applications CSV into structured records.",
+            source_code="async def parse_eligibility_policy_and_applications_csv():\n    return {}",
+        )
+        aggregate_artifact = _make_artifact(
+            name="aggregate-eligibility-counts",
+            description="Aggregate eligibility decisions into counts and summaries.",
+            source_code="async def aggregate_eligibility_counts():\n    return {}",
+        )
+
+        classify_and_tag_artifacts([parse_artifact, aggregate_artifact])
+
+        assert aggregate_artifact.domain == "eligibility-aggregation"
+        assert parse_artifact.domain == "eligibility-aggregation"
+        categories = DomainTaxonomy(taxonomy_path).list_categories()
+        assert "eligibility-aggregation" in categories
+        assert structured_llm.prompts[0].count("eligibility-aggregation") == 0
+        assert "- eligibility-aggregation:" in structured_llm.prompts[1]

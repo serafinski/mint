@@ -88,6 +88,48 @@ def _run_skill_precheck(
 # AST-based checks
 # ---------------------------------------------------------------------------
 
+def _resolve_return_expr(val: ast.expr, assignments: dict[str, ast.expr]) -> ast.expr:
+    """Resolve one level of variable indirection for return values."""
+    if isinstance(val, ast.Name):
+        return assignments.get(val.id, val)
+    return val
+
+
+def _dict_key_signature(val: ast.expr) -> tuple[object, ...] | None:
+    """Return a comparable key signature for dict literals with constant keys."""
+    if not isinstance(val, ast.Dict):
+        return None
+    if not all(isinstance(k, ast.Constant) for k in val.keys if k is not None):
+        return None
+    return tuple(k.value for k in val.keys if k is not None)
+
+
+def _has_dynamic_dict_return_with_same_keys(
+    current_return: ast.Return,
+    current_val: ast.Dict,
+    resolved_returns: list[tuple[ast.Return, ast.expr]],
+) -> bool:
+    """Detect fallback summary dicts paired with a real dynamic return.
+
+    This avoids false positives for tools that return a constant empty/default
+    summary in one branch but compute the same output shape dynamically in the
+    main path. Pure hardcoded stubs still fail because they have no matching
+    dynamic return.
+    """
+    current_sig = _dict_key_signature(current_val)
+    if current_sig is None:
+        return False
+
+    for other_return, other_val in resolved_returns:
+        if other_return is current_return or not isinstance(other_val, ast.Dict):
+            continue
+        if _dict_key_signature(other_val) != current_sig:
+            continue
+        if any(not isinstance(v, ast.Constant) for v in other_val.values):
+            return True
+    return False
+
+
 def _check_hardcoded_return(node: ast.AST, findings: list[VerificationFinding]) -> None:
     """Detect literal lists/dicts of >=3 items returned from a function body.
 
@@ -105,13 +147,12 @@ def _check_hardcoded_return(node: ast.AST, findings: list[VerificationFinding]) 
                 if isinstance(target, ast.Name) and target.id not in assignments:
                     assignments[target.id] = stmt.value
 
+    resolved_returns: list[tuple[ast.Return, ast.expr]] = []
     for child in ast.walk(node):
-        if not isinstance(child, ast.Return) or child.value is None:
-            continue
-        val = child.value
-        # Follow one level of variable indirection.
-        if isinstance(val, ast.Name):
-            val = assignments.get(val.id, val)
+        if isinstance(child, ast.Return) and child.value is not None:
+            resolved_returns.append((child, _resolve_return_expr(child.value, assignments)))
+
+    for child, val in resolved_returns:
         if isinstance(val, ast.List) and len(val.elts) >= 3:
             if all(isinstance(e, ast.Constant) for e in val.elts):
                 findings.append(
@@ -127,6 +168,8 @@ def _check_hardcoded_return(node: ast.AST, findings: list[VerificationFinding]) 
             if all(isinstance(k, ast.Constant) for k in val.keys if k is not None) and all(
                 isinstance(v, ast.Constant) for v in val.values
             ):
+                if _has_dynamic_dict_return_with_same_keys(child, val, resolved_returns):
+                    continue
                 findings.append(
                     VerificationFinding(
                         tier=1,

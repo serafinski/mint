@@ -12,10 +12,12 @@ from src.schemas.verification import Severity
 from src.verification.behavioral import (
     TIMEOUT_THRESHOLD_S,
     _build_sandbox_code,
+    _build_sandbox_code_with_tempfiles,
     _extract_function_name,
     _generate_boundary_inputs,
     _generate_large_inputs,
     _generate_negative_inputs,
+    _test_knn_identifier_column_csv,
     _test_latency,
     _test_output_variation,
     _test_parameterless_smoke,
@@ -78,6 +80,18 @@ async def process(
     config: dict,
 ) -> str:
     return "done"
+'''
+
+KNN_CSV_TOOL = '''\
+import pandas as pd
+from sklearn.impute import KNNImputer
+
+async def knn_impute(csv_path: str) -> dict:
+    df = pd.read_csv(csv_path)
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    imputed = KNNImputer(n_neighbors=5).fit_transform(df[numeric_cols])
+    df.loc[:, numeric_cols] = imputed
+    return {"null_count": int(df.isna().sum().sum())}
 '''
 
 
@@ -200,6 +214,20 @@ async def second_fn(b: float) -> str:
         assert extract_parameter_schema(source, func_name="nonexistent") == {}
 
 
+class TestBuildSandboxCodeWithTempfiles:
+    def test_embeds_temp_file_setup_and_path_mapping(self):
+        code = _build_sandbox_code_with_tempfiles(
+            CLEAN_TOOL,
+            "compute_sum",
+            {"a": 1, "b": 2},
+            {"probe.csv": "id,value\n1,2\n"},
+            {"csv_path": "probe.csv"},
+        )
+        assert "TemporaryDirectory" in code
+        assert "probe.csv" in code
+        assert "_inputs[_param] = str(_tmp / _relpath)" in code
+
+
 # ---------------------------------------------------------------------------
 # _extract_function_name
 # ---------------------------------------------------------------------------
@@ -214,6 +242,33 @@ class TestExtractFunctionName:
 
     def test_syntax_error(self):
         assert _extract_function_name("def broken(:") is None
+
+
+class TestKnnIdentifierColumnProbe:
+    def test_flags_crash_on_integer_id_probe_csv(self):
+        schema = {"csv_path": {"type": "str"}}
+        findings = _test_knn_identifier_column_csv(
+            KNN_CSV_TOOL,
+            "knn_impute",
+            schema,
+            _sandbox=lambda code, timeout=15: _sandbox_success(
+                "None",
+                error="TypeError: Invalid value '1.0' for dtype 'int64'",
+            ),
+        )
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.HIGH
+        assert findings[0].category == "tabular_identifier_column"
+
+    def test_skips_non_knn_tools(self):
+        schema = {"csv_path": {"type": "str"}}
+        findings = _test_knn_identifier_column_csv(
+            CLEAN_TOOL,
+            "compute_sum",
+            schema,
+            _sandbox=lambda code, timeout=15: _sandbox_failure("should not be called"),
+        )
+        assert findings == []
 
 
 # ---------------------------------------------------------------------------

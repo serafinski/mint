@@ -359,6 +359,50 @@ def _build_sandbox_code(source_code: str, func_name: str, inputs: dict[str, Any]
     """)
 
 
+def _build_sandbox_code_with_tempfiles(
+    source_code: str,
+    func_name: str,
+    inputs: dict[str, Any],
+    temp_files: dict[str, str],
+    path_inputs: dict[str, str],
+) -> str:
+    """Build sandbox code that writes temp files and passes their paths to the tool."""
+    inputs_json = json.dumps(inputs)
+    temp_files_json = json.dumps(temp_files)
+    path_inputs_json = json.dumps(path_inputs)
+    return textwrap.dedent(f"""\
+        import asyncio
+        import json
+        import tempfile
+        import time
+        from pathlib import Path
+
+        __name__ = "not_main"  # prevent if __name__ == "__main__": mcp.run() from firing
+        # --- Inline the tool source ---
+        {textwrap.indent(source_code, "        ").strip()}
+        # --- End tool source ---
+
+        async def _run():
+            start = time.monotonic()
+            try:
+                _inputs = json.loads({inputs_json!r})
+                with tempfile.TemporaryDirectory() as _tmpdir:
+                    _tmp = Path(_tmpdir)
+                    for _name, _content in json.loads({temp_files_json!r}).items():
+                        (_tmp / _name).write_text(_content, encoding="utf-8")
+                    for _param, _relpath in json.loads({path_inputs_json!r}).items():
+                        _inputs[_param] = str(_tmp / _relpath)
+                    result = await {func_name}(**_inputs)
+                elapsed = time.monotonic() - start
+                print(json.dumps({{"result": repr(result), "elapsed": elapsed, "error": None}}))
+            except Exception as exc:
+                elapsed = time.monotonic() - start
+                print(json.dumps({{"result": None, "elapsed": elapsed, "error": f"{{type(exc).__name__}}: {{exc}}"}}))
+
+        asyncio.run(_run())
+    """)
+
+
 def _parse_sandbox_output(result: dict) -> dict | None:
     """Parse the JSON output from a sandbox execution. Returns None on failure.
 
@@ -406,6 +450,89 @@ def _test_parameterless_smoke(source_code: str, func_name: str, _sandbox=sandbox
                 location="parameterless_smoke",
             )
         ]
+    return []
+
+
+def _test_knn_identifier_column_csv(
+    source_code: str,
+    func_name: str,
+    schema: dict[str, dict],
+    _sandbox=sandbox_execute,
+) -> list[VerificationFinding]:
+    """Probe KNN CSV tools with a valid fixture-shaped file containing an integer ID column.
+
+    This catches the common failure mode where a tool imputes *all* numeric
+    columns, including identifier columns such as ``id`` / ``*_id``, then
+    crashes or mutates schema on reassignment.
+    """
+    lowered = source_code.lower()
+    if "knnimputer" not in lowered and "sklearn.impute" not in lowered:
+        return []
+    if "read_csv" not in lowered:
+        return []
+
+    csv_params = [
+        name
+        for name, info in schema.items()
+        if info.get("type") == "str"
+        and any(token in name.lower() for token in ("csv", "path", "file"))
+    ]
+    if len(csv_params) != 1:
+        return []
+
+    path_param = csv_params[0]
+    inputs = _generate_boundary_inputs(schema)
+    inputs.pop(path_param, None)
+
+    probe_csv = "\n".join(
+        [
+            "id,feature_a,feature_b,feature_c,feature_d",
+            "1,10.0,20.0,,40.0",
+            "2,11.0,,31.0,41.0",
+            "3,,22.0,32.0,42.0",
+            "4,13.0,23.0,33.0,",
+            "5,14.0,24.0,34.0,44.0",
+            "6,15.0,25.0,35.0,45.0",
+        ]
+    )
+    code = _build_sandbox_code_with_tempfiles(
+        source_code,
+        func_name,
+        inputs,
+        {"probe.csv": probe_csv},
+        {path_param: "probe.csv"},
+    )
+    result = _sandbox(code, timeout=15)
+    parsed = _parse_sandbox_output(result)
+
+    if parsed is None:
+        return [
+            VerificationFinding(
+                tier=2,
+                category="tabular_identifier_column",
+                severity=Severity.HIGH,
+                message=(
+                    "KNN CSV probe produced no parseable output on a valid tabular fixture "
+                    "with an integer 'id' column"
+                ),
+                location="tabular_identifier_column",
+            )
+        ]
+
+    if parsed.get("error") is not None:
+        return [
+            VerificationFinding(
+                tier=2,
+                category="tabular_identifier_column",
+                severity=Severity.HIGH,
+                message=(
+                    "KNN CSV probe crashed on a valid tabular fixture with an integer 'id' "
+                    f"column: {parsed.get('error')}"
+                ),
+                location="tabular_identifier_column",
+            )
+        ]
+
     return []
 
 
@@ -929,6 +1056,7 @@ def run(
         findings.extend(_test_nonexistent_entity(source_code, func_name, schema, _sandbox))
         findings.extend(_test_consistency(source_code, func_name, schema, _sandbox))
         findings.extend(_test_boundary(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_knn_identifier_column_csv(source_code, func_name, schema, _sandbox))
         findings.extend(_test_timeout(source_code, func_name, schema, _sandbox))
         findings.extend(_test_latency(source_code, func_name, schema, _sandbox))
         findings.extend(_test_output_variation(source_code, func_name, schema, _sandbox))

@@ -10,12 +10,17 @@ import pytest
 
 from tests.evaluation.execution import (
     AGENT_EXECUTION_TIMEOUT_S,
+    LEAD_WITH_SUBAGENTS_TIMEOUT_S,
     TASK_RESULT_MODELS,
     AgentExecutionMeta,
     GenericResult,
     T11Result,
     T12Result,
     T13Result,
+    T19Result,
+    _build_dynamic_result_model,
+    _agent_process_context,
+    _agent_timeout_seconds,
     _extract_last_ai_json,
     _extract_last_json_object,
     _extract_last_sandbox_json,
@@ -23,11 +28,58 @@ from tests.evaluation.execution import (
     _format_fixture_message,
     _read_fixture_contents,
     _record_agent_execution_meta,
+    _select_result_model,
     clear_last_agent_execution_meta,
     execute_agent_artifact,
     execute_skill_artifact,
     get_last_agent_execution_meta,
 )
+
+
+def _inline_agent_process_context():
+    class _InlineQueue:
+        def __init__(self):
+            self._items: list[dict] = []
+
+        def put(self, item):
+            self._items.append(item)
+
+        def get_nowait(self):
+            return self._items.pop(0)
+
+    class _InlineProcess:
+        def __init__(self, target, args, kwargs):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs
+            self.exitcode = 0
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            self._target(*self._args, **self._kwargs)
+            self._alive = False
+
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return self._alive
+
+        def terminate(self):
+            self._alive = False
+
+        def kill(self):
+            self._alive = False
+
+    class _InlineContext:
+        def Queue(self, maxsize=1):
+            return _InlineQueue()
+
+        def Process(self, target, args=(), kwargs=None):
+            return _InlineProcess(target, args, kwargs or {})
+
+    return _InlineContext()
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +100,10 @@ class TestResultModels:
         r = T13Result(anomaly_count=5, anomalies=[{"ts": "a", "m": "b", "v": 1}], metrics_analyzed=4)
         assert r.anomaly_count == 5
 
+    def test_t19_result_valid(self):
+        r = T19Result(n_rows=25, n_categories=3, categories=["A", "B", "C"])
+        assert r.n_rows == 25
+
     def test_generic_result(self):
         r = GenericResult(result={"key": "value"})
         assert r.result == {"key": "value"}
@@ -56,7 +112,40 @@ class TestResultModels:
         assert TASK_RESULT_MODELS["T11"] is T11Result
         assert TASK_RESULT_MODELS["T12"] is T12Result
         assert TASK_RESULT_MODELS["T13"] is T13Result
+        assert TASK_RESULT_MODELS["T19"] is T19Result
         assert "T01" not in TASK_RESULT_MODELS
+
+
+class TestSelectResultModel:
+    def test_named_task_prefers_task_model_without_output_schema(self):
+        task = SimpleNamespace(task_id="T19")
+        model = _select_result_model(task)
+        assert model is T19Result
+
+    def test_chain_step_output_schema_overrides_task_model(self):
+        task = SimpleNamespace(task_id="T15")
+        schema = {
+            "daily_aggregates": "list[dict]",
+            "metrics_processed": "int",
+        }
+        model = _select_result_model(
+            task,
+            output_schema=schema,
+            prefer_output_schema=True,
+        )
+        assert model is not TASK_RESULT_MODELS["T15"]
+        assert set(model.model_fields.keys()) == set(schema.keys())
+
+    def test_generic_task_uses_dynamic_model_when_output_schema_present(self):
+        task = SimpleNamespace(task_id="")
+        schema = {"records": "list[dict]"}
+        model = _select_result_model(
+            task,
+            output_schema=schema,
+            prefer_output_schema=True,
+        )
+        assert model is not GenericResult
+        assert set(model.model_fields.keys()) == {"records"}
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +228,11 @@ class TestExecuteAgentArtifact:
             skill_content=None,
             capability_type="agent",
         )
-        result = execute_agent_artifact(artifact, task, {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            result = execute_agent_artifact(artifact, task, {})
         assert result["anomaly_count"] == 5
 
     @patch("tests.evaluation.execution._execute_agent_inner")
@@ -147,7 +240,11 @@ class TestExecuteAgentArtifact:
         mock_inner.side_effect = RuntimeError("boom")
         task = SimpleNamespace(task_id="T13", task_prompt="test", fixture_paths=[])
         artifact = SimpleNamespace(agent_config={}, skill_content=None, capability_type="agent")
-        result = execute_agent_artifact(artifact, task, {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            result = execute_agent_artifact(artifact, task, {})
         assert result == {}
 
     @patch("tests.evaluation.execution._execute_agent_inner")
@@ -156,7 +253,11 @@ class TestExecuteAgentArtifact:
         mock_inner.side_effect = concurrent.futures.TimeoutError()
         task = SimpleNamespace(task_id="T13", task_prompt="test", fixture_paths=[])
         artifact = SimpleNamespace(agent_config={}, skill_content=None, capability_type="agent")
-        result = execute_agent_artifact(artifact, task, {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            result = execute_agent_artifact(artifact, task, {})
         assert result == {}
 
 
@@ -245,7 +346,11 @@ class TestExecuteAgentArtifactMeta:
     @patch("tests.evaluation.execution._execute_agent_inner")
     def test_success_records_succeeded_true(self, mock_inner):
         mock_inner.return_value = {"result": "ok"}
-        execute_agent_artifact(self._artifact(), self._task(), {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            execute_agent_artifact(self._artifact(), self._task(), {})
         meta = get_last_agent_execution_meta()
         assert meta is not None
         assert meta.succeeded is True
@@ -254,7 +359,11 @@ class TestExecuteAgentArtifactMeta:
     @patch("tests.evaluation.execution._execute_agent_inner")
     def test_exception_in_inner_records_error(self, mock_inner):
         mock_inner.side_effect = RuntimeError("boom")
-        execute_agent_artifact(self._artifact(), self._task(), {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            execute_agent_artifact(self._artifact(), self._task(), {})
         meta = get_last_agent_execution_meta()
         assert meta is not None
         assert meta.succeeded is False
@@ -275,7 +384,11 @@ class TestExecuteAgentArtifactMeta:
         import tests.evaluation.execution as exec_mod
         monkeypatch.setattr(exec_mod, "_execute_agent_inner", _fake_inner)
 
-        result = execute_agent_artifact(self._artifact(), self._task(), {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            result = execute_agent_artifact(self._artifact(), self._task(), {})
         assert result == {}
         meta = get_last_agent_execution_meta()
         assert meta is not None
@@ -287,13 +400,21 @@ class TestExecuteAgentArtifactMeta:
     def test_meta_cleared_between_calls(self, mock_inner):
         # First call records error.
         mock_inner.side_effect = RuntimeError("boom")
-        execute_agent_artifact(self._artifact(), self._task(), {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            execute_agent_artifact(self._artifact(), self._task(), {})
         assert get_last_agent_execution_meta().failure_reason == "error"
 
         # Second call succeeds — must overwrite, not leak prior error.
         mock_inner.side_effect = None
         mock_inner.return_value = {"ok": True}
-        execute_agent_artifact(self._artifact(), self._task(), {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            execute_agent_artifact(self._artifact(), self._task(), {})
         meta = get_last_agent_execution_meta()
         assert meta.succeeded is True
         assert meta.failure_reason is None
@@ -303,6 +424,15 @@ class TestExecuteAgentArtifactMeta:
         # the value in tests/evaluation/execution.py and re-read the
         # langfuse trace that justified it.
         assert AGENT_EXECUTION_TIMEOUT_S == 900
+
+    def test_lead_with_subagents_timeout_is_extended(self):
+        artifact = SimpleNamespace(
+            agent_config={
+                "system_prompt": "You are an agent.",
+                "subagents": [{"name": "worker", "description": "x", "system_prompt": "y", "tools": []}],
+            }
+        )
+        assert _agent_timeout_seconds(artifact) == LEAD_WITH_SUBAGENTS_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +991,10 @@ class TestBuildDynamicResultModel:
 
 
 class TestExecuteAgentArtifactDynamicResponseFormat:
+    @staticmethod
+    def _inline_process_context():
+        return _inline_agent_process_context()
+
     @patch("tests.evaluation.execution._execute_agent_inner")
     def test_output_schema_threaded_through(self, mock_inner):
         """execute_agent_artifact forwards output_schema to _execute_agent_inner."""
@@ -875,10 +1009,14 @@ class TestExecuteAgentArtifactDynamicResponseFormat:
             "metrics_table": "list[dict]",
             "root_cause_metric": "str",
         }
-        execute_agent_artifact(
-            artifact, task, {},
-            output_schema=output_schema,
-        )
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=self._inline_process_context(),
+        ):
+            execute_agent_artifact(
+                artifact, task, {},
+                output_schema=output_schema,
+            )
 
         # _execute_agent_inner received output_schema as a keyword arg.
         _, kwargs = mock_inner.call_args
@@ -893,7 +1031,75 @@ class TestExecuteAgentArtifactDynamicResponseFormat:
         artifact = SimpleNamespace(agent_config={"system_prompt": "you are"})
         task = SimpleNamespace(task_id="", task_prompt="test")
 
-        execute_agent_artifact(artifact, task, {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=self._inline_process_context(),
+        ):
+            execute_agent_artifact(artifact, task, {})
+
+        _, kwargs = mock_inner.call_args
+        assert kwargs["output_schema"] is None
+
+
+class TestAgentProcessContext:
+    def test_prefers_spawn_on_darwin(self, monkeypatch):
+        import tests.evaluation.execution as exec_mod
+
+        calls = []
+
+        def _fake_get_context(method=None):
+            calls.append(method)
+            return method
+
+        monkeypatch.setattr(exec_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(exec_mod.multiprocessing, "get_context", _fake_get_context)
+
+        ctx = _agent_process_context()
+        assert ctx == "spawn"
+        assert calls == ["spawn"]
+
+    def test_prefers_fork_off_darwin(self, monkeypatch):
+        import tests.evaluation.execution as exec_mod
+
+        calls = []
+
+        def _fake_get_context(method=None):
+            calls.append(method)
+            return method
+
+        monkeypatch.setattr(exec_mod.sys, "platform", "linux")
+        monkeypatch.setattr(exec_mod.multiprocessing, "get_context", _fake_get_context)
+
+        ctx = _agent_process_context()
+        assert ctx == "fork"
+        assert calls == ["fork"]
+
+
+class TestExecuteSkillArtifactDynamicResponseFormat:
+    @patch("tests.evaluation.execution._execute_skill_inner")
+    def test_output_schema_threaded_through(self, mock_inner):
+        mock_inner.return_value = {"summary": "ok", "counts": {}}
+
+        artifact = SimpleNamespace(skill_content="# skill")
+        task = SimpleNamespace(task_id="T04", task_prompt="test")
+        output_schema = {"summary": "str", "counts": "dict"}
+
+        execute_skill_artifact(
+            artifact, task, {},
+            output_schema=output_schema,
+        )
+
+        _, kwargs = mock_inner.call_args
+        assert kwargs["output_schema"] == output_schema
+
+    @patch("tests.evaluation.execution._execute_skill_inner")
+    def test_default_no_output_schema(self, mock_inner):
+        mock_inner.return_value = {}
+
+        artifact = SimpleNamespace(skill_content="# skill")
+        task = SimpleNamespace(task_id="T04", task_prompt="test")
+
+        execute_skill_artifact(artifact, task, {})
 
         _, kwargs = mock_inner.call_args
         assert kwargs["output_schema"] is None
