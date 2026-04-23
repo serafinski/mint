@@ -79,6 +79,17 @@ def _condition_metrics_store_path(
     return base_path.with_name(f"{base_path.name}_{condition}")
 
 
+def _persisted_evaluation_run_count(db_path: str) -> int | None:
+    """Return persisted evaluation row count, or None if unavailable."""
+    try:
+        import duckdb
+
+        with duckdb.connect(db_path, read_only=True) as con:
+            return int(con.execute("SELECT COUNT(*) FROM evaluation_runs").fetchone()[0])
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # Security audit finding #103 (2026-04-19, ext10): SIGALRM-based
 # total-budget watchdog. Wraps a long-running ``harness.run_condition``
 # call so a hung Docker container or LangFuse-API stall can't silently
@@ -498,12 +509,27 @@ def main() -> int:
 
         logger.info("Results persisted to %s", DB_PATH)
 
-        # Final summary across all conditions (computed from in-memory records)
+        # Final summary across all conditions. On watchdog abort the in-memory
+        # list can undercount the DB because per-task rows are flushed inside
+        # the harness before BudgetExceeded bubbles out.
         total = len(all_records)
         n_success = sum(r.success for r in all_records)
         n_gate = sum(r.gate_passed for r in all_records)
-        final_lines = [f"Total records: {total}"]
-        if total:
+        persisted_total = _persisted_evaluation_run_count(DB_PATH) if watchdog_aborted else None
+        summary_total = total
+        final_lines = []
+        if persisted_total is not None and persisted_total > total:
+            summary_total = persisted_total
+            final_lines.append(
+                f"Total records: {persisted_total} ({total} captured in-memory before abort)"
+            )
+            final_lines.append(
+                "Overall rates omitted: watchdog aborted after additional rows were "
+                "persisted to DuckDB."
+            )
+        else:
+            final_lines.append(f"Total records: {summary_total}")
+        if total and summary_total == total:
             final_lines.append(f"Overall success rate: {n_success/total:.1%}")
             final_lines.append(f"Overall gate pass rate: {n_gate/total:.1%}")
         from collections import Counter

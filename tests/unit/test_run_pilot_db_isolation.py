@@ -218,3 +218,29 @@ def test_all_conditions_use_isolated_metrics_store_paths(tmp_path, monkeypatch):
     assert seen["no_verification"].endswith("campaign_metrics_no_verification.duckdb")
     assert seen["no_optimization"].endswith("campaign_metrics_no_optimization.duckdb")
     assert seen["static"].endswith("campaign_metrics_static.duckdb")
+
+
+def test_persisted_evaluation_run_count_reads_duckdb(tmp_path):
+    """Watchdog summary should be able to recover persisted row counts."""
+    import duckdb
+
+    import scripts.run_pilot as rp
+
+    db = tmp_path / "campaign.duckdb"
+    with duckdb.connect(str(db)) as con:
+        con.execute("create table evaluation_runs (task_id varchar)")
+        con.execute("insert into evaluation_runs values ('T01'), ('T02')")
+
+    assert rp._persisted_evaluation_run_count(str(db)) == 2
+
+
+def test_persisted_evaluation_run_count_returns_none_without_table(tmp_path):
+    import duckdb
+
+    import scripts.run_pilot as rp
+
+    db = tmp_path / "empty.duckdb"
+    with duckdb.connect(str(db)):
+        pass
+
+    assert rp._persisted_evaluation_run_count(str(db)) is None

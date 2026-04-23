@@ -17,11 +17,11 @@ from src.orchestrator.taxonomy import (
     CapabilityDomainClassification,
     DomainTaxonomy,
     QueryDomainChoice,
+    _normalize_category_name,
     classify_and_tag_artifacts,
 )
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -155,6 +155,26 @@ class TestCategoryGrowth:
         tmp_taxonomy.get_or_create_for_capability(artifact, llm)
         assert "unknown-domain" in tmp_taxonomy.list_categories()
 
+    def test_blank_domain_falls_back_without_creating_empty_category(
+        self, tmp_taxonomy: DomainTaxonomy,
+    ):
+        artifact = _make_artifact()
+        llm = _mock_llm_returning(
+            CapabilityDomainClassification(
+                domain="   ",
+                is_new=False,
+                new_description="",
+                is_generic=False,
+                rationale="LLM returned whitespace only.",
+            )
+        )
+
+        result = tmp_taxonomy.get_or_create_for_capability(artifact, llm)
+
+        assert result.domain == "general"
+        assert result.is_new is False
+        assert tmp_taxonomy.list_categories() == {}
+
     def test_growth_is_persistent_across_instances(self, tmp_path: Path):
         path = tmp_path / "domains.json"
         tx1 = DomainTaxonomy(path)
@@ -241,6 +261,33 @@ class TestQueryClassification:
         )
         # "finance" isn't in the taxonomy — should be treated as None
         assert tmp_taxonomy.get_for_query("query", query_llm) is None
+
+    def test_blank_query_domain_treated_as_none(self, tmp_taxonomy: DomainTaxonomy):
+        seed_llm = _mock_llm_returning(
+            CapabilityDomainClassification(
+                domain="sales",
+                is_new=True,
+                new_description="Sales",
+                is_generic=False,
+                rationale="",
+            )
+        )
+        tmp_taxonomy.get_or_create_for_capability(_make_artifact(), seed_llm)
+
+        query_llm = _mock_query_llm_returning(
+            QueryDomainChoice(domain="   ", rationale="Bad whitespace response.")
+        )
+        assert tmp_taxonomy.get_for_query("parse sales csv", query_llm) is None
+
+
+class TestCategoryNameNormalization:
+    def test_blank_names_normalize_to_none(self):
+        assert _normalize_category_name(None) is None
+        assert _normalize_category_name("") is None
+        assert _normalize_category_name("   ") is None
+
+    def test_names_are_stripped(self):
+        assert _normalize_category_name("  sales  ") == "sales"
 
 
 # ---------------------------------------------------------------------------

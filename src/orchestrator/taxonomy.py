@@ -64,6 +64,14 @@ logger = logging.getLogger(__name__)
 _MAX_TAXONOMY_ATTEMPTS = 3
 
 
+def _normalize_category_name(name: str | None) -> str | None:
+    """Return a stripped category name, or None for blank/invalid names."""
+    if name is None:
+        return None
+    normalized = name.strip()
+    return normalized or None
+
+
 # ---------------------------------------------------------------------------
 # Structured-output schemas for the LLM calls
 # ---------------------------------------------------------------------------
@@ -415,6 +423,29 @@ class DomainTaxonomy:
                 rationale=f"(LLM failure: {type(exc).__name__}: {str(exc)[:120]})",
             )
 
+        normalized_domain = _normalize_category_name(result.domain)
+        if normalized_domain is None:
+            logger.warning(
+                "DomainTaxonomy.get_or_create_for_capability received blank domain "
+                "for '%s' — using fallback classification",
+                artifact.capability_name,
+            )
+            return CapabilityDomainClassification(
+                domain="general",
+                is_new=False,
+                new_description="",
+                is_generic=result.is_generic,
+                rationale=(
+                    f"{result.rationale} (invalid blank domain from taxonomy classifier)"
+                ),
+            )
+        result = result.model_copy(
+            update={
+                "domain": normalized_domain,
+                "new_description": result.new_description.strip(),
+            }
+        )
+
         # If the LLM proposed a new category, add it to the taxonomy atomically.
         if result.is_new:
             self._commit_new_category(result.domain, result.new_description)
@@ -441,25 +472,29 @@ class DomainTaxonomy:
         Re-loads the file under the lock (to pick up concurrent updates from
         other processes) and writes the merged result.
         """
+        normalized_name = _normalize_category_name(name)
+        if normalized_name is None:
+            raise ValueError("Category name must be non-empty")
+
         with self._lock:
             data = self._load()
             categories = data.setdefault("categories", {})
-            if name in categories:
+            if normalized_name in categories:
                 # Someone else added this category between our LLM call and
                 # this commit — no-op. The description of the first writer
                 # wins.
                 logger.debug(
-                    "DomainTaxonomy: category '%s' already exists — no-op", name
+                    "DomainTaxonomy: category '%s' already exists — no-op", normalized_name
                 )
                 return
-            categories[name] = {
+            categories[normalized_name] = {
                 "description": description or "",
                 "created_at": datetime.now(UTC).isoformat(),
             }
             self._save(data)
             logger.info(
                 "DomainTaxonomy: added new category '%s' — '%s'",
-                name, description[:80],
+                normalized_name, description[:80],
             )
 
     # ------------------------------------------------------------------
@@ -531,15 +566,23 @@ class DomainTaxonomy:
 
         # Validate: if the LLM returned a domain not in the taxonomy, treat
         # as None (the LLM hallucinated a category that doesn't exist).
-        if result.domain is not None and result.domain not in cats:
+        normalized_domain = _normalize_category_name(result.domain)
+        if normalized_domain is None:
+            logger.warning(
+                "DomainTaxonomy.get_for_query: LLM returned blank domain for "
+                "query %r — bypassing filter",
+                query[:80],
+            )
+            return None
+        if normalized_domain not in cats:
             logger.warning(
                 "DomainTaxonomy.get_for_query: LLM returned '%s' which is not "
                 "in the current taxonomy — bypassing filter",
-                result.domain,
+                normalized_domain,
             )
             return None
 
-        return result.domain
+        return normalized_domain
 
     # ------------------------------------------------------------------
     # Implementation text extraction
