@@ -442,8 +442,8 @@ class EvaluationStore:
         run_id: str,
         condition: str,
         task_id: str,
-        task_family_id: str,
-        task_instance_id: str,
+        task_family_id: str | None = None,
+        task_instance_id: str | None = None,
         variant_id: str | None = None,
         benchmark_track: str = "breadth",
         events: list[dict],
@@ -476,6 +476,8 @@ class EvaluationStore:
         """
         if not events:
             return 0
+        task_family_id = task_family_id or task_id
+        task_instance_id = task_instance_id or task_id
         rows = []
         now = datetime.now(UTC)
         for ev in events:
@@ -515,8 +517,8 @@ class EvaluationStore:
         run_id: str,
         condition: str,
         task_id: str,
-        task_family_id: str,
-        task_instance_id: str,
+        task_family_id: str | None = None,
+        task_instance_id: str | None = None,
         variant_id: str | None = None,
         benchmark_track: str = "breadth",
         scores: dict[str, float],
@@ -540,6 +542,8 @@ class EvaluationStore:
         """
         if not scores:
             return 0
+        task_family_id = task_family_id or task_id
+        task_instance_id = task_instance_id or task_id
         now = occurred_at if occurred_at is not None else datetime.now(UTC)
         rows = [
             [
@@ -575,8 +579,8 @@ class EvaluationStore:
         run_id: str,
         condition: str,
         task_id: str,
-        task_family_id: str,
-        task_instance_id: str,
+        task_family_id: str | None = None,
+        task_instance_id: str | None = None,
         variant_id: str | None = None,
         benchmark_track: str = "breadth",
         events: list[dict],
@@ -604,6 +608,8 @@ class EvaluationStore:
         """
         if not events:
             return 0
+        task_family_id = task_family_id or task_id
+        task_instance_id = task_instance_id or task_id
         now = occurred_at if occurred_at is not None else datetime.now(UTC)
         rows = []
         for ev in events:

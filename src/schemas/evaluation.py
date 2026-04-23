@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src.schemas.capability import CapabilityType
 
@@ -147,11 +147,13 @@ class EvaluationRecord(BaseModel):
         ..., description="Baseline condition"
     )
     task_id: str = Field(..., description="Testbed task identifier (e.g. 'T01')")
-    task_family_id: str = Field(
-        ..., description="Stable task-family identifier (e.g. 'T11') across breadth/recurrence"
+    task_family_id: str | None = Field(
+        default=None,
+        description="Stable task-family identifier (e.g. 'T11') across breadth/recurrence",
     )
-    task_instance_id: str = Field(
-        ..., description="Concrete task instance identifier (e.g. 'T11.v02'); equals task_id for breadth"
+    task_instance_id: str | None = Field(
+        default=None,
+        description="Concrete task instance identifier (e.g. 'T11.v02'); equals task_id for breadth",
     )
     variant_id: str | None = Field(
         default=None,
@@ -363,6 +365,15 @@ class EvaluationRecord(BaseModel):
     )
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _default_task_identity(self) -> "EvaluationRecord":
+        """Backfill breadth rows created before recurrence identity existed."""
+        if self.task_family_id is None:
+            self.task_family_id = self.task_id
+        if self.task_instance_id is None:
+            self.task_instance_id = self.task_id
+        return self
 
     @classmethod
     def is_success(
