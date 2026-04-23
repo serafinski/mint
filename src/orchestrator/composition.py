@@ -234,6 +234,40 @@ class CompositionalExecutor:
             )
             return None
 
+    def _collect_transitive_depends_on(self, step_index: int) -> list[int] | None:
+        """Return the transitive predecessor closure for ``step_index``.
+
+        The decomposer's coherence contract is transitive: a downstream subtask
+        may require keys produced by any ancestor reachable through
+        ``depends_on``. MCP_TOOL generation is prompted with the same contract,
+        describing ``upstream_data`` as "all upstream data". To keep the
+        executor aligned with both layers while preserving the ext9 isolation
+        fix (avoid unrelated parallel-branch state), we pass the sandbox the
+        transitive closure of declared predecessors rather than only the direct
+        dependency list.
+
+        Returns ``None`` for invalid indices so callers can fall back to the
+        pre-existing fail-safe behaviour.
+        """
+        if not (0 <= step_index < len(self.subtasks)):
+            return None
+
+        visited: set[int] = set()
+        queue: list[int] = list(self.subtasks[step_index].depends_on)
+
+        while queue:
+            dep = queue.pop(0)
+            if dep in visited:
+                continue
+            if not (0 <= dep < len(self.subtasks)):
+                # ``build_execution_order`` already fails closed on malformed
+                # DAGs; keep this helper defensive and skip invalid edges.
+                continue
+            visited.add(dep)
+            queue.extend(self.subtasks[dep].depends_on)
+
+        return sorted(visited)
+
     # ------------------------------------------------------------------
     # Workspace management
     # ------------------------------------------------------------------
@@ -519,10 +553,16 @@ class CompositionalExecutor:
             )
             return {}
 
-        # Security audit finding #91 (2026-04-19, ext9): pass the
-        # subtask's depends_on so the sandbox only merges state from
-        # declared predecessors, not every prior step's output.
-        depends_on = list(subtask.depends_on) if subtask is not None else None
+        # Security audit finding #91 (2026-04-19, ext9): restrict sandbox state
+        # to declared predecessors, not every prior step's output. Use the
+        # transitive closure rather than only direct dependencies so
+        # downstream MCP_TOOL writers receive the same "all upstream data"
+        # contract enforced by decomposition/generation.
+        depends_on = (
+            self._collect_transitive_depends_on(step_index)
+            if subtask is not None
+            else None
+        )
 
         return execute_mcp_tool_in_chain(
             source_code=source_code,

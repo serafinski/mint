@@ -857,12 +857,15 @@ def execute_mcp_tool_in_chain(
 
     Security audit finding #91 (2026-04-19, ext9): when ``depends_on``
     is provided, the sandbox code only loads ``step_*_output.json``
-    files whose step index is in the dependency set. Pre-fix every
-    prior step's output was globbed and merged unconditionally, so
-    parallel branches saw each other's state (T11-shape chains had
-    cross-branch corruption depending on alphabetical glob order).
-    ``depends_on=None`` preserves the pre-fix broad-load behaviour for
-    callers (unit tests) that have no dependency information.
+    files whose step index is in the dependency filter set. The caller
+    may pass either the direct dependency list or the transitive closure
+    of declared predecessors; in both cases the key property is that
+    unrelated parallel branches are excluded. Pre-fix every prior step's
+    output was globbed and merged unconditionally, so parallel branches
+    saw each other's state (T11-shape chains had cross-branch corruption
+    depending on alphabetical glob order). ``depends_on=None`` preserves
+    the pre-fix broad-load behaviour for callers (unit tests) that have
+    no dependency information.
 
     Never raises — returns ``{}`` on any failure.
     """

@@ -465,6 +465,77 @@ class TestChainExecution:
         assert chain_result.chain_length == 3
         assert len(chain_result.step_results) == 3
         assert chain_result.step_results[-1] == {"aggregated": 60}
+        assert mock_exec.call_args_list[0].kwargs["depends_on"] == []
+        assert mock_exec.call_args_list[1].kwargs["depends_on"] == [0]
+        assert mock_exec.call_args_list[2].kwargs["depends_on"] == [0, 1]
+
+    @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
+    def test_mcp_tool_receives_transitive_upstream_closure(self, mock_exec):
+        """Downstream MCP tools should see all ancestor outputs, not just direct deps.
+
+        T12 exposed a contract mismatch: decomposition/generation treat
+        ``requires_upstream_keys`` as satisfiable by transitive predecessors, but
+        the executor previously passed only direct ``depends_on`` indices into the
+        MCP sandbox. The final summary step therefore lost counts produced two
+        hops earlier even though the chain was deemed coherent.
+        """
+        mock_exec.side_effect = [
+            {"raw_rows": []},
+            {"after_non_null_rows": [], "removed_non_null_count": 10},
+            {"after_range_rows": [], "removed_range_count": 5},
+            {"final_clean_rows": [], "removed_dedup_count": 5},
+            {"clean_row_count": 60, "violations_found": 20, "rules_applied": 3},
+        ]
+
+        arts = [
+            _make_artifact("reader", CapabilityType.MCP_TOOL, gap_query="read",
+                           source_code="async def reader(): pass"),
+            _make_artifact("nonnull", CapabilityType.MCP_TOOL, gap_query="nonnull",
+                           source_code="async def nonnull(): pass"),
+            _make_artifact("range", CapabilityType.MCP_TOOL, gap_query="range",
+                           source_code="async def range_tool(): pass"),
+            _make_artifact("dedup", CapabilityType.MCP_TOOL, gap_query="dedup",
+                           source_code="async def dedup(): pass"),
+            _make_artifact("summary", CapabilityType.MCP_TOOL, gap_query="summary",
+                           source_code="async def summary(): pass"),
+        ]
+
+        subtasks = [
+            _make_subtask("read", ["read"]),
+            _make_subtask("nonnull", ["nonnull"], depends_on=[0]),
+            _make_subtask("range", ["range"], depends_on=[1]),
+            _make_subtask("dedup", ["dedup"], depends_on=[2]),
+            _make_subtask("summary", ["summary"], depends_on=[3]),
+        ]
+
+        resolution = {
+            "read": CapabilityReference(
+                source="generated", capability_name="reader",
+                capability_type=CapabilityType.MCP_TOOL,
+            ),
+            "nonnull": CapabilityReference(
+                source="generated", capability_name="nonnull",
+                capability_type=CapabilityType.MCP_TOOL,
+            ),
+            "range": CapabilityReference(
+                source="generated", capability_name="range",
+                capability_type=CapabilityType.MCP_TOOL,
+            ),
+            "dedup": CapabilityReference(
+                source="generated", capability_name="dedup",
+                capability_type=CapabilityType.MCP_TOOL,
+            ),
+            "summary": CapabilityReference(
+                source="generated", capability_name="summary",
+                capability_type=CapabilityType.MCP_TOOL,
+            ),
+        }
+
+        ex = self._make_chain_executor(subtasks=subtasks, resolution=resolution, artifacts=arts)
+        chain_result = ex.run()
+
+        assert chain_result.chain_success is True
+        assert mock_exec.call_args_list[4].kwargs["depends_on"] == [0, 1, 2, 3]
 
     @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
     def test_mid_chain_failure(self, mock_exec):
