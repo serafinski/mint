@@ -26,9 +26,85 @@ from langgraph.types import Command
 
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
-from src.schemas.task import GapItem, MatchItem, TaskState, TaskStatus
+from src.schemas.capability import CapabilityDescriptor, CapabilityType
+from src.schemas.task import GapItem, MatchItem, SubTask, TaskState, TaskStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _is_match_compatible_with_subtask(
+    *,
+    subtask: SubTask,
+    capability: CapabilityDescriptor,
+) -> tuple[bool, str | None]:
+    """Return whether a registry match is compatible with a decomposed subtask.
+
+    The current guard has two parts:
+
+    - if the subtask declares no ``output_schema``, preserve legacy behavior
+    - if the capability stores no ``output_schema``, preserve legacy behavior
+    - otherwise, require the capability's output keys to cover the subtask's
+      declared output keys
+    - for downstream MCP tools, require an input call-shape that the chain
+      executor can actually satisfy:
+      - either the tool accepts ``upstream_data``
+      - or it accepts the subtask's declared ``requires_upstream_keys`` as
+        named parameters
+
+    This blocks terminal whole-workflow capabilities from being reused as
+    intermediate parser/adapter subtasks while preserving valid whole-task
+    retrieval and substep reuse.
+    """
+    expected = set(subtask.output_schema.keys())
+    if not expected:
+        output_reason = None
+    else:
+        actual = set((capability.output_schema or {}).keys())
+        if not actual:
+            output_reason = None
+        else:
+            missing = expected - actual
+            if missing:
+                output_reason = (
+                    f"registry match '{capability.name}' incompatible with subtask "
+                    f"output_schema: expected keys {sorted(expected)}, "
+                    f"got {sorted(actual)}"
+                )
+            else:
+                output_reason = None
+
+    if output_reason is not None:
+        return False, output_reason
+
+    # Downstream MCP tools have a second compatibility dimension: can the
+    # chain executor actually call them? Steps 1+ pass either:
+    # - a single ``upstream_data`` dict, or
+    # - named kwargs that match ``requires_upstream_keys`` exactly.
+    #
+    # Skills/agents do not use the same call-shape constraints, so keep this
+    # gate MCP_TOOL-only.
+    required_inputs = set(subtask.requires_upstream_keys or [])
+    if capability.capability_type is not CapabilityType.MCP_TOOL:
+        return True, None
+    if not required_inputs:
+        return True, None
+
+    actual_inputs = set((capability.input_schema or {}).keys())
+    if not actual_inputs:
+        return True, None
+    if "upstream_data" in actual_inputs:
+        return True, None
+
+    missing_inputs = required_inputs - actual_inputs
+    if not missing_inputs:
+        return True, None
+
+    reason = (
+        f"registry match '{capability.name}' incompatible with subtask "
+        f"input call shape: requires upstream keys {sorted(required_inputs)}, "
+        f"but tool inputs are {sorted(actual_inputs)}"
+    )
+    return False, reason
 
 
 def gap_detection_node(
@@ -124,6 +200,7 @@ def gap_detection_node(
     # See ``docs/registry_retrieval_fix_plan.md`` for the empirical
     # evidence, ranked options, and methodology notes.
     slug_to_description: dict[str, str] = {}
+    slug_to_subtask: dict[str, SubTask] = {}
     for subtask in state.subtasks:
         for slug in subtask.required_capabilities:
             # First subtask that claims a slug wins if the decomposer
@@ -131,6 +208,7 @@ def gap_detection_node(
             # but possible. Same-slug-across-subtasks is a decomposition
             # quality issue caught elsewhere.
             slug_to_description.setdefault(slug, subtask.description)
+            slug_to_subtask.setdefault(slug, subtask)
 
     auxiliary_queries: list[str | None] = [
         slug_to_description.get(slug) for slug in state.required_capabilities
@@ -143,10 +221,28 @@ def gap_detection_node(
         include_generic=True,
     )
 
-    matches = [
-        MatchItem(capability=cap, score=score, query=query)
-        for cap, score, query in matches_raw
-    ]
+    compatible_matches: list[MatchItem] = []
+    demoted_gaps: list[tuple[str, str]] = []
+    for cap, score, query in matches_raw:
+        subtask = slug_to_subtask.get(query)
+        if subtask is not None and subtask.output_schema:
+            compatible, reason = _is_match_compatible_with_subtask(
+                subtask=subtask,
+                capability=cap,
+            )
+            if not compatible:
+                demoted_gaps.append((query, reason or "incompatible registry match"))
+                logger.info(
+                    "gap_detection: demoting registry match %s for %s — %s",
+                    cap.name,
+                    query,
+                    reason or "incompatible registry match",
+                )
+                continue
+
+        compatible_matches.append(
+            MatchItem(capability=cap, score=score, query=query)
+        )
 
     # Stage 1 of the compositional refactor: matches are NOT recorded as
     # InvocationRecords here. Doing so inflated reuse counts (e.g., csv-parser
@@ -157,28 +253,29 @@ def gap_detection_node(
     # one per unmatched required capability. The per-gap classifier downstream
     # classifies each gap independently within the context of the whole task,
     # which lets generators produce N artifacts (one per workflow step).
+    all_gaps_raw = [*gaps_raw, *demoted_gaps]
     gaps: list[GapItem] = [
         GapItem(
             description=capability_name,
             query=capability_name,
         )
-        for capability_name, _reason in gaps_raw
+        for capability_name, _reason in all_gaps_raw
     ]
 
     logger.info(
         "Gap detection: %d match(es), %d unmatched capability(ies) → %d gap(s) for classification",
-        len(matches),
-        len(gaps_raw),
+        len(compatible_matches),
+        len(all_gaps_raw),
         len(gaps),
     )
-    for m in matches:
+    for m in compatible_matches:
         logger.info("  ✓ matched: %s (score=%.2f)", m.capability.name, m.score)
     for g in gaps:
         logger.info("  ✗ gap: %s", g.query)
 
     return Command(
         update={
-            "matches": matches,
+            "matches": compatible_matches,
             "gaps": gaps,
             "status": TaskStatus.DETECTING_GAPS,
             "errors": errors,

@@ -18,12 +18,20 @@ from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import GapItem, MatchItem, TaskState, TaskStatus
 
 
-def _make_descriptor(name: str = "test-tool") -> CapabilityDescriptor:
+def _make_descriptor(
+    name: str = "test-tool",
+    *,
+    capability_type: CapabilityType = CapabilityType.MCP_TOOL,
+    input_schema: dict[str, str] | None = None,
+    output_schema: dict[str, str] | None = None,
+) -> CapabilityDescriptor:
     return CapabilityDescriptor(
         name=name,
         description=f"A test capability: {name}",
-        capability_type=CapabilityType.MCP_TOOL,
+        capability_type=capability_type,
         domain="testing",
+        input_schema=input_schema or {},
+        output_schema=output_schema or {},
     )
 
 
@@ -296,6 +304,199 @@ def test_dual_query_multiple_slugs_in_one_subtask():
         "Shared description for multi-capability subtask.",
         "Shared description for multi-capability subtask.",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Registry-match compatibility gate for decomposed subtasks
+# ---------------------------------------------------------------------------
+
+
+def test_incompatible_registry_match_demoted_to_gap():
+    """A registry hit that cannot satisfy the subtask's declared produced
+    keys must be demoted back into a gap so generation can fill it.
+    """
+    from src.schemas.task import SubTask
+
+    cap = _make_descriptor(
+        "sales-integration-report",
+        output_schema={
+            "summary_row_count": "int",
+            "region_revenues": "dict",
+            "regions_meeting_target": "int",
+            "output_file": "str",
+        },
+    )
+    registry = _make_registry(
+        matches=[(cap, 0.70, "parse-sales-products-and-targets")],
+    )
+    state = TaskState(
+        task_description="T11-style integration task",
+        required_capabilities=["parse-sales-products-and-targets"],
+        subtasks=[
+            SubTask(
+                description="Parse the sales CSV, products workbook, and targets CSV.",
+                required_capabilities=["parse-sales-products-and-targets"],
+                depends_on=[],
+                output_schema={
+                    "sales": "list[dict]",
+                    "products": "list[dict]",
+                    "targets": "list[dict]",
+                },
+            ),
+        ],
+    )
+
+    cmd = gap_detection_node(state, registry)
+
+    assert cmd.update["matches"] == []
+    assert [g.query for g in cmd.update["gaps"]] == [
+        "parse-sales-products-and-targets"
+    ]
+
+
+def test_compatible_registry_match_preserved_for_subtask():
+    from src.schemas.task import SubTask
+
+    cap = _make_descriptor(
+        "csv-parser",
+        output_schema={
+            "sales": "list[dict]",
+            "products": "list[dict]",
+            "targets": "list[dict]",
+            "extra": "dict",
+        },
+    )
+    registry = _make_registry(
+        matches=[(cap, 0.91, "parse-sales-products-and-targets")],
+    )
+    state = TaskState(
+        task_description="parse files",
+        required_capabilities=["parse-sales-products-and-targets"],
+        subtasks=[
+            SubTask(
+                description="Parse the sales CSV, products workbook, and targets CSV.",
+                required_capabilities=["parse-sales-products-and-targets"],
+                depends_on=[],
+                output_schema={
+                    "sales": "list[dict]",
+                    "products": "list[dict]",
+                    "targets": "list[dict]",
+                },
+            ),
+        ],
+    )
+
+    cmd = gap_detection_node(state, registry)
+
+    assert len(cmd.update["matches"]) == 1
+    assert cmd.update["matches"][0].capability.name == "csv-parser"
+    assert cmd.update["gaps"] == []
+
+
+def test_no_subtasks_preserves_legacy_match_behavior():
+    """Direct retrieval flows without decomposition must remain unchanged."""
+    cap = _make_descriptor(
+        "sales-integration-report",
+        output_schema={
+            "summary_row_count": "int",
+            "region_revenues": "dict",
+            "regions_meeting_target": "int",
+            "output_file": "str",
+        },
+    )
+    registry = _make_registry(
+        matches=[(cap, 0.70, "parse-sales-products-and-targets")],
+    )
+    state = TaskState(
+        task_description="legacy direct retrieval",
+        required_capabilities=["parse-sales-products-and-targets"],
+        subtasks=[],
+    )
+
+    cmd = gap_detection_node(state, registry)
+
+    assert len(cmd.update["matches"]) == 1
+    assert cmd.update["matches"][0].capability.name == "sales-integration-report"
+    assert cmd.update["gaps"] == []
+
+
+def test_incompatible_registry_mcp_tool_input_shape_demoted_to_gap():
+    from src.schemas.task import SubTask
+
+    cap = _make_descriptor(
+        "hash-rows-and-remove-exact-duplicates",
+        input_schema={"csv_path": "str"},
+        output_schema={
+            "unique_rows": "list[dict]",
+            "duplicate_count": "int",
+        },
+    )
+    registry = _make_registry(
+        matches=[(cap, 0.64, "hash-rows-and-remove-exact-duplicates")],
+    )
+    state = TaskState(
+        task_description="T12-style cleaning task",
+        required_capabilities=["hash-rows-and-remove-exact-duplicates"],
+        subtasks=[
+            SubTask(
+                description="Deduplicate the cleaned upstream rows.",
+                required_capabilities=["hash-rows-and-remove-exact-duplicates"],
+                depends_on=[0],
+                output_schema={
+                    "unique_rows": "list[dict]",
+                    "duplicate_count": "int",
+                },
+                requires_upstream_keys=["rows_after_range"],
+            ),
+        ],
+    )
+
+    cmd = gap_detection_node(state, registry)
+
+    assert cmd.update["matches"] == []
+    assert [g.query for g in cmd.update["gaps"]] == [
+        "hash-rows-and-remove-exact-duplicates"
+    ]
+
+
+def test_compatible_registry_mcp_tool_input_shape_preserved_for_subtask():
+    from src.schemas.task import SubTask
+
+    cap = _make_descriptor(
+        "hash-rows-and-remove-exact-duplicates",
+        input_schema={"upstream_data": "dict[str, Any]"},
+        output_schema={
+            "unique_rows": "list[dict]",
+            "duplicate_count": "int",
+        },
+    )
+    registry = _make_registry(
+        matches=[(cap, 0.82, "hash-rows-and-remove-exact-duplicates")],
+    )
+    state = TaskState(
+        task_description="T12-style cleaning task",
+        required_capabilities=["hash-rows-and-remove-exact-duplicates"],
+        subtasks=[
+            SubTask(
+                description="Deduplicate the cleaned upstream rows.",
+                required_capabilities=["hash-rows-and-remove-exact-duplicates"],
+                depends_on=[0],
+                output_schema={
+                    "unique_rows": "list[dict]",
+                    "duplicate_count": "int",
+                },
+                requires_upstream_keys=["rows_after_range"],
+            ),
+        ],
+    )
+
+    cmd = gap_detection_node(state, registry)
+
+    assert len(cmd.update["matches"]) == 1
+    assert cmd.update["matches"][0].capability.name == (
+        "hash-rows-and-remove-exact-duplicates"
+    )
+    assert cmd.update["gaps"] == []
 
 
 # ---------------------------------------------------------------------------
