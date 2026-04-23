@@ -18,9 +18,9 @@ from tests.evaluation.execution import (
     T12Result,
     T13Result,
     T19Result,
-    _build_dynamic_result_model,
     _agent_process_context,
     _agent_timeout_seconds,
+    _build_dynamic_result_model,
     _extract_last_ai_json,
     _extract_last_json_object,
     _extract_last_sandbox_json,
@@ -31,6 +31,7 @@ from tests.evaluation.execution import (
     _select_result_model,
     clear_last_agent_execution_meta,
     execute_agent_artifact,
+    execute_mcp_tool_in_chain,
     execute_skill_artifact,
     get_last_agent_execution_meta,
 )
@@ -202,6 +203,62 @@ class TestExecuteSkillArtifact:
         artifact = SimpleNamespace(skill_content="# Test Skill", capability_type="skill")
         result = execute_skill_artifact(artifact, task, {})
         assert result == {}
+
+
+class TestExecuteMcpToolInChain:
+    @patch("src.verification.sandbox_tool.sandbox_execute_in_workspace")
+    def test_later_root_step_uses_root_fixture_binding(self, mock_sandbox, tmp_path):
+        captured: dict[str, str] = {}
+
+        def _fake_sandbox(code, **kwargs):
+            captured["code"] = code
+            return {"success": True, "stdout": '{"result": {"hourly_rows": []}}', "stderr": ""}
+
+        mock_sandbox.side_effect = _fake_sandbox
+
+        source_code = """
+async def parse_csv_with_timestamps(csv_path: str) -> dict:
+    return {"hourly_rows": []}
+"""
+        result = execute_mcp_tool_in_chain(
+            source_code=source_code,
+            step_index=1,
+            workspace_path=tmp_path,
+            capability_name="parse-csv-with-timestamps",
+            depends_on=[],
+        )
+
+        assert result == {"hourly_rows": []}
+        assert "if True:\n                        _all_inputs[_fp] = _full" in captured["code"]
+        assert 'if not True and "upstream_data" in _valid:' in captured["code"]
+        assert "if True:\n                        # Root step: broad matching" in captured["code"]
+
+    @patch("src.verification.sandbox_tool.sandbox_execute_in_workspace")
+    def test_downstream_step_preserves_non_root_binding(self, mock_sandbox, tmp_path):
+        captured: dict[str, str] = {}
+
+        def _fake_sandbox(code, **kwargs):
+            captured["code"] = code
+            return {"success": True, "stdout": '{"result": {"daily_aggregates": {}}}', "stderr": ""}
+
+        mock_sandbox.side_effect = _fake_sandbox
+
+        source_code = """
+async def aggregate_metrics(upstream_data: dict) -> dict:
+    return {"daily_aggregates": {}}
+"""
+        result = execute_mcp_tool_in_chain(
+            source_code=source_code,
+            step_index=2,
+            workspace_path=tmp_path,
+            capability_name="aggregate-metrics",
+            depends_on=[0, 1],
+        )
+
+        assert result == {"daily_aggregates": {}}
+        assert "if False:\n                        _all_inputs[_fp] = _full" in captured["code"]
+        assert 'if not False and "upstream_data" in _valid:' in captured["code"]
+        assert "if False:\n                        # Root step: broad matching" in captured["code"]
 
     @patch("tests.evaluation.execution._execute_skill_inner")
     def test_returns_empty_on_timeout(self, mock_inner):

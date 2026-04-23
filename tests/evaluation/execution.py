@@ -873,6 +873,11 @@ def execute_mcp_tool_in_chain(
     )
 
     func_name = _extract_function_name(source_code) or capability_name.replace("-", "_")
+    # ``step_index`` reflects execution order, not DAG rootness. In chains with
+    # multiple independent root subtasks (e.g. JSON loader + CSV parser),
+    # later root steps still need broad fixture binding even when their
+    # topological position is > 0.
+    is_root_step = depends_on == [] if depends_on is not None else (step_index == 0)
 
     # Security audit finding #91 (2026-04-19, ext9): encode the
     # depends_on filter so the sandbox only merges state from direct
@@ -926,9 +931,10 @@ async def _run():
             except Exception:
                 pass
 
-        # Read fixture files. For step 0, fixture filenames are added to
-        # _all_inputs as generic keys (the parser step needs broad access).
-        # For later steps, fixtures are only in _fixture_paths for explicit
+        # Read fixture files. For root steps (no dependencies), fixture
+        # filenames are added to _all_inputs as generic keys because parser/
+        # loader steps need broad access. For dependent steps, fixtures are
+        # only in _fixture_paths for explicit
         # parameter-name matching — they won't be assigned to unrelated params
         # via the generic fuzzy matcher below.
         _fixtures_dir = "/workspace/fixtures"
@@ -937,7 +943,7 @@ async def _run():
                 _full = os.path.join(_fixtures_dir, _fp)
                 if os.path.isfile(_full):
                     _fixture_paths.append(_full)
-                    if {step_index} == 0:
+                    if {is_root_step!r}:
                         _all_inputs[_fp] = _full
 
         # Match available inputs to function parameters.
@@ -948,7 +954,7 @@ async def _run():
         _sig = inspect.signature({func_name})
         _valid = set(_sig.parameters.keys())
 
-        if {step_index} > 0 and "upstream_data" in _valid:
+        if not {is_root_step!r} and "upstream_data" in _valid:
             # Collect only upstream step outputs (not fixtures) into one dict.
             # Security audit finding #91: filter by depends_on so parallel
             # branches don't see each other's state.
@@ -969,8 +975,8 @@ async def _run():
 
         # Path-like parameter matching: assign fixture paths to params
         # whose names suggest they expect a file path (file_path, csv_path, etc.)
-        # For step 0: any path-like param gets the first unused fixture (broad).
-        # For later steps: only match when the fixture filename overlaps with
+        # For root steps: any path-like param gets the first unused fixture
+        # (broad). For dependent steps: only match when the fixture filename overlaps with
         # the parameter name (e.g. param "xlsx_path" matches "products.xlsx").
         # This prevents binary fixtures from being blindly assigned to unrelated
         # params in downstream steps (T11 .xlsx crash reproducer).
@@ -988,8 +994,8 @@ async def _run():
                 for _fp in _fixture_paths:
                     if _fp in _used_fixtures:
                         continue
-                    if {step_index} == 0:
-                        # Step 0: broad matching — first unused fixture
+                    if {is_root_step!r}:
+                        # Root step: broad matching — first unused fixture
                         _kwargs[_p] = _fp
                         _used_fixtures.add(_fp)
                         break
