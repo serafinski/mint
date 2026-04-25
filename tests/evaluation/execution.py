@@ -22,6 +22,7 @@ import multiprocessing
 import queue
 import sys
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple
 
@@ -490,11 +491,28 @@ def _fixtures_to_workspace_files(fixture_contents: dict[str, str]) -> dict:
     for filename, content in fixture_contents.items():
         # Prepend "/" to match what validate_path() produces at read time.
         key = filename if filename.startswith("/") else f"/{filename}"
-        # StateBackend expects splitlines for content. Use keepends=False
-        # (default) so the lines don't carry trailing newlines — matches
-        # how ``_collect_skill_files`` writes skills.
-        files[key] = {"content": content.splitlines()}
+        files[key] = _make_workspace_file_entry(content)
     return files
+
+
+def _make_workspace_file_entry(content: str) -> dict[str, Any]:
+    """Build a DeepAgents ``FileData``-compatible state entry.
+
+    Our eval harness seeds DeepAgents' in-memory ``files`` mapping directly.
+    DeepAgents' documented ``FileData`` shape treats ``created_at`` and
+    ``modified_at`` as optional, but some glob/listing codepaths still sort by
+    ``modified_at`` via direct indexing. Providing timestamps here keeps our
+    payload aligned with the backend contract and avoids integration-only
+    crashes in filesystem tools.
+    """
+    timestamp = datetime.now(UTC).isoformat()
+    # Use splitlines() without keepends so the in-memory representation matches
+    # the format expected by StateBackend and by our skill-file collector.
+    return {
+        "content": content.splitlines(),
+        "created_at": timestamp,
+        "modified_at": timestamp,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1180,7 +1198,7 @@ def _collect_skill_files(skills_dir: Path | None = None) -> dict:
         if skill_md.exists():
             rel_path = f"{skills_prefix}/{skill_dir.name}/SKILL.md"
             content = skill_md.read_text(encoding="utf-8")
-            skill_files[rel_path] = {"content": content.splitlines()}
+            skill_files[rel_path] = _make_workspace_file_entry(content)
     return skill_files
 
 
@@ -1206,7 +1224,7 @@ def _ensure_skill_on_disk(
     skills_prefix = str(skills_dir).rstrip("/")
     rel_path = f"{skills_prefix}/{name}/SKILL.md"
     if rel_path not in skill_files:
-        skill_files[rel_path] = {"content": skill_content.splitlines()}
+        skill_files[rel_path] = _make_workspace_file_entry(skill_content)
 
 
 def execute_agent_artifact(

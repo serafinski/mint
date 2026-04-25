@@ -694,9 +694,12 @@ class TestFixturesToWorkspaceFiles:
         # Key MUST start with "/" to match validate_path normalization.
         assert "/t16_incident.yaml" in result
         assert "t16_incident.yaml" not in result
-        assert result["/t16_incident.yaml"] == {
-            "content": ["onset_time: '2024-07-01 05:00:00'", "affected: api"]
-        }
+        assert result["/t16_incident.yaml"]["content"] == [
+            "onset_time: '2024-07-01 05:00:00'",
+            "affected: api",
+        ]
+        assert "created_at" in result["/t16_incident.yaml"]
+        assert "modified_at" in result["/t16_incident.yaml"]
 
     def test_multiple_fixtures_all_absolute(self):
         fixtures = {
@@ -706,6 +709,8 @@ class TestFixturesToWorkspaceFiles:
         result = _fixtures_to_workspace_files(fixtures)
         assert set(result.keys()) == {"/t16_system_metrics.csv", "/t16_incident.yaml"}
         assert result["/t16_system_metrics.csv"]["content"] == ["ts,cpu,mem", "0,10,50", "1,11,52"]
+        assert "created_at" in result["/t16_system_metrics.csv"]
+        assert "modified_at" in result["/t16_system_metrics.csv"]
 
     def test_already_absolute_path_not_double_prefixed(self):
         """If a caller passes a key that already starts with ``/``, the
@@ -770,6 +775,8 @@ class TestFixturesToWorkspaceFiles:
         assert "content" in entry
         assert isinstance(entry["content"], list)
         assert all(isinstance(line, str) for line in entry["content"])
+        assert isinstance(entry["created_at"], str)
+        assert isinstance(entry["modified_at"], str)
 
     def test_preserves_blank_lines_but_strips_newlines(self):
         """splitlines() drops trailing newlines but preserves blank lines
@@ -783,12 +790,16 @@ class TestFixturesToWorkspaceFiles:
     def test_empty_file_content(self):
         fixtures = {"empty.txt": ""}
         result = _fixtures_to_workspace_files(fixtures)
-        assert result["/empty.txt"] == {"content": []}
+        assert result["/empty.txt"]["content"] == []
+        assert "created_at" in result["/empty.txt"]
+        assert "modified_at" in result["/empty.txt"]
 
     def test_single_line_no_trailing_newline(self):
         fixtures = {"oneline.txt": "just one line"}
         result = _fixtures_to_workspace_files(fixtures)
-        assert result["/oneline.txt"] == {"content": ["just one line"]}
+        assert result["/oneline.txt"]["content"] == ["just one line"]
+        assert "created_at" in result["/oneline.txt"]
+        assert "modified_at" in result["/oneline.txt"]
 
 
 # ---------------------------------------------------------------------------
@@ -860,6 +871,10 @@ class TestAgentInvokeInput:
             "onset_time: '2024-07-01 05:00:00'"
         ]
         assert files["/t16_system_metrics.csv"]["content"] == ["timestamp,cpu", "0,10"]
+        assert "created_at" in files["/t16_incident.yaml"]
+        assert "modified_at" in files["/t16_incident.yaml"]
+        assert "created_at" in files["/t16_system_metrics.csv"]
+        assert "modified_at" in files["/t16_system_metrics.csv"]
 
     def test_user_message_lists_workspace_filenames(self, tmp_path):
         """Agent's user message must tell the LLM which workspace filenames
