@@ -127,6 +127,35 @@ def find_all_subtasks_for_gap(
     return [st for st in subtasks if gap.query in st.required_capabilities]
 
 
+def _collect_transitive_depends_on(
+    target_subtask: SubTask,
+    subtasks: list[SubTask],
+) -> list[int]:
+    """Return the transitive predecessor closure for ``target_subtask``.
+
+    Mirrors the runtime contract in ``composition._collect_transitive_depends_on``:
+    a downstream step may read keys produced by any ancestor reachable through
+    ``depends_on``, not just its direct parents.
+
+    The returned list preserves the existing breadth-first / declaration-order
+    traversal so prompt collision markers stay aligned with runtime last-write-
+    wins semantics as closely as possible.
+    """
+    visited: set[int] = set()
+    queue: list[int] = list(target_subtask.depends_on)
+
+    while queue:
+        dep = queue.pop(0)
+        if dep in visited:
+            continue
+        if not (0 <= dep < len(subtasks)):
+            continue
+        visited.add(dep)
+        queue.extend(subtasks[dep].depends_on)
+
+    return list(visited)
+
+
 def _contract_fingerprint_for_subtasks(subtasks: list[SubTask]) -> str | None:
     """Return a stable hash of the subtask contract(s), or ``None`` if absent.
 
@@ -253,7 +282,7 @@ def build_schema_context(
 
     lines: list[str] = []
 
-    # Input contract: upstream steps' output_schema.
+    # Input contract: transitive upstream steps' output_schema.
     #
     # Security audit finding #102 (2026-04-19, ext10): when two
     # predecessors emit the SAME output-key (e.g., both produce
@@ -269,11 +298,12 @@ def build_schema_context(
     # depends_on iteration (also caught by
     # ``_detect_upstream_key_collisions`` at the decomposition layer
     # as a soft warning per ext6 #13).
-    if target_subtask.depends_on:
+    transitive_depends_on = _collect_transitive_depends_on(target_subtask, subtasks)
+    if transitive_depends_on:
         input_parts: list[str] = []
         seen_keys: dict[str, tuple[int, str]] = {}  # key → (first dep_idx, desc)
         collision_warnings: list[str] = []
-        for dep_idx in target_subtask.depends_on:
+        for dep_idx in transitive_depends_on:
             if 0 <= dep_idx < len(subtasks):
                 dep = subtasks[dep_idx]
                 if dep.output_schema:

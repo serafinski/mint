@@ -110,3 +110,57 @@ class TestBuildSchemaContext:
         ctx = build_schema_context(gap, subtasks)
         assert '"data"' in ctx
         assert "receives" not in ctx.lower()  # no input contract for first step
+
+    def test_transitive_upstream_keys_are_included_in_input_contract(self):
+        """Downstream schema context should include transitive ancestor outputs.
+
+        T11 exposed a generator/runtime drift: execution passes the transitive
+        upstream closure, but ``build_schema_context`` previously documented
+        only direct parents. A downstream step that consumes a transitive key
+        such as ``targets`` must see that key in the generator prompt.
+        """
+        gap = ClassifiedGap(
+            description="compare revenues to targets",
+            query="compare-revenues-to-targets",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="",
+        )
+        subtasks = [
+            SubTask(
+                description="parse files",
+                required_capabilities=["parse-inputs"],
+                depends_on=[],
+                output_schema={
+                    "sales": "list[dict]",
+                    "products": "list[dict]",
+                    "targets": "list[dict]",
+                },
+            ),
+            SubTask(
+                description="aggregate region revenues",
+                required_capabilities=["aggregate-revenues"],
+                depends_on=[0],
+                output_schema={
+                    "region_revenues": "dict",
+                    "summary_row_count": "int",
+                },
+            ),
+            SubTask(
+                description="compare revenues to targets",
+                required_capabilities=["compare-revenues-to-targets"],
+                depends_on=[1],
+                output_schema={
+                    "summary_rows": "list[dict]",
+                    "regions_meeting_target": "int",
+                },
+            ),
+        ]
+
+        ctx = build_schema_context(gap, subtasks)
+
+        assert '"region_revenues"' in ctx
+        assert '"summary_row_count"' in ctx
+        assert '"targets"' in ctx
+        assert "from step 0" in ctx
+        assert "from step 1" in ctx
