@@ -15,5 +15,408 @@
       "total_reorder_cost": 19261.26,
       "min_days_of_stock": 14
     }
+  },
+  {
+    "task_family_id": "T04",
+    "task_instance_id": "T04.v02",
+    "variant_id": "v02",
+    "benchmark_track": "recurrence",
+    "seed": 8202,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T04/v02/t04_inventory.csv",
+      "tests/evaluation/fixtures_recurrence/T04/v02/t04_reorder_rules.yaml"
+    ],
+    "expected_values": {
+      "product_count": 10,
+      "items_below_threshold": 4,
+      "total_reorder_cost": 20000.0,
+      "min_days_of_stock": 14
+    }
+  },
+  {
+    "task_family_id": "T04",
+    "task_instance_id": "T04.v03",
+    "variant_id": "v03",
+    "benchmark_track": "recurrence",
+    "seed": 8203,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T04/v03/t04_inventory.csv",
+      "tests/evaluation/fixtures_recurrence/T04/v03/t04_reorder_rules.yaml"
+    ],
+    "expected_values": {
+      "product_count": 10,
+      "items_below_threshold": 8,
+      "total_reorder_cost": 38109.14,
+      "min_days_of_stock": 14
+    }
+  },
+  {
+    "task_family_id": "T11",
+    "task_instance_id": "T11.v01",
+    "variant_id": "v01",
+    "benchmark_track": "recurrence",
+    "seed": 15201,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T11/v01/t11_products.xlsx",
+      "tests/evaluation/fixtures_recurrence/T11/v01/t11_sales.csv",
+      "tests/evaluation/fixtures_recurrence/T11/v01/t11_targets.csv"
+    ],
+    "expected_values": {
+      "summary_row_count": 4,
+      "region_revenues": {
+        "East": 20813.4,
+        "West": 19437.5,
+        "North": 15598.44,
+        "South": 13563.51
+      },
+      "regions_meeting_target": 2,
+      "revenue_tolerance_pct": 5
+    }
+  },
+  {
+    "task_family_id": "T11",
+    "task_instance_id": "T11.v02",
+    "variant_id": "v02",
+    "benchmark_track": "recurrence",
+    "seed": 15202,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T11/v02/t11_products.xlsx",
+      "tests/evaluation/fixtures_recurrence/T11/v02/t11_sales.csv",
+      "tests/evaluation/fixtures_recurrence/T11/v02/t11_targets.csv"
+    ],
+    "expected_values": {
+      "summary_row_count": 4,
+      "region_revenues": {
+        "North": 16446.62,
+        "South": 22398.29,
+        "West": 6935.83,
+        "East": 17623.23
+      },
+      "regions_meeting_target": 2,
+      "revenue_tolerance_pct": 5
+    }
+  },
+  {
+    "task_family_id": "T11",
+    "task_instance_id": "T11.v03",
+    "variant_id": "v03",
+    "benchmark_track": "recurrence",
+    "seed": 15203,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T11/v03/t11_products.xlsx",
+      "tests/evaluation/fixtures_recurrence/T11/v03/t11_sales.csv",
+      "tests/evaluation/fixtures_recurrence/T11/v03/t11_targets.csv"
+    ],
+    "expected_values": {
+      "summary_row_count": 4,
+      "region_revenues": {
+        "East": 16941.89,
+        "West": 11410.82,
+        "North": 15699.69,
+        "South": 20326.09
+      },
+      "regions_meeting_target": 1,
+      "revenue_tolerance_pct": 5
+    }
+  },
+  {
+    "task_family_id": "T13",
+    "task_instance_id": "T13.v01",
+    "variant_id": "v01",
+    "benchmark_track": "recurrence",
+    "seed": 17201,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T13/v01/t13_baselines.json",
+      "tests/evaluation/fixtures_recurrence/T13/v01/t13_metrics.csv"
+    ],
+    "expected_values": {
+      "anomaly_count": 5,
+      "planted_anomalies": [
+        {
+          "timestamp": "2024-06-01 13:15:00",
+          "metric": "error_rate",
+          "value": 0.247
+        },
+        {
+          "timestamp": "2024-06-01 13:45:00",
+          "metric": "request_latency_ms",
+          "value": 1830.222
+        },
+        {
+          "timestamp": "2024-06-01 14:00:00",
+          "metric": "request_latency_ms",
+          "value": 1340.014
+        },
+        {
+          "timestamp": "2024-06-01 17:45:00",
+          "metric": "cpu_usage",
+          "value": 366.817
+        },
+        {
+          "timestamp": "2024-06-01 21:30:00",
+          "metric": "request_latency_ms",
+          "value": 1804.536
+        }
+      ],
+      "metrics_analyzed": 4
+    }
+  },
+  {
+    "task_family_id": "T13",
+    "task_instance_id": "T13.v02",
+    "variant_id": "v02",
+    "benchmark_track": "recurrence",
+    "seed": 17202,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T13/v02/t13_baselines.json",
+      "tests/evaluation/fixtures_recurrence/T13/v02/t13_metrics.csv"
+    ],
+    "expected_values": {
+      "anomaly_count": 5,
+      "planted_anomalies": [
+        {
+          "timestamp": "2024-06-01 02:15:00",
+          "metric": "request_latency_ms",
+          "value": 1428.703
+        },
+        {
+          "timestamp": "2024-06-01 10:00:00",
+          "metric": "memory_mb",
+          "value": 11078.011
+        },
+        {
+          "timestamp": "2024-06-01 12:45:00",
+          "metric": "cpu_usage",
+          "value": 289.183
+        },
+        {
+          "timestamp": "2024-06-01 13:45:00",
+          "metric": "error_rate",
+          "value": 0.135
+        },
+        {
+          "timestamp": "2024-06-01 23:30:00",
+          "metric": "cpu_usage",
+          "value": 301.113
+        }
+      ],
+      "metrics_analyzed": 4
+    }
+  },
+  {
+    "task_family_id": "T13",
+    "task_instance_id": "T13.v03",
+    "variant_id": "v03",
+    "benchmark_track": "recurrence",
+    "seed": 17203,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T13/v03/t13_baselines.json",
+      "tests/evaluation/fixtures_recurrence/T13/v03/t13_metrics.csv"
+    ],
+    "expected_values": {
+      "anomaly_count": 5,
+      "planted_anomalies": [
+        {
+          "timestamp": "2024-06-01 02:30:00",
+          "metric": "cpu_usage",
+          "value": 224.584
+        },
+        {
+          "timestamp": "2024-06-01 05:45:00",
+          "metric": "request_latency_ms",
+          "value": 2244.489
+        },
+        {
+          "timestamp": "2024-06-01 06:30:00",
+          "metric": "memory_mb",
+          "value": 10332.887
+        },
+        {
+          "timestamp": "2024-06-01 10:45:00",
+          "metric": "request_latency_ms",
+          "value": 1593.073
+        },
+        {
+          "timestamp": "2024-06-01 16:15:00",
+          "metric": "cpu_usage",
+          "value": 323.408
+        }
+      ],
+      "metrics_analyzed": 4
+    }
+  },
+  {
+    "task_family_id": "T14",
+    "task_instance_id": "T14.v01",
+    "variant_id": "v01",
+    "benchmark_track": "recurrence",
+    "seed": 18201,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T14/v01/t14_departments.csv",
+      "tests/evaluation/fixtures_recurrence/T14/v01/t14_rules.json",
+      "tests/evaluation/fixtures_recurrence/T14/v01/t14_transactions.tsv"
+    ],
+    "expected_values": {
+      "department_count": 5,
+      "department_spending": {
+        "Marketing": 155626.57,
+        "Engineering": 208257.08,
+        "Sales": 259391.07,
+        "HR": 289315.76,
+        "Support": 174072.21
+      },
+      "spending_tolerance_pct": 5,
+      "over_budget_count": 1,
+      "flagged_transactions": 16
+    }
+  },
+  {
+    "task_family_id": "T14",
+    "task_instance_id": "T14.v02",
+    "variant_id": "v02",
+    "benchmark_track": "recurrence",
+    "seed": 18202,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T14/v02/t14_departments.csv",
+      "tests/evaluation/fixtures_recurrence/T14/v02/t14_rules.json",
+      "tests/evaluation/fixtures_recurrence/T14/v02/t14_transactions.tsv"
+    ],
+    "expected_values": {
+      "department_count": 5,
+      "department_spending": {
+        "Support": 179531.96,
+        "Sales": 263819.69,
+        "Marketing": 229254.51,
+        "HR": 226261.69,
+        "Engineering": 108392.63
+      },
+      "spending_tolerance_pct": 5,
+      "over_budget_count": 2,
+      "flagged_transactions": 14
+    }
+  },
+  {
+    "task_family_id": "T14",
+    "task_instance_id": "T14.v03",
+    "variant_id": "v03",
+    "benchmark_track": "recurrence",
+    "seed": 18203,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T14/v03/t14_departments.csv",
+      "tests/evaluation/fixtures_recurrence/T14/v03/t14_rules.json",
+      "tests/evaluation/fixtures_recurrence/T14/v03/t14_transactions.tsv"
+    ],
+    "expected_values": {
+      "department_count": 5,
+      "department_spending": {
+        "Support": 235685.72,
+        "Marketing": 313122.33,
+        "Engineering": 191648.68,
+        "Sales": 103062.27,
+        "HR": 184283.45
+      },
+      "spending_tolerance_pct": 5,
+      "over_budget_count": 2,
+      "flagged_transactions": 21
+    }
+  },
+  {
+    "task_family_id": "T15",
+    "task_instance_id": "T15.v01",
+    "variant_id": "v01",
+    "benchmark_track": "recurrence",
+    "seed": 19201,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T15/v01/t15_agg_config.json",
+      "tests/evaluation/fixtures_recurrence/T15/v01/t15_hourly_metrics.csv"
+    ],
+    "expected_values": {
+      "n_days": 7,
+      "metrics_aggregated": 4,
+      "alert_days": 7
+    }
+  },
+  {
+    "task_family_id": "T15",
+    "task_instance_id": "T15.v02",
+    "variant_id": "v02",
+    "benchmark_track": "recurrence",
+    "seed": 19202,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T15/v02/t15_agg_config.json",
+      "tests/evaluation/fixtures_recurrence/T15/v02/t15_hourly_metrics.csv"
+    ],
+    "expected_values": {
+      "n_days": 7,
+      "metrics_aggregated": 4,
+      "alert_days": 7
+    }
+  },
+  {
+    "task_family_id": "T15",
+    "task_instance_id": "T15.v03",
+    "variant_id": "v03",
+    "benchmark_track": "recurrence",
+    "seed": 19203,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T15/v03/t15_agg_config.json",
+      "tests/evaluation/fixtures_recurrence/T15/v03/t15_hourly_metrics.csv"
+    ],
+    "expected_values": {
+      "n_days": 7,
+      "metrics_aggregated": 4,
+      "alert_days": 7
+    }
+  },
+  {
+    "task_family_id": "T20",
+    "task_instance_id": "T20.v01",
+    "variant_id": "v01",
+    "benchmark_track": "recurrence",
+    "seed": 24201,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T20/v01/t20_applications.csv",
+      "tests/evaluation/fixtures_recurrence/T20/v01/t20_eligibility_policy.json"
+    ],
+    "expected_values": {
+      "total_applications": 36,
+      "eligible_count": 3,
+      "ineligible_count": 33,
+      "rules_applied": 4
+    }
+  },
+  {
+    "task_family_id": "T20",
+    "task_instance_id": "T20.v02",
+    "variant_id": "v02",
+    "benchmark_track": "recurrence",
+    "seed": 24202,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T20/v02/t20_applications.csv",
+      "tests/evaluation/fixtures_recurrence/T20/v02/t20_eligibility_policy.json"
+    ],
+    "expected_values": {
+      "total_applications": 36,
+      "eligible_count": 3,
+      "ineligible_count": 33,
+      "rules_applied": 4
+    }
+  },
+  {
+    "task_family_id": "T20",
+    "task_instance_id": "T20.v03",
+    "variant_id": "v03",
+    "benchmark_track": "recurrence",
+    "seed": 24203,
+    "fixture_files": [
+      "tests/evaluation/fixtures_recurrence/T20/v03/t20_applications.csv",
+      "tests/evaluation/fixtures_recurrence/T20/v03/t20_eligibility_policy.json"
+    ],
+    "expected_values": {
+      "total_applications": 36,
+      "eligible_count": 1,
+      "ineligible_count": 35,
+      "rules_applied": 4
+    }
   }
 ]

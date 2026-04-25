@@ -1,0 +1,22 @@
+{
+  "cpu_usage": {
+    "min": 10.0,
+    "max": 80.0,
+    "unit": "percent"
+  },
+  "memory_mb": {
+    "min": 512.0,
+    "max": 4096.0,
+    "unit": "MB"
+  },
+  "request_latency_ms": {
+    "min": 5.0,
+    "max": 500.0,
+    "unit": "ms"
+  },
+  "error_rate": {
+    "min": 0.0,
+    "max": 0.05,
+    "unit": "ratio"
+  }
+}

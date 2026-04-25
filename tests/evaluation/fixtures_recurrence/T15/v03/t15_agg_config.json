@@ -1,0 +1,24 @@
+{
+  "aggregation_interval": "daily",
+  "metrics": {
+    "cpu_pct": [
+      "mean",
+      "max"
+    ],
+    "memory_pct": [
+      "mean",
+      "max"
+    ],
+    "requests_per_sec": [
+      "sum"
+    ],
+    "error_count": [
+      "sum"
+    ]
+  },
+  "alert_thresholds": {
+    "cpu_pct_max": 85,
+    "memory_pct_max": 80,
+    "error_count_sum": 100
+  }
+}

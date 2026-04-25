@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from pathlib import Path
 
 from src.registry.evaluation_store import EvaluationStore
@@ -147,3 +148,47 @@ def test_build_recurrence_tasks_from_manifest(tmp_path, monkeypatch):
     assert task.variant_id == "v01"
     assert task.benchmark_track == "recurrence"
     assert task.fixture_paths[0] == fixture_dir / "t04_inventory.csv"
+
+
+def test_recurrence_tasks_use_picklable_validators(tmp_path, monkeypatch):
+    root = tmp_path
+    manifest_path = root / "tests" / "evaluation" / "fixtures_recurrence" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    fixture_dir = root / "tests" / "evaluation" / "fixtures_recurrence" / "T11" / "v01"
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("t11_sales.csv", "t11_products.xlsx", "t11_targets.csv"):
+        (fixture_dir / name).write_text("stub")
+
+    manifest_path.write_text(json.dumps([
+        {
+            "task_family_id": "T11",
+            "task_instance_id": "T11.v01",
+            "variant_id": "v01",
+            "benchmark_track": "recurrence",
+            "seed": 123,
+            "fixture_files": [
+                "tests/evaluation/fixtures_recurrence/T11/v01/t11_sales.csv",
+                "tests/evaluation/fixtures_recurrence/T11/v01/t11_products.xlsx",
+                "tests/evaluation/fixtures_recurrence/T11/v01/t11_targets.csv",
+            ],
+            "expected_values": {
+                "summary_row_count": 4,
+                "region_revenues": {"North": 100.0},
+                "regions_meeting_target": 1,
+                "revenue_tolerance_pct": 20,
+            },
+        }
+    ], indent=2))
+
+    import tests.evaluation.recurrence_tasks as recurrence_tasks
+
+    monkeypatch.setattr(recurrence_tasks, "ROOT", root)
+    monkeypatch.setattr(recurrence_tasks, "RECURRENCE_MANIFEST_PATH", manifest_path)
+    monkeypatch.setattr(recurrence_tasks, "_rewrite_prompt", lambda task, fps: task.task_prompt)
+
+    task = build_recurrence_tasks(task_ids=["T11"])[0]
+
+    pickle.dumps(task)
+    pickle.dumps(task.validator)
+    assert task.file_validator is not None
+    pickle.dumps(task.file_validator)
