@@ -19,7 +19,10 @@ from typing import Literal
 import yaml
 from langgraph.types import Command
 
-from src.orchestrator.generators.utils import build_task_context, slugify_gap_hyphen
+from src.orchestrator.generators.utils import (
+    build_task_context,
+    stable_capability_name_for_gap,
+)
 from src.orchestrator.prompts.skill_generator import SKILL_GENERATOR_PROMPT, SKILL_REPAIR_PROMPT
 from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
@@ -223,13 +226,18 @@ def _generate_single_skill(
     task_context: str,
     output_dir: Path | None = None,
     schema_context: str = "",
+    subtasks: list | None = None,
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate a single SKILL.md for a classified gap.
 
     Returns:
         Tuple of (artifact, error).  Exactly one will be ``None``.
     """
-    forced_name = slugify_gap_hyphen(gap.query)
+    forced_name = stable_capability_name_for_gap(
+        gap,
+        list(subtasks or []),
+        hyphen_case=True,
+    )
 
     llm = _get_llm()
 
@@ -383,6 +391,7 @@ def generate_skill(
             pool.submit(
                 _generate_single_skill, gap, task_context,
                 schema_context=build_schema_context(gap, subtasks),
+                subtasks=subtasks,
             ): gap
             for gap in gaps_to_generate
         }

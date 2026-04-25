@@ -20,7 +20,10 @@ from typing import Literal
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from src.orchestrator.generators.utils import build_task_context, slugify_gap
+from src.orchestrator.generators.utils import (
+    build_task_context,
+    stable_capability_name_for_gap,
+)
 from src.orchestrator.prompts.mcp_tool_generator import (
     DOWNSTREAM_STEP_DIRECTIVE,
     FIRST_STEP_DIRECTIVE,
@@ -267,6 +270,7 @@ def generate_single_tool(
     task_context: str = "",
     schema_context: str = "",
     is_first_step: bool | None = None,
+    subtasks: list | None = None,
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate a single MCP tool from a classified gap.
 
@@ -286,7 +290,11 @@ def generate_single_tool(
     Returns:
         (artifact, None) on success, (None, error_message) on failure.
     """
-    forced_name = slugify_gap(gap.query)
+    forced_name = stable_capability_name_for_gap(
+        gap,
+        list(subtasks or []),
+        hyphen_case=False,
+    )
 
     llm = _get_llm()
     structured_llm = llm.with_structured_output(GeneratedToolCode)
@@ -481,6 +489,7 @@ def generate_mcp_tool(
                 task_context=task_context,
                 schema_context=build_schema_context(gap, subtasks),
                 is_first_step=is_first_step_for_gap(gap, subtasks),
+                subtasks=subtasks,
             ): gap
             for gap in gaps_to_generate
         }

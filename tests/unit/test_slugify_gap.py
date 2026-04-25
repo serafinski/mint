@@ -1,6 +1,11 @@
-"""Tests for slugify_gap and slugify_gap_hyphen (Fix 5)."""
+"""Tests for slugify_gap naming helpers."""
 
-from src.orchestrator.generators.utils import slugify_gap, slugify_gap_hyphen
+from src.orchestrator.generators.utils import (
+    slugify_gap,
+    slugify_gap_hyphen,
+    stable_capability_name_for_gap,
+)
+from src.schemas.task import ClassifiedGap, SubTask
 
 
 class TestSlugifyGap:
@@ -66,3 +71,66 @@ class TestSlugifyGap:
         assert slug.startswith("cap_")
         slug2 = slugify_gap("!!!")
         assert slug2.startswith("cap_")
+
+    def test_contract_fingerprint_separates_same_query_with_different_schema(self):
+        gap = ClassifiedGap(
+            description="Apply eligibility policy",
+            query="apply-eligibility-policy-to-applications",
+            classified_type="skill",
+            confidence=0.9,
+        )
+        counts_subtask = SubTask(
+            description="Return counts",
+            required_capabilities=[gap.query],
+            depends_on=[0],
+            output_schema={
+                "total_applications": "int",
+                "eligible_count": "int",
+                "ineligible_count": "int",
+                "rules_applied": "int",
+            },
+            requires_upstream_keys=["applications", "policy_rules"],
+        )
+        decisions_subtask = SubTask(
+            description="Return decisions",
+            required_capabilities=[gap.query],
+            depends_on=[0],
+            output_schema={"decisions": "list[dict]"},
+            requires_upstream_keys=["applications", "policy"],
+        )
+
+        counts_name = stable_capability_name_for_gap(
+            gap,
+            [counts_subtask],
+            hyphen_case=True,
+        )
+        decisions_name = stable_capability_name_for_gap(
+            gap,
+            [decisions_subtask],
+            hyphen_case=True,
+        )
+
+        assert counts_name != decisions_name
+
+    def test_contract_fingerprint_preserves_same_query_same_schema(self):
+        gap = ClassifiedGap(
+            description="Apply thresholds",
+            query="apply-alert-thresholds-and-summarize",
+            classified_type="skill",
+            confidence=0.9,
+        )
+        subtask = SubTask(
+            description="Return alert summary",
+            required_capabilities=[gap.query],
+            depends_on=[2],
+            output_schema={
+                "n_days": "int",
+                "metrics_aggregated": "int",
+                "alert_days": "int",
+            },
+            requires_upstream_keys=["daily_aggregates", "policy"],
+        )
+
+        assert stable_capability_name_for_gap(gap, [subtask], hyphen_case=True) == (
+            stable_capability_name_for_gap(gap, [subtask], hyphen_case=True)
+        )

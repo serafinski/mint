@@ -20,7 +20,11 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from src.orchestrator.generators.skill import extract_skill_name, validate_skill_content
-from src.orchestrator.generators.utils import build_task_context, slugify_gap_hyphen
+from src.orchestrator.generators.utils import (
+    build_task_context,
+    stable_capability_name_for_gap,
+    stable_capability_name_for_gaps,
+)
 from src.orchestrator.prompts.agent_generator import (
     AGENT_GENERATOR_PROMPT,
     AGENT_LEAD_SUBAGENTS_PROMPT,
@@ -225,12 +229,17 @@ def _generate_single_agent(
     *,
     output_dir: Path | None = None,
     schema_context: str = "",
+    subtasks: list | None = None,
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate an agent config for a single classified gap.
 
     Returns (artifact, error). Exactly one will be non-None.
     """
-    forced_name = slugify_gap_hyphen(gap.query)
+    forced_name = stable_capability_name_for_gap(
+        gap,
+        list(subtasks or []),
+        hyphen_case=True,
+    )
 
     llm = _get_llm()
     structured_llm = llm.with_structured_output(AgentGenerationResult)
@@ -418,6 +427,7 @@ def _generate_lead_with_subagents(
     task_context: str,
     *,
     output_dir: Path | None = None,
+    subtasks: list | None = None,
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate a lead agent with subagents for multiple AGENT gaps.
 
@@ -425,7 +435,11 @@ def _generate_lead_with_subagents(
     contains the subagent dicts and ``agent_config["subagent_gap_queries"]``
     lists all covered gap queries for resolution-map indexing.
     """
-    forced_name = slugify_gap_hyphen(gaps[0].query)
+    forced_name = stable_capability_name_for_gaps(
+        gaps,
+        list(subtasks or []),
+        hyphen_case=True,
+    )
 
     gap_descriptions = "\n\n".join(
         f"Step {i + 1}: {g.description or g.query}"
@@ -597,6 +611,7 @@ def generate_agent(
         )
         artifact, error = _generate_lead_with_subagents(
             gaps_to_generate, task_context,
+            subtasks=subtasks,
         )
         if artifact is not None:
             artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
@@ -612,6 +627,7 @@ def generate_agent(
                     pool.submit(
                         _generate_single_agent, gap, task_context,
                         schema_context=build_schema_context(gap, subtasks),
+                        subtasks=subtasks,
                     ): gap
                     for gap in gaps_to_generate
                 }
@@ -634,6 +650,7 @@ def generate_agent(
                 pool.submit(
                     _generate_single_agent, gap, task_context,
                     schema_context=build_schema_context(gap, subtasks),
+                    subtasks=subtasks,
                 ): gap
                 for gap in gaps_to_generate
             }

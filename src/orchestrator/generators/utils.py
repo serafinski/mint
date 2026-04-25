@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from typing import TYPE_CHECKING
 
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
     from src.schemas.task import ClassifiedGap, SubTask
 
 
-def slugify_gap(query: str) -> str:
+def slugify_gap(query: str, contract_fingerprint: str | None = None) -> str:
     """Derive a stable, collision-free snake_case name from a gap query string.
 
     Since the classifier now emits semantic capability names with a hash
@@ -21,6 +22,11 @@ def slugify_gap(query: str) -> str:
     primarily re-formats hyphens to underscores for Python identifier
     compatibility. A 6-character sha256 suffix is still appended to ensure
     collision safety if a caller passes a raw non-suffixed query.
+
+    When ``contract_fingerprint`` is provided, it is mixed into the suffix
+    hash. This keeps the human-readable base stable while preventing
+    semantically different subtasks with the same ``gap.query`` from
+    claiming the same registry slot.
 
     The previous implementation truncated to 40 chars BEFORE stripping
     trailing underscores, which could produce names with a trailing
@@ -38,13 +44,14 @@ def slugify_gap(query: str) -> str:
     # trailing underscores to avoid the double-underscore-before-suffix bug.
     base = re.sub(r"[^a-z0-9]+", "_", query.lower().strip())
     base = base[:40].strip("_") or "cap"
-    suffix = hashlib.sha256(query.encode()).hexdigest()[:6]
+    hash_input = query if contract_fingerprint is None else f"{query}\0{contract_fingerprint}"
+    suffix = hashlib.sha256(hash_input.encode()).hexdigest()[:6]
     return f"{base}_{suffix}"
 
 
-def slugify_gap_hyphen(query: str) -> str:
+def slugify_gap_hyphen(query: str, contract_fingerprint: str | None = None) -> str:
     """Like ``slugify_gap`` but returns hyphen-case (for skills and agents)."""
-    return slugify_gap(query).replace("_", "-")
+    return slugify_gap(query, contract_fingerprint=contract_fingerprint).replace("_", "-")
 
 
 def build_task_context(state: TaskState) -> str:
@@ -118,6 +125,70 @@ def find_all_subtasks_for_gap(
     subtask matches.
     """
     return [st for st in subtasks if gap.query in st.required_capabilities]
+
+
+def _contract_fingerprint_for_subtasks(subtasks: list[SubTask]) -> str | None:
+    """Return a stable hash of the subtask contract(s), or ``None`` if absent.
+
+    The fingerprint deliberately excludes prose descriptions so legitimate
+    reuse survives paraphrases. It captures only the execution-relevant
+    contract: dependencies, upstream keys, required capabilities, and
+    declared output schema.
+    """
+    if not subtasks:
+        return None
+
+    payload = [
+        {
+            "required_capabilities": list(st.required_capabilities),
+            "depends_on": [int(dep) for dep in st.depends_on],
+            "requires_upstream_keys": list(st.requires_upstream_keys),
+            "output_schema": {
+                key: st.output_schema[key]
+                for key in sorted(st.output_schema)
+            },
+        }
+        for st in subtasks
+    ]
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+def stable_capability_name_for_gap(
+    gap: ClassifiedGap,
+    subtasks: list[SubTask],
+    *,
+    hyphen_case: bool,
+) -> str:
+    """Return a deterministic capability name tied to the gap's subtask contract."""
+    matches = find_all_subtasks_for_gap(gap, subtasks)
+    contract_fingerprint = _contract_fingerprint_for_subtasks(matches)
+    if hyphen_case:
+        return slugify_gap_hyphen(gap.query, contract_fingerprint=contract_fingerprint)
+    return slugify_gap(gap.query, contract_fingerprint=contract_fingerprint)
+
+
+def stable_capability_name_for_gaps(
+    gaps: list[ClassifiedGap],
+    subtasks: list[SubTask],
+    *,
+    hyphen_case: bool,
+) -> str:
+    """Return a deterministic capability name for a multi-gap lead artifact."""
+    if not gaps:
+        base_query = "cap"
+        contract_fingerprint = None
+    else:
+        base_query = gaps[0].query
+        relevant_subtasks = [
+            st for st in subtasks
+            if any(g.query in st.required_capabilities for g in gaps)
+        ]
+        contract_fingerprint = _contract_fingerprint_for_subtasks(relevant_subtasks)
+
+    if hyphen_case:
+        return slugify_gap_hyphen(base_query, contract_fingerprint=contract_fingerprint)
+    return slugify_gap(base_query, contract_fingerprint=contract_fingerprint)
 
 
 def is_first_step_for_gap(
