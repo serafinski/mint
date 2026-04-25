@@ -61,11 +61,30 @@ def _make_cap(
 
 
 class TestPrune:
+    def test_skips_freshly_created_capabilities_inside_prune_window(self):
+        registry = MagicMock()
+        fresh_cap = _make_cap("fresh-cap").model_copy(
+            update={"created_at": datetime.now(UTC)}
+        )
+        registry.list_all.return_value = [fresh_cap]
+
+        store = MagicMock()
+
+        result = prune(registry, store, window_days=30)
+
+        assert result == []
+        registry.deactivate.assert_not_called()
+        store.invocations_since.assert_not_called()
+
     def test_prunes_zero_invocation_capabilities(self):
         registry = MagicMock()
         registry.list_all.return_value = [
-            _make_cap("cap-a"),
-            _make_cap("cap-b"),
+            _make_cap("cap-a").model_copy(
+                update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+            ),
+            _make_cap("cap-b").model_copy(
+                update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+            ),
         ]
 
         store = MagicMock()
@@ -80,8 +99,12 @@ class TestPrune:
     def test_skips_capabilities_with_recent_invocations(self):
         registry = MagicMock()
         registry.list_all.return_value = [
-            _make_cap("cap-a"),
-            _make_cap("cap-b"),
+            _make_cap("cap-a").model_copy(
+                update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+            ),
+            _make_cap("cap-b").model_copy(
+                update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+            ),
         ]
 
         store = MagicMock()
@@ -103,7 +126,11 @@ class TestPrune:
 
     def test_custom_window_days(self):
         registry = MagicMock()
-        registry.list_all.return_value = [_make_cap("cap-a")]
+        registry.list_all.return_value = [
+            _make_cap("cap-a").model_copy(
+                update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+            )
+        ]
 
         store = MagicMock()
         store.invocations_since.return_value = 0
@@ -120,7 +147,12 @@ class TestPrune:
     def test_prune_skips_pinned_capability(self):
         """Pinned capabilities are never pruned, even with zero invocations."""
         pinned_cap = _make_cap("csv-parser")
-        pinned_cap = pinned_cap.model_copy(update={"metadata": {"pinned": "true"}})
+        pinned_cap = pinned_cap.model_copy(
+            update={
+                "created_at": datetime(2020, 1, 1, tzinfo=UTC),
+                "metadata": {"pinned": "true"},
+            }
+        )
         registry = MagicMock()
         registry.list_all.return_value = [pinned_cap]
         store = MagicMock()
@@ -141,7 +173,9 @@ class TestPrune:
         drift when the prune helper is refactored.
         """
         registry = MagicMock()
-        cap = _make_cap("ephemeral")
+        cap = _make_cap("ephemeral").model_copy(
+            update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+        )
         # Explicitly no "pinned" key in metadata (empty {})
         assert cap.metadata == {}
         registry.list_all.return_value = [cap]
@@ -163,9 +197,18 @@ class TestPrune:
     def test_prune_mixed_registry_only_deactivates_unpinned(self):
         """Mixed registry: pinned survives, active-with-invocations survives, idle-unpinned pruned."""
         pinned = _make_cap("pinned-cap")
-        pinned = pinned.model_copy(update={"metadata": {"pinned": "true"}})
-        active = _make_cap("active-cap")
-        idle = _make_cap("idle-cap")
+        pinned = pinned.model_copy(
+            update={
+                "created_at": datetime(2020, 1, 1, tzinfo=UTC),
+                "metadata": {"pinned": "true"},
+            }
+        )
+        active = _make_cap("active-cap").model_copy(
+            update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+        )
+        idle = _make_cap("idle-cap").model_copy(
+            update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+        )
 
         registry = MagicMock()
         registry.list_all.return_value = [pinned, active, idle]

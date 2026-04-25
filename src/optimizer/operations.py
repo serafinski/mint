@@ -688,6 +688,11 @@ def prune(
 
     Applies to ALL capability types.
 
+    Freshly created capabilities are exempt until they age past the prune
+    window. Otherwise the eval harness's `loading_node -> optimizer_node`
+    ordering would deactivate a capability immediately after registration,
+    before any later task in the same run had a chance to reuse it.
+
     Returns:
         List of pruned (deactivated) capability IDs.
     """
@@ -700,6 +705,15 @@ def prune(
         # optimizer cycles regardless of invocation count)
         if (cap.metadata or {}).get("pinned") == "true":
             logger.debug("Skipping pinned capability '%s'", cap.name)
+            continue
+        if cap.created_at >= cutoff:
+            logger.debug(
+                "Skipping freshly created capability '%s' from prune window "
+                "(created_at=%s, cutoff=%s)",
+                cap.name,
+                cap.created_at.isoformat(),
+                cutoff.isoformat(),
+            )
             continue
         count = metrics_store.invocations_since(cap.name, cutoff)
         if count == 0:
