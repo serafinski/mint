@@ -623,8 +623,8 @@ def test_resolve_scope_auto_selects_latest_when_many_runs_with_warning(capsys):
     # WARNING emitted to stderr.
     assert "WARNING" in captured.err
     assert "per condition" in captured.err
-    # Default cap is 5; single condition present → 5 run_ids selected.
-    assert fragment.count("'") == 10  # 5 run_ids × 2 quotes each
+    # Default cap is 3; single condition present → 3 run_ids selected.
+    assert fragment.count("'") == 6  # 3 run_ids × 2 quotes each
 
 
 # ---------------------------------------------------------------------------

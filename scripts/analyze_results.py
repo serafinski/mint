@@ -132,11 +132,11 @@ _SCOPE_SQL: str = ""
 _COMPLETENESS_BANNER: str = ""
 
 
-# ext7 #46: canonical eval shape is --n-runs 5 per condition × 4 conditions
-# = 20 distinct run_ids, not 4. Pre-fix auto-select of "4 most recent" silently
+# ext7 #46: canonical eval shape is --n-runs 3 per condition × 4 conditions
+# = 12 distinct run_ids, not 4. Pre-fix auto-select of "4 most recent" silently
 # dropped 3 of 4 conditions on a canonical eval DB. Configurable via
 # --per-condition-cap.
-_DEFAULT_PER_CONDITION_CAP = 5
+_DEFAULT_PER_CONDITION_CAP = 3
 
 
 def _scope_for_table(table: str, scope_sql: str | None = None) -> str:
@@ -180,9 +180,9 @@ def _resolve_scope(
     - Explicit ``run_ids`` → filter on exactly those.
     - ``since`` → filter on timestamp.
     - Neither: auto-select the ``per_condition_cap`` most recent run_ids
-      PER CONDITION (ext7 #46 — the canonical run-sheet eval shape is
-      ``--n-runs 5 × 4 conditions = 20 distinct run_ids``, so a fixed
-      4-total cap silently drops 3 of 4 conditions). Default: 5 per
+      PER CONDITION (ext7 #46 — the canonical eval-protocol shape is
+      ``--n-runs 3 × 4 conditions = 12 distinct run_ids``, so a fixed
+      4-total cap silently drops 3 of 4 conditions). Default: 3 per
       condition. Fails loud with exit code 2 if the selected set doesn't
       cover every condition present in the DB.
 
@@ -203,7 +203,7 @@ def _resolve_scope(
 
     # Auto-select: balanced per-condition. For each distinct condition, pick
     # the N most recent run_ids; union across conditions. This preserves the
-    # canonical eval shape (5 per condition × 4 conditions = 20 run_ids) while
+    # canonical eval shape (3 per condition × 4 conditions = 12 run_ids) while
     # tolerating DBs with fewer runs per condition.
     total_available = conn.execute(
         "SELECT COUNT(DISTINCT run_id) FROM evaluation_runs WHERE is_pilot = FALSE"
@@ -1036,7 +1036,7 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
 
     # ext14 #147 (2026-04-21): per-(condition, run_id) M3 completeness
     # check. ext13 #128's gate above fires only when an ENTIRE CONDITION
-    # has no invocations. A complete evaluation_runs shape (5 runs/cond)
+    # has no invocations. A complete evaluation_runs shape (3 runs/cond)
     # paired with invocation_events for only 1 run/cond silently passes
     # that gate — Chapter 6's "N runs" column lies. Sibling of ext14 #144
     # for M3. Cross-check per-condition invocation coverage against the
@@ -1119,7 +1119,7 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
        ignores them.
 
     4. **Proposal's natural granularity is per-task.** The four
-       baseline conditions × 5 runs × 20 tasks = 400 records; the
+       baseline conditions × 3 runs × 20 tasks = 240 records; the
        cross-baseline comparison that Chapter 6 hinges on is per-task.
 
     **What we lose by not going per-gap:** classifier mistakes on
@@ -1529,7 +1529,7 @@ def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
 
     # ext14 #144 (2026-04-21): per-(condition, run_id) M2 completeness
     # check. ext13 #132's gate above fires only when an ENTIRE CONDITION
-    # has no labels. A campaign with 5 runs/condition but labels for only
+    # has no labels. A campaign with 3 runs/condition but labels for only
     # 1 run/condition passes that gate because every JIT condition has
     # ≥1 labeled row. Compounds with ext14 #143 (audit_contamination.py
     # fail-open on per-run coverage) to silently half the effective M2
@@ -1603,9 +1603,9 @@ def main() -> int:
              "matches run_sheet.md T01-T20). ext7 #52.",
     )
     parser.add_argument(
-        "--expected-runs-per-condition", type=int, default=5,
-        help="Expected number of runs per condition (default: 5, matches "
-             "run_sheet.md --n-runs). ext7 #52.",
+        "--expected-runs-per-condition", type=int, default=3,
+        help="Expected number of runs per condition (default: 3, matches "
+             "EVAL_PROTOCOL.md Stage 1 and stage1_main_eval.sh --n-runs). ext7 #52.",
     )
     parser.add_argument(
         "--expected-conditions", type=int, default=4,
@@ -1628,6 +1628,12 @@ def main() -> int:
              "(M2 contamination, M3 Gini) cannot be computed or have "
              "per-condition gaps. Chapter 4.5 disclosure REQUIRED. "
              "Default: refuse with exit 7. ext13 #126 / #128 / #132.",
+    )
+    parser.add_argument(
+        "--chapter6-primary-scope", action="store_true",
+        help="Protocol mode for EVAL_PROTOCOL.md Chapter 6 primary scope. "
+             "Skips deferred M2 contamination and M4 token-cost sections so "
+             "they do not print warnings or block Stage 2 headline runs.",
     )
     args = parser.parse_args()
 
@@ -1808,7 +1814,9 @@ def main() -> int:
 
     # ── Table 4: Per-task detail ─────────────────────────────────────────
     per_task = query_per_task(conn)
-    csv_per_task = print_per_task_table(per_task)
+    csv_per_task: list[str] = []
+    if not args.chapter6_primary_scope:
+        csv_per_task = print_per_task_table(per_task)
 
     # ── Table 5: Gate pass vs output validation (separate) ───────────────
     print_gate_vs_output_table(per_task)
@@ -1825,11 +1833,16 @@ def main() -> int:
     print_failure_breakdown(failures, condition_totals)
 
     # ── Token costs ──────────────────────────────────────────────────────
-    # ext14 #149 (2026-04-21): capture return value so missing_metrics
-    # below can flag silent-zero M4 campaigns (Row 11 skipped / truncated /
-    # partial) and exit 7 rather than emitting infinite pro-JIT manufactured
-    # evidence.
-    m4_ok = print_token_cost_summary(conn)
+    # EVAL_PROTOCOL.md moves M4 out of Chapter 6 primary scope. In that
+    # protocol mode we skip the section entirely instead of printing a stale
+    # "incomplete" warning for an intentionally deferred metric.
+    m4_ok = True
+    if not args.chapter6_primary_scope:
+        # ext14 #149 (2026-04-21): capture return value so missing_metrics
+        # below can flag silent-zero M4 campaigns (Row 11 skipped / truncated /
+        # partial) and exit 7 rather than emitting infinite pro-JIT manufactured
+        # evidence.
+        m4_ok = print_token_cost_summary(conn)
 
     # ── Latency summary ──────────────────────────────────────────────────
     # ext16 #177 (2026-04-22): capture return value for missing_metrics
@@ -1852,17 +1865,21 @@ def main() -> int:
         missing_metrics.append("M3 (Gini / Pillar 3 RQ #1)")
 
     # ── M2 mock contamination rate (Step 18.10, proposal §M2) ────────────
-    # Graceful fallback prints "audit not performed" when human_label
-    # column is unpopulated.
-    if not print_contamination_rate(conn):
-        missing_metrics.append("M2 (Contamination)")
+    # EVAL_PROTOCOL.md defers M2 and M4 to future work / proxy treatment, so
+    # protocol-mode runs should not emit stale sections or missing-metric
+    # banners for them.
+    if not args.chapter6_primary_scope:
+        # Graceful fallback prints "audit not performed" when human_label
+        # column is unpopulated.
+        if not print_contamination_rate(conn):
+            missing_metrics.append("M2 (Contamination)")
 
-    # ext14 #149: M4 silent-zero gate sits in the same missing-metrics
-    # family as M2 / M3. Chapter 6 M4 is thesis-critical Pillar 3 Context
-    # Economy evidence; a uniform-zero campaign passes Row 17 without this
-    # gate (pre-fix behaviour).
-    if not m4_ok:
-        missing_metrics.append("M4 (Token Cost / Pillar 3 Context Economy)")
+        # ext14 #149: M4 silent-zero gate sits in the same missing-metrics
+        # family as M2 / M3. Chapter 6 M4 is thesis-critical Pillar 3 Context
+        # Economy evidence; a uniform-zero campaign passes Row 17 without this
+        # gate (pre-fix behaviour).
+        if not m4_ok:
+            missing_metrics.append("M4 (Token Cost / Pillar 3 Context Economy)")
 
     # ext16 #177: M5 latency — fifth instance of the retrofit gap.
     if not m5_ok:
@@ -1880,7 +1897,8 @@ def main() -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "condition_all_tasks.csv").write_text("\n".join(csv_all) + "\n")
         (out_dir / "condition_synthesis_only.csv").write_text("\n".join(csv_synth) + "\n")
-        (out_dir / "per_task_detail.csv").write_text("\n".join(csv_per_task) + "\n")
+        if csv_per_task:
+            (out_dir / "per_task_detail.csv").write_text("\n".join(csv_per_task) + "\n")
         print(f"\nCSV files written to {out_dir}/")
 
     # ext13 #126 / #128 / #132: exit 7 when any thesis-critical metric
