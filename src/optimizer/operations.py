@@ -313,12 +313,10 @@ def _register_artifact_directly(
             # look sane. The MCP_TOOL path delegates to
             # ``ToolLoader.register_tool`` which runs AST-based schema
             # extraction; SKILL/AGENT have no AST equivalent because the
-            # "tool" is prose + embedded Python fences. Defensive check:
-            # if the artifact has executable content (skill_content /
-            # agent_config) but both schemas are empty, the LLM merge/
-            # split response didn't populate them — log a WARN so the
-            # issue surfaces in Chapter 4.5 disclosure rather than
-            # manifesting later as an unexecutable registry entry.
+            # "tool" is prose + embedded Python fences. Fail closed if
+            # the artifact has executable content (skill_content /
+            # agent_config) but both schemas are empty — a schema-less
+            # registration would poison later compatibility-aware reuse.
             has_content = bool(
                 artifact.skill_content or artifact.agent_config
             )
@@ -327,14 +325,12 @@ def _register_artifact_directly(
                 or (artifact.output_schema or {})
             )
             if has_content and not has_schemas:
-                logger.warning(
-                    "ext8 #63: SKILL/AGENT variant '%s' registered with no "
-                    "input_schema / output_schema — optimizer merge/split "
-                    "LLM response may have omitted them. Downstream "
-                    "invocation may fail if the claimed schema mismatches "
-                    "the embedded code. Chapter 4.5 disclosure required.",
-                    name,
+                reason = (
+                    f"schema-less {artifact.capability_type.value} artifact "
+                    f"'{name}' is not registerable"
                 )
+                logger.warning("ext8 #63: %s", reason)
+                return False, reason
             metadata: dict[str, str] = {
                 "generated": "true",
                 "source": "optimizer",
@@ -1295,6 +1291,14 @@ def _merge_agents(
             sa.model_dump() for sa in result.combined_subagents
         ]
 
+    merged_input_schema: dict[str, str] = {}
+    merged_output_schema: dict[str, str] = {}
+    for c in caps:
+        for k, v in (c.input_schema or {}).items():
+            merged_input_schema.setdefault(k, v)
+        for k, v in (c.output_schema or {}).items():
+            merged_output_schema.setdefault(k, v)
+
     all_tags = list({tag for c in caps for tag in c.tags})
 
     artifact = GeneratedArtifact(
@@ -1302,6 +1306,8 @@ def _merge_agents(
         capability_type=CapabilityType.AGENT,
         description=result.description,
         agent_config=agent_config,
+        input_schema=merged_input_schema,
+        output_schema=merged_output_schema,
         gap_query=None,
         domain=caps[0].domain,
     )
@@ -2070,7 +2076,9 @@ def _split_agents(
             )
             return None
 
-    # Phase A — build GeneratedArtifacts with agent_config dict.
+    # Phase A — build GeneratedArtifacts. Like SKILL splitting, AGENT
+    # variants inherit the parent's input/output contract; the LLM is
+    # specializing behavior, not redefining the callable schema.
     artifacts: list[GeneratedArtifact] = []
     for v in result.variants:
         agent_config: dict = {
@@ -2086,6 +2094,8 @@ def _split_agents(
                 description=v.description,
                 agent_config=agent_config,
                 gap_query=None,
+                input_schema=dict(parent.input_schema or {}),
+                output_schema=dict(parent.output_schema or {}),
                 domain=parent.domain,
             )
         )

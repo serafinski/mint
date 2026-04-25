@@ -656,7 +656,10 @@ class TestMergeSkills:
             ),
             tags=tags,
             domain="analytics",
-        )
+        ).model_copy(update={
+            "input_schema": {"request": "str"},
+            "output_schema": {"result": "str"},
+        })
 
     @patch("src.verification.gate.verify")
     @patch("src.optimizer.operations.init_chat_model")
@@ -726,22 +729,43 @@ class TestMergeSkills:
 class TestMergeAgents:
     """_merge_agents: AGENT parents → combined agent_config, budget ceiling enforced."""
 
-    def _agent_cap(self, name: str, subagents: list[dict] | None = None) -> CapabilityDescriptor:
+    def _agent_cap(
+        self,
+        name: str,
+        subagents: list[dict] | None = None,
+        *,
+        input_schema: dict[str, str] | None = None,
+        output_schema: dict[str, str] | None = None,
+    ) -> CapabilityDescriptor:
         cfg: dict = {"system_prompt": f"You are {name}."}
         if subagents is not None:
             cfg["subagents"] = subagents
-        return _cap_with_source(
+        cap = _cap_with_source(
             name,
             cap_type=CapabilityType.AGENT,
             agent_config=cfg,
             domain="research",
         )
+        if input_schema is not None or output_schema is not None:
+            cap = cap.model_copy(update={
+                "input_schema": input_schema or {},
+                "output_schema": output_schema or {},
+            })
+        return cap
 
     @patch("src.verification.gate.verify")
     @patch("src.optimizer.operations.init_chat_model")
     def test_happy_path_solo_agents(self, mock_init, mock_verify):
-        cap_a = self._agent_cap("agent-a")
-        cap_b = self._agent_cap("agent-b")
+        cap_a = self._agent_cap(
+            "agent-a",
+            input_schema={"question": "str"},
+            output_schema={"summary": "str"},
+        )
+        cap_b = self._agent_cap(
+            "agent-b",
+            input_schema={"context": "str"},
+            output_schema={"answer": "str"},
+        )
         registry = MagicMock()
         registry.get.side_effect = lambda n: {
             "agent-a": cap_a, "agent-b": cap_b, "merged-agent": None,
@@ -772,13 +796,23 @@ class TestMergeAgents:
         assert agent_cfg["system_prompt"] == "You investigate both X and Y."
         # No subagents key when the list is empty
         assert "subagents" not in agent_cfg
+        assert descriptor.input_schema == {"question": "str", "context": "str"}
+        assert descriptor.output_schema == {"summary": "str", "answer": "str"}
         assert registry.deactivate.call_count == 2
 
     @patch("src.verification.gate.verify")
     @patch("src.optimizer.operations.init_chat_model")
     def test_happy_path_with_subagents_under_budget(self, mock_init, mock_verify):
-        cap_a = self._agent_cap("agent-a")
-        cap_b = self._agent_cap("agent-b")
+        cap_a = self._agent_cap(
+            "agent-a",
+            input_schema={"left": "str"},
+            output_schema={"left_result": "str"},
+        )
+        cap_b = self._agent_cap(
+            "agent-b",
+            input_schema={"right": "str"},
+            output_schema={"right_result": "str"},
+        )
         registry = MagicMock()
         registry.get.side_effect = lambda n: {
             "agent-a": cap_a, "agent-b": cap_b, "merged-agent": None,
@@ -814,9 +848,46 @@ class TestMergeAgents:
         result = merge(registry, store, ["agent-a", "agent-b"])
         assert result == "merged-agent"
         import json as _json
-        agent_cfg = _json.loads(registry.add.call_args[0][0].metadata["agent_config"])
+        descriptor = registry.add.call_args[0][0]
+        agent_cfg = _json.loads(descriptor.metadata["agent_config"])
         assert len(agent_cfg["subagents"]) == 2
         assert agent_cfg["subagents"][0]["name"] == "sub-1"
+        assert descriptor.input_schema == {"left": "str", "right": "str"}
+        assert descriptor.output_schema == {
+            "left_result": "str",
+            "right_result": "str",
+        }
+
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_parents_without_schemas_fail_closed_before_registration(
+        self, mock_init, mock_verify
+    ):
+        cap_a = self._agent_cap("agent-a")
+        cap_b = self._agent_cap("agent-b")
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "agent-a": cap_a, "agent-b": cap_b, "merged-agent": None,
+        }.get(n)
+        store = MagicMock()
+        mock_verify.return_value = _passing_report("merged-agent")
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = MergeAgentsResult(
+            name="merged-agent",
+            description="Merged agent",
+            rationale="Both investigate",
+            combined_system_prompt="You investigate both X and Y.",
+            combined_subagents=[],
+        )
+
+        result = merge(registry, store, ["agent-a", "agent-b"])
+        assert result is None
+        registry.add.assert_not_called()
+        registry.deactivate.assert_not_called()
 
     @patch("src.verification.gate.verify")
     @patch("src.optimizer.operations.init_chat_model")
@@ -1194,7 +1265,10 @@ class TestSplitSkills:
             ),
             tags=["workflow"],
             domain="analytics",
-        )
+        ).model_copy(update={
+            "input_schema": {"request": "str"},
+            "output_schema": {"result": "str"},
+        })
 
     def _variant(self, name: str) -> SplitSkillVariant:
         return SplitSkillVariant(
@@ -1297,7 +1371,10 @@ class TestSplitAgents:
             cap_type=CapabilityType.AGENT,
             agent_config={"system_prompt": f"You are {name}."},
             domain="research",
-        )
+        ).model_copy(update={
+            "input_schema": {"question": "str"},
+            "output_schema": {"answer": "str"},
+        })
 
     def _variant(self, name: str, n_subagents: int = 0) -> SplitAgentVariant:
         subagents = [
