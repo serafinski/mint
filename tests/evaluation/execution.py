@@ -977,12 +977,13 @@ async def _run():
             _kwargs = {{k: v for k, v in _all_inputs.items() if k in _valid}}
 
         # Path-like parameter matching: assign fixture paths to params
-        # whose names suggest they expect a file path (file_path, csv_path, etc.)
-        # For root steps: any path-like param gets the first unused fixture
-        # (broad). For dependent steps: only match when the fixture filename overlaps with
-        # the parameter name (e.g. param "xlsx_path" matches "products.xlsx").
-        # This prevents binary fixtures from being blindly assigned to unrelated
-        # params in downstream steps (T11 .xlsx crash reproducer).
+        # whose names suggest they expect a file path (file_path, csv_path, etc.).
+        # Use greedy global best-match assignment by keyword overlap so root
+        # steps don't invert semantically obvious bindings like
+        # hourly_csv_path -> metrics.csv / policy_json_path -> config.json.
+        # Root steps still get a positional fallback for otherwise-ambiguous
+        # fixtures; downstream steps remain overlap-gated to avoid blindly
+        # binding unrelated files.
         _PATH_KEYWORDS = {{"path", "file", "csv", "log", "json", "txt", "xml",
                           "yaml", "yml", "tsv", "xlsx", "doc", "input"}}
         _required = {{
@@ -991,25 +992,48 @@ async def _run():
         }}
         _unmatched = _required - set(_kwargs)
         _used_fixtures = set()
-        for _p in sorted(_unmatched):
-            _p_lower = _p.lower()
-            if any(kw in _p_lower for kw in _PATH_KEYWORDS):
+        def _words(_text):
+            return {{
+                _w.rstrip("s")
+                for _w in _text.lower().replace("_", " ").replace("-", " ").split()
+                if len(_w) > 2
+            }}
+
+        def _score_fixture(_param, _fp):
+            _score = len(_words(_param) & _words(os.path.splitext(os.path.basename(_fp))[0]))
+            _ext = os.path.splitext(_fp)[1].lstrip(".").lower()
+            if _ext and _ext in _param.lower():
+                _score += 2
+            return _score
+
+        _path_params = [
+            _p for _p in sorted(_unmatched)
+            if any(_kw in _p.lower() for _kw in _PATH_KEYWORDS)
+        ]
+        while _path_params:
+            _best = None
+            for _p in _path_params:
                 for _fp in _fixture_paths:
                     if _fp in _used_fixtures:
                         continue
-                    if {is_root_step!r}:
-                        # Root step: broad matching — first unused fixture
-                        _kwargs[_p] = _fp
-                        _used_fixtures.add(_fp)
-                        break
-                    else:
-                        # Later steps: name-aware matching only
-                        _fp_words = set(os.path.splitext(os.path.basename(_fp))[0].lower().replace("_", " ").replace("-", " ").split())
-                        _p_words = set(_p_lower.replace("_", " ").replace("-", " ").split())
-                        if _fp_words & _p_words:
-                            _kwargs[_p] = _fp
-                            _used_fixtures.add(_fp)
-                            break
+                    _score = _score_fixture(_p, _fp)
+                    if _best is None or _score > _best[0]:
+                        _best = (_score, _p, _fp)
+            if _best is None or _best[0] <= 0:
+                break
+            _, _best_param, _best_fp = _best
+            _kwargs[_best_param] = _best_fp
+            _used_fixtures.add(_best_fp)
+            _path_params.remove(_best_param)
+
+        if {is_root_step!r}:
+            for _p in _path_params:
+                for _fp in _fixture_paths:
+                    if _fp in _used_fixtures:
+                        continue
+                    _kwargs[_p] = _fp
+                    _used_fixtures.add(_fp)
+                    break
 
         # Fuzzy word-overlap match for remaining unmatched params
         _still_unmatched = _required - set(_kwargs)

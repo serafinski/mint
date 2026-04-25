@@ -231,7 +231,8 @@ async def parse_csv_with_timestamps(csv_path: str) -> dict:
         assert result == {"hourly_rows": []}
         assert "if True:\n                        _all_inputs[_fp] = _full" in captured["code"]
         assert 'if not True and "upstream_data" in _valid:' in captured["code"]
-        assert "if True:\n                        # Root step: broad matching" in captured["code"]
+        assert "Use greedy global best-match assignment by keyword overlap" in captured["code"]
+        assert "if True:\n            for _p in _path_params:" in captured["code"]
 
     @patch("src.verification.sandbox_tool.sandbox_execute_in_workspace")
     def test_downstream_step_preserves_non_root_binding(self, mock_sandbox, tmp_path):
@@ -258,7 +259,8 @@ async def aggregate_metrics(upstream_data: dict) -> dict:
         assert result == {"daily_aggregates": {}}
         assert "if False:\n                        _all_inputs[_fp] = _full" in captured["code"]
         assert 'if not False and "upstream_data" in _valid:' in captured["code"]
-        assert "if False:\n                        # Root step: broad matching" in captured["code"]
+        assert "Use greedy global best-match assignment by keyword overlap" in captured["code"]
+        assert "if False:\n            for _p in _path_params:" in captured["code"]
 
     @patch("tests.evaluation.execution._execute_skill_inner")
     def test_returns_empty_on_timeout(self, mock_inner):

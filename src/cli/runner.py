@@ -715,29 +715,45 @@ def _match_files_to_params(
     _PATH_KEYWORDS = ("path", "file", "csv", "json", "txt", "log", "doc", "tsv", "yaml", "yml", "xml", "xlsx", "xls", "sql", "parquet")
     path_params = [p for p in param_names if any(kw in p.lower() for kw in _PATH_KEYWORDS)]
 
+    def _words(text: str) -> set[str]:
+        return {
+            word.rstrip("s")
+            for word in text.lower().replace("_", " ").replace("-", " ").split()
+            if len(word) > 2
+        }
+
+    def _score_match(param: str, fp: Path) -> int:
+        score = len(_words(param) & _words(fp.stem))
+        ext = fp.suffix.lstrip(".").lower()
+        if ext and ext in param.lower():
+            score += 2
+        return score
+
     inputs: dict[str, str] = {}
     unmatched_files = list(zip(file_paths, sandbox_paths))
+    unmatched_params = list(path_params)
 
-    # Match path params to files by keyword overlap
-    for param in path_params:
-        param_lower = param.lower()
-        best_idx, best_score = -1, 0
-        for idx, (fp, _sp) in enumerate(unmatched_files):
-            stem = fp.stem.lower()
-            score = sum(1 for kw in stem.split("_") if kw in param_lower)
-            # Also check extension match (e.g. "json" in param)
-            ext = fp.suffix.lstrip(".").lower()
-            if ext in param_lower:
-                score += 1
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-        if best_idx >= 0 and best_score > 0:
-            inputs[param] = unmatched_files[best_idx][1]
-            unmatched_files.pop(best_idx)
+    # Greedy global best-match assignment avoids alphabetical inversions like
+    # hourly_csv_path -> config.json / policy_json_path -> metrics.csv.
+    while unmatched_params and unmatched_files:
+        best_param = None
+        best_idx = -1
+        best_score = 0
+        for param in unmatched_params:
+            for idx, (fp, _sp) in enumerate(unmatched_files):
+                score = _score_match(param, fp)
+                if score > best_score:
+                    best_score = score
+                    best_param = param
+                    best_idx = idx
+        if best_param is None or best_score <= 0:
+            break
+        inputs[best_param] = unmatched_files[best_idx][1]
+        unmatched_params.remove(best_param)
+        unmatched_files.pop(best_idx)
 
     # Assign remaining path params by position
-    remaining_params = [p for p in path_params if p not in inputs]
+    remaining_params = [p for p in unmatched_params if p not in inputs]
     for param, (_fp, sp) in zip(remaining_params, unmatched_files):
         inputs[param] = sp
 
