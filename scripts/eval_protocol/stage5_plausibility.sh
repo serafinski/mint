@@ -97,8 +97,14 @@ if dead:
         flag("INVESTIGATE","P4_eval_broken",f"{len(dead)}/20 dead — eval broken, not thesis")
 
 err_rows = c.execute("""
-    SELECT failure_reason, COUNT(*) n FROM evaluation_runs
-    WHERE NOT is_pilot AND failure_reason IS NOT NULL GROUP BY 1 ORDER BY n DESC LIMIT 10
+    SELECT failure_reason, COUNT(*) n
+    FROM evaluation_runs
+    WHERE NOT is_pilot
+      AND failure_reason IS NOT NULL
+      AND lower(trim(failure_reason)) NOT IN ('', 'none', 'null')
+    GROUP BY 1
+    ORDER BY n DESC
+    LIMIT 10
 """).fetchall()
 report["info"]["top_errors"] = err_rows
 if err_rows and err_rows[0][1] >= 40:

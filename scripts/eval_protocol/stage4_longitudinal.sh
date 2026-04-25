@@ -311,7 +311,9 @@ ANALYZER_JSON_RC=${PIPESTATUS[0]}
 
 banner "Stage 4 — analyzer (Source 1 for M6)"
 run_logged "33_analyze_longitudinal.log" \
-    uv run scripts/analyze_longitudinal.py --db "$EVAL_OUT/31_longitudinal.duckdb"
+    uv run scripts/analyze_longitudinal.py \
+        --db "$EVAL_OUT/31_longitudinal.duckdb" \
+        --expected-cycles "$EXPECTED_CYCLES"
 ANALYZER_RC=$?
 
 banner "Stage 4 — agreement detector"
@@ -322,6 +324,8 @@ import json
 import os
 import sys
 from pathlib import Path
+
+from scripts.analyze_longitudinal import _detect_convergence
 
 eval_out = Path(os.environ["EVAL_OUT"])
 analyzer = json.loads((eval_out / "33_analyzer_m6.json").read_text())
@@ -380,16 +384,11 @@ for idx, (a_row, s_row) in enumerate(zip(an_rows, sp_rows), start=1):
 
 analyzer_conv = analyzer.get("convergence_cycle")
 scipy_conv = None
-streak = 0
-for row in sp_rows[1:]:
-    kl = row.get("kl_utility")
-    if kl is not None and kl < 0.05:
-        streak += 1
-        if streak >= 3:
-            scipy_conv = row["cycle"]
-            break
-    else:
-        streak = 0
+scipy_kls = [row.get("kl_utility") for row in sp_rows]
+if len(scipy_kls) > 1:
+    scipy_conv = _detect_convergence(scipy_kls[1:], 0.05, 3)
+    if scipy_conv is not None:
+        scipy_conv += 1
 if analyzer_conv != scipy_conv:
     details.append({
         "field": "convergence_cycle",
