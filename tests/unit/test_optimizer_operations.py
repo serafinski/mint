@@ -116,6 +116,26 @@ class TestPrune:
         assert result == ["cap-b"]
         registry.deactivate.assert_called_once_with("cap-b")
 
+
+class TestAgentSubagentNameValidation:
+    def test_merge_agents_subagent_name_over_64_chars_is_rejected(self):
+        with pytest.raises(Exception, match="64"):
+            MergeAgentsSubagent(
+                name="x" * 65,
+                description="subagent",
+                system_prompt="prompt",
+                tools=["sandbox_execute"],
+            )
+
+    def test_split_agents_subagent_name_over_64_chars_is_rejected(self):
+        with pytest.raises(Exception, match="64"):
+            SplitAgentVariantSubagent(
+                name="x" * 65,
+                description="subagent",
+                system_prompt="prompt",
+                tools=["sandbox_execute"],
+            )
+
     def test_empty_registry(self):
         registry = MagicMock()
         registry.list_all.return_value = []

@@ -446,7 +446,7 @@ class SplitSkillVariant(_SplitVariantCommon):
 class SplitAgentVariantSubagent(BaseModel):
     """One subagent of one AGENT variant in a split."""
 
-    name: str = Field(..., description="Subagent name (hyphen-case)")
+    name: str = Field(..., max_length=64, description="Subagent name (hyphen-case, max 64 chars)")
     description: str = Field(..., description="One-sentence subagent role")
     system_prompt: str = Field(
         ..., description="Full system prompt for the subagent's isolated context"
@@ -620,7 +620,7 @@ class MergeSkillsResult(_MergeResultCommon):
 class MergeAgentsSubagent(BaseModel):
     """One subagent in a lead-with-subagents AGENT configuration."""
 
-    name: str = Field(..., description="Subagent name (hyphen-case)")
+    name: str = Field(..., max_length=64, description="Subagent name (hyphen-case, max 64 chars)")
     description: str = Field(..., description="One-sentence description of the subagent's role")
     system_prompt: str = Field(
         ..., description="Full system prompt for the subagent's isolated context"

@@ -117,6 +117,33 @@ class TestResultModels:
         assert "T01" not in TASK_RESULT_MODELS
 
 
+class TestLeadWithSubagentValidation:
+    def test_execute_agent_artifact_rejects_overlong_subagent_name(self):
+        clear_last_agent_execution_meta()
+        artifact = SimpleNamespace(
+            agent_config={
+                "system_prompt": "You are an agent.",
+                "subagents": [{
+                    "name": "x" * 65,
+                    "description": "worker",
+                    "system_prompt": "do work",
+                    "tools": [],
+                }],
+            }
+        )
+        task = SimpleNamespace(
+            task_id="T17",
+            fixture_paths=[],
+            output_contract=SimpleNamespace(required_keys=[]),
+        )
+        result = execute_agent_artifact(artifact, task, {})
+        assert result == {}
+        meta = get_last_agent_execution_meta()
+        assert meta is not None
+        assert meta.succeeded is False
+        assert meta.failure_reason == "error"
+
+
 class TestSelectResultModel:
     def test_named_task_prefers_task_model_without_output_schema(self):
         task = SimpleNamespace(task_id="T19")

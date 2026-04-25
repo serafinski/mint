@@ -1392,12 +1392,17 @@ def _execute_agent_inner(
     if subagents_config:
         subagents_param = []
         for sub in subagents_config:
+            sub_name = str(sub["name"])
+            if len(sub_name) > 64:
+                raise ValueError(
+                    f"subagent name too long ({len(sub_name)} chars, max 64): {sub_name}"
+                )
             sub_tools = []
             for tool_name in sub.get("tools", []):
                 if tool_name == "sandbox_execute":
                     sub_tools.append(sandbox_execute)
             subagents_param.append({
-                "name": sub["name"],
+                "name": sub_name,
                 "description": sub["description"],
                 "system_prompt": sub["system_prompt"],
                 "tools": sub_tools,

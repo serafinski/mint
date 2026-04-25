@@ -842,6 +842,12 @@ class TestValidateLeadResult:
         errors = _validate_lead_result(result)
         assert any("hyphen-case" in e for e in errors)
 
+    def test_subagent_name_too_long(self):
+        result = _valid_lead_result()
+        result.subagents[0].name = "a" * 65
+        errors = _validate_lead_result(result)
+        assert any("too long" in e for e in errors)
+
     def test_empty_subagent_system_prompt(self):
         result = _valid_lead_result()
         result.subagents[0].system_prompt = "  "

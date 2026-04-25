@@ -411,6 +411,10 @@ def _validate_lead_result(result: LeadWithSubagentsResult) -> list[str]:
                 errors.append(
                     f"subagents[{i}].name '{sub.name}' must be hyphen-case"
                 )
+            elif len(sub.name) > 64:
+                errors.append(
+                    f"subagents[{i}].name too long ({len(sub.name)} chars, max 64)"
+                )
             if sub.name in seen_names:
                 errors.append(f"subagents[{i}].name '{sub.name}' is duplicated")
             seen_names.add(sub.name)
