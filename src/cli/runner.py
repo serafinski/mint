@@ -2207,11 +2207,11 @@ def execute_task(
             "partial output only[/bold yellow]"
         )
         err_console.print(
-            "[yellow]The task decomposer hit its timeout or errored. "
-            "The pipeline ran through a single-sentence fallback path, so "
-            "the output above is almost certainly incomplete. "
-            "Results should be treated as a diagnostic, not a successful "
-            "run.[/yellow]"
+            "[yellow]The task decomposition stage did not produce a fully "
+            "valid plan. This can reflect timeout/error, chain-coherence "
+            "violations, or uncovered output-contract keys. The pipeline may "
+            "still have run far enough to produce partial output, but results "
+            "should be treated as diagnostic rather than successful.[/yellow]"
         )
         _errs = _get_final("errors", []) or []
         if _errs:
