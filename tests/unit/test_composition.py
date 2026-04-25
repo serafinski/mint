@@ -1570,6 +1570,229 @@ class TestAgentOutputSchemaRuntimeCheck:
             "cascade_chain": "list[str]",
         }
 
+    @patch("tests.evaluation.execution.execute_agent_artifact")
+    def test_fully_collapsed_lead_uses_task_level_model(self, mock_exec, tmp_path):
+        """Lead-only tasks should not validate against conceptual handoff schemas.
+
+        T08/T10 style failure: all subtasks collapsed into one lead-with-
+        subagents artifact, but the runtime still built a response model from
+        the union of every conceptual subtask's output_schema. The lead then
+        failed structured-output validation for omitting intermediate fields
+        that never cross a real runtime boundary.
+        """
+        mock_exec.return_value = {
+            "n_rows": 15,
+            "n_columns": 6,
+            "quality_issues_found": 4,
+            "issue_categories": ["invalid_dates"],
+        }
+
+        subtasks = [
+            SubTask(
+                description="load csv",
+                required_capabilities=["load"],
+                depends_on=[],
+                output_schema={"raw_csv": "str"},
+            ),
+            SubTask(
+                description="profile csv",
+                required_capabilities=["profile"],
+                depends_on=[0],
+                output_schema={"null_counts": "dict", "sample_rows": "list[dict]"},
+            ),
+            SubTask(
+                description="summarize issues",
+                required_capabilities=["summarize"],
+                depends_on=[1],
+                output_schema={"final_summary": "dict"},
+            ),
+        ]
+        lead_ref = CapabilityReference(
+            source="generated", capability_name="data-quality-lead",
+            capability_type=CapabilityType.AGENT,
+        )
+        art = _make_artifact(
+            "data-quality-lead", CapabilityType.AGENT,
+            gap_query="load",
+            agent_config={
+                "system_prompt": "lead",
+                "subagents": [{
+                    "name": "reader",
+                    "description": "Read and inspect input",
+                    "system_prompt": "Use sandbox_execute",
+                    "tools": ["sandbox_execute"],
+                }],
+            },
+        )
+        executor = CompositionalExecutor(
+            subtasks=subtasks,
+            resolution={
+                "load": lead_ref,
+                "profile": lead_ref,
+                "summarize": lead_ref,
+            },
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(task_id="T08"),
+        )
+
+        workspace = tmp_path / "ws"
+        (workspace / "fixtures").mkdir(parents=True)
+
+        executor._execute_agent_step(art, lead_ref, workspace, {}, subtask=subtasks[0])
+
+        assert mock_exec.call_count == 1
+        assert mock_exec.call_args.kwargs["output_schema"] is None
+
+    @patch("tests.evaluation.execution.execute_agent_artifact")
+    def test_partially_collapsed_lead_still_uses_union_output_schema(self, mock_exec, tmp_path):
+        """Keep the union schema when downstream runtime handoffs still exist."""
+        mock_exec.return_value = {"parsed_yaml": {}, "metrics_table": []}
+
+        subtasks = [
+            SubTask(
+                description="parse yaml",
+                required_capabilities=["parse-yaml"],
+                depends_on=[],
+                output_schema={"parsed_yaml": "dict"},
+            ),
+            SubTask(
+                description="derive metrics",
+                required_capabilities=["derive-metrics"],
+                depends_on=[0],
+                output_schema={"metrics_table": "list[dict]"},
+            ),
+            SubTask(
+                description="write report",
+                required_capabilities=["write-report"],
+                depends_on=[1],
+                output_schema={"output_file": "str"},
+            ),
+        ]
+        lead_ref = CapabilityReference(
+            source="generated", capability_name="incident-triage-lead",
+            capability_type=CapabilityType.AGENT,
+        )
+        writer_ref = CapabilityReference(
+            source="generated", capability_name="writer",
+            capability_type=CapabilityType.MCP_TOOL,
+        )
+        lead = _make_artifact(
+            "incident-triage-lead", CapabilityType.AGENT,
+            gap_query="parse-yaml",
+            agent_config={
+                "system_prompt": "lead",
+                "subagents": [{
+                    "name": "reader",
+                    "description": "Read and inspect input",
+                    "system_prompt": "Use sandbox_execute",
+                    "tools": ["sandbox_execute"],
+                }],
+            },
+        )
+        writer = _make_artifact(
+            "writer", CapabilityType.MCP_TOOL,
+            gap_query="write-report",
+            source_code="async def writer(): return {'output_file': 'x'}",
+        )
+        executor = CompositionalExecutor(
+            subtasks=subtasks,
+            resolution={
+                "parse-yaml": lead_ref,
+                "derive-metrics": lead_ref,
+                "write-report": writer_ref,
+            },
+            artifacts=[lead, writer],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(task_id="T16"),
+        )
+
+        workspace = tmp_path / "ws"
+        (workspace / "fixtures").mkdir(parents=True)
+
+        executor._execute_agent_step(lead, lead_ref, workspace, {}, subtask=subtasks[0])
+
+        assert mock_exec.call_count == 1
+        assert mock_exec.call_args.kwargs["output_schema"] == {
+            "parsed_yaml": "dict",
+            "metrics_table": "list[dict]",
+        }
+
+    @patch("tests.evaluation.execution.execute_agent_artifact")
+    def test_fully_collapsed_lead_skips_subtask_schema_compliance(self, mock_exec):
+        """Cached conceptual steps should not re-check private subagent schemas.
+
+        The fully-collapsed lead executes once and later conceptual steps reuse
+        that cached output. Their output_schema declarations are planning-time
+        structure, not real runtime boundaries, so enforcing them against the
+        cached lead payload is incorrect.
+        """
+        mock_exec.return_value = {
+            "n_rows": 15,
+            "n_columns": 4,
+            "quality_issues_found": 3,
+            "issue_categories": ["null_ages"],
+        }
+
+        subtasks = [
+            SubTask(
+                description="load csv",
+                required_capabilities=["load"],
+                depends_on=[],
+                output_schema={"raw_csv": "str"},
+            ),
+            SubTask(
+                description="profile csv",
+                required_capabilities=["profile"],
+                depends_on=[0],
+                output_schema={"null_counts": "dict"},
+            ),
+            SubTask(
+                description="categorize issues",
+                required_capabilities=["categorize"],
+                depends_on=[1],
+                output_schema={"issue_counts": "dict"},
+            ),
+        ]
+        lead_ref = CapabilityReference(
+            source="generated", capability_name="data-quality-lead",
+            capability_type=CapabilityType.AGENT,
+        )
+        art = _make_artifact(
+            "data-quality-lead", CapabilityType.AGENT,
+            gap_query="load",
+            agent_config={
+                "system_prompt": "lead",
+                "subagents": [{
+                    "name": "reader",
+                    "description": "Read and inspect input",
+                    "system_prompt": "Use sandbox_execute",
+                    "tools": ["sandbox_execute"],
+                }],
+            },
+        )
+        executor = CompositionalExecutor(
+            subtasks=subtasks,
+            resolution={
+                "load": lead_ref,
+                "profile": lead_ref,
+                "categorize": lead_ref,
+            },
+            artifacts=[art],
+            matches=[],
+            fixture_paths=[],
+            task=_make_task(task_id="T08"),
+        )
+
+        result = executor.run()
+
+        assert result.chain_success is True
+        assert len(result.step_results) == 3
+        assert mock_exec.call_count == 1
+        assert result.step_results[-1]["quality_issues_found"] == 3
+
     @patch("tests.evaluation.execution.execute_skill_artifact")
     def test_skill_missing_schema_keys_also_fails(self, mock_skill):
         """The runtime validator applies to SKILL too, not just AGENT."""

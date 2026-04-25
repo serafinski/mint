@@ -604,6 +604,46 @@ class CompositionalExecutor:
             allow_network=self.allow_network,
         )
 
+    def _is_fully_collapsed_lead_artifact(
+        self,
+        *,
+        artifact: Any,
+        current_ref: CapabilityReference,
+    ) -> bool:
+        """Whether every resolved subtask maps to the same lead-with-subagents artifact.
+
+        In this shape there are no real runtime handoff boundaries between the
+        decomposer's conceptual subtasks: the lead executes once, its output is
+        cached, and that same payload is reused for every conceptual step. Using
+        per-subtask or union-of-subtasks ``output_schema`` as the lead's
+        ``response_format`` therefore over-constrains the lead to surface
+        intermediate subagent state that never leaves the lead's private context.
+
+        When this returns true, the agent should be validated against the
+        task-level result model instead of a synthetic handoff schema, and the
+        per-subtask runtime output-schema compliance check should be skipped.
+        """
+        if not (
+            isinstance(artifact, GeneratedArtifact)
+            and getattr(artifact, "capability_type", None) == CapabilityType.AGENT
+            and artifact.agent_config
+            and artifact.agent_config.get("subagents")
+        ):
+            return False
+
+        current_name = getattr(artifact, "capability_name", None) or current_ref.capability_name
+        for other in self.subtasks:
+            other_ref, _ = self._resolve_step(other)
+            if other_ref is None:
+                return False
+            if other_ref.source != "generated":
+                return False
+            if other_ref.capability_type != CapabilityType.AGENT:
+                return False
+            if other_ref.capability_name != current_name:
+                return False
+        return True
+
     def _collect_union_output_schema(
         self,
         *,
@@ -613,16 +653,17 @@ class CompositionalExecutor:
         """Union output_schemas across every subtask that resolves to this artifact.
 
         §12 finding #12 refinement (2026-04-16 after T16 third-run
-        empirical failure). When a lead+subagents artifact covers N
-        decomposer gaps, the lead executes once and produces an
-        aggregated output covering all N gaps. Using just the currently-
-        executing subtask's schema as ``response_format`` is too narrow —
-        the lead's natural aggregation includes task-level return keys
-        and sibling subtasks' declared keys. This helper produces the
-        union so the dynamic Pydantic model captures every key the
-        downstream consumers might need. Paired with ``extra="allow"``
-        on the dynamic model (see ``_build_dynamic_result_model``) so the
-        lead's composite output isn't rejected for including extras.
+        empirical failure). When a generated AGENT artifact covers
+        multiple decomposer gaps *and there are still downstream runtime
+        handoffs*, using just the currently-executing subtask's schema as
+        ``response_format`` is too narrow — the aggregated output must
+        contain whatever sibling handoff keys downstream steps will read.
+        This helper produces that union.
+
+        Fully-collapsed lead-with-subagents tasks are handled separately
+        by :meth:`_is_fully_collapsed_lead_artifact`: those tasks do not
+        have real runtime handoffs between the conceptual subtasks, so the
+        lead should use the task-level result model instead of this union.
 
         Returns ``None`` when no subtask resolves to this artifact (e.g.
         match from the registry, not a generated artifact) or when the
@@ -661,22 +702,32 @@ class CompositionalExecutor:
             else self._match_to_artifact(artifact_or_match, ref)
         )
 
-        # §12 finding #12: thread the subtask's decomposer-declared
-        # output_schema into the agent executor so it can build a dynamic
-        # Pydantic response_format. This enforces Structured State
-        # Communication on AGENT handoffs (the key that downstream
-        # MCP_TOOL writers use via requires_upstream_keys).
-        #
-        # For lead+subagents artifacts: multiple subtasks can resolve to
-        # the same artifact. The lead executes ONCE and produces an
-        # aggregated output covering ALL collapsed gaps. Using just the
-        # current subtask's narrow schema makes the response_format reject
-        # the lead's natural composite output. Compute the UNION of all
-        # subtasks that resolve to this artifact so the schema captures
-        # every key the downstream consumers might need.
-        output_schema = self._collect_union_output_schema(
-            artifact=artifact, current_ref=ref,
-        ) if subtask else None
+        fully_collapsed_lead = (
+            self._is_fully_collapsed_lead_artifact(
+                artifact=artifact, current_ref=ref,
+            )
+            if subtask
+            else False
+        )
+
+        # §12 finding #12: thread the decomposer-declared output_schema into
+        # the agent executor so it can build a dynamic Pydantic
+        # response_format when the agent's output is consumed by downstream
+        # runtime steps. Fully-collapsed lead-with-subagents tasks are the
+        # exception: there, the lead's output is validated only at the task
+        # boundary, not at conceptual subtask boundaries that never exist at
+        # runtime.
+        output_schema = None
+        if subtask and not fully_collapsed_lead:
+            output_schema = self._collect_union_output_schema(
+                artifact=artifact, current_ref=ref,
+            )
+        elif fully_collapsed_lead:
+            logger.info(
+                "Agent step %s spans the full task via cached lead reuse; "
+                "using task-level response model instead of subtask schemas",
+                ref.capability_name,
+            )
 
         output = execute_agent_artifact(
             artifact,
@@ -959,6 +1010,13 @@ class CompositionalExecutor:
                 step_results.append(output)
                 executed_outputs[step_idx] = output
 
+                fully_collapsed_lead = (
+                    ref.capability_type == CapabilityType.AGENT
+                    and self._is_fully_collapsed_lead_artifact(
+                        artifact=artifact_or_match, current_ref=ref,
+                    )
+                )
+
                 # §12 finding #12: runtime output-schema compliance check.
                 # Layer 2 of the two-layer defense (Layer 1 is the dynamic
                 # response_format in execute_agent_artifact). Fails the chain
@@ -967,8 +1025,13 @@ class CompositionalExecutor:
                 # MCP_TOOL/SKILL steps rely on via requires_upstream_keys.
                 # MCP_TOOL output is deterministic (whatever the function
                 # returns) so only enforce for AGENT/SKILL runtime outputs.
-                if subtask.output_schema and output and ref.capability_type in (
+                if (
+                    subtask.output_schema
+                    and output
+                    and not fully_collapsed_lead
+                    and ref.capability_type in (
                     CapabilityType.AGENT, CapabilityType.SKILL,
+                    )
                 ):
                     expected = set(subtask.output_schema.keys())
                     actual = set(output.keys())
