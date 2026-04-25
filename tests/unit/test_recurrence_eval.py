@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import pickle
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from src.registry.evaluation_store import EvaluationStore
 from src.schemas.evaluation import EvaluationRecord, FailureReason
 from tests.evaluation.conditions import get_condition_profile
 from tests.evaluation.fixtures import generate_recurrence
 from tests.evaluation.recurrence_tasks import build_recurrence_tasks
+from tests.evaluation.tasks import get_task
 
 
 def test_condition_profiles_are_proposal_aligned():
@@ -192,3 +196,82 @@ def test_recurrence_tasks_use_picklable_validators(tmp_path, monkeypatch):
     pickle.dumps(task.validator)
     assert task.file_validator is not None
     pickle.dumps(task.file_validator)
+
+
+@pytest.mark.parametrize("task_id", ["T11", "T13", "T14", "T15"])
+def test_build_recurrence_tasks_rebinds_fixture_roles_by_filename(
+    tmp_path, monkeypatch, task_id
+):
+    root = tmp_path
+    manifest_path = root / "tests" / "evaluation" / "fixtures_recurrence" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import tests.evaluation.recurrence_tasks as recurrence_tasks
+
+    source_root = recurrence_tasks.ROOT
+    canonical = get_task(task_id)
+    canonical_fixture_paths = [
+        root / fp.relative_to(source_root)
+        for fp in canonical.fixture_paths
+    ]
+    patched_task = replace(canonical, fixture_paths=canonical_fixture_paths)
+
+    fixture_dir = root / "tests" / "evaluation" / "fixtures_recurrence" / task_id / "v01"
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    recurrence_fixture_paths = []
+    for name in sorted(fp.name for fp in canonical_fixture_paths):
+        path = fixture_dir / name
+        path.write_text("stub")
+        recurrence_fixture_paths.append(path)
+
+    expected_values_by_task = {
+        "T11": {
+            "summary_row_count": 4,
+            "region_revenues": {"North": 100.0},
+            "regions_meeting_target": 1,
+            "revenue_tolerance_pct": 20,
+        },
+        "T13": {"anomaly_count": 5},
+        "T14": {
+            "department_count": 5,
+            "department_spending": {"Engineering": 100.0},
+            "over_budget_count": 1,
+            "flagged_transactions": 2,
+            "spending_tolerance_pct": 20,
+        },
+        "T15": {
+            "n_days": 7,
+            "metrics_aggregated": 4,
+            "alert_days": 3,
+        },
+    }
+    manifest_path.write_text(json.dumps([
+        {
+            "task_family_id": task_id,
+            "task_instance_id": f"{task_id}.v01",
+            "variant_id": "v01",
+            "benchmark_track": "recurrence",
+            "seed": 123,
+            "fixture_files": [
+                str(path.relative_to(root))
+                for path in recurrence_fixture_paths
+            ],
+            "expected_values": expected_values_by_task[task_id],
+        }
+    ], indent=2))
+
+    monkeypatch.setattr(recurrence_tasks, "ROOT", root)
+    monkeypatch.setattr(recurrence_tasks, "RECURRENCE_MANIFEST_PATH", manifest_path)
+    monkeypatch.setattr(recurrence_tasks, "get_task", lambda _task_id: patched_task)
+
+    task = build_recurrence_tasks(task_ids=[task_id])[0]
+
+    assert [fp.name for fp in task.fixture_paths] == [
+        fp.name for fp in canonical_fixture_paths
+    ]
+
+    for old_fp, rebound_fp in zip(canonical_fixture_paths, task.fixture_paths, strict=False):
+        old_rel = str(old_fp.relative_to(root))
+        new_rel = str(rebound_fp.relative_to(root))
+        assert old_rel not in task.task_prompt
+        assert new_rel in task.task_prompt

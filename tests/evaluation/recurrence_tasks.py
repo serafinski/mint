@@ -31,7 +31,42 @@ def _manifest_rows() -> list[dict]:
     return json.loads(RECURRENCE_MANIFEST_PATH.read_text())
 
 
+def _rebind_fixture_paths(task: TaskDefinition, fixture_paths: list[Path]) -> list[Path]:
+    """Return recurrence fixtures in the canonical semantic order.
+
+    Recurrence manifests store fixture files in alphabetical order, but several
+    canonical tasks expect a different positional order. Rebind by exact
+    filename so both prompt rewriting and any positional execution path (notably
+    the static baseline) preserve canonical file roles.
+    """
+    by_name: dict[str, Path] = {}
+    for fp in fixture_paths:
+        if fp.name in by_name:
+            raise ValueError(
+                f"Duplicate recurrence fixture filename '{fp.name}' for task {task.task_id}"
+            )
+        by_name[fp.name] = fp
+
+    ordered: list[Path] = []
+    missing: list[str] = []
+    for canonical_fp in task.fixture_paths:
+        matched = by_name.get(canonical_fp.name)
+        if matched is None:
+            missing.append(canonical_fp.name)
+        else:
+            ordered.append(matched)
+
+    extra = sorted(set(by_name) - {fp.name for fp in task.fixture_paths})
+    if missing or extra:
+        raise ValueError(
+            "Recurrence fixture-role binding mismatch for "
+            f"{task.task_id}: missing={missing}, extra={extra}"
+        )
+    return ordered
+
+
 def _rewrite_prompt(task: TaskDefinition, fixture_paths: list[Path]) -> str:
+    fixture_paths = _rebind_fixture_paths(task, fixture_paths)
     prompt = task.task_prompt
     for old_fp, new_fp in zip(task.fixture_paths, fixture_paths, strict=False):
         old_rel = str(old_fp.relative_to(ROOT))
@@ -209,7 +244,10 @@ def build_recurrence_tasks(
         if selected_variants and variant_id not in selected_variants:
             continue
         canonical = get_task(task_family_id)
-        fixture_paths = [ROOT / rel for rel in row["fixture_files"]]
+        fixture_paths = _rebind_fixture_paths(
+            canonical,
+            [ROOT / rel for rel in row["fixture_files"]],
+        )
         validator_updates = _VALIDATOR_FACTORY_MAP[task_family_id](row["expected_values"], canonical)
         built.append(
             replace(
