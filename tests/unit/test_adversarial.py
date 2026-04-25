@@ -607,6 +607,55 @@ class TestAdversarialModels:
             )
             assert f.severity == sev
 
+    def test_adversarial_finding_missing_severity_defaults_by_pattern(self):
+        hidden_demo = AdversarialFinding(
+            attack_pattern="hidden_demo_mode",
+            suspicious=True,
+            evidence="Returns canned output for demo-like inputs",
+        )
+        network = AdversarialFinding(
+            attack_pattern="network_disconnect",
+            suspicious=True,
+            evidence="Returns plausible output despite offline sandbox",
+        )
+        ground_truth = AdversarialFinding(
+            attack_pattern="ground_truth",
+            suspicious=True,
+            evidence="Output diverges from reference implementation",
+        )
+        clean = AdversarialFinding(
+            attack_pattern="ground_truth",
+            suspicious=False,
+            evidence="Matches reference implementation",
+        )
+
+        assert hidden_demo.severity == Severity.CRITICAL
+        assert network.severity == Severity.CRITICAL
+        assert ground_truth.severity == Severity.HIGH
+        assert clean.severity == Severity.INFO
+
+    def test_adversarial_findings_model_accepts_missing_severity(self):
+        findings = AdversarialFindings.model_validate(
+            {
+                "findings": [
+                    {
+                        "attack_pattern": "hidden_demo_mode",
+                        "suspicious": True,
+                        "evidence": "Canned response detected.",
+                    },
+                    {
+                        "attack_pattern": "ground_truth",
+                        "suspicious": False,
+                        "evidence": "Reference implementation matches.",
+                    },
+                ],
+                "conclusion": "Tool behavior reviewed.",
+            }
+        )
+
+        assert findings.findings[0].severity == Severity.CRITICAL
+        assert findings.findings[1].severity == Severity.INFO
+
 
 # ---------------------------------------------------------------------------
 # pip_packages propagation — Step 14.9

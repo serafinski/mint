@@ -35,7 +35,7 @@ import concurrent.futures
 import logging
 from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.task import GeneratedArtifact
@@ -105,11 +105,40 @@ class AdversarialFinding(BaseModel):
     evidence: str = Field(
         ..., description="Evidence supporting the finding"
     )
-    severity: Severity = Field(
-        ..., description="Severity level of the finding"
+    severity: Severity | None = Field(
+        default=None,
+        description=(
+            "Severity level of the finding. If omitted, infer it from "
+            "attack_pattern and suspiciousness."
+        ),
     )
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _fill_missing_severity(self) -> AdversarialFinding:
+        """Backfill omitted severity from the attack pattern.
+
+        The adversarial DeepAgent sometimes returns otherwise-valid findings
+        but omits ``severity``. Accept the record and recover a conservative
+        default so Tier 3 does not crash on schema parsing.
+        """
+        if self.severity is not None:
+            return self
+
+        if not self.suspicious:
+            self.severity = Severity.INFO
+            return self
+
+        default_by_pattern = {
+            "hidden_demo_mode": Severity.CRITICAL,
+            "network_disconnect": Severity.CRITICAL,
+            "ground_truth": Severity.HIGH,
+        }
+        self.severity = default_by_pattern.get(
+            self.attack_pattern, Severity.HIGH
+        )
+        return self
 
 
 class AdversarialFindings(BaseModel):
