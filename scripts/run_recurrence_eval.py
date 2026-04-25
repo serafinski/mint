@@ -12,8 +12,11 @@ recommended default matrix is:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
+import signal
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -39,6 +42,52 @@ MCP_TOOLS_DIR = ROOT / "src" / "mcp_tools"
 SKILLS_DIR = DATA_DIR / "eval" / "skills"
 
 
+class BudgetExceeded(BaseException):
+    """Raised by the recurrence condition watchdog when the budget elapses."""
+
+
+@contextlib.contextmanager
+def _condition_budget_watchdog(
+    seconds: int,
+    *,
+    condition: str,
+    logger_: logging.Logger,
+):
+    """Raise ``BudgetExceeded`` if the wrapped condition exceeds ``seconds``."""
+    if not hasattr(signal, "SIGALRM"):
+        logger_.warning(
+            "Condition budget watchdog requested (%ds) but signal.SIGALRM "
+            "is unavailable on this platform — skipping watchdog. A hung "
+            "recurrence condition will block the campaign without bound.",
+            seconds,
+        )
+        yield
+        return
+
+    def _on_alarm(_sig: int, _frame: object) -> None:
+        raise BudgetExceeded(
+            f"Condition '{condition}' exceeded {seconds}s recurrence budget — "
+            f"watchdog fired"
+        )
+
+    prev_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(seconds)
+    try:
+        t_start = time.monotonic()
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, prev_handler)
+        elapsed = time.monotonic() - t_start
+        logger_.info(
+            "Recurrence condition '%s' watchdog: elapsed %.1fs / budget %ds (%.1f%%)",
+            condition,
+            elapsed,
+            seconds,
+            100.0 * elapsed / seconds,
+        )
+
+
 def _parse_csv_arg(value: str | None, default: list[str]) -> list[str]:
     if not value:
         return list(default)
@@ -55,6 +104,14 @@ def main() -> int:
         default="full,no_verification,no_optimization,static",
     )
     parser.add_argument("--n-runs", type=int, default=3)
+    parser.add_argument(
+        "--condition-budget-hours",
+        type=float,
+        default=8.0,
+        help="Wall-clock budget per condition (hours). Mirrors Stage 1's "
+             "watchdog model so a hung recurrence condition cannot block the "
+             "campaign indefinitely. Default 8h; set to 0 to disable.",
+    )
     parser.add_argument("--base-seed", type=int, default=42)
     parser.add_argument("--regenerate-fixtures", action="store_true")
     parser.add_argument("--db", type=str, default=None)
@@ -109,39 +166,71 @@ def main() -> int:
 
     total_records = 0
     flush_failures = 0
+    watchdog_aborted = False
+    abort_condition: str | None = None
     for condition in conditions:
-        for run_idx in range(args.n_runs):
-            metrics_store_path = metrics_root / db_path.stem / condition / f"run_{run_idx:02d}.duckdb"
-            metrics_store_path.parent.mkdir(parents=True, exist_ok=True)
-            if metrics_store_path.exists():
-                metrics_store_path.unlink()
-
-            config = HarnessConfig(
-                chroma_dir=CHROMA_DIR,
-                mcp_tools_dir=MCP_TOOLS_DIR,
-                skills_dir=SKILLS_DIR,
-                db_path=str(db_path),
-                n_runs=1,
-                base_seed=args.base_seed + run_idx,
-                langfuse_handler=langfuse_handler,
-                metrics_store_path=str(metrics_store_path),
+        budget_seconds = max(0, int(args.condition_budget_hours * 3600))
+        watchdog_cm = (
+            _condition_budget_watchdog(
+                budget_seconds,
+                condition=condition,
+                logger_=logger,
             )
-            with EvaluationHarness(config) as harness:
-                snap_id = harness.prepare()
-                logger.info(
-                    "Running recurrence condition=%s run=%02d tasks=%d snapshot=%s metrics_store=%s",
-                    condition, run_idx, len(recurrence_tasks), snap_id, metrics_store_path,
-                )
-                records = harness.run_condition(condition, recurrence_tasks)
-                total_records += len(records)
-                flush_failures += sum(0 if fr.all_ok else 1 for fr in harness.flush_results)
-                logger.info(
-                    "Completed recurrence condition=%s run=%02d success=%d/%d",
-                    condition, run_idx, sum(r.success for r in records), len(records),
-                )
+            if budget_seconds > 0
+            else contextlib.nullcontext()
+        )
+        try:
+            with watchdog_cm:
+                for run_idx in range(args.n_runs):
+                    metrics_store_path = metrics_root / db_path.stem / condition / f"run_{run_idx:02d}.duckdb"
+                    metrics_store_path.parent.mkdir(parents=True, exist_ok=True)
+                    if metrics_store_path.exists():
+                        metrics_store_path.unlink()
+
+                    config = HarnessConfig(
+                        chroma_dir=CHROMA_DIR,
+                        mcp_tools_dir=MCP_TOOLS_DIR,
+                        skills_dir=SKILLS_DIR,
+                        db_path=str(db_path),
+                        n_runs=1,
+                        base_seed=args.base_seed + run_idx,
+                        langfuse_handler=langfuse_handler,
+                        metrics_store_path=str(metrics_store_path),
+                    )
+                    with EvaluationHarness(config) as harness:
+                        snap_id = harness.prepare()
+                        logger.info(
+                            "Running recurrence condition=%s run=%02d tasks=%d snapshot=%s metrics_store=%s",
+                            condition, run_idx, len(recurrence_tasks), snap_id, metrics_store_path,
+                        )
+                        records = harness.run_condition(condition, recurrence_tasks)
+                        total_records += len(records)
+                        flush_failures += sum(0 if fr.all_ok else 1 for fr in harness.flush_results)
+                        logger.info(
+                            "Completed recurrence condition=%s run=%02d success=%d/%d",
+                            condition, run_idx, sum(r.success for r in records), len(records),
+                        )
+        except BudgetExceeded as exc:
+            logger.error(
+                "Recurrence condition '%s' aborted by watchdog: %s. "
+                "Partial per-task records may already be persisted; skipping "
+                "the remaining conditions.",
+                condition,
+                exc,
+            )
+            watchdog_aborted = True
+            abort_condition = condition
+            break
 
     logger.info("Recurrence DB: %s", db_path)
     logger.info("Total recurrence records: %d", total_records)
+    if watchdog_aborted:
+        logger.error(
+            "Recurrence campaign aborted during condition '%s' by watchdog. "
+            "Partial data persisted; exiting with code 7.",
+            abort_condition,
+        )
+        return 7
     if flush_failures:
         logger.error("cycle_flush partial failures detected: %d", flush_failures)
         return 5
