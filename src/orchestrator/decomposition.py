@@ -284,6 +284,36 @@ def _validate_chain_coherence(subtasks: list[SubTask]) -> list[str]:
     return violations
 
 
+def _validate_output_contract_coverage(
+    subtasks: list[SubTask],
+    required_keys: list[str],
+) -> list[str]:
+    """Return violations when the decomposition cannot satisfy required_keys.
+
+    The task-level OutputContract defines the minimum top-level keys that must
+    appear in the final result dict. A valid decomposition may produce those
+    keys across multiple subtasks, but the union of all declared
+    ``output_schema`` keys must still cover the contract. If it does not, the
+    chain cannot satisfy the task regardless of downstream generation quality.
+    """
+    if not subtasks or not required_keys:
+        return []
+
+    produced_keys: set[str] = set()
+    for subtask in subtasks:
+        produced_keys.update(subtask.output_schema.keys())
+
+    missing = sorted(set(required_keys) - produced_keys)
+    if not missing:
+        return []
+
+    return [
+        "Decomposition does not cover output_contract.required_keys. "
+        f"Missing keys: {missing}. Produced keys across all subtasks: "
+        f"{sorted(produced_keys)}."
+    ]
+
+
 def _collect_transitive_key_producers(
     subtasks: list[SubTask], subtask_index: int
 ) -> dict[str, list[int]]:
@@ -970,6 +1000,27 @@ def decomposition_node(
                     "subtask_count": len(subtasks),
                 },
             )
+
+        if state.output_contract is not None and state.output_contract.required_keys:
+            coverage_violations = _validate_output_contract_coverage(
+                subtasks, state.output_contract.required_keys,
+            )
+            if coverage_violations:
+                decomposition_succeeded = False
+                for violation in coverage_violations:
+                    errors.append(f"Output contract coverage violation: {violation}")
+                    logger.warning("DecompositionAgent: %s", violation)
+                emit_langfuse_event(
+                    langfuse_handler,
+                    "decomposition.output_contract_uncovered",
+                    "ERROR",
+                    {
+                        "violation_count": len(coverage_violations),
+                        "violations": coverage_violations,
+                        "required_keys": state.output_contract.required_keys,
+                        "subtask_count": len(subtasks),
+                    },
+                )
 
         # Soft warnings — upstream key collisions that won't necessarily
         # break the chain but indicate silent last-write-wins data loss at

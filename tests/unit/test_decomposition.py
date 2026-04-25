@@ -14,6 +14,7 @@ import pytest
 from src.orchestrator.decomposition import decomposition_node
 from src.schemas.task import (
     DecompositionResult,
+    OutputContract,
     SubTask,
     SubTaskItem,
     TaskState,
@@ -1332,6 +1333,111 @@ class TestDecompositionNodeCoherenceIntegration:
         # The warning message must cite last-write-wins so a reader
         # understands the runtime consequence.
         assert "last-write-wins" in warning_entries[0]
+
+
+class TestValidateOutputContractCoverage:
+    """Hard validator for task-level required_keys coverage."""
+
+    def test_empty_required_keys_is_trivially_satisfied(self):
+        from src.orchestrator.decomposition import _validate_output_contract_coverage
+
+        subtasks = [
+            SubTask(
+                description="Return stats.",
+                required_capabilities=["stats"],
+                depends_on=[],
+                output_schema={"row_count": "int"},
+            ),
+        ]
+        assert _validate_output_contract_coverage(subtasks, []) == []
+
+    def test_union_of_subtask_keys_satisfies_contract(self):
+        from src.orchestrator.decomposition import _validate_output_contract_coverage
+
+        subtasks = [
+            SubTask(
+                description="Profile the dataset.",
+                required_capabilities=["profile"],
+                depends_on=[],
+                output_schema={"n_rows": "int", "n_columns": "int"},
+            ),
+            SubTask(
+                description="Summarize issues.",
+                required_capabilities=["summarize-issues"],
+                depends_on=[0],
+                output_schema={
+                    "quality_issues_found": "list[str]",
+                    "issue_categories": "list[str]",
+                },
+                requires_upstream_keys=["n_rows", "n_columns"],
+            ),
+        ]
+        assert _validate_output_contract_coverage(
+            subtasks,
+            ["n_rows", "n_columns", "quality_issues_found", "issue_categories"],
+        ) == []
+
+    def test_missing_required_keys_are_flagged(self):
+        from src.orchestrator.decomposition import _validate_output_contract_coverage
+
+        subtasks = [
+            SubTask(
+                description="Request the dataset file or a corrected path.",
+                required_capabilities=["request-missing-file-or-path"],
+                depends_on=[],
+                output_schema={
+                    "file_path_confirmed": "str",
+                    "file_upload_provided": "bool",
+                },
+            ),
+        ]
+        violations = _validate_output_contract_coverage(
+            subtasks,
+            ["n_rows", "n_columns", "quality_issues_found", "issue_categories"],
+        )
+        assert len(violations) == 1
+        assert "Missing keys" in violations[0]
+        assert "n_rows" in violations[0]
+        assert "issue_categories" in violations[0]
+
+
+class TestDecompositionNodeOutputContractCoverage:
+    def test_uncovered_required_keys_set_decomposition_succeeded_false(self):
+        state = TaskState(
+            task_description="Investigate the dataset and report quality issues.",
+            output_contract=OutputContract(
+                required_keys=[
+                    "n_rows",
+                    "n_columns",
+                    "quality_issues_found",
+                    "issue_categories",
+                ],
+            ),
+        )
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(
+                    description="Request the dataset file or a corrected path.",
+                    required_capabilities=["request-missing-file-or-path"],
+                    output_schema={
+                        "file_path_confirmed": "str",
+                        "file_upload_provided": "bool",
+                    },
+                ),
+            ],
+            reasoning="Need the file before the investigation can proceed.",
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is False
+        assert any(
+            "Output contract coverage violation:" in err
+            for err in cmd.update["errors"]
+        )
 
 
 # ---------------------------------------------------------------------------
