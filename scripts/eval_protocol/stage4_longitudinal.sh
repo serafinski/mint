@@ -20,6 +20,7 @@ require_prior_stage "stage1.marker" "stage4" || exit $?
 
 MARKER="stage4.marker"
 PID_FILE="$EVAL_OUT/30_longitudinal.pid"
+LOG_FILE="$EVAL_OUT/30_longitudinal.log"
 LIVE_DB="data/eval/longitudinal.duckdb"
 
 export EXPECTED_CYCLES="${EXPECTED_CYCLES:-40}"
@@ -44,7 +45,9 @@ if [[ -f "$EVAL_OUT/$MARKER" ]]; then
         LAUNCHED)
             if [[ -f "$PID_FILE" ]] && ps -p "$(cat "$PID_FILE")" > /dev/null 2>&1; then
                 banner "Stage 4 — longitudinal still running (PID $(cat "$PID_FILE"))"
-                tail -20 "$EVAL_OUT/30_longitudinal.log" 2>/dev/null
+                echo "Log file: $LOG_FILE"
+                echo "Follow live: tail -f $LOG_FILE"
+                tail -20 "$LOG_FILE" 2>/dev/null
                 exit 0
             fi
             banner "Stage 4 — longitudinal finished, verifying"
@@ -65,13 +68,15 @@ if [[ ! -f "$EVAL_OUT/$MARKER" ]]; then
 
     nohup caffeinate -i -s uv run scripts/run_longitudinal.py \
         --db "$LIVE_DB" --n-tasks "$EXPECTED_CYCLES" --fresh-db \
-        > "$EVAL_OUT/30_longitudinal.log" 2>&1 &
+        > "$LOG_FILE" 2>&1 &
     LPID=$!
     echo "$LPID" > "$PID_FILE"
     echo "Started PID $LPID, n_tasks=$EXPECTED_CYCLES at $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         > "$EVAL_OUT/30_longitudinal_start.txt"
 
     write_marker "$MARKER" "LAUNCHED" "longitudinal PID $LPID, tasks=$EXPECTED_CYCLES"
+    echo "Log file: $LOG_FILE"
+    echo "Follow live: tail -f $LOG_FILE"
     echo "STAGE 4 LAUNCHED. Re-run this script when it finishes."
     exit 0
 fi
@@ -83,7 +88,7 @@ snapshot_git_state "30_stage4_verify"
 
 cp "$LIVE_DB" "$EVAL_OUT/31_longitudinal.duckdb"
 echo "Finished at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$EVAL_OUT/31_longitudinal_status.txt"
-tail -50 "$EVAL_OUT/30_longitudinal.log" >> "$EVAL_OUT/31_longitudinal_status.txt"
+tail -50 "$LOG_FILE" >> "$EVAL_OUT/31_longitudinal_status.txt"
 
 banner "Stage 4 — raw-window completeness checks + scipy KL cross-check"
 uv run python - <<'PY' 2>&1 | tee "$EVAL_OUT/32_stage4_gate.json"
