@@ -503,7 +503,6 @@ def main() -> int:
                 )
             summary_lines.append("")
             summary = "\n".join(summary_lines)
-            print(summary)
             logger.info("Condition summary:\n%s", summary)
             all_records.extend(records)
 
