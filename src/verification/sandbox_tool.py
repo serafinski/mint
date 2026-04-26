@@ -33,6 +33,7 @@ _pip_resolution_cache: dict[str, str] = {}
 class _PackageMapping(BaseModel):
     """LLM response: mapping from Python import names to PyPI package names."""
     mappings: dict[str, str] = Field(
+        default_factory=dict,
         description="Dict mapping each Python import name to its PyPI package name"
     )
 
@@ -65,6 +66,22 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
         )
 
         result: _PackageMapping = structured_llm.invoke(prompt)
+
+        if not result.mappings:
+            logger.warning(
+                "LLM package resolution returned an empty mapping for imports %s. "
+                "Falling back to identity mapping (import name = pip name).",
+                list(uncached),
+            )
+        else:
+            missing = [name for name in uncached if name not in result.mappings]
+            if missing:
+                logger.warning(
+                    "LLM package resolution returned a partial mapping for imports %s. "
+                    "Missing %s; falling back to identity mapping for missing imports.",
+                    list(uncached),
+                    missing,
+                )
 
         # Update cache with LLM results.
         for name in uncached:

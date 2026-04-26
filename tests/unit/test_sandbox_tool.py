@@ -336,6 +336,35 @@ class TestResolveImportsViaLLM:
         assert result["fuzzywuzzy"] == "fuzzywuzzy"
         assert result["msgpack"] == "msgpack"  # fallback to identity
 
+    @patch("src.verification.sandbox_tool.init_chat_model")
+    def test_empty_mapping_response_uses_identity(self, mock_init, caplog):
+        mock_llm = MagicMock()
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = _PackageMapping()
+        mock_init.return_value = mock_llm
+
+        result = _resolve_imports_via_llm(["numpy", "pandas"])
+
+        assert result == {"numpy": "numpy", "pandas": "pandas"}
+        assert "returned an empty mapping" in caplog.text
+
+    @patch("src.verification.sandbox_tool.init_chat_model")
+    def test_partial_mapping_logs_missing_imports(self, mock_init, caplog):
+        mock_llm = MagicMock()
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = _PackageMapping(
+            mappings={"numpy": "numpy"}
+        )
+        mock_init.return_value = mock_llm
+
+        result = _resolve_imports_via_llm(["numpy", "pandas"])
+
+        assert result == {"numpy": "numpy", "pandas": "pandas"}
+        assert "returned a partial mapping" in caplog.text
+        assert "pandas" in caplog.text
+
 
 class TestResolveExtraPackages:
     """Tests for the full resolve_extra_packages pipeline (extract + filter + LLM)."""
@@ -690,5 +719,3 @@ class TestSandboxExecuteInWorkspaceLoudFailsOnInvalidPackages:
             "requires the loud-fail dict shape."
         )
         assert result["success"] is False
-
-
