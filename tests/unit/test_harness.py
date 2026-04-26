@@ -14,7 +14,7 @@ from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import GeneratedArtifact, MatchItem, TaskState
 from src.schemas.verification import VerificationReport
 from tests.evaluation.harness import EvaluationHarness, HarnessConfig, _extract_result
-from tests.evaluation.tasks import T01, T03, T04, T07
+from tests.evaluation.tasks import T01, T03, T04, T07, T13
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -49,13 +49,20 @@ def _make_report(passed=True, tier_reached=2):
     )
 
 
-def _make_state(artifacts=None, reports=None, attempt_count=1, matches=None):
+def _make_state(
+    artifacts=None,
+    reports=None,
+    attempt_count=1,
+    matches=None,
+    **extra,
+):
     return TaskState(
         task_description="test",
         generated_artifacts=artifacts or [],
         verification_results=reports or [],
         attempt_count=attempt_count,
         matches=matches or [],
+        **extra,
     )
 
 
@@ -248,6 +255,23 @@ class TestExtractResult:
         assert result["gate_passed"] is True
         assert result["output_in_range"] is False
 
+    def test_decomposition_failure_short_circuits_single_artifact_path(self):
+        state = _make_state(
+            artifacts=[_make_artifact()],
+            reports=[_make_report(passed=True)],
+            decomposition_succeeded=False,
+        )
+        loader = MagicMock()
+        with patch("tests.evaluation.harness._execute_artifact") as mock_exec:
+            result = _extract_result(state, T01, loader)
+        mock_exec.assert_not_called()
+        assert result["gate_passed"] is False
+        assert result["output_in_range"] is False
+        assert result["failure_reason"] == "generation_failed"
+        assert result["failed_step_reason"] == "decomposition_failed"
+        assert result["chain_success"] is False
+        assert len(result["generated_artifact_sources"]) == 1
+
     def test_registry_match_with_source_code_executes(self):
         """Registry match with source_code in metadata → sandbox-executed.
 
@@ -299,6 +323,34 @@ class TestExtractResult:
         assert result["gate_passed"] is True
         assert result["output_in_range"] is False
         assert result["failure_reason"] == "output_rejected"
+
+    def test_decomposition_failure_short_circuits_compositional_path(self):
+        from src.schemas.task import SubTask
+
+        state = _make_state(
+            artifacts=[_make_artifact(name="lead", cap_type=CapabilityType.AGENT, source_code=None)],
+            reports=[_make_report(passed=True)],
+            decomposition_succeeded=False,
+            required_capabilities=["parse-timeseries", "assemble-report"],
+            subtasks=[
+                SubTask(description="parse", required_capabilities=["parse-timeseries"]),
+                SubTask(
+                    description="assemble",
+                    required_capabilities=["assemble-report"],
+                    depends_on=[0],
+                ),
+            ],
+        )
+        loader = MagicMock()
+        with patch("tests.evaluation.harness._extract_result_compositional") as mock_extract:
+            result = _extract_result(state, T13, loader)
+        mock_extract.assert_not_called()
+        assert result["gate_passed"] is False
+        assert result["failure_reason"] == "generation_failed"
+        assert result["failed_step_reason"] == "decomposition_failed"
+        assert result["chain_length"] == 2
+        assert result["required_capability_count"] == 2
+        assert result["chain_success"] is False
 
 
 # ---------------------------------------------------------------------------

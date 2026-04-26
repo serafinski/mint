@@ -1188,8 +1188,44 @@ def _extract_result(
     attempt_count = _get("attempt_count", 0)
     subtasks = _get("subtasks", []) or []
     classified_gaps = _get("classified_gaps", []) or []
+    decomposition_succeeded = bool(_get("decomposition_succeeded", True))
     # Step 14.12 — preserve task-level network policy through execution.
     allow_network = bool(_get("allow_network", False))
+
+    # ext18 #191 (2026-04-25): fail closed in the eval harness when the
+    # decomposition sticky flag is false. The CLI already exits early on
+    # decomposition_succeeded=False, but the harness previously ignored the
+    # flag and could still execute / score a run as successful if later chain
+    # steps happened to produce validator-happy output (observed on T13).
+    if not decomposition_succeeded:
+        logger.warning(
+            "Task %s marked decomposition_succeeded=False; failing closed in eval harness",
+            task.task_id,
+        )
+        return {
+            "gate_passed": False,
+            "output_in_range": False,
+            "failure_reason": "generation_failed",
+            "attempt_count": attempt_count,
+            "capability_type": None,
+            "verification_tier_reached": None,
+            "token_cost": 0,
+            "invocation_record_id": _get("trace_id", None),
+            "required_capability_count": len(required_capabilities),
+            "matched_in_registry_count": len(matches),
+            "chain_length": max(len(subtasks), 1),
+            "chain_success": False,
+            "matched_and_executed_count": 0,
+            "generated_artifact_count": 0,
+            "capability_types": [],
+            "failed_step_index": None,
+            "failed_step_name": None,
+            "failed_step_reason": "decomposition_failed",
+            "generated_artifact_sources": _snapshot_artifacts(artifacts),
+            "output_shape_mismatch": False,
+            "output_shape_missing_keys": [],
+            "output_shape_missing_files": [],
+        }
 
     # ---------------------------------------------------------------
     # Compositional execution path (Phase 3): when the task was
