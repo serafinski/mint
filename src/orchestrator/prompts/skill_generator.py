@@ -37,7 +37,8 @@ The file MUST:
 1. Start with YAML frontmatter between `---` delimiters (the very first line must be `---`)
 2. Have a `name` field: hyphen-case (lowercase letters, digits, hyphens only), max 64 characters, \
 no leading/trailing/consecutive hyphens
-3. Have a `description` field: max 1024 characters, no angle brackets (< or >)
+3. Have a `description` field: max 1024 characters, no angle brackets (< or >); \
+use plain identifiers like `metric_function` instead of `<metric>_<function>`
 4. Only use allowed frontmatter keys: `name`, `description`, `license`, `compatibility`, \
 `allowed-tools`, `metadata`
 5. Have non-empty content after the frontmatter closing `---`
@@ -157,7 +158,7 @@ Here is the SKILL.md content you produced:
 Please fix the SKILL.md to pass validation. Remember:
 - First line must be exactly `---`
 - YAML frontmatter must have `name` (hyphen-case, max 64 chars) and `description` \
-(max 1024 chars, no angle brackets)
+(max 1024 chars, no angle brackets; use `metric_function` instead of `<metric>_<function>`)
 - Only allowed keys: `name`, `description`, `license`, `compatibility`, `allowed-tools`, `metadata`
 - Content after the closing `---` must be non-empty
 

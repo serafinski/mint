@@ -17,6 +17,7 @@ import src.orchestrator.generators.skill as _skill_module
 from src.orchestrator.generators.skill import (
     _generate_single_skill,
     _get_validate_skill,
+    _sanitize_frontmatter_description,
     _strip_code_fences,
     extract_skill_name,
     generate_skill,
@@ -145,6 +146,28 @@ class TestExtractSkillName:
     def test_missing_name(self):
         content = "---\ndescription: test\n---\ncontent"
         assert extract_skill_name(content) is None
+
+
+class TestSanitizeFrontmatterDescription:
+    def test_removes_angle_brackets_from_description_only(self):
+        content = """\
+---
+name: metric-skill
+description: "Apply <metric>_<function> thresholds and summarize alerts."
+---
+
+# Metric Skill
+
+Body keeps <angle brackets> if it wants them.
+"""
+        result = _sanitize_frontmatter_description(content)
+        assert 'description: Apply metric_function thresholds and summarize alerts.' in result
+        assert "Body keeps <angle brackets> if it wants them." in result
+        assert "<metric>" not in result
+
+    def test_no_frontmatter_is_unchanged(self):
+        content = "# No frontmatter\n\nBody"
+        assert _sanitize_frontmatter_description(content) == content
 
 
 class TestValidateSkillContent:
@@ -483,6 +506,23 @@ class TestGenerateSingleSkill:
         assert artifact is not None
         from src.orchestrator.generators.utils import slugify_gap_hyphen
         assert artifact.capability_name == slugify_gap_hyphen("csv-loader")
+
+    def test_angle_brackets_in_description_are_sanitized_without_repair(self, tmp_path):
+        content = VALID_SKILL_MD.replace(
+            'description: "Load and parse CSV files for data pipeline ingestion."',
+            'description: "Load <metric>_<function> CSV files for data pipeline ingestion."',
+        )
+        mock_llm = self._make_mock_llm([content])
+        with patch(
+            "src.orchestrator.generators.skill._get_llm",
+            return_value=mock_llm,
+        ):
+            artifact, error = _generate_single_skill(self._gap(), "context", output_dir=tmp_path)
+
+        assert error is None
+        assert artifact is not None
+        assert "<" not in artifact.skill_content
+        assert "metric_function" in artifact.skill_content
 
     def test_first_llm_call_fails(self, tmp_path):
         """LLM error on first attempt returns (None, error) without raising."""

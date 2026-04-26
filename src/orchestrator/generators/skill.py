@@ -177,6 +177,38 @@ def extract_skill_description(content: str) -> str | None:
     return None
 
 
+def _sanitize_frontmatter_description(content: str) -> str:
+    """Remove validator-disallowed angle brackets from frontmatter description.
+
+    The skill prompt already forbids ``<`` / ``>`` in the YAML ``description``,
+    but models still occasionally emit idioms like ``<metric>_<function>``.
+    Sanitizing this single field avoids an otherwise pointless repair pass while
+    leaving the body untouched.
+    """
+    match = re.match(r"^---\n(.*?)\n---\n?(.*)$", content, re.DOTALL)
+    if not match:
+        return content
+
+    frontmatter = _parse_frontmatter(content)
+    if frontmatter is None:
+        return content
+
+    description = frontmatter.get("description")
+    if not isinstance(description, str) or ("<" not in description and ">" not in description):
+        return content
+
+    frontmatter["description"] = description.replace("<", "").replace(">", "")
+    frontmatter_yaml = yaml.safe_dump(
+        frontmatter,
+        sort_keys=False,
+        allow_unicode=False,
+    ).strip()
+    body = match.group(2).lstrip("\n")
+    if body:
+        return f"---\n{frontmatter_yaml}\n---\n\n{body}"
+    return f"---\n{frontmatter_yaml}\n---\n"
+
+
 def validate_skill_content(content: str, skill_name: str) -> tuple[bool, str]:
     """Validate SKILL.md content using ``tools/quick_validate.py``.
 
@@ -261,6 +293,7 @@ def _generate_single_skill(
     try:
         response = llm.invoke(prompt)
         content = _strip_code_fences(response.content)
+        content = _sanitize_frontmatter_description(content)
     except Exception as exc:  # noqa: BLE001
         error_msg = f"LLM call failed for skill '{gap.query}': {exc}"
         logger.warning(error_msg)
@@ -296,6 +329,7 @@ def _generate_single_skill(
         try:
             repair_response = llm.invoke(repair_prompt)
             content = _strip_code_fences(repair_response.content)
+            content = _sanitize_frontmatter_description(content)
             skill_name = extract_skill_name(content) or skill_name
             is_valid, message = validate_skill_content(content, skill_name)
         except Exception as exc:  # noqa: BLE001
