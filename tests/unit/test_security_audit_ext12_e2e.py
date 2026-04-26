@@ -438,11 +438,9 @@ def test_analyze_results_auto_select_at_production_density_e2e(tmp_path):
     base_ts = datetime(2026, 4, 20, 10, 0, 0)
     rows: list[dict] = []
     # Seed 8 run_ids per condition (32 total) with 20 tasks each (640
-    # rows). With the default --per-condition-cap of 5 the auto-select
-    # picks 20 and the WARNING fires because total_available (32) >
-    # len(latest) (20). Pre-fix at this density the CTE would pick
-    # rows-not-run_ids and DISTINCT would collapse to 4 total — the
-    # exact bug ext12 #114 closed.
+    # rows). We pass --per-condition-cap 5 explicitly so this test keeps
+    # exercising the original ext12 #114 production-density shape even
+    # though the script default is now 3 per condition.
     for c_idx, condition in enumerate(
         ("full", "no_verification", "no_optimization", "static")
     ):
@@ -463,6 +461,7 @@ def test_analyze_results_auto_select_at_production_density_e2e(tmp_path):
     result = _run_script(
         "analyze_results.py",
         "--db", str(db),
+        "--per-condition-cap", "5",
         timeout=60,
     )
     # We don't care about the script's exit code for this assertion (it
@@ -821,4 +820,3 @@ sys.exit(_rp.main() or 0)
         f"Expected clean exit 0, got {result.returncode}. "
         f"stderr:\n{result.stderr[:2000]}"
     )
-

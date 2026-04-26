@@ -380,6 +380,8 @@ def test_ext13_126_exits_7_when_invocation_events_empty(tmp_path):
     result = _run_script(
         "analyze_results.py",
         "--db", str(db),
+        "--per-condition-cap", "5",
+        "--expected-runs-per-condition", "5",
     )
     assert result.returncode == 7, (
         f"Expected exit 7 (M3 missing), got {result.returncode}. "
@@ -412,7 +414,9 @@ def test_ext13_126_allow_missing_metrics_proceeds(tmp_path):
 
     result = _run_script(
         "analyze_results.py",
-        "--db", str(db), "--allow-missing-metrics",
+        "--db", str(db),
+        "--allow-missing-metrics",
+        "--expected-runs-per-condition", "5",
     )
     # The test isn't asserting 0 specifically (other assertions may fire
     # on this shape); the important contract is "NOT 7".
@@ -451,6 +455,8 @@ def test_ext13_131_refuses_single_task_inflation(tmp_path):
     result = _run_script(
         "analyze_results.py",
         "--db", str(db),
+        "--per-condition-cap", "5",
+        "--expected-runs-per-condition", "5",
     )
     assert result.returncode == 2, (
         f"Expected exit 2 (distinct-task gap), got {result.returncode}. "
@@ -510,6 +516,8 @@ def test_ext13_132_exits_7_on_partial_m2_coverage(tmp_path):
     result = _run_script(
         "analyze_results.py",
         "--db", str(db),
+        "--per-condition-cap", "5",
+        "--expected-runs-per-condition", "5",
     )
     # ext13 #132 partial coverage → exit 7 (shared with #126).
     assert result.returncode == 7, (

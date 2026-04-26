@@ -633,11 +633,12 @@ def test_resolve_scope_auto_selects_latest_when_many_runs_with_warning(capsys):
 
 
 def test_auto_select_covers_all_conditions_in_canonical_eval_shape():
-    """Canonical run_sheet.md eval: 4 conditions × 5 runs = 20 distinct run_ids.
-    Pre-ext7-#46 auto-select picked the 4 most recent run_ids — by timestamp
-    order with fixed condition order this is typically one condition's 4 runs,
-    silently dropping 3 of 4 conditions. Post-fix, auto-select is balanced
-    per-condition and covers all 4 conditions.
+    """Balanced auto-select covers all conditions under the current default cap.
+
+    The protocol default is now 3 run_ids per condition, so a canonical
+    4-condition / 5-run-per-condition DB should auto-select 12 distinct
+    run_ids while still covering all 4 conditions. Pre-ext7-#46 a fixed
+    total cap could select only one condition's newest runs.
     """
     import scripts.analyze_results as ar
 
@@ -661,7 +662,7 @@ def test_auto_select_covers_all_conditions_in_canonical_eval_shape():
     # Strip the leading " AND run_id IN (" and trailing ")".
     inner = fragment.split("IN (", 1)[1].rstrip(")")
     selected_ids = [s.strip().strip("'") for s in inner.split(",")]
-    assert len(selected_ids) == 20  # 5 per condition × 4 conditions
+    assert len(selected_ids) == 12  # 3 per condition × 4 conditions
 
     conditions = conn.execute(
         "SELECT DISTINCT condition FROM evaluation_runs "
