@@ -4,6 +4,7 @@ All tests mock subprocess.run — no Docker required.
 Integration tests that actually invoke Docker are marked @pytest.mark.integration.
 """
 
+import logging
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -344,7 +345,8 @@ class TestResolveImportsViaLLM:
         mock_structured.invoke.return_value = _PackageMapping()
         mock_init.return_value = mock_llm
 
-        result = _resolve_imports_via_llm(["numpy", "pandas"])
+        with caplog.at_level(logging.WARNING, logger="src.verification.sandbox_tool"):
+            result = _resolve_imports_via_llm(["numpy", "pandas"])
 
         assert result == {"numpy": "numpy", "pandas": "pandas"}
         assert "returned an empty mapping" in caplog.text
@@ -359,7 +361,8 @@ class TestResolveImportsViaLLM:
         )
         mock_init.return_value = mock_llm
 
-        result = _resolve_imports_via_llm(["numpy", "pandas"])
+        with caplog.at_level(logging.WARNING, logger="src.verification.sandbox_tool"):
+            result = _resolve_imports_via_llm(["numpy", "pandas"])
 
         assert result == {"numpy": "numpy", "pandas": "pandas"}
         assert "returned a partial mapping" in caplog.text
