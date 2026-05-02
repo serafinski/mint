@@ -522,7 +522,7 @@ class TestExecuteAgentArtifactMeta:
 
 
 # ---------------------------------------------------------------------------
-# JSON extraction helpers — regression for CLI T11-style empty-output bug
+# JSON extraction helpers — regression for T11-style empty-output bug
 # ---------------------------------------------------------------------------
 
 
@@ -536,12 +536,12 @@ def _ai_msg(content: str) -> SimpleNamespace:
 
 
 class TestExtractLastSandboxJson:
-    """Regression tests for the CLI T11 empty-output bug.
+    """Regression tests for the T11 empty-output bug.
 
     The original implementation only parsed the LAST LINE of sandbox stdout,
     which broke on `print(json.dumps(result, indent=2))` output (last line
-    would be just `}`). This caused MINT CLI SKILL runs to return empty dicts
-    when the generated skill used pretty-printed JSON output.
+    would be just `}`). This caused generated SKILL runs to return empty dicts
+    when the skill used pretty-printed JSON output.
     """
 
     def test_single_line_json(self):
@@ -556,7 +556,7 @@ class TestExtractLastSandboxJson:
         assert result == {"summary_row_count": 60, "regions_meeting_target": 3}
 
     def test_multiline_pretty_printed_json(self):
-        """Regression for CLI T11 bug — pretty-printed multi-line JSON."""
+        """Regression for T11 bug — pretty-printed multi-line JSON."""
         import json
         pretty = json.dumps(
             {"summary_row_count": 60, "region_revenues": {"East": 15019.57}, "regions_meeting_target": 3},

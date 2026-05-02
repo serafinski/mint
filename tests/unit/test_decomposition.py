@@ -148,8 +148,7 @@ class TestDecompositionNode:
         """§12 finding #15: 3x retries with None structured_response → fail-closed.
 
         No single-sentence fallback; decomposition_succeeded=False flips so
-        the CLI exits with code 2 and the eval harness classifies this as
-        a generation_failed run.
+        terminal callers classify this as a generation_failed run.
         """
         from src.orchestrator.decomposition import MAX_DECOMPOSITION_ATTEMPTS
 
@@ -174,7 +173,7 @@ class TestDecompositionNode:
         - Every attempt times out → errors list has 3 timeout entries
         - No single-sentence fallback (required_capabilities stays empty)
         - decomposition_succeeded=False sticky flag flips
-        - CLI detects the flag and exits with code 2
+        - terminal callers detect the flag as a generation failure
         """
         from src.orchestrator.decomposition import MAX_DECOMPOSITION_ATTEMPTS
 
@@ -284,9 +283,9 @@ class TestDecompositionNode:
     # ------------------------------------------------------------------
     # Sticky decomposition_succeeded flag (Fix 2b)
     # ------------------------------------------------------------------
-    # These tests verify the sticky failure flag added to TaskState so the
-    # user-facing CLI and the evaluation harness can distinguish a real
-    # success from a fallback-path "success" where the decomposer bailed out
+    # These tests verify the sticky failure flag added to TaskState so terminal
+    # callers can distinguish a real success from a fallback-path "success"
+    # where the decomposer bailed out
     # and the pipeline produced whatever it could from a single-sentence
     # fallback query. See docs/perf_fixes_2026_04_14.md §2b.
 
@@ -448,7 +447,7 @@ class TestCircuitBreaker:
 #
 # These tests cover the _validate_chain_coherence helper and its integration
 # into decomposition_node. The motivating failure is the 2026-04-14 19:01
-# test_mint TSV run where the decomposer produced a 3-subtask chain whose
+# eval TSV run where the decomposer produced a 3-subtask chain whose
 # step 2 referenced an 'transactions' key no predecessor produced, causing
 # a runtime crash. See docs/perf_fixes_2026_04_14.md §4.5 and
 # docs/MASTER_PLAN_2026_04_13.md Phase 2 Step 14.

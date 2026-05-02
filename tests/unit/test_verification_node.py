@@ -200,7 +200,7 @@ def test_max_attempts_drops_failed_artifacts():
 
 def test_max_attempts_sets_sticky_fail_flag():
     """§12 finding #14: sticky verification_succeeded flag flips to False
-    so CLI runner + harness classify the task as VERIFICATION_FAILED.
+    so terminal callers classify the task as VERIFICATION_FAILED.
     """
     state = TaskState(
         task_description="t",
@@ -241,8 +241,8 @@ def test_max_attempts_all_pass_keeps_sticky_flag_true():
 
 
 def test_max_attempts_records_fail_closed_error():
-    """Errors list should carry a VERIFICATION_FAILED marker that the CLI
-    runner and eval harness can surface.
+    """Errors list should carry a VERIFICATION_FAILED marker that terminal
+    callers can surface.
     """
     state = TaskState(
         task_description="t",

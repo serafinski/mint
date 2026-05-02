@@ -988,7 +988,7 @@ def test_task_state_sticky_flags_default_true():
 
 
 def test_task_state_sticky_flags_false_roundtrip():
-    """Sticky False values survive serialization — they drive CLI exit codes."""
+    """Sticky False values survive serialization for terminal failure handling."""
     state = TaskState(
         task_description="test",
         decomposition_succeeded=False,
@@ -1415,7 +1415,7 @@ def test_chain_result_all_fields_roundtrip():
 
 
 class TestDecodeAgentConfigMetadata:
-    """Shared decoder used by composition, CLI registry-match, and store
+    """Shared decoder used by composition, registry-match, and store
     snapshot construction. Ensures the three call sites agree on how to
     unpack a ChromaDB-serialized agent_config back to a dict."""
 

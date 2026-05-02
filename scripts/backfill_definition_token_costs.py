@@ -17,8 +17,7 @@ Usage::
     # Actually write back to ChromaDB
     uv run scripts/backfill_definition_token_costs.py --write
 
-    # Restrict to one store
-    uv run scripts/backfill_definition_token_costs.py --write --stores cli
+    # Explicitly select the eval store
     uv run scripts/backfill_definition_token_costs.py --write --stores eval
 
 Exit codes:
@@ -48,7 +47,6 @@ from src.schemas.task import GeneratedArtifact  # noqa: E402
 logger = logging.getLogger(__name__)
 
 _STORES: dict[str, Path] = {
-    "cli": ROOT / "data" / "cli" / "chroma",
     "eval": ROOT / "data" / "eval" / "chroma",
 }
 

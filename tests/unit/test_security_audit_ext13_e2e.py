@@ -4,7 +4,7 @@ Sibling of ``test_security_audit_ext12_e2e.py`` — same pattern (seed a
 minimal DuckDB in ``tmp_path``, invoke the target script via
 ``subprocess.run``, assert on ``returncode`` + banners in stdout/stderr).
 Covers the high-leverage findings where the subprocess path could drift
-from the unit-test path: exit-code propagation, CLI-flag wiring, argparse
+    from the unit-test path: exit-code propagation, script-flag wiring, argparse
 integration, and banner interpolation in section headers.
 
 Scripts that require LLM / LangFuse runtime state (#134 test_registry_
@@ -607,7 +607,7 @@ sys.exit(_rl.main() or 0)
 
 
 # ---------------------------------------------------------------------------
-# #124 / #126 / #127 — CLI flags present in --help output
+# #124 / #126 / #127 — script flags present in --help output
 # ---------------------------------------------------------------------------
 
 

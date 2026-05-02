@@ -40,9 +40,9 @@ def test_init_creates_parent_directory_if_missing(tmp_path):
     """``MetricsStore(db_path=...)`` mkdirs missing parent dirs.
 
     Regression guard: ``duckdb.connect(db_path)`` raises FileNotFoundError
-    when the parent directory doesn't exist. CLI + eval harness relied on
-    upstream code (e.g., ``_create_infra``) to pre-mkdir; tests that bypass
-    that path crashed. Defensive init closes the class of bug.
+    when the parent directory doesn't exist. Runners relied on upstream code
+    (e.g., ``_create_infra``) to pre-mkdir; tests that bypass that path
+    crashed. Defensive init closes the class of bug.
     """
     nested = tmp_path / "nested" / "sub" / "dir" / "metrics.duckdb"
     assert not nested.parent.exists()
@@ -355,7 +355,7 @@ class TestGetRecentFailures:
         2026-04-16 fix: an earlier version of get_recent_failures also
         required ``actual_output IS NOT NULL`` in the SQL filter, which
         silently dropped every error-case. That made Step 8's
-        error-case coverage branch CLI-dead-code because crash-path
+        error-case coverage branch unreachable because crash-path
         InvocationRecords never reached verify_coverage. The bug was
         empirically caught by scripts/test_split_merge.py --split-mcp-only
         when "Seeded 1 failure case(s) for replay" didn't match the

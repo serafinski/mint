@@ -200,7 +200,7 @@ def test_longitudinal_runners_declare_reuse_metrics_store_flag():
         src = path.read_text()
         assert '"--reuse-metrics-store"' in src, (
             f"ext11 #113: {path.name} must declare a --reuse-metrics-store "
-            "CLI flag so callers can opt into cross-invocation state "
+            "flag so callers can opt into cross-invocation state "
             "accumulation. Default behaviour must wipe the DB on start."
         )
 

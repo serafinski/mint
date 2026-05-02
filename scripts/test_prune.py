@@ -7,9 +7,9 @@ registry + metrics + prune mechanics.
 
 Seeded state::
 
-    cap A  "pinned-cap"       zero invocations, metadata.pinned=true
-    cap B  "recently-used"    5 invocations in the last day
-    cap C  "idle-orphan"      zero invocations, unpinned
+    cap A  "pinned-cap"       old, zero invocations, metadata.pinned=true
+    cap B  "recently-used"    old, 5 invocations in the last day
+    cap C  "idle-orphan"      old, zero invocations, unpinned
 
 Expected post-prune::
 
@@ -48,6 +48,7 @@ from src.schemas.metrics import InvocationRecord  # noqa: E402
 
 def _seed_registry(registry: SkillRegistry) -> None:
     """Register the three canonical test capabilities."""
+    old_created_at = datetime(2020, 1, 1, tzinfo=UTC)
     registry.add(
         CapabilityDescriptor(
             name="pinned-cap",
@@ -56,6 +57,7 @@ def _seed_registry(registry: SkillRegistry) -> None:
             domain="core",
             tags=["core"],
             metadata={"pinned": "true"},
+            created_at=old_created_at,
         )
     )
     registry.add(
@@ -65,6 +67,7 @@ def _seed_registry(registry: SkillRegistry) -> None:
             capability_type=CapabilityType.MCP_TOOL,
             domain="active",
             tags=["active"],
+            created_at=old_created_at,
         )
     )
     registry.add(
@@ -74,6 +77,7 @@ def _seed_registry(registry: SkillRegistry) -> None:
             capability_type=CapabilityType.MCP_TOOL,
             domain="idle",
             tags=["stale"],
+            created_at=old_created_at,
         )
     )
 

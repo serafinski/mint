@@ -136,7 +136,7 @@ def test_create_pipeline_compiles_with_positional_args(seeded_registry, mock_loa
     from langgraph.graph.state import CompiledStateGraph
 
     # Two positional args — the load-bearing contract other modules use
-    # (CLI runner, evaluation harness, scripts).
+    # (evaluation harness and scripts).
     builder = create_pipeline(seeded_registry, mock_loader)
     graph = builder.compile()
     assert isinstance(graph, CompiledStateGraph)

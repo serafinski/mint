@@ -4,12 +4,12 @@ Pre-fix, ``run_pilot.py`` hardcoded ``data/eval/metrics.duckdb``. Every
 invocation appended into the same file, silently pooling across sessions.
 
 Post-fix:
-- ``--db`` CLI arg (default: a fresh timestamped path).
+- ``--db`` script arg (default: a fresh timestamped path).
 - ``--fresh-db`` wipes an existing path.
 - ``--append`` opts into appending to an existing path.
 - Refuses (exit 2) to run against an existing non-empty DB without either flag.
 
-The tests below invoke the runner's CLI arg plumbing without actually running
+The tests below invoke the runner's argument plumbing without actually running
 the harness (which would require Docker + LLM). We import ``main`` and drive
 it through ``monkeypatch.setattr(sys, 'argv', ...)`` + mock the downstream
 imports so the exit happens before the expensive paths.

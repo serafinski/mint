@@ -478,19 +478,13 @@ def test_tmp_md_p1_update_human_label_optimistic_concurrency(tmp_path):
 
 def test_tmp_md_p1_backfill_definition_token_costs_all_missing_exits_4(tmp_path):
     """Every targeted store missing → previously exited 0 silently."""
-    # Redirect _STORES to missing paths by pointing --stores at both
-    # via environment-agnostic harness: just run with --stores cli eval
-    # where neither path exists under tmp_path. The script's ROOT-relative
-    # paths default to data/cli/chroma + data/eval/chroma — in the test,
-    # those may or may not exist. To isolate, we patch via an env-var
-    # override isn't supported; so we use the test-by-intent: if the
-    # default paths happen to exist on this dev machine, the test is
-    # skipped. The assertion is the key one.
-    cli_chroma = ROOT / "data" / "cli" / "chroma"
+    # The script's ROOT-relative path defaults to data/eval/chroma. To isolate,
+    # we use the test-by-intent: if the default path happens to exist on this
+    # dev machine, the test is skipped. The assertion is the key one.
     eval_chroma = ROOT / "data" / "eval" / "chroma"
-    if cli_chroma.exists() or eval_chroma.exists():
+    if eval_chroma.exists():
         pytest.skip(
-            "default ChromaDB stores exist on this machine; "
+            "default ChromaDB store exists on this machine; "
             "the all-missing branch can't be exercised deterministically."
         )
 
@@ -502,4 +496,3 @@ def test_tmp_md_p1_backfill_definition_token_costs_all_missing_exits_4(tmp_path)
         f"expected exit 4 (all stores missing); got {result.returncode}. "
         f"stderr: {result.stderr[:400]}"
     )
-
