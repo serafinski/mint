@@ -88,12 +88,11 @@ def test_default_in_memory_still_works():
 
 
 def test_longitudinal_runners_use_persistent_store_path():
-    """ext8 #71 regression guard: both longitudinal runner files MUST
+    """ext8 #71 regression guard: the longitudinal runner MUST
     construct MetricsStore with a non-default path.
     """
     runners = [
         ROOT / "scripts" / "run_longitudinal.py",
-        ROOT / "scripts" / "run_longitudinal_shift.py",
     ]
     for path in runners:
         src = path.read_text()
@@ -190,13 +189,12 @@ def test_harness_default_preserves_legacy_behavior():
 
 
 def test_longitudinal_runners_declare_reuse_metrics_store_flag():
-    """Both longitudinal runners must expose ``--reuse-metrics-store`` so
+    """The longitudinal runner must expose ``--reuse-metrics-store`` so
     cross-invocation accumulation is opt-in (ext11 #113). Default = fresh
     baseline per invocation.
     """
     runners = [
         ROOT / "scripts" / "run_longitudinal.py",
-        ROOT / "scripts" / "run_longitudinal_shift.py",
     ]
     for path in runners:
         src = path.read_text()
@@ -208,7 +206,7 @@ def test_longitudinal_runners_declare_reuse_metrics_store_flag():
 
 
 def test_longitudinal_runners_reset_metrics_store_by_default():
-    """Both longitudinal runners must wipe their persistent MetricsStore DB
+    """The longitudinal runner must wipe its persistent MetricsStore DB
     at the top of ``main()`` unless the caller passed
     ``--reuse-metrics-store``. Pre-ext11-#113 the DB was never reset;
     cycle-1 KL + prune thresholds silently inherited prior invocation's
@@ -218,7 +216,6 @@ def test_longitudinal_runners_reset_metrics_store_by_default():
 
     runners = [
         ROOT / "scripts" / "run_longitudinal.py",
-        ROOT / "scripts" / "run_longitudinal_shift.py",
     ]
     for path in runners:
         src = path.read_text()

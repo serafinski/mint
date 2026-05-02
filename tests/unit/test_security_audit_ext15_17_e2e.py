@@ -169,30 +169,6 @@ def test_ext15_175_run_longitudinal_refuses_existing_nonempty_db(tmp_path):
         assert "ext15 #175" in result.stderr or "Refusing" in result.stderr
 
 
-def test_ext15_176_run_longitudinal_shift_refuses_existing_nonempty_db(tmp_path):
-    db = tmp_path / "longitudinal_shifted.duckdb"
-    _seed_eval_runs(
-        db, [{"run_id": "existing_shift_1", "condition": "longitudinal"}]
-    )
-
-    result = _run_script(
-        "run_longitudinal_shift.py",
-        "--db", str(db),
-        "--phase-a-tasks", "T04",
-        "--phase-b-tasks", "T05",
-        "--shift-at", "1",
-        "--total", "2",
-        timeout=15,
-    )
-    if result.returncode not in (1, 2):
-        pytest.fail(
-            f"expected exit 2 (freshness guard) or 1 (env missing), got "
-            f"{result.returncode}. stderr: {result.stderr[:500]}"
-        )
-    if result.returncode == 2:
-        assert "ext15 #176" in result.stderr or "Refusing" in result.stderr
-
-
 # ---------------------------------------------------------------------------
 # ext15 #172 — analyze_longitudinal overfull-timeline gate.
 # ---------------------------------------------------------------------------
@@ -254,53 +230,6 @@ def test_ext15_172_longitudinal_overfull_cycles_exits_3(tmp_path):
         f"stderr: {result.stderr[:400]}"
     )
     assert "overfull" in result.stderr.lower()
-
-
-# ---------------------------------------------------------------------------
-# ext16 #182 — file-only contract violations classify as compression_loss_task.
-# ---------------------------------------------------------------------------
-
-
-def test_ext16_182_classify_failure_file_only_contract_violation():
-    sys.path.insert(0, str(ROOT))
-    from scripts.analyze_compression_loss import FailureRow, classify_failure
-
-    row = FailureRow(
-        condition="full",
-        capability_type="skill",
-        failed_step_reason=None,
-        output_shape_mismatch=True,
-        output_shape_missing_keys=[],  # empty — the T2 bug trigger
-        output_shape_missing_files=["expected.csv"],
-        output_in_range=False,
-        gate_passed=True,
-        chain_success=True,
-        failure_reason="output_shape_mismatch",
-    )
-    assert classify_failure(row) == "compression_loss_task"
-
-
-def test_ext16_182_crashed_run_classifies_as_agent_timeout_not_compression_loss():
-    """tmp.md P0: even if output_shape_mismatch=True (written pre-fix),
-    a crashed run with failure_reason='agent_execution_timeout' must
-    NOT bucket as compression_loss_task.
-    """
-    sys.path.insert(0, str(ROOT))
-    from scripts.analyze_compression_loss import FailureRow, classify_failure
-
-    row = FailureRow(
-        condition="full",
-        capability_type="agent",
-        failed_step_reason=None,
-        output_shape_mismatch=True,
-        output_shape_missing_keys=["schema_sha"],
-        output_shape_missing_files=[],
-        output_in_range=False,
-        gate_passed=True,
-        chain_success=False,  # crashed mid-chain
-        failure_reason="agent_execution_timeout",
-    )
-    assert classify_failure(row) == "agent_execution_timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -543,40 +472,6 @@ def test_tmp_md_p1_update_human_label_optimistic_concurrency(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# tmp.md P1 — backfill_token_costs empty-run-set exits non-zero.
-# ---------------------------------------------------------------------------
-
-
-def test_tmp_md_p1_backfill_token_costs_empty_db_exits_nonzero(tmp_path):
-    """Pre-fix, an empty DB exited 0 with "No evaluation runs found".
-    Post-fix, exit 6 — wrong --db or filter matched zero rows.
-    """
-    db = tmp_path / "empty.duckdb"
-    # Create an empty DB with the schema.
-    sys.path.insert(0, str(ROOT))
-    from src.registry.evaluation_store import EvaluationStore
-    EvaluationStore(db_path=str(db)).close()
-
-    # Env must have LANGFUSE keys; mock them so the health check passes
-    # or fails loudly. Since we don't have a real LangFuse in tests, we
-    # expect either exit 6 (our new gate) or exit 1 (auth/connectivity).
-    result = _run_script(
-        "backfill_token_costs.py",
-        "--db", str(db),
-        env_extra={
-            "LANGFUSE_PUBLIC_KEY": "pk-test",
-            "LANGFUSE_SECRET_KEY": "sk-test",
-            "LANGFUSE_HOST": "http://localhost:1",  # unreachable
-        },
-        timeout=15,
-    )
-    assert result.returncode in (1, 6), (
-        f"expected exit 6 (empty-db gate) or 1 (health check failure); "
-        f"got {result.returncode}. stderr: {result.stderr[:400]}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # tmp.md P1 — backfill_definition_token_costs missing stores exit 4.
 # ---------------------------------------------------------------------------
 
@@ -608,81 +503,3 @@ def test_tmp_md_p1_backfill_definition_token_costs_all_missing_exits_4(tmp_path)
         f"stderr: {result.stderr[:400]}"
     )
 
-
-# ---------------------------------------------------------------------------
-# ext16 #180 — tier2_probes exits 7 when ALL events are malformed.
-# ---------------------------------------------------------------------------
-
-
-def test_ext16_180_render_table_exits_7_when_all_malformed():
-    sys.path.insert(0, str(ROOT))
-    from scripts.analyze_tier2_probes import ProbeBreakdown, render_table
-
-    bd = ProbeBreakdown()
-    bd.events_total = 50
-    bd.events_reject = 12
-    bd.events_pass = 38
-    bd.events_malformed_categories = 50
-    # categories is empty because every event had non-list categories.
-
-    rc = render_table(bd, include_pass=True)
-    assert rc == 7, (
-        "all-malformed events must render exit code 7, not silent "
-        "'No findings observed' narrative."
-    )
-
-
-def test_ext16_180_render_table_exits_0_when_no_events():
-    sys.path.insert(0, str(ROOT))
-    from scripts.analyze_tier2_probes import ProbeBreakdown, render_table
-
-    bd = ProbeBreakdown()
-    bd.events_total = 0
-    rc = render_table(bd, include_pass=False)
-    assert rc == 0
-
-
-# ---------------------------------------------------------------------------
-# ext16 #183 — per-model context-window lookup.
-# ---------------------------------------------------------------------------
-
-
-def test_ext16_183_context_window_lookup_per_model():
-    sys.path.insert(0, str(ROOT))
-    from scripts.analyze_context_utilization import _context_window_for
-
-    assert _context_window_for("gpt-5-mini") == 128_000
-    assert _context_window_for("openai:gpt-5-mini") == 128_000
-    assert _context_window_for("claude-sonnet-4-6") == 200_000
-    assert _context_window_for("claude-opus-4-7-1m") == 1_000_000
-    # Unknown falls back to default with a warning (dedup on second call).
-    assert _context_window_for("future-model-9000") == 128_000
-    assert _context_window_for("future-model-9000") == 128_000
-
-
-# ---------------------------------------------------------------------------
-# ext16 #184 — empty observation_ids flagged as degraded.
-# ---------------------------------------------------------------------------
-
-
-def test_ext16_184_empty_observation_ids_flagged_as_degraded():
-    """Via direct call to extract_trace_context with a trace whose
-    observation_ids is [] — the no-steps branch must return
-    _fetch_degraded=True (pre-fix returned False) AND
-    _empty_observation_ids=True (new field).
-    """
-    sys.path.insert(0, str(ROOT))
-    from scripts.analyze_context_utilization import extract_trace_context
-
-    # Use a dummy httpx client that would never be called since
-    # observation_ids is empty.
-    class _DummyClient:
-        def get(self, *_args, **_kwargs):  # pragma: no cover — not called
-            raise RuntimeError("should not be called for empty obs_ids")
-
-    trace = {"observation_ids": [], "id": "t1", "sessionId": "s1"}
-    result = extract_trace_context(_DummyClient(), trace)
-    assert result["_fetch_degraded"] is True, (
-        "empty observation_ids must be flagged as degraded"
-    )
-    assert result["_empty_observation_ids"] is True

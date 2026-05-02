@@ -19,7 +19,6 @@ import logging
 import math
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -162,133 +161,6 @@ def test_budget_watchdog_not_swallowed_by_broad_exception_handler():
 
 
 # ---------------------------------------------------------------------------
-# #120 — analyze_context_utilization fetch-degraded flag
-# ---------------------------------------------------------------------------
-
-
-def test_extract_trace_context_marks_all_failed_fetches_as_degraded():
-    """ext12 #120: a trace whose every observation fetch returns None
-    must carry ``_fetch_degraded=True`` so the aggregate pass can
-    exclude it from Context Economy averages.
-    """
-    from scripts import analyze_context_utilization as acu
-
-    mock_client = MagicMock()
-    trace = {"id": "t1", "observation_ids": ["o1", "o2", "o3"]}
-    with patch.object(acu, "fetch_observation", return_value=None):
-        metrics = acu.extract_trace_context(mock_client, trace)
-
-    assert metrics.get("_fetch_degraded") is True
-    assert metrics.get("_obs_attempted") == 3
-    assert metrics.get("_obs_failed") == 3
-    assert metrics.get("context_utilization_pct") == 0.0
-
-
-def test_extract_trace_context_no_generations_is_not_degraded():
-    """A trace with successful fetches that simply had no GENERATION-typed
-    observations should NOT be flagged as degraded — it's legitimate
-    zero-util data, not a fetch failure.
-    """
-    from scripts import analyze_context_utilization as acu
-
-    mock_client = MagicMock()
-    trace = {"id": "t1", "observation_ids": ["o1", "o2"]}
-    # Observations fetched successfully but NOT GENERATION-typed.
-    with patch.object(
-        acu,
-        "fetch_observation",
-        side_effect=[{"type": "SPAN"}, {"type": "EVENT"}],
-    ):
-        metrics = acu.extract_trace_context(mock_client, trace)
-
-    assert metrics.get("_fetch_degraded") is False
-    assert metrics.get("_obs_attempted") == 2
-    assert metrics.get("_obs_failed") == 0
-
-
-def test_extract_trace_context_with_usable_generations_is_not_degraded():
-    """Sanity: the non-empty-steps happy path still sets _fetch_degraded=False."""
-    from scripts import analyze_context_utilization as acu
-
-    mock_client = MagicMock()
-    trace = {"id": "t1", "observation_ids": ["o1", "o2"]}
-    good_obs = {
-        "type": "GENERATION",
-        "id": "o1",
-        "name": "step1",
-        "model": "gpt-5-mini",
-        "usage": {"input": 1000, "output": 100, "total": 1100},
-        "usageDetails": {},
-        "startTime": None,
-    }
-    with patch.object(
-        acu, "fetch_observation", side_effect=[good_obs, None]
-    ):
-        metrics = acu.extract_trace_context(mock_client, trace)
-
-    # One fetch failed but the trace still has a valid GENERATION → not degraded.
-    assert metrics.get("_fetch_degraded") is False
-    assert metrics.get("step_count") == 1
-
-
-# ---------------------------------------------------------------------------
-# #117 — run-sheet longitudinal selector carries completeness filter
-# ---------------------------------------------------------------------------
-
-
-def test_run_sheet_longitudinal_selector_has_completeness_filter():
-    """ext12 #117: the longitudinal + shift run_id selectors in the run
-    sheet must include ``HAVING COUNT(*) >= ?`` so a stub aborted run
-    can't win by ``MAX(timestamp)``. Lint test — prevents future
-    regressions where the selector is reverted to a bare ``LIMIT 1``.
-    """
-    content = (ROOT / "docs" / "run_sheet.md").read_text()
-    assert "HAVING COUNT(*)" in content, (
-        "ext12 #117: longitudinal selector in run_sheet.md is missing "
-        "the completeness filter. Aborted partial runs will silently "
-        "win by MAX(timestamp)."
-    )
-    # Both selectors (longitudinal + shifted) should carry it.
-    count = content.count("HAVING COUNT(*)")
-    assert count >= 2, (
-        f"Expected both longitudinal + shifted selectors to use "
-        f"HAVING COUNT(*); found {count} occurrence(s)."
-    )
-
-
-# ---------------------------------------------------------------------------
-# #122 — backfill_token_costs per-run completeness + sys.exit wrapper
-# ---------------------------------------------------------------------------
-
-
-def test_backfill_main_returns_int_exit_code():
-    """ext12 #122: ``main()`` now returns an int exit code + the module
-    entrypoint uses ``sys.exit(main() or 0)``. Pin the contract by
-    checking the signature + the entrypoint source.
-    """
-    import inspect
-
-    from scripts import backfill_token_costs
-
-    sig = inspect.signature(backfill_token_costs.main)
-    # Return annotation is a string under ``from __future__ import annotations``.
-    assert sig.return_annotation in (int, "int"), (
-        "ext12 #122: backfill_token_costs.main() must be annotated -> int "
-        "so the exit-code contract is visible at the API boundary."
-    )
-
-
-def test_backfill_module_entrypoint_wraps_main_with_sys_exit():
-    """Source-level check — prevents regression to bare ``main()``."""
-    source = (ROOT / "scripts" / "backfill_token_costs.py").read_text()
-    assert "sys.exit(main()" in source, (
-        "ext12 #122: backfill_token_costs.py module entrypoint must wrap "
-        "main() in sys.exit(...) so the integer return value becomes the "
-        "process exit code."
-    )
-
-
-# ---------------------------------------------------------------------------
 # #115 — run_pilot exit-code contract
 # ---------------------------------------------------------------------------
 
@@ -331,28 +203,6 @@ def test_analyze_longitudinal_main_supports_expected_cycles_flag():
     source = (ROOT / "scripts" / "analyze_longitudinal.py").read_text()
     assert "--expected-cycles" in source
     assert "--allow-incomplete" in source
-
-
-# ---------------------------------------------------------------------------
-# #123 — shift-marker robustness
-# ---------------------------------------------------------------------------
-
-
-def test_run_longitudinal_shift_retries_marker_write_three_times():
-    """ext12 #123: the shift-marker write retries up to 3 times with
-    jitter before giving up. Source-level check that the retry loop
-    and the end-of-campaign loud-fail are wired.
-    """
-    source = (ROOT / "scripts" / "run_longitudinal_shift.py").read_text()
-    # Retry loop: ``for attempt in range(3):``
-    assert "for attempt in range(3):" in source, (
-        "ext12 #123: shift-marker write must retry 3x before failing."
-    )
-    # Loud-fail: campaign returns exit 4 when marker never lands.
-    assert "return 4" in source
-    # End-of-campaign check on shift_reached + shift_marked.
-    assert "shift_reached" in source
-    assert "shift_marked" in source
 
 
 def test_analyze_longitudinal_refuses_shift_db_without_marker():

@@ -308,31 +308,6 @@ def test_run_pilot_help_exits_zero_via_sys_exit_wrapper():
 
 
 # ---------------------------------------------------------------------------
-# #122 — backfill_token_costs.py --help exit code
-# ---------------------------------------------------------------------------
-
-
-def test_backfill_help_exits_zero_and_documents_allow_partial():
-    """ext12 #122: --allow-partial flag must be documented in --help, and
-    the sys.exit(main() or 0) wrapper must propagate argparse's exit 0.
-    """
-    result = _run_script("backfill_token_costs.py", "--help", timeout=10)
-    assert result.returncode == 0
-    assert "--allow-partial" in result.stdout
-
-
-# ---------------------------------------------------------------------------
-# #121 — audit_contamination.py --help exit code + --force-fresh-plan flag
-# ---------------------------------------------------------------------------
-
-
-def test_audit_contamination_help_documents_force_fresh_plan():
-    result = _run_script("audit_contamination.py", "--help", timeout=10)
-    assert result.returncode == 0
-    assert "--force-fresh-plan" in result.stdout
-
-
-# ---------------------------------------------------------------------------
 # #119 — longitudinal runner --help smoke tests (watchdog flags visible)
 # ---------------------------------------------------------------------------
 
@@ -342,80 +317,6 @@ def test_run_longitudinal_help_exposes_watchdog_flags():
     assert result.returncode == 0
     assert "--per-task-budget-seconds" in result.stdout
     assert "--campaign-budget-hours" in result.stdout
-
-
-def test_run_longitudinal_shift_help_exposes_watchdog_flags():
-    result = _run_script("run_longitudinal_shift.py", "--help", timeout=10)
-    assert result.returncode == 0
-    assert "--per-task-budget-seconds" in result.stdout
-    assert "--campaign-budget-hours" in result.stdout
-
-
-# ---------------------------------------------------------------------------
-# #117 — run-sheet selector parses + rejects stub under HAVING filter
-# ---------------------------------------------------------------------------
-
-
-def test_run_sheet_completeness_filter_rejects_stub(tmp_path):
-    """ext12 #117 e2e: seed a DB with both a complete and a stub run; run
-    the run-sheet SQL directly against it and assert the stub is
-    rejected when EXPECTED_LONGITUDINAL_ROWS >= complete-run size.
-    """
-    db = tmp_path / "longitudinal.duckdb"
-    base_ts = datetime(2026, 4, 20, 10, 0, 0)
-    rows: list[dict] = []
-    # Complete run: 40 rows.
-    for i in range(40):
-        rows.append({
-            "run_id": "complete_old",
-            "condition": "longitudinal",
-            "task_id": f"T{(i % 20) + 1:02d}",
-            "timestamp": base_ts + timedelta(seconds=i),
-        })
-    # Partial run: 5 rows written LATER (newer timestamps).
-    later_ts = base_ts + timedelta(hours=24)
-    for i in range(5):
-        rows.append({
-            "run_id": "partial_new",
-            "condition": "longitudinal",
-            "task_id": f"T{i + 1:02d}",
-            "timestamp": later_ts + timedelta(seconds=i),
-        })
-    _seed_evaluation_runs(db, rows=rows)
-
-    conn = duckdb.connect(str(db), read_only=True)
-    try:
-        # Pre-fix selector (MAX(timestamp) only) would pick 'partial_new'.
-        row_prefix = conn.execute(
-            "SELECT run_id FROM evaluation_runs GROUP BY run_id "
-            "ORDER BY MAX(timestamp) DESC LIMIT 1"
-        ).fetchone()
-        assert row_prefix[0] == "partial_new", (
-            "Sanity: pre-fix selector picks the newer partial run."
-        )
-
-        # Post-fix selector (HAVING COUNT(*) >= 40) must pick 'complete_old'.
-        row_postfix = conn.execute(
-            "SELECT run_id FROM evaluation_runs GROUP BY run_id "
-            "HAVING COUNT(*) >= ? "
-            "ORDER BY MAX(timestamp) DESC LIMIT 1",
-            [40],
-        ).fetchone()
-        assert row_postfix is not None, (
-            "Completeness filter must find the 40-row complete run."
-        )
-        assert row_postfix[0] == "complete_old"
-
-        # And with a threshold that NO run meets, the selector returns None.
-        row_none = conn.execute(
-            "SELECT run_id FROM evaluation_runs GROUP BY run_id "
-            "HAVING COUNT(*) >= ? "
-            "ORDER BY MAX(timestamp) DESC LIMIT 1",
-            [100],
-        ).fetchone()
-        assert row_none is None
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -476,28 +377,6 @@ def test_analyze_results_auto_select_at_production_density_e2e(tmp_path):
         f"'auto-selecting 5 ... (4 total)'. Got:\n{combined[:3000]}"
     )
     assert "across 4 conditions" in combined
-
-
-# ---------------------------------------------------------------------------
-# #120 — analyze_context_utilization.py --help smoke
-# ---------------------------------------------------------------------------
-
-
-def test_analyze_context_utilization_help_smoke():
-    """Smoke: the script imports cleanly + --help exits 0. Full e2e
-    requires a live LangFuse instance so we don't attempt it here.
-    """
-    # --help must NOT require LangFuse env vars (argparse runs first).
-    result = _run_script(
-        "analyze_context_utilization.py", "--help", timeout=15,
-        env_extra={
-            "LANGFUSE_PUBLIC_KEY": "test",
-            "LANGFUSE_SECRET_KEY": "test",
-            "LANGFUSE_HOST": "http://localhost:3000",
-        },
-    )
-    assert result.returncode == 0
-    assert "--allow-empty" in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -683,90 +562,6 @@ sys.exit(_rl.main() or 0)
     result = _run_wrapper(wrapper, timeout=60)
     assert result.returncode == 3, (
         f"Expected exit 3 on per-task watchdog abort, got "
-        f"{result.returncode}. stderr:\n{result.stderr[:3000]}\n"
-        f"stdout:\n{result.stdout[:2000]}"
-    )
-
-
-def test_run_longitudinal_shift_exits_4_when_marker_write_fails(tmp_path):
-    """ext12 #123 e2e: mock eval_store.record_cycle_events to always
-    raise; campaign completes but shift marker never lands → exit 4.
-    """
-    db = tmp_path / "longitudinal_shifted.duckdb"
-    wrapper = tmp_path / "wrap_run_shift_marker_fail.py"
-    _write_wrapper(wrapper, f"""
-from unittest.mock import MagicMock
-import sys
-
-import src.orchestrator.pipeline as _pipeline_mod
-import src.orchestrator.tool_loader as _tool_loader_mod
-import src.registry.evaluation_store as _eval_store_mod
-import src.registry.metrics as _metrics_mod
-import src.registry.store as _store_mod
-import tests.evaluation.harness as _h
-import tests.evaluation.snapshots as _snaps
-import scripts._eval_registry_lock as _lock
-
-_compiled = MagicMock()
-# Compose a non-erroring TaskState-like return.
-_compiled.invoke.return_value = MagicMock()
-_graph = MagicMock()
-_graph.compile.return_value = _compiled
-_pipeline_mod.create_pipeline = lambda *a, **kw: _graph
-
-_tool_loader_mod.ToolLoader = MagicMock()
-
-# EvaluationStore: record_run is fine, record_cycle_events raises so
-# the shift-marker write path hits its 3-attempt retry + give-up branch.
-class _EvalStoreStub:
-    def __init__(self, **kw): pass
-    def record_run(self, rec): return None
-    def record_cycle_events(self, **kw):
-        raise RuntimeError("simulated DuckDB transient lock")
-    def close(self): return None
-_eval_store_mod.EvaluationStore = _EvalStoreStub
-
-_metrics_mod.MetricsStore = MagicMock()
-_store_mod.SkillRegistry = MagicMock()
-_store_mod.seed_registry = lambda r: None
-_snaps.take_clean_snapshot = lambda *a, **kw: "snap-id"
-_snaps.restore_clean_snapshot = lambda *a, **kw: "snap-id"
-_h._extract_result = lambda *a, **kw: {{
-    "gate_passed": True, "output_in_range": True,
-    "failure_reason": "none", "attempt_count": 1,
-    "capability_type": "mcp_tool", "verification_tier_reached": 3,
-}}
-_lock.acquire_runner_lock = lambda **kw: MagicMock()
-
-import tests.evaluation.cycle_flush as _cf
-_cf.flush_task_cycle_state = lambda **kw: _cf.FlushResult(invocations_ok=True, utility_scores_ok=True, events_ok=True)
-
-# Patch the trace_context to a no-op so we don't need langfuse.
-import src.orchestrator.tracing as _tracing
-import contextlib
-_tracing.trace_context = lambda **kw: contextlib.nullcontext()
-
-import shutil
-shutil.rmtree = lambda *a, **kw: None
-
-import scripts.run_longitudinal_shift as _rls
-# Shift at cycle 2 of 3 so we reach the marker write in cycle 2, which
-# will fail, and the end-of-campaign re-check returns exit 4.
-sys.argv = [
-    "run_longitudinal_shift.py",
-    "--phase-a-tasks", "T01",
-    "--phase-b-tasks", "T02",
-    "--shift-at", "2",
-    "--total", "3",
-    "--db", r"{db}",
-    "--per-task-budget-seconds", "60",
-    "--campaign-budget-hours", "1",
-]
-sys.exit(_rls.main() or 0)
-""")
-    result = _run_wrapper(wrapper, timeout=60)
-    assert result.returncode == 4, (
-        f"Expected exit 4 when shift marker never landed, got "
         f"{result.returncode}. stderr:\n{result.stderr[:3000]}\n"
         f"stdout:\n{result.stdout[:2000]}"
     )

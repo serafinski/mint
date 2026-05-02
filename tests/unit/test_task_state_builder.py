@@ -50,18 +50,17 @@ def test_build_initial_state_sets_allow_network():
 
 
 def test_longitudinal_runners_use_shared_builder():
-    """ext7 #53 regression guard: grep the two longitudinal runners + the
+    """ext7 #53 regression guard: grep the longitudinal runner + the
     harness for ``TaskState(`` direct construction. There MUST be no bare
     ``TaskState(task_description=...)`` without using ``build_initial_state``.
 
-    Pre-ext7-#53, both longitudinal runners constructed TaskState directly and
+    Pre-ext7-#53, longitudinal runners constructed TaskState directly and
     omitted ``output_contract``. The shared builder prevents future drift.
     """
     import re
 
     runners = [
         ROOT / "scripts" / "run_longitudinal.py",
-        ROOT / "scripts" / "run_longitudinal_shift.py",
         ROOT / "tests" / "evaluation" / "harness.py",
     ]
     offenders: list[str] = []
