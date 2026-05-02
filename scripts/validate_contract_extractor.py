@@ -2,13 +2,13 @@
 
 Step 14.6 — Fix B (extractor agreement validation).
 
-The CLI free-form path uses ``_extract_output_contract_llm`` to convert a
-natural-language task prompt into a typed ``OutputContract``. The harness
-path uses authored contracts directly. To make sure the eval results are
-representative of CLI behavior — and to apply the thesis's verification
-philosophy to its own measurement instrument — this script runs the LLM
-extractor on every T-task ``task_prompt`` and asserts agreement with the
-authored ``output_contract``.
+The free-form task path uses ``_extract_output_contract_llm`` to convert a
+natural-language task prompt into a typed ``OutputContract``. The eval harness
+mostly uses authored contracts directly. To make sure the eval results remain
+representative of the extractor behavior — and to apply the thesis's
+verification philosophy to its own measurement instrument — this script runs
+the LLM extractor on every T-task ``task_prompt`` and asserts agreement with
+the authored ``output_contract``.
 
 Usage::
 
@@ -20,8 +20,7 @@ The result gets recorded in the thesis appendix as evidence that the
 contract-extraction layer is calibrated. If N < 20, the disagreement cases
 are either fixed by tightening the extractor system prompt
 (``src/orchestrator/output_contract_resolver.py::_EXTRACTOR_SYSTEM_PROMPT``)
-or disclosed in Chapter 4 as known cases where CLI behavior differs from
-the eval.
+or disclosed in Chapter 4 as known extractor/eval-contract differences.
 
 Aligned with ``docs/thesis_proposal.md`` §Pillar 2 (verification of LLM
 output before trust) and ``docs/MASTER_PLAN_2026_04_13.md`` §14.6 Part D.
@@ -37,9 +36,8 @@ from pathlib import Path
 def _load_env() -> None:
     """Load OPENAI_API_KEY (and friends) from .env at the repo root.
 
-    The CLI runner does this in ``_load_env()``; standalone scripts have to
-    do it themselves or every LLM call dies with ``OpenAIError: The api_key
-    client option must be set...``.
+    Standalone scripts have to do this themselves or every LLM call dies with
+    ``OpenAIError: The api_key client option must be set...``.
     """
     try:
         from dotenv import load_dotenv
@@ -148,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    note:      {note}")
         return 1
 
-    print("\nAll tasks agree. The CLI extractor is calibrated against the eval.")
+    print("\nAll tasks agree. The extractor is calibrated against the eval.")
     return 0
 
 

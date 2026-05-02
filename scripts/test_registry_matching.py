@@ -30,10 +30,9 @@ Usage::
     # Phase A only (no LLM)
     uv run scripts/test_registry_matching.py --naive
 
-    # Self-consistency audit only, on the CLI persistent registry
-    # (audits real generated capabilities from prior mint runs)
+    # Self-consistency audit only, on an existing persistent registry.
     uv run scripts/test_registry_matching.py --self-audit \\
-        --registry-path data/cli/chroma
+        --registry-path data/eval/chroma
 
     # Tune threshold or verbosity
     uv run scripts/test_registry_matching.py --threshold 0.55 --verbose
@@ -859,7 +858,7 @@ def run_phase_d(
 #
 # The 13-category taxonomy below is a hardcoded testbed-scoped list
 # (Business Analytics domain) kept for measurement reproducibility —
-# NOT a production mechanism. Production MINT CLI uses an evolutionary
+# NOT a production mechanism. The runtime registry uses an evolutionary
 # taxonomy (src/orchestrator/taxonomy.py post-B1) that grows organically.
 # The historical one-off migration script that seeded this same list
 # onto pre-B1 generated capabilities was deleted 2026-04-19 (Step 13.6
@@ -2038,10 +2037,9 @@ def main() -> int:
             "the domain filter, then report the decision-gate metrics "
             "(recall preservation + false-positive reduction) for B1 "
             "Step 3.5. Implies --generalization-audit. Requires the "
-            "registry to have meaningful domain labels (CLI registry "
-            "acquires them automatically via src/orchestrator/taxonomy.py "
-            "once `mint run` has been exercised; legacy registries need "
-            "the historical migration — see git history for "
+            "registry to have meaningful domain labels. Runtime registries "
+            "acquire them through src/orchestrator/taxonomy.py; legacy "
+            "registries need the historical migration — see git history for "
             "scripts/migrate_business_domain_labels.py, deleted 2026-04-19)."
         ),
     )

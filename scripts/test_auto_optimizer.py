@@ -1,4 +1,4 @@
-"""Synthetic test for the CLI auto-optimizer feature.
+"""Synthetic test for the pipeline auto-optimizer feature.
 
 Tests that the optimizer, when triggered via the pipeline's optimizer_node,
 correctly executes all three operations (prune, split, merge) with seeded
@@ -677,7 +677,7 @@ def test_rollback(verbose: bool = False) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Synthetic test for CLI auto-optimizer (pipeline-wiring)"
+        description="Synthetic test for pipeline auto-optimizer wiring"
     )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--happy-only", action="store_true")

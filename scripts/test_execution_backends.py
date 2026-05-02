@@ -2,10 +2,9 @@
 
 Runs one SKILL task (T04) and one AGENT task (T16) directly through
 `execute_skill_artifact` / `execute_agent_artifact` with a MockArtifact,
-bypassing the generator and verification gate. Complements
-`test_mint.py` (which exercises the full CLI path including generation).
-Use this when the full CLI is broken and you need to isolate whether
-the execution backends themselves still work — ~30s vs ~10min for test_mint.
+bypassing the generator and verification gate. Use this when eval execution
+behaves unexpectedly and you need to isolate whether the execution backends
+themselves still work.
 
 Usage::
 
