@@ -82,11 +82,9 @@ class ToolLoader:
         the lifetime of the loader and are only reclaimed at process
         exit.
 
-        Production loaders are bounded by process lifetime (CLI: one
-        task per ``mint run`` invocation, ``atexit`` fires immediately;
-        eval harness: one loader per run, bounded by task count). Pre-
-        eval telemetry at 400 tasks is ~400 small files — disk cost
-        is negligible.
+        Production loaders are bounded by process lifetime. The eval harness
+        uses one loader per run, bounded by task count; pre-eval telemetry at
+        400 tasks is ~400 small files, so disk cost is negligible.
 
         Long-running drivers (daemon mode, future Chapter-7 hot-reload
         surface) that want bounded disk use must call

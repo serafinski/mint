@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 ADVERSARIAL_RECURSION_LIMIT = 50
 # Step 14.11 (2026-04-15): raised from 300 → 480 s. The 300 s ceiling
 # was an operational default not grounded in any proposal constraint;
-# the 2026-04-15 post-Step-13 test_mint run surfaced a T09 run where
+# the 2026-04-15 post-Step-13 eval run surfaced a T09 run where
 # the adversarial agent hit the 300 s cap and the gate fail-opened,
 # letting an un-verified artifact into the registry. Bump to 480 s
 # (1.6x, conservative match to Step 13's 480 → 900 ratio) gives
@@ -272,7 +272,7 @@ def _make_probe_sandbox_execute(pip_packages: list[str], *, allow_network: bool 
     to add adversarial testing libraries; the artifact's declared
     dependencies are installed regardless. Deduplicated, order-preserving.
 
-    **Observed failure (2026-04-15 T11 test_mint run, trace
+    **Observed failure (2026-04-15 T11 eval run, trace
     ``8ae5cd28a342fb9c8c0e0ea1262b050c``):** probe against
     ``parse_sales_products_and_targets_3f7485`` called ``sandbox_execute``
     with the tool source inlined, got back

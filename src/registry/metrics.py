@@ -482,11 +482,12 @@ class MetricsStore:
     ) -> InvocationRecord | None:
         """Mark the most recent invocation as ``success=False`` with a user reason.
 
-        Implements §12 finding #6b — the CLI feedback loop so Step 8 split's
-        wrong-output-case semantics can fire on subsequent splits. Without
-        this, CLI ``InvocationRecord``s only ever get ``success=False`` from
-        crashes (``error_message`` populated by the executor); user-judgment
-        wrong-output-flagging had no path into the metrics store.
+        Implements §12 finding #6b — an external-feedback path so Step 8
+        split's wrong-output-case semantics can fire on subsequent splits.
+        Without this, ``InvocationRecord``s only ever get ``success=False``
+        from crashes (``error_message`` populated by the executor);
+        user-judgment wrong-output-flagging had no path into the metrics
+        store.
 
         The flagged row's ``error_message`` is set to ``reason`` (so the
         coverage verifier's error-case branch can read it) while preserving
@@ -506,7 +507,7 @@ class MetricsStore:
             no matching invocation exists (nothing to flag).
 
         Also records a ``user_flagged_wrong`` capability event via
-        :meth:`record_event` so Chapter 6 can count CLI user-feedback signal.
+        :meth:`record_event` so Chapter 6 can count external-feedback signal.
         """
         if capability_id is not None:
             query = (
@@ -656,7 +657,7 @@ class MetricsStore:
         **2026-04-16 fix:** an earlier version of this query also
         required ``actual_output IS NOT NULL``, which silently excluded
         every error-case (where parent raised before producing output).
-        That made Step 8's error-case coverage branch CLI-dead-code. The
+        That made Step 8's error-case coverage branch unreachable. The
         bug was empirically caught by ``scripts/test_split_merge.py
         --split-mcp-only``'s "Seeded N failure case(s) for replay" log
         line not matching the expected count. See §12 pre-registered

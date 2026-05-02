@@ -259,7 +259,7 @@ def sandbox_execute_silent(
       - ``tests/evaluation/execution.py`` (AGENT runtime): ``tools=[sandbox_execute_silent]``
         passed to ``create_deep_agent``
 
-    DO NOT use for programmatic callers (Tier 1.5/2, coverage, CLI) or
+    DO NOT use for programmatic callers (Tier 1.5/2, coverage) or
     SKILL runtime's manual loop — those are NOT auto-traced, and the
     silent variant would leave them invisible. See
     ``docs/langfuse_redundancy_audit_2026_04_19.md`` Fix #1 for the

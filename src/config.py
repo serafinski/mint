@@ -38,7 +38,7 @@ FILE_SIZE_LIMIT_BYTES: int = 10 * 1024 * 1024  # 10 MB
 
 #: File extensions treated as binary.  Used for two purposes:
 #:
-#: 1. **CLI file validation** (``_resolve_files``): files matching these
+#: 1. **Input file validation**: files matching these
 #:    extensions are rejected *unless* they are also in the "processable
 #:    binary" carve-out (currently ``.xlsx`` / ``.xls``, handled via openpyxl).
 #: 2. **Sandbox file transfer** (``_execute_mcp_tool``): matching files are
@@ -76,7 +76,7 @@ BINARY_EXTENSIONS: frozenset[str] = frozenset({
 # Optimizer
 # ---------------------------------------------------------------------------
 
-#: Number of invocations before auto-enabling the optimizer in CLI mode.
+#: Number of invocations before auto-enabling the optimizer.
 AUTO_OPTIMIZER_THRESHOLD: int = 20
 
 # ---------------------------------------------------------------------------

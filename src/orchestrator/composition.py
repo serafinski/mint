@@ -144,12 +144,12 @@ class CompositionalExecutor:
         self.langfuse_tags = langfuse_tags
         self.langfuse_session_id = langfuse_session_id
         # Step 13.7 Batch B2: allow the caller to override the default
-        # user_id. Eval harness runs produce different user_id than
-        # interactive CLI runs (enables per-source aggregation in UI).
-        self.langfuse_user_id = langfuse_user_id or "mint-cli"
+        # user_id. Eval harness runs pass their own user_id so traces can
+        # still be aggregated separately from ad-hoc programmatic runs.
+        self.langfuse_user_id = langfuse_user_id or "runtime"
         # Step 14.12: task-level network policy threaded into every step
         # executor (MCP_TOOL / SKILL / AGENT) so downstream ``sandbox_execute``
-        # calls honor the same policy the CLI / harness resolved at task entry.
+        # calls honor the same policy the caller resolved at task entry.
         self.allow_network = allow_network
 
         # Index artifacts by gap_query for quick lookup
@@ -436,7 +436,7 @@ class CompositionalExecutor:
         raw ``agent_config`` string from ChromaDB metadata straight into
         the schema constructor, which crashes with ``ValidationError`` on
         every registry-matched AGENT row. Now uses the shared
-        ``decode_agent_config_metadata`` helper so composition, CLI
+        ``decode_agent_config_metadata`` helper so composition,
         registry-match, and store snapshot construction all follow one
         policy.
         """

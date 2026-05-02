@@ -41,8 +41,8 @@ SKILLS_OUTPUT_DIR = _PROJECT_ROOT / "data" / "eval" / "skills"
 def set_skills_output_dir(path: Path) -> None:
     """Override the directory where generated skills are written.
 
-    Used by the CLI to separate its skill storage (``data/cli/skills/``)
-    from the evaluation harness (``data/eval/skills/``).
+    Evaluation runs write to ``data/eval/skills`` by default. Tests and
+    custom runners can override the path to isolate generated artifacts.
     Also updates ``agent.py``'s ``SKILLS_OUTPUT_DIR`` to stay in sync.
     """
     global SKILLS_OUTPUT_DIR  # noqa: PLW0603

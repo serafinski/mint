@@ -827,7 +827,7 @@ _MAX_AGENT_SUBAGENT_BUDGET = 8
 # (BOM markers, line endings, header detection), etc. — that was
 # effective at steering the LLM past the specific bugs seen on
 # `test_split_merge.py`, but it overfit the hint to the Business
-# Analytics testbed. MINT is supposed to work across arbitrary CLI
+# Analytics testbed. MINT is supposed to work across arbitrary user
 # inputs (medical, legal, factory simulation, text analysis, …), and
 # a prompt that biases every merge toward file-format parsing would
 # add noise on non-file-format tasks and hurt generalization. The

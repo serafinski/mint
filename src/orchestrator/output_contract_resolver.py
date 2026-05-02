@@ -1,26 +1,24 @@
 """Boundary adapter: resolve a task's OutputContract at task entry (Step 14.6).
 
-Single shared entry point used by BOTH the CLI runner and the evaluation
-harness, so "the eval and CLI use the same code" is a structural property
-rather than a thesis-chapter caveat.
+Single shared entry point for authored evaluation tasks and free-form task
+prompts. This keeps contract resolution in one structural boundary instead of
+spreading task-shape logic across callers.
 
 Two tiers, in order:
 
 1. **Authored shortcut** — if the caller supplies a ``task_definition`` (which
    carries an authored ``output_contract``), return it directly. Zero LLM
-   calls. Deterministic. Used by the harness for every T-task and by the CLI
-   when the user re-runs a known testbed task.
+   calls. Deterministic. Used by the harness for every T-task.
 2. **LLM extractor fallback** — otherwise, one ``gpt-5-mini`` call with
-   ``response_format=OutputContract`` (LangChain structured output). Used by
-   the CLI for genuinely free-form user prompts where no authored contract
-   exists. On any failure (LLM exception, validation error), returns ``None``
-   so the terminal-state contract check degrades to the legacy exit-code-only
-   behavior — fail open, never blocks legitimate runs.
+   ``response_format=OutputContract`` (LangChain structured output). Used for
+   genuinely free-form prompts where no authored contract exists. On any
+   failure (LLM exception, validation error), returns ``None`` so the
+   terminal-state contract check degrades to the legacy status-only behavior —
+   fail open, never blocks legitimate runs.
 
-The resolver does NOT know about the testbed catalogue. The CLI runner is
-responsible for matching free-form prompts against ``ALL_TASKS`` and passing
-the match (if any) as ``task_definition=...``. This keeps the orchestrator
-layer free of ``tests/`` imports.
+The resolver does NOT know about the testbed catalogue. Callers that have a
+matching ``TaskDefinition`` pass it as ``task_definition=...``. This keeps the
+orchestrator layer free of ``tests/`` imports.
 
 See ``docs/MASTER_PLAN_2026_04_13.md`` §14.6 for the full design rationale,
 and ``docs/thesis_proposal.md`` §Structured State Communication for the
@@ -106,7 +104,7 @@ def _extract_output_contract_llm(task_prompt: str) -> OutputContract:
     Raises any exception the LLM client raises (network, validation, etc.) —
     callers in ``resolve_output_contract`` wrap this in ``try/except`` and
     return ``None`` on failure so the terminal-state check falls through to
-    the legacy exit-code-only path.
+    the legacy status-only path.
     """
     extractor = _get_extractor_llm()
     response = extractor.invoke(
@@ -130,8 +128,8 @@ def resolve_output_contract(
 ) -> OutputContract | None:
     """Resolve a task's OutputContract at the system boundary (Step 14.6).
 
-    Single shared entry point for both the CLI runner and the evaluation
-    harness. See module docstring for the two-tier design rationale.
+    Shared entry point for authored evaluation tasks and free-form prompts.
+    See module docstring for the two-tier design rationale.
 
     Args:
         task_prompt: The natural-language task description as it would be
@@ -139,14 +137,13 @@ def resolve_output_contract(
             authored contract is available.
         task_definition: Optional object carrying an ``output_contract``
             attribute. Harness call sites pass the matching ``TaskDefinition``;
-            CLI call sites pass ``None`` (or the result of their own
-            known-task lookup).
+            free-form call sites pass ``None``.
 
     Returns:
         An ``OutputContract`` if either tier succeeds, or ``None`` if the
         free-form fallback fails (network error, malformed LLM output, etc.).
         The ``None`` return path lets the terminal-state check degrade to
-        the legacy exit-code-only success classification, preserving
+        the legacy status-only success classification, preserving
         backwards compatibility with code paths that have no contract.
     """
     if task_definition is not None:

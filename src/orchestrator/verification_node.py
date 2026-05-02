@@ -24,8 +24,8 @@ On each call the node:
    ``state.verification_succeeded`` is set to ``False``; routing still
    proceeds to ``loading_node`` (which registers only the remaining
    passed artifacts) and then through the rest of the pipeline, but the
-   CLI runner and evaluation harness both detect the sticky flag at
-   terminal state and classify the run as VERIFICATION_FAILED with a
+   terminal callers detect the sticky flag at terminal state and classify the
+   run as VERIFICATION_FAILED with a
    clear error. This replaces the pre-2026-04-16 fail-open behavior
    (unverified artifacts kept + executed with warnings), which was a
    latent drift from the proposal — see master plan §12 finding #14 for
@@ -316,7 +316,7 @@ def verification_node(
         # §12 finding #14 (2026-04-16): FAIL CLOSED per the proposal's
         # Pillar 2 contract. Drop the failed artifacts (they never
         # register) and set the sticky verification_succeeded=False flag
-        # so the CLI runner / evaluation harness classify the run as
+        # so terminal callers classify the run as
         # verification_failed. Still route to loading_node so any
         # passed-sibling artifacts register normally, and so the pipeline
         # reaches a terminal state (never-raises contract preserved).

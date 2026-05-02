@@ -4,7 +4,9 @@
 
 ## Overview
 
-Just-in-time capability synthesis in multi-agent systems. The system generates, verifies, and optimizes its own capabilities on-demand. User-facing CLI: `uv run mint`.
+Just-in-time capability synthesis in multi-agent systems. The system generates,
+verifies, and optimizes its own capabilities on demand, with the evaluation
+protocol as the primary runnable surface on this branch.
 
 **Research question:** How to balance autonomy vs correctness, specificity vs generality, and context economy in self-developing multi-agent systems?
 
@@ -53,9 +55,9 @@ All LLM-calling components default to `openai:gpt-5-mini` via `DEFAULT_LLM_MODEL
 Generated skills (Pillar 1) target the DeepAgents runtime skill format:
 
 - **Skill structure**: `SKILL.md` (required) + optional `scripts/`, `references/`, `assets/` directories
-- **Skill locations**: `data/eval/skills/` (evaluation) or `data/cli/skills/` (CLI), configured via `set_skills_output_dir()`
+- **Skill locations**: `data/eval/skills/` by default, configurable via `set_skills_output_dir()`
 - **Frontmatter**: YAML with `name` and `description` (required). Allowed keys: `name`, `description`, `license`, `compatibility`, `allowed-tools`, `metadata`
-- **Validation**: `tools/quick_validate.py` validates structure; `tools/init_skill.py` scaffolds new skills
+- **Validation**: `tools/quick_validate.py` validates structure
 - **Naming**: hyphen-case, max 64 chars. Description max 1024 chars, no angle brackets.
 
 The verification gate runs `quick_validate.py` as a Tier 0 structural pre-check before the three-tier semantic verification.
@@ -65,7 +67,6 @@ The verification gate runs `quick_validate.py` as a Tier 0 structural pre-check 
 ```
 src/
 ├── config.py               # Centralized constants (model, sandbox, thresholds)
-├── cli/                    # MINT CLI (Typer + Rich): app.py, runner.py, display.py
 ├── orchestrator/           # Pillar 1: pipeline orchestration (LangGraph)
 │   ├── pipeline.py         # Main LangGraph pipeline graph
 │   ├── decomposition.py    # Task decomposition (DeepAgent-backed)
@@ -85,9 +86,11 @@ src/
 └── mcp_tools/              # Reference hand-built MCP tools (fibonacci)
 
 tests/    unit/ (1000+ tests), integration/ (Docker-required), evaluation/ (harness + tasks + fixtures)
-scripts/  run_pilot, run_longitudinal, analyze_results, backfill_token_costs, test_mint,
-          test_pipeline, test_verification, test_auto_optimizer, test_split_merge, test_registry_matching
-tools/    quick_validate.py, init_skill.py (DeepAgents skill utilities)
+scripts/  run_pilot, run_longitudinal, run_recurrence_eval, analyze_results,
+          analyze_longitudinal, backfill_definition_token_costs, eval_protocol/,
+          test_pipeline, test_verification, test_auto_optimizer, test_split_merge,
+          test_registry_matching
+tools/    quick_validate.py (DeepAgents skill validation)
 sandbox/  Dockerfile (mcp + pydantic base image)
 ```
 
@@ -153,11 +156,11 @@ The evaluation testbed is the **Business Analytics Pipeline** — data ingestion
 
 ### MCP Tool Loading Strategy
 
-Generated MCP tools are registered by reading `source_code` into the `SkillRegistry`; no host-side import or subprocess runs the generated code during loading. Execution happens exclusively through the Docker sandbox (`src/verification/sandbox_tool.py::sandbox_execute`) at CLI runtime (`src/cli/runner.py::_execute_mcp_tool`) and in the eval harness (`tests/evaluation/execution.py::execute_mcp_tool_in_chain`). The three-tier gate's Tier 1.5 / Tier 2 / Tier 3 also run generated code exclusively in Docker. `ToolLoader.load_tool` / `ToolLoader.execute_tool` in `src/orchestrator/tool_loader.py` remain for unit-test inspection only and are **not production paths** — security audit finding #1 (2026-04-19) removed them from `loading_node` because they ran `spec.loader.exec_module` on the host after the gate had signed off. **Not** persistent FastMCP server processes — no ports, health checks, or zombie process risk. Full MCP server deployment is Chapter 7 future work.
+Generated MCP tools are registered by reading `source_code` into the `SkillRegistry`; no host-side import or subprocess runs the generated code during loading. Execution happens exclusively through the Docker sandbox (`src/verification/sandbox_tool.py::sandbox_execute`) in the eval harness (`tests/evaluation/execution.py::execute_mcp_tool_in_chain`). The three-tier gate's Tier 1.5 / Tier 2 / Tier 3 also run generated code exclusively in Docker. `ToolLoader.load_tool` / `ToolLoader.execute_tool` in `src/orchestrator/tool_loader.py` remain for unit-test inspection only and are **not production paths** — security audit finding #1 (2026-04-19) removed them from `loading_node` because they ran `spec.loader.exec_module` on the host after the gate had signed off. **Not** persistent FastMCP server processes — no ports, health checks, or zombie process risk. Full MCP server deployment is Chapter 7 future work.
 
 ### Generated Skills Landing Path
 
-Generated SKILL.md files are written to `data/eval/skills/<name>/` (evaluation, snapshot-controlled) or `data/cli/skills/<name>/` (CLI, accumulates). Path set by `set_skills_output_dir()` in `src/orchestrator/generators/skill.py`. `src/skills/` does not exist and should not be used.
+Generated SKILL.md files are written to `data/eval/skills/<name>/` by default. Path set by `set_skills_output_dir()` in `src/orchestrator/generators/skill.py`. `src/skills/` does not exist and should not be used.
 
 ### Generated Agent Tool Scope
 
@@ -181,9 +184,9 @@ Each capability type executes via a genuinely different backend, making the clas
 
 **Structured State Communication is enforced at three granularities** (§3.4 of thesis proposal). Inter-stage handoffs use strictly typed schemas, never free-form LLM output:
 
-1. **Task level** (Step 14.6): `OutputContract.check()` at chain completion validates final output against declared `required_keys` + `required_files`, CLI exit code 3 on mismatch.
+1. **Task level** (Step 14.6): `OutputContract.check()` at chain completion validates final output against declared `required_keys` + `required_files`; mismatches surface as terminal shape failures.
 2. **Subtask level** (§12 finding #12, Layer 2): `CompositionalExecutor` validates AGENT/SKILL step outputs against the decomposer's per-gap `output_schema` at runtime; fails chain immediately with a descriptive `failed_step_reason` on missing keys. MCP_TOOL output is deterministic so this check skips MCP_TOOL.
-3. **Generation level** (§12 finding #12, Layer 1): `execute_agent_artifact` builds a dynamic Pydantic `response_format` from the decomposer's `output_schema` (via `_build_dynamic_result_model` in `tests/evaluation/execution.py`) when the CLI path would otherwise fall through to `GenericResult`. Forces the LLM's structured-output call to produce exactly the declared keys.
+3. **Generation level** (§12 finding #12, Layer 1): `execute_agent_artifact` builds a dynamic Pydantic `response_format` from the decomposer's `output_schema` (via `_build_dynamic_result_model` in `tests/evaluation/execution.py`) when a task-specific result model is available. Forces the LLM's structured-output call to produce exactly the declared keys.
 
 **File outputs are MCP_TOOL last steps (decomposer Rule 15 + classifier file-writer exception).** Only MCP_TOOL can write to the Docker workspace where `_collect_output_files` picks files up. When a task's authored `OutputContract.required_files` is non-empty:
 
@@ -192,9 +195,8 @@ Each capability type executes via a genuinely different backend, making the clas
 
 The appended writer is generated by the MCP_TOOL generator, verified by the three-tier gate, and registered for reuse — e.g. `write-csv-file`, `write-xlsx-file`, `write-md-file` become first-class capabilities eligible for Pillar 3 operations. An earlier executor-level synthesis approach (Option A) was implemented and reverted on 2026-04-16 after a proposal-alignment review — see `docs/archive/file_output_fix_plan.md` §Resolution and master plan §12 findings #10 (Option A → Option B pivot) + #11 (classifier parent-task bias drift) for the full methodology nuggets.
 
-**Data path separation:**
+**Data path:**
 - Evaluation: `data/eval/chroma/`, `data/eval/metrics.duckdb`, `data/eval/skills/`, `data/eval/longitudinal.duckdb`
-- CLI: `data/cli/chroma/`, `data/cli/metrics.duckdb`, `data/cli/skills/`
 
 ### Verification Gate (Tiered Cost Optimization)
 
@@ -208,17 +210,16 @@ The gate uses fail-fast tiering to avoid wasting tokens:
 
 **Tier 1 scans Python source wherever it appears.** `static_scanner.scan()` runs AST + regex only on MCP_TOOL Python (prose-based SKILL/AGENT content false-flagged on words like "mock" and "placeholder" — T04 reproducer, 2026-04-08). However, `gate.py _static_scan()` wraps the scanner with a **layered code-fence extractor** (`_extract_python_fences`): for SKILL and AGENT artifacts, every ```python ... ``` block inside `skill_content` / `system_prompt` / embedded `skill_content` is extracted and fed back through the full MCP_TOOL AST + regex scan. Only the prose around code is skipped. Full methodology note in `docs/proposal_vs_implementation_v2.md`.
 
-**Three-layer strict-gate pattern (§12 findings #14, #15, #16, 2026-04-16).** Every proposal-critical LLM-dependent stage follows a uniform retry + sticky-flag + dedicated exit code pattern. No silent fallback paths anywhere in the pipeline:
+**Three-layer strict-gate pattern (§12 findings #14, #15, #16, 2026-04-16).** Every proposal-critical LLM-dependent stage follows a uniform retry + sticky-flag + terminal-failure pattern. No silent fallback paths anywhere in the pipeline:
 
-| Layer | Code | Sticky flag | Max attempts | CLI exit |
+| Layer | Code | Sticky flag | Max attempts | Terminal failure |
 |---|---|---|---|---|
-| Pillar 1.1 decomposition | `src/orchestrator/decomposition.py` | `decomposition_succeeded` | `MAX_DECOMPOSITION_ATTEMPTS=3` | 2 |
-| Pillar 1.3 classification | `src/orchestrator/classifier.py::classify_gap` | `classification_succeeded` | `MAX_CLASSIFICATION_ATTEMPTS=3` | 5 |
-| Pillar 2 verification | `src/orchestrator/verification_node.py` | `verification_succeeded` | `MAX_ATTEMPTS=3` | 4 |
-| Task-level output contract | `src/orchestrator/output_contract_resolver.py` | `output_contract_matched` | — (single check) | 3 |
-| Execution (post-pipeline) — security audit #10 | `src/cli/runner.py::execute_task` | — (post-pipeline) | — (single attempt) | 6 |
+| Pillar 1.1 decomposition | `src/orchestrator/decomposition.py` | `decomposition_succeeded` | `MAX_DECOMPOSITION_ATTEMPTS=3` | `generation_failed` |
+| Pillar 1.3 classification | `src/orchestrator/classifier.py::classify_gap` | `classification_succeeded` | `MAX_CLASSIFICATION_ATTEMPTS=3` | `classification_failed` |
+| Pillar 2 verification | `src/orchestrator/verification_node.py` | `verification_succeeded` | `MAX_ATTEMPTS=3` | `verification_failed` |
+| Task-level output contract | `src/orchestrator/output_contract_resolver.py` | `output_contract_matched` | — (single check) | `output_shape_mismatch` |
 
-Each stage retries the LLM call up to N times. On exhaustion: flip the sticky flag, emit an ERROR-level LangFuse event, drop any partially-produced artifacts from state, allow the pipeline to continue to terminal state via the never-raises contract. The CLI runner detects the sticky flag and exits with a dedicated code so failure reasons are layer-specific. Pre-fix behaviour (single-attempt + silent fallback at decomposition; single-attempt + MCP_TOOL default at classification; 3x retry + fail-open at verification) let unverified / mis-classified / degraded artifacts through production — all three corrected to proposal-strict semantics. See master plan §12 findings #14/#15/#16 for full audit trails.
+Each stage retries the LLM call up to N times. On exhaustion: flip the sticky flag, emit an ERROR-level LangFuse event, drop any partially-produced artifacts from state, allow the pipeline to continue to terminal state via the never-raises contract. Terminal callers inspect the sticky flags so failure reasons are layer-specific. Pre-fix behaviour (single-attempt + silent fallback at decomposition; single-attempt + MCP_TOOL default at classification; 3x retry + fail-open at verification) let unverified / mis-classified / degraded artifacts through production — all three corrected to proposal-strict semantics. See master plan §12 findings #14/#15/#16 for full audit trails.
 
 ### Pillar 3: Type-Scoped Operations
 
@@ -264,7 +265,6 @@ Import from these; avoid modifying unless explicitly required. These are the mod
 - **`src/registry/store.py`** — `SkillRegistry` (CRUD + hierarchical embedding search); `seed_registry()`.
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + granularity metric queries).
 - **`src/config.py`** — `DEFAULT_LLM_MODEL` (env: `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env: `JIT_SANDBOX_IMAGE`), `FILE_SIZE_LIMIT_BYTES`, `BINARY_EXTENSIONS`, `AUTO_OPTIMIZER_THRESHOLD`.
-- **`src/cli/app.py`** — MINT CLI entry point (Typer): `run`, `plan`, `retry`, `list`, `inspect`, `history`, `prune`, `seed`, `reset`, `disable`, `enable`, `config set/show/unset` (per-operation optimizer config per §12 finding #8), `feedback --wrong` (CLI wrong-output flagging per §12 finding #6b).
 - **`tests/evaluation/`** — `tasks.py` (`TaskDefinition`, `ALL_TASKS`, `PILOT_TASKS`), `harness.py` (`EvaluationHarness`), `execution.py` (`execute_skill_artifact`, `execute_agent_artifact`), `snapshots.py`.
 
 Other stable interfaces (optimizer loop, verification tiers, tool_loader, sandbox_tool, evaluation_store, schema_extraction) can be discovered by reading the corresponding source files.

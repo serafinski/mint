@@ -61,10 +61,10 @@ _RECURSION_LIMIT = 100
 # failure vs a legitimately-empty answer.
 #
 # The thread-local below records the outcome of the most recent
-# ``execute_agent_artifact`` call in the calling thread. The harness,
-# CLI, and compositional executor read it immediately after the call to
+# ``execute_agent_artifact`` call in the calling thread. The harness and
+# compositional executor read it immediately after the call to
 # distinguish timeout from error from success. Thread-local scoping is
-# safe because all three callers invoke agent execution synchronously
+# safe because these callers invoke agent execution synchronously
 # from the same thread (no hidden thread hops between the call and the
 # meta read).
 
@@ -284,9 +284,10 @@ def _build_dynamic_result_model(
 
     **Why (§12 finding #12, 2026-04-16).** The proposal's §3.4 Structured
     State Communication requires *"strictly typed JSON schemas representing
-    the world state at each handoff point"*. The CLI path for AGENT
-    execution falls back to :class:`GenericResult` (``extra="allow"``),
-    which lets the LLM pick any keys it wants. The T16 second-run failure
+    the world state at each handoff point"*. AGENT execution without a
+    task-specific schema falls back to :class:`GenericResult`
+    (``extra="allow"``), which lets the LLM pick any keys it wants. The T16
+    second-run failure
     (`Missing required upstream_data key: metrics_table`) was the
     empirical consequence: AGENT produced task-level return keys only,
     the decomposer's declared ``metrics_table`` key never reached the
@@ -785,7 +786,7 @@ def _execute_skill_inner(
         #      cases where the LLM wrote the answer as its final text reply)
         #   3. Only if both fail, do a structured-output LLM call
         #
-        # For GenericResult (CLI path, no task_id), the LLM extraction has no
+        # For GenericResult (no task_id), the LLM extraction has no
         # useful schema to guide it and will produce an empty dict — so we
         # skip it entirely and return whatever the non-LLM fallbacks found,
         # even if that's an empty dict.
@@ -816,7 +817,7 @@ def _execute_skill_inner(
         if result_model is GenericResult:
             logger.warning(
                 "Skill execution produced no extractable JSON output "
-                "(CLI path, GenericResult); returning empty dict"
+                "(GenericResult fallback); returning empty dict"
             )
             return {}
 
@@ -1250,7 +1251,7 @@ def execute_agent_artifact(
     call to produce exactly those keys and satisfy the downstream MCP_TOOL
     writer's ``requires_upstream_keys`` contract. Falls back to
     ``TASK_RESULT_MODELS.get(task_id, GenericResult)`` when the schema is
-    empty (CLI free-form tasks without a matching authored task).
+    empty (free-form tasks without a matching authored task).
 
     Never raises — returns ``{}`` on any failure. The sticky outcome
     (success / timeout / error) is recorded via
@@ -1347,15 +1348,16 @@ def _execute_agent_inner(
     # NOTE: skill_content is NO LONGER prepended to system_prompt.
     # Skills are loaded via progressive disclosure through the skills= parameter.
 
-    # Determine skills directory — CLI sets SKILLS_OUTPUT_DIR, eval uses default
+    # Determine skills directory — eval uses the generator default unless tests
+    # or custom runners override it.
     from src.orchestrator.generators.skill import SKILLS_OUTPUT_DIR
     skills_dir = SKILLS_OUTPUT_DIR
 
     # If agent has skill_content, ensure it's on disk and pass ONLY that skill
     # for progressive disclosure. In evaluation, passing all skills from disk
     # causes noise (irrelevant skills from other tasks in the same run).
-    # In CLI mode, _collect_skill_files() returns all accumulated skills,
-    # which is the intended progressive discovery behavior.
+    # If no task-local skill was materialized, fall back to discovering all
+    # skills on disk for progressive disclosure.
     skill_files: dict = {}
     skill_content = getattr(artifact, "skill_content", None)
     if not skill_content and agent_config.get("is_deep_agent"):
@@ -1363,9 +1365,8 @@ def _execute_agent_inner(
     if skill_content:
         _ensure_skill_on_disk(artifact, skill_content, skill_files, skills_dir)
 
-    # In CLI mode (skills accumulate), discover all skills on disk.
-    # In eval mode (this agent's skill is already in skill_files), skip
-    # to avoid loading irrelevant skills from earlier tasks in the same run.
+    # When this agent's skill is already in skill_files, skip disk discovery to
+    # avoid loading irrelevant skills from earlier tasks in the same run.
     if not skill_files:
         skill_files = _collect_skill_files(skills_dir)
 
@@ -1431,7 +1432,7 @@ def _execute_agent_inner(
     # tells the agent to `read_file(...)` the input files will fail —
     # previously the agent sometimes recovered by falling back to
     # `sandbox_execute` with inline data, but that was LLM non-determinism,
-    # not correct behavior (see T16 MINT CLI failure on 2026-04-08).
+    # not correct behavior (see T16 failure on 2026-04-08).
     workspace_files: dict = dict(skill_files)  # start with skills
     fixture_workspace = _fixtures_to_workspace_files(fixture_contents)
     for filename, entry in fixture_workspace.items():

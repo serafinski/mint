@@ -326,7 +326,7 @@ class OutputContract(BaseModel):
     counterpart to ``task_description`` (which says *what to do*). Promotes the
     expected-output shape from prose buried inside ``task_prompt`` strings and
     imperative logic buried inside per-task ``validator`` closures into a single
-    structured field that the CLI terminal-state check, the evaluation harness,
+    structured field that terminal-state checks, the evaluation harness,
     and any future regeneration loop can read deterministically.
 
     The contract carries two orthogonal shapes:
@@ -337,7 +337,7 @@ class OutputContract(BaseModel):
       ``output_files`` mapping (covers tasks like T07, T11 that produce CSV /
       Excel outputs alongside a metadata dict).
 
-    A task may declare either, both, or (for legacy / free-form CLI prompts
+    A task may declare either, both, or (for legacy / free-form prompts
     where extraction failed) neither — when ``required_keys`` and
     ``required_files`` are both empty the contract check is a no-op and the
     pipeline falls back to its current exit-code-only success classification.
@@ -381,8 +381,8 @@ class OutputContract(BaseModel):
     ) -> "ContractCheckResult":
         """Set-compare the contract against an actual output dict + files map.
 
-        Pure function — no IO, no LLM, no exceptions. Used by both the CLI
-        terminal-state check and the evaluation harness's result assembly.
+        Pure function — no IO, no LLM, no exceptions. Used by terminal-state
+        checks and the evaluation harness's result assembly.
         """
         produced_keys: set[str] = set()
         if isinstance(output, dict):
@@ -486,7 +486,7 @@ class TaskState(BaseModel):
             "Sticky flag set to False by decomposition_node whenever the "
             "DeepAgent times out, errors, or returns zero subtasks. Downstream "
             "nodes MUST NOT read or write this field — it is consumed only by "
-            "the terminal CLI display and the evaluation harness's success "
+            "terminal-state checks and the evaluation harness's success "
             "classifier so the pipeline can continue through its fallback path "
             "without the user-facing layer mistaking a fallback-produced wrong "
             "output for success. The enum `status` field transitions forward "
@@ -498,8 +498,8 @@ class TaskState(BaseModel):
         description=(
             "Declared shape of the task's expected output (Step 14.6). "
             "Populated at task entry by the harness (directly from "
-            "TaskDefinition.output_contract) or by the CLI boundary adapter "
-            "(known-task shortcut, then LLM extractor for free-form prompts). "
+            "TaskDefinition.output_contract) or by the boundary adapter "
+            "(LLM extractor for free-form prompts). "
             "Pipeline nodes MUST NOT read or write this field — it is a "
             "passenger that flows from task entry to the terminal-state "
             "contract check, where a pure set comparison against the final "
@@ -517,8 +517,8 @@ class TaskState(BaseModel):
             "fails the three-tier gate. Restores proposal-strict Pillar 2 "
             "semantics (§12 finding #14): 'Only verified capabilities enter "
             "production'. When False, failed artifacts are dropped from "
-            "generated_artifacts (so they never register) and the CLI "
-            "runner / evaluation harness classify the run as "
+            "generated_artifacts (so they never register) and terminal "
+            "callers classify the run as "
             "VERIFICATION_FAILED rather than fall-through success. Same "
             "sticky-flag pattern as decomposition_succeeded — carried "
             "dedicated because the status enum transitions forward through "
@@ -537,8 +537,8 @@ class TaskState(BaseModel):
             "failure silently defaulted to MCP_TOOL with confidence=0.3, "
             "which is exactly the type-mismatch failure mode the proposal "
             "warns against. Under the new contract: 3x retry on exception; "
-            "final failure flips this sticky flag, surfaces a distinct CLI "
-            "exit code, and fails the task cleanly rather than shipping a "
+            "final failure flips this sticky flag, surfaces a distinct "
+            "terminal failure reason, and fails the task cleanly rather than shipping a "
             "mis-classified artifact. Same sticky-flag pattern as "
             "decomposition_succeeded and verification_succeeded."
         ),
@@ -549,9 +549,8 @@ class TaskState(BaseModel):
             "When True, runtime sandbox execution and the verification gate "
             "(Tier 2 + Tier 3) allow outbound network access — Docker runs "
             "with ``--network bridge`` instead of ``--network none``. Set "
-            "by the CLI from the ``--allow-network`` flag (overridable via "
-            "``mint config set network.allow true``) and by the evaluation "
-            "harness for tasks flagged as network-dependent. Offline-by-"
+            "by the evaluation harness for tasks flagged as network-dependent "
+            "or by custom callers that opt in explicitly. Offline-by-"
             "default (False) preserves the standard safety posture. "
             "Plumbed through CompositionalExecutor → execution backends and "
             "gate.verify(). Step 14.12."

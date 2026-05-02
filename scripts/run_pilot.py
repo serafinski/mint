@@ -49,7 +49,7 @@ CHROMA_DIR = DATA_DIR / "eval" / "chroma"
 MCP_TOOLS_DIR = ROOT / "src" / "mcp_tools"
 SKILLS_DIR = DATA_DIR / "eval" / "skills"
 # ext7 #49 (2026-04-20): prior hardcoded ``data/eval/metrics.duckdb`` pooled
-# every invocation into the same file across sessions. Path is now a CLI
+# every invocation into the same file across sessions. Path is now a script
 # argument with a timestamped default; legacy hardcode is retained as a
 # canonical-location constant used only when the user explicitly asks for it
 # via ``--db auto``.
@@ -156,7 +156,7 @@ def main() -> int:
     Returns an integer process exit code:
 
     - ``0`` — campaign ran to completion and produced at least one record.
-    - ``2`` — argparse / CLI validation error (raised via ``sys.exit(2)``).
+    - ``2`` — argument parsing / validation error (raised via ``sys.exit(2)``).
     - ``4`` — campaign produced zero records with no watchdog abort
       recorded (empty ``--tasks`` filter, harness setup failure, etc.).
     - ``7`` — watchdog fired on a condition (ext10 #103 + ext12 #115).

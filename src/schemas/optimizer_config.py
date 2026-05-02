@@ -42,8 +42,8 @@ class OptimizerConfig(BaseModel):
       specific operation too expensive (e.g., split's 60-120s cost
       post-Step-8) or wants to isolate behavior.
 
-    The three operations are gated independently, so a CLI user running
-    short interactive sessions might set ``prune=auto, split=off,
+    The three operations are gated independently, so a short ad-hoc run
+    might set ``prune=auto, split=off,
     merge=auto`` (cheap cleanup without the expensive split rewrites).
     """
 
@@ -59,7 +59,7 @@ class OptimizerConfig(BaseModel):
         description=(
             "Split operation control. Same semantics as prune. Note that "
             "split is the most expensive operation (~60-120s + ~$0.10-0.15 "
-            "per firing post-Step-8) so 'off' is a common CLI choice."
+            "per firing post-Step-8) so 'off' is common for short runs."
         ),
     )
     merge: OperationSetting = Field(
@@ -142,7 +142,7 @@ class OptimizerConfig(BaseModel):
 
         Eval harness and older integration tests pass ``run_optimizer=True``
         or ``False`` via :func:`src.orchestrator.pipeline.create_pipeline`.
-        This keeps them working unchanged while the CLI adopts the new
+        This keeps them working unchanged while newer callers can use the
         per-operation surface.
         """
         return cls.all_on() if run_optimizer else cls.all_off()

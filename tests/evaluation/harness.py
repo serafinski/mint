@@ -245,7 +245,7 @@ class EvaluationHarness:
 
         Wipes generated artifacts (skills, chroma) and rebuilds a fresh
         seeded registry so the snapshot captures only the baseline state,
-        not leftover artifacts from previous runs or CLI usage.
+        not leftover artifacts from previous runs.
 
         Must be called before any run_* method.  Returns the snapshot ID.
         """
@@ -786,7 +786,6 @@ class EvaluationHarness:
             # - task_id / tier: per-task + per-tier aggregation
             # - format:X: per-file-format behavior
             # - allow_network:{true|false}: network-policy consistency
-            #   with CLI (CLI also tags this)
             # - pilot: fast exclusion of pilot runs from primary metrics
             # - static_coverage:{true|false}: filter retrieval vs synthesis
             #   tasks (the 6-of-20 that static can handle)
@@ -794,10 +793,8 @@ class EvaluationHarness:
 
             invoke_config["metadata"] = {
                 "langfuse_session_id": run_id,
-                # user_id differentiates eval-harness traces from
-                # interactive `mint` CLI traces (which set user_id="mint-cli").
-                # Per-user LangFuse dashboards show eval-aggregate vs
-                # ad-hoc-CLI-aggregate separately.
+                # user_id differentiates eval-harness traces from ad-hoc
+                # programmatic traces in per-user LangFuse dashboards.
                 "langfuse_user_id": "eval-harness",
                 "langfuse_tags": _tags,
                 "task_id": task.task_id,
@@ -816,12 +813,12 @@ class EvaluationHarness:
 
         # Step 14.6 — resolve the output contract via the shared boundary
         # adapter. The harness path hits tier-1 (authored shortcut) by passing
-        # ``task_definition=task``; zero LLM calls. CLI free-form prompts go
+        # ``task_definition=task``; zero LLM calls. Free-form prompts go
         # through the same function with ``task_definition=None`` and fall to
         # the LLM extractor. Same code path, different inputs.
         contract = resolve_output_contract(task.task_prompt, task_definition=task)
 
-        # Option 1 — token-cost honesty. The CLI's free-form path runs the
+        # Option 1 — token-cost honesty. The free-form path runs the
         # LLM extractor at task entry, which costs tokens. The eval would
         # under-count per-task token cost (one of the four thesis metrics)
         # if the harness skipped this call. Run the extractor inside the
@@ -1105,7 +1102,7 @@ def _extract_result_compositional(
     # declared required_files with a happy dict-only validator recorded
     # failure_reason="none" AND output_in_range=True — counted as
     # success in Chapter 6 tables. Now the reason surfaces explicitly,
-    # matching the CLI's exit-code-3 semantics, and the analyzer's
+    # matching the terminal-state shape-failure semantics, and the analyzer's
     # success predicate excludes shape-mismatched rows.
     #
     # ext8 #64 (2026-04-20): also flip output_in_range=False so the
@@ -1193,10 +1190,11 @@ def _extract_result(
     allow_network = bool(_get("allow_network", False))
 
     # ext18 #191 (2026-04-25): fail closed in the eval harness when the
-    # decomposition sticky flag is false. The CLI already exits early on
-    # decomposition_succeeded=False, but the harness previously ignored the
-    # flag and could still execute / score a run as successful if later chain
-    # steps happened to produce validator-happy output (observed on T13).
+    # decomposition sticky flag is false. Earlier terminal paths already
+    # stopped on decomposition_succeeded=False, but the harness previously
+    # ignored the flag and could still execute / score a run as successful if
+    # later chain steps happened to produce validator-happy output (observed on
+    # T13).
     if not decomposition_succeeded:
         logger.warning(
             "Task %s marked decomposition_succeeded=False; failing closed in eval harness",

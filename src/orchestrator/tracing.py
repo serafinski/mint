@@ -47,7 +47,7 @@ def trace_context(
     """Set LangFuse trace tags/session/user/trace_id for emit_langfuse_event fallback.
 
     Wrap each task/cycle ``pipeline.invoke`` site (harness, longitudinal
-    runners, CLI runner) in this context manager so events emitted from
+    runners, ad-hoc programmatic callers) in this context manager so events emitted from
     contexts where ``langgraph.config.get_config()`` returns nothing —
     ThreadPool workers, LangChain ``@tool`` runtime, post-pipeline
     callers — still inherit tags/session/user.
@@ -60,7 +60,7 @@ def trace_context(
     instead of creating standalone wrapper traces in the LangFuse UI.
     The pipeline trace thus shows all its Pillar-2/3 events nested as
     children, not scattered as siblings — ~80% fewer standalone-trace
-    rows. The outer wrap (harness/longitudinal/CLI) typically does NOT
+    rows. The outer wrap (harness/longitudinal/ad-hoc caller) typically does NOT
     pass trace_id because the handler hasn't minted one yet; inner
     wraps (verification_node, optimizer's merge/split paths) DO pass it
     because ``handler.last_trace_id`` is already populated by then.

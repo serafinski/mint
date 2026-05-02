@@ -376,8 +376,8 @@ def main(argv: list[str] | None = None) -> int:
             invoke_config["metadata"] = {
                 "langfuse_session_id": _lf_session,
                 # Step 13.7 tagging audit (2026-04-18) — user_id
-                # differentiates longitudinal runs from CLI + eval-harness
-                # in per-user LangFuse dashboards.
+                # differentiates longitudinal runs from eval-harness and
+                # ad-hoc programmatic traces in per-user LangFuse dashboards.
                 "langfuse_user_id": "longitudinal-runner",
                 "langfuse_tags": _lf_tags,
                 "task_id": task.task_id,

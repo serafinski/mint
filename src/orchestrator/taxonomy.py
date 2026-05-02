@@ -13,9 +13,8 @@ An evolutionary taxonomy starts empty and grows a category when no existing
 one fits — preventing vocabulary drift (the LLM must check existing categories
 first) while remaining open to new verticals.
 
-The file-backed taxonomy is stored as JSON alongside the ChromaDB registry:
-- ``data/cli/domains.json`` for the CLI mode
-- ``data/eval/domains.json`` for the evaluation harness
+The file-backed taxonomy is stored as JSON alongside the ChromaDB registry,
+defaulting to ``data/eval/domains.json`` for evaluation runs.
 
 Both start empty and accumulate categories as MINT encounters new kinds of
 tasks. The file is the single source of truth for the vocabulary at any point
@@ -262,7 +261,7 @@ class DomainTaxonomy:
 
     Usage::
 
-        tx = DomainTaxonomy(Path("data/cli/domains.json"))
+        tx = DomainTaxonomy(Path("data/eval/domains.json"))
         # LLM-driven classification (needs a LangChain chat model configured
         # with structured output)
         result = tx.get_or_create_for_capability(artifact, llm)
@@ -615,7 +614,7 @@ class DomainTaxonomy:
 
 
 # ---------------------------------------------------------------------------
-# Module-level path configuration (mirrors set_skills_output_dir pattern)
+# Module-level path configuration
 # ---------------------------------------------------------------------------
 
 _TAXONOMY_PATH: Path | None = None
@@ -624,10 +623,9 @@ _TAXONOMY_PATH: Path | None = None
 def set_taxonomy_path(path: Path | str) -> None:
     """Override the default taxonomy file path.
 
-    The CLI runner calls this to redirect from the evaluation default
-    (``data/eval/domains.json``) to the CLI path (``data/cli/domains.json``).
-    The evaluation harness leaves the default alone. Mirrors the
-    ``set_skills_output_dir()`` pattern in ``generators/skill.py``.
+    Evaluation runs use ``data/eval/domains.json`` by default. This override
+    remains available for tests or custom runners that need an isolated
+    taxonomy file.
     """
     global _TAXONOMY_PATH  # noqa: PLW0603
     _TAXONOMY_PATH = Path(path)
@@ -637,10 +635,8 @@ def get_taxonomy_path() -> Path:
     """Return the currently-configured taxonomy file path.
 
     Defaults to ``<project-root>/data/eval/domains.json`` if the path
-    has not been overridden via :func:`set_taxonomy_path`. This matches
-    the skills pattern (eval is the default, CLI overrides) so the
-    evaluation harness stays hermetic without needing harness wiring,
-    and the CLI runner flips it explicitly.
+    has not been overridden via :func:`set_taxonomy_path`. The default keeps
+    evaluation runs hermetic without requiring harness-specific wiring.
     """
     if _TAXONOMY_PATH is not None:
         return _TAXONOMY_PATH

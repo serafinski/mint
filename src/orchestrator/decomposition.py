@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # Operational boundaries
 # ---------------------------------------------------------------------------
 
-# Bumped 120 → 240 on 2026-04-14 after a test_mint run surfaced repeated
+# Bumped 120 → 240 on 2026-04-14 after an eval run surfaced repeated
 # timeouts on the T04 5-stage inventory reorder task. Empirical data (LangFuse
 # traces across April 7 → April 14) shows the DeepAgent routinely completes
 # its real work in 87–180s of LLM wall time on complex tasks, but tail variance
@@ -167,7 +167,7 @@ def _validate_depends_on_indices(subtasks: list[SubTask]) -> list[str]:
     → ``[0, 1, 2]`` ignoring the dependency). This validator catches
     them at the decomposition layer so the §12 finding #15 strict-gate
     pattern actually fires: violation → ``decomposition_succeeded=False``
-    → 3x retry → CLI exit 2 on exhaustion.
+    → 3x retry → terminal failure on exhaustion.
 
     Checks:
     - Every ``depends_on`` index ``dep`` must satisfy ``0 <= dep < len(subtasks)``.
@@ -872,9 +872,8 @@ def decomposition_node(
     # downstream pipeline sees no work to do, reaches a terminal state
     # cleanly via the never-raises contract, and the sticky
     # decomposition_succeeded=False flag surfaces the failure at the
-    # CLI (exit 2) or the evaluation harness (failure_reason=
-    # generation_failed with decomposition-fail distinction). No silent
-    # degraded output.
+    # terminal boundary (failure_reason=generation_failed with
+    # decomposition-fail distinction). No silent degraded output.
     decomposition_succeeded = bool(subtasks)
 
     # Chain coherence validation (Phase 2 Step 14). Only meaningful when we
@@ -956,7 +955,7 @@ def decomposition_node(
         # decomposer legitimately emits multi-cap subtasks for
         # parallel multi-file-output tasks (e.g., ``['write-markdown-
         # report', 'write-csv-file']`` on a "write report.md AND
-        # metrics.csv" task). Hard-rejecting these regressed test_mint
+        # metrics.csv" task). Hard-rejecting these regressed
         # AGENT-YAML-incident with a loud "DECOMPOSITION FAILED"
         # whereas the chain previously executed the first cap and
         # produced partial output. Soft-warning preserves the loud

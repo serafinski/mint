@@ -93,8 +93,8 @@ def create_pipeline(
         An uncompiled ``StateGraph[TaskState]`` ready to be compiled and invoked.
     """
     # Normalize to an OptimizerConfig — callers pass either the legacy bool
-    # (eval harness, older tests) or the new config (CLI runner). The new
-    # config takes precedence when both are provided.
+    # (eval harness, older tests) or a per-operation config. The config takes
+    # precedence when both are provided.
     if optimizer_config is None:
         optimizer_config = OptimizerConfig.from_run_optimizer_bool(run_optimizer)
 

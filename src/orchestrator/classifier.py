@@ -163,8 +163,8 @@ def classify_gap(
     a best-guess classification.
 
     Callers (``classifier_node``) handle ``None`` by flipping the sticky
-    ``TaskState.classification_succeeded`` flag to ``False`` so CLI /
-    harness classify the task as CLASSIFICATION_FAILED.
+    ``TaskState.classification_succeeded`` flag to ``False`` so terminal
+    callers classify the task as CLASSIFICATION_FAILED.
 
     Args:
         gap: The single ``GapItem`` to classify (one step of the workflow).

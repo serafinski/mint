@@ -174,8 +174,8 @@ def create_optimization_loop(
     """
     # Default to all-"on" when caller doesn't specify — preserves the
     # pre-finding-#8 loop semantic (operations always fire when invoked).
-    # The threshold gate is enforced upstream by create_pipeline / the CLI
-    # runner, not by this loop.
+    # The threshold gate is enforced upstream by create_pipeline / callers,
+    # not by this loop.
     _config = optimizer_config or OptimizerConfig.all_on()
 
     def compute_metrics_node(state: OptimizerState) -> Command:

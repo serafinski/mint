@@ -169,7 +169,7 @@ like a successful result to the caller and silently hides the failure. The \
 *only* time you may catch an exception is to add diagnostic context, and \
 in that case you MUST re-raise it (e.g. \
 ``raise RuntimeError(f"Failed to parse {path}: {original_exc}") from original_exc``). \
-The pipeline's verification gate, retry loop, and CLI error display all \
+The pipeline's verification gate, retry loop, and caller diagnostics all \
 depend on real exceptions reaching them. Returning a soft-failure dict \
 defeats every layer of error handling above the tool.\
 """

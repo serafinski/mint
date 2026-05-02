@@ -38,11 +38,11 @@ def build_initial_state(
     ``if state.output_contract.required_files:`` check without a prior
     null-guard.
 
-    Callers: ``EvaluationHarness._run_jit``, ``scripts/run_longitudinal.py``,
-    ``scripts/run_longitudinal_shift.py``. Any new runner MUST use this
-    helper rather than constructing TaskState directly; a regression test
-    (``tests/unit/test_task_state_builder.py``) asserts the contract field
-    is always populated from ``task.output_contract``.
+    Callers: ``EvaluationHarness._run_jit`` and
+    ``scripts/run_longitudinal.py``. Any new runner MUST use this helper
+    rather than constructing TaskState directly; a regression test
+    (``tests/unit/test_task_state_builder.py``) asserts the contract field is
+    always populated from ``task.output_contract``.
     """
     contract = getattr(task, "output_contract", None)
     return TaskState(
