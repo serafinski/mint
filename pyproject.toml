@@ -1,7 +1,7 @@
 [project]
-name = "justintimemas"
+name = "mint"
 version = "0.1.0"
-description = "JIT Capability Synthesis for Self-Developing Multi-Agent Systems"
+description = "Just-in-Time Capability Synthesis, Verification, and Evolutionary Optimization in Self-Evolving Multi-Agent Systems Backed by Large Language Models"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -18,14 +18,9 @@ dependencies = [
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.1",
     "pyyaml>=6.0.3",
-    "rich>=13.0.0",
     "scipy>=1.17.1",
     "tiktoken>=0.12.0",
-    "typer>=0.15.0",
 ]
-
-[project.scripts]
-mint = "src.cli.app:app"
 
 [build-system]
 requires = ["hatchling"]

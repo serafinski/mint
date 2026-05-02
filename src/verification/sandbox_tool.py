@@ -188,7 +188,6 @@ def sandbox_execute(
     - Tier 1.5 import check (``src/verification/import_check.py``)
     - Tier 2 behavioral probes (``src/verification/behavioral.py``)
     - Coverage replay (``src/verification/coverage.py``)
-    - CLI execution (``src/cli/runner.py``)
 
     For DeepAgent-dispatched invocations (adversarial Tier 3 + generated
     AGENT runtime via ``create_deep_agent(tools=[...])``), use

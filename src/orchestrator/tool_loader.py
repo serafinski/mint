@@ -200,11 +200,10 @@ class ToolLoader:
             filesystem, and (before Step 14.12) network as the parent.
             Not the Docker sandbox backend.
 
-            Security audit finding #1 (2026-04-19) removed all production
-            callers of this method. Generated capabilities execute
-            exclusively through ``src/cli/runner.py::_execute_mcp_tool``
-            (CLI) and ``tests/evaluation/execution.py`` (eval harness),
-            both of which invoke the Docker sandbox directly.
+            Security audit finding #1 (2026-04-19) removed production
+            callers of this method. Eval generated capabilities execute
+            through ``tests/evaluation/execution.py``, which invokes the
+            Docker sandbox directly.
 
             This method + ``load_tool`` are preserved for unit-test
             inspection of the loader semantics.
