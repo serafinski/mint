@@ -170,7 +170,6 @@ def test_harness_default_preserves_legacy_behavior():
 
     default_cfg = HarnessConfig(
         chroma_dir=Path("/tmp"),
-        mcp_tools_dir=Path("/tmp"),
         skills_dir=Path("/tmp"),
     )
     # Default must be None so legacy callers see no behavior change.

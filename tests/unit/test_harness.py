@@ -24,7 +24,6 @@ from tests.evaluation.tasks import T01, T03, T04, T07, T13
 def config(tmp_path):
     return HarnessConfig(
         chroma_dir=tmp_path / "chroma",
-        mcp_tools_dir=tmp_path / "mcp_tools",
         skills_dir=tmp_path / "skills",
         db_path=None,  # in-memory
         n_runs=2,

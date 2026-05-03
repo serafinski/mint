@@ -82,8 +82,7 @@ src/
 ├── registry/               # ChromaDB skill registry + DuckDB metrics
 ├── verification/           # Pillar 2: static_scanner, behavioral, adversarial, gate, sandbox_tool
 ├── optimizer/              # Pillar 3: utility, operations, loop, simulation
-├── schemas/                # Shared Pydantic state schemas (single source of truth)
-└── mcp_tools/              # Reference hand-built MCP tools (fibonacci)
+└── schemas/                # Shared Pydantic state schemas (single source of truth)
 
 tests/    unit/ (1000+ tests), integration/ (Docker-required), evaluation/ (harness + tasks + fixtures)
 scripts/  run_pilot, run_longitudinal, run_recurrence_eval, analyze_results,

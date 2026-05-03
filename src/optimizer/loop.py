@@ -19,6 +19,7 @@ from src.optimizer.operations import merge, prune, split
 from src.optimizer.utility import compute_all_utilities
 from src.registry.metrics import MetricsStore
 from src.registry.store import SkillRegistry
+from src.schemas.capability import CapabilityDescriptor
 from src.schemas.metrics import GranularityMetrics
 from src.schemas.optimizer_config import OptimizerConfig
 
@@ -84,9 +85,9 @@ def _compute_kl_divergence(
 
     NOTE — this is the *online* convergence metric stored in
     ``OptimizerState.kl_divergence`` and propagated across pipeline
-    invocations via ``_prev_optimizer_scores``.  A separate histogram-based
-    KL implementation exists in ``simulation.py`` for visualisation; the two
-    measure different aspects of convergence (see ``_kl_divergence`` there).
+    invocations via ``_prev_optimizer_scores``. The longitudinal analyzer uses
+    the same utility-score distribution semantics for Chapter 6 convergence
+    reporting.
     """
     if not prev_scores or not curr_scores:
         # Empty distribution signals catastrophic failure (e.g. all pruned),
@@ -116,9 +117,7 @@ def _compute_kl_divergence(
     return float(entropy(curr, prev))
 
 
-def _schema_jaccard(
-    cap_a: "CapabilityDescriptor", cap_b: "CapabilityDescriptor"
-) -> float:
+def _schema_jaccard(cap_a: CapabilityDescriptor, cap_b: CapabilityDescriptor) -> float:
     """Jaccard similarity over the union of input+output schema key names.
 
     Implements the proposal's second Merge conjunct: *"overlapping input
@@ -192,10 +191,9 @@ def create_optimization_loop(
         # Compute KL divergence against previous cycle
         kl = _compute_kl_divergence(state.previous_utility_scores, scores)
 
-        # Step 13.7 Batch A4 — emit KL as a LangFuse score attached to
-        # the active trace so Chapter 5.4 convergence analysis is
-        # queryable via LangFuse dashboards (not just DuckDB
-        # cycle_utility_scores). Never raises.
+        # Emit KL as a LangFuse score attached to the active trace so
+        # convergence analysis is queryable via dashboards, not just DuckDB
+        # cycle_utility_scores. Never raises.
         try:
             from langfuse import get_client
             try:
@@ -263,9 +261,9 @@ def create_optimization_loop(
         #
         # Type scoping: candidates are collected across all three capability
         # types (MCP_TOOL, SKILL, AGENT). Pairing within the search loop
-        # enforces same-type pairs — cross-type merge is not supported
-        # because merge() dispatches on type and the combined executable
-        # content only makes sense within a type (Ch 7 future work).
+        # enforces same-type pairs — cross-type merge is not supported because
+        # merge() dispatches on type and the combined executable content only
+        # makes sense within a type.
         low_reuse: list[str] = []
         for cap_id in state.capabilities_snapshot:
             cap = registry.get(cap_id)

@@ -40,7 +40,6 @@ logger = logging.getLogger("run_recurrence_eval")
 
 DATA_DIR = ROOT / "data"
 CHROMA_DIR = DATA_DIR / "eval" / "chroma"
-MCP_TOOLS_DIR = ROOT / "src" / "mcp_tools"
 SKILLS_DIR = DATA_DIR / "eval" / "skills"
 
 
@@ -202,7 +201,6 @@ def main() -> int:
 
                     config = HarnessConfig(
                         chroma_dir=CHROMA_DIR,
-                        mcp_tools_dir=MCP_TOOLS_DIR,
                         skills_dir=SKILLS_DIR,
                         db_path=str(db_path),
                         n_runs=1,

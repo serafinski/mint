@@ -1,18 +1,14 @@
-"""Utility function computation for the granularity optimizer.
+"""Utility scoring for the granularity optimizer.
 
 U(c) = alpha * reuse(c) * success(c)
        - beta  * token_cost(c)           (per-invocation execution cost)
        - gamma * maintenance(c)
        - delta * definition_token_cost(c)  (prompt-bloat / Context Economy)
 
-ext8 #66 (2026-04-20): added the ``delta * definition_token_cost`` term so
-the formula can optimize for the proposal's "Context Economy" tension
-(§Bootstrapping #3 + §Pillar 3 four-metric table line 170). Pre-fix the
-optimizer was blind to prompt bloat — whatever the observed registry
-evolution did, it wasn't optimizing for definition-token-cost even though
-the proposal names it as a core input. ``CapabilityDescriptor.
-definition_token_cost`` is populated when capabilities are registered
-(seeded, generated, loaded, or optimizer-created).
+``definition_token_cost`` represents the prompt footprint of a capability.
+Including it keeps the optimizer sensitive to context economy, not just
+runtime success and invocation cost. The field is populated when capabilities
+are seeded, generated, loaded, or created by optimizer operations.
 """
 
 from __future__ import annotations
@@ -37,10 +33,9 @@ def compute_utility(
         capability_id: Registry ID of the capability.
         metrics_store: DuckDB metrics store to pull metrics from.
         registry: Optional SkillRegistry; used to read
-            ``definition_token_cost`` off the CapabilityDescriptor (ext8
-            #66 Context Economy term). When ``None``, the delta term
-            contributes 0 (backward-compat for legacy callers without
-            registry visibility).
+            ``definition_token_cost`` off the CapabilityDescriptor. When
+            ``None``, the delta term contributes 0 so callers without registry
+            visibility can still score metrics-only records.
         alpha: Weight for reuse * success (positive contribution).
         beta: Weight for per-invocation token cost (negative contribution).
         gamma: Weight for maintenance burden (negative contribution).
@@ -54,9 +49,8 @@ def compute_utility(
         Utility score (higher is better).
     """
     m = metrics_store.compute_granularity_metrics(capability_id)
-    # ext8 #66: Context Economy term. Nonzero only when a registry is
-    # supplied — defensive so tests that only exercise metrics-side
-    # behavior don't need registry plumbing.
+    # Context-economy term. Nonzero only when a registry is supplied, so
+    # metrics-only callers can still use the base formula.
     def_cost = 0
     if registry is not None:
         cap = registry.get(capability_id)

@@ -2,8 +2,7 @@
 
 ``run_pilot.py`` and ``run_longitudinal.py`` both mutate shared eval state:
 ``data/eval/chroma``, ``data/eval/skills``, and the clean snapshot under
-``tests/evaluation/snapshots``. Snapshot restore also touches
-``src/mcp_tools`` because it is part of the snapshot contract.
+``tests/evaluation/snapshots``.
 
 Running both active eval runners concurrently can corrupt that state: one
 runner's cleanup can wipe the other's active registry, and one runner's

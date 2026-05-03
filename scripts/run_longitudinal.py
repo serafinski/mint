@@ -45,7 +45,6 @@ logger = logging.getLogger("run_longitudinal")
 
 DATA_DIR = ROOT / "data"
 CHROMA_DIR = DATA_DIR / "eval" / "chroma"
-MCP_TOOLS_DIR = ROOT / "src" / "mcp_tools"
 SKILLS_DIR = DATA_DIR / "eval" / "skills"
 DEFAULT_DB = str(DATA_DIR / "eval" / "longitudinal.duckdb")
 
@@ -242,14 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     # re-snapshot over the seeded state so downstream restores hit
     # that same known baseline.
     #
-    # Security audit finding #86 (2026-04-19, ext9): MCP_TOOLS_DIR
-    # (``src/mcp_tools``) is PROJECT SOURCE — it contains hand-written
-    # reference tools (e.g., ``fibonacci.py``) tracked in git. The
-    # pre-fix rmtree deleted the reference tools on every longitudinal
-    # run. Generated MCP tools are persisted as ``source_code`` metadata
-    # in ChromaDB (per CLAUDE.md "MCP Tool Loading Strategy"), not on
-    # disk under ``src/mcp_tools``, so there is no runtime-accumulating
-    # state in that directory to clean. Clean ChromaDB + skills only.
+    # Generated MCP tools are persisted as ``source_code`` metadata in
+    # ChromaDB, not as source-tree files. Clean ChromaDB + skills only.
     import shutil as _shutil
     # Safety net for security audit finding #86: refuse to rmtree any
     # directory that lives inside project source.
@@ -272,8 +265,8 @@ def main(argv: list[str] | None = None) -> int:
             _shutil.rmtree(_d)
         _d.mkdir(parents=True, exist_ok=True)
 
-    snap_id = take_clean_snapshot(CHROMA_DIR, MCP_TOOLS_DIR, SKILLS_DIR)
-    restore_snap = restore_clean_snapshot(CHROMA_DIR, MCP_TOOLS_DIR, SKILLS_DIR)
+    snap_id = take_clean_snapshot(CHROMA_DIR, SKILLS_DIR)
+    restore_snap = restore_clean_snapshot(CHROMA_DIR, SKILLS_DIR)
     logger.info("Snapshot: %s (restored: %s)", snap_id, restore_snap)
 
     # --- ONE registry, ONE metrics store, ONE loader ---

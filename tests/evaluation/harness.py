@@ -36,7 +36,6 @@ Usage::
 
     config = HarnessConfig(
         chroma_dir=Path("data/eval/chroma"),
-        mcp_tools_dir=Path("src/mcp_tools"),
         skills_dir=Path("data/eval/skills"),
         db_path="data/eval/metrics.duckdb",
         n_runs=8,
@@ -81,7 +80,6 @@ class HarnessConfig:
     """Configuration for one evaluation campaign."""
 
     chroma_dir: Path
-    mcp_tools_dir: Path
     skills_dir: Path
 
     # EvaluationStore path (None = in-memory, useful for tests)
@@ -281,7 +279,7 @@ class EvaluationHarness:
         logger.info("Rebuilt clean registry with %d seeded capabilities", len(registry.list_all()))
 
         # 3. Take snapshot of the clean state
-        self._snap_id = take_clean_snapshot(cfg.chroma_dir, cfg.mcp_tools_dir, cfg.skills_dir)
+        self._snap_id = take_clean_snapshot(cfg.chroma_dir, cfg.skills_dir)
         logger.info("Clean snapshot taken: %s", self._snap_id)
         return self._snap_id
 
@@ -404,7 +402,7 @@ class EvaluationHarness:
         gc.collect()
 
         # Step 1: restore clean snapshot
-        snap_id = restore_clean_snapshot(cfg.chroma_dir, cfg.mcp_tools_dir, cfg.skills_dir)
+        snap_id = restore_clean_snapshot(cfg.chroma_dir, cfg.skills_dir)
         if self._snap_id and snap_id != self._snap_id:
             msg = (
                 f"Snapshot ID mismatch: expected {self._snap_id}, got {snap_id} "

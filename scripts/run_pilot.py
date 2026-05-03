@@ -50,7 +50,6 @@ logger = logging.getLogger("run_pilot")
 
 DATA_DIR = ROOT / "data"
 CHROMA_DIR = DATA_DIR / "eval" / "chroma"
-MCP_TOOLS_DIR = ROOT / "src" / "mcp_tools"
 SKILLS_DIR = DATA_DIR / "eval" / "skills"
 ALL_CONDITIONS = ["full", "no_verification", "no_optimization", "static"]
 
@@ -400,7 +399,6 @@ def main() -> int:
 
     config = HarnessConfig(
         chroma_dir=CHROMA_DIR,
-        mcp_tools_dir=MCP_TOOLS_DIR,
         skills_dir=SKILLS_DIR,
         db_path=DB_PATH,
         n_runs=args.n_runs,

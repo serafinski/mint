@@ -77,7 +77,7 @@ class TestComputeAllUtilities:
         registry = MagicMock()
         cap1 = MagicMock()
         cap1.name = "cap-a"
-        cap1.definition_token_cost = 0  # ext8 #66: zero out delta term for legacy expectation
+        cap1.definition_token_cost = 0
         cap2 = MagicMock()
         cap2.name = "cap-b"
         cap2.definition_token_cost = 0
@@ -87,8 +87,20 @@ class TestComputeAllUtilities:
 
         store = MagicMock()
         store.compute_granularity_metrics.side_effect = [
-            _make_metrics("cap-a", reuse_rate=0.5, success_rate=0.8, token_cost=100.0, maintenance_burden=0.2),
-            _make_metrics("cap-b", reuse_rate=1.0, success_rate=1.0, token_cost=0.0, maintenance_burden=0.0),
+            _make_metrics(
+                "cap-a",
+                reuse_rate=0.5,
+                success_rate=0.8,
+                token_cost=100.0,
+                maintenance_burden=0.2,
+            ),
+            _make_metrics(
+                "cap-b",
+                reuse_rate=1.0,
+                success_rate=1.0,
+                token_cost=0.0,
+                maintenance_burden=0.0,
+            ),
         ]
 
         result = compute_all_utilities(registry, store)
@@ -110,7 +122,7 @@ class TestComputeAllUtilities:
         registry = MagicMock()
         cap = MagicMock()
         cap.name = "cap-x"
-        cap.definition_token_cost = 0  # ext8 #66: zero out delta term
+        cap.definition_token_cost = 0
         registry.get.return_value = cap
         registry.list_all.return_value = [cap]
 
@@ -124,12 +136,8 @@ class TestComputeAllUtilities:
         assert result["cap-x"] == pytest.approx(-3.4)
 
 
-class TestExt8_66ContextEconomyTerm:
-    """ext8 #66: compute_utility reads CapabilityDescriptor.definition_token_cost
-    and subtracts ``delta * definition_token_cost`` so the optimizer can
-    optimize for prompt bloat. Pre-fix this term was absent → the proposal's
-    "Context Economy" tension was unoptimizable.
-    """
+class TestDefinitionTokenCostPenalty:
+    """Definition-token cost lowers utility when registry metadata is available."""
 
     def test_larger_definition_lowers_utility(self):
         """Two caps with identical metrics but different definition sizes:
@@ -158,7 +166,7 @@ class TestExt8_66ContextEconomyTerm:
 
         result = compute_all_utilities(registry, store)
         assert result["cap-small"] > result["cap-huge"], (
-            "ext8 #66: larger definition_token_cost must lower U(c). "
+            "larger definition_token_cost must lower U(c). "
             f"cap-small={result['cap-small']} vs cap-huge={result['cap-huge']}"
         )
         # Exact arithmetic with default delta=0.01:
@@ -167,11 +175,8 @@ class TestExt8_66ContextEconomyTerm:
         assert result["cap-small"] == pytest.approx(-0.05)
         assert result["cap-huge"] == pytest.approx(-49.55)
 
-    def test_no_registry_preserves_legacy_zero_delta_behavior(self):
-        """compute_utility(cap_id, store) with no registry arg must equal the
-        pre-ext8 formula (no delta term). Backward-compat for callers that
-        don't have registry visibility.
-        """
+    def test_no_registry_uses_metrics_only_formula(self):
+        """No registry means no definition-token-cost term."""
         store = MagicMock()
         store.compute_granularity_metrics.return_value = _make_metrics(
             reuse_rate=0.8, success_rate=1.0, token_cost=10.0, maintenance_burden=0.0,

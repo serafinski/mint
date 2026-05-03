@@ -3,7 +3,7 @@
 Strategy (per advisor doc):
 - Take ONE clean snapshot before evaluation begins.
 - Restore it at the START of every run (not per-task, not per-condition).
-- Scope: ChromaDB persist dir + src/mcp_tools/ + data/eval/skills/
+- Scope: ChromaDB persist dir + data/eval/skills/
 
 The snapshot ID is a deterministic hash of the clean state contents.
 All runs that start from the same clean slate share the same snap_id —
@@ -23,7 +23,6 @@ _SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 
 def take_clean_snapshot(
     chroma_dir: Path,
-    mcp_tools_dir: Path,
     skills_dir: Path,
     *,
     snapshot_dir: Path = _SNAPSHOT_DIR,
@@ -38,11 +37,11 @@ def take_clean_snapshot(
     """
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-    for src, dst_name in [
-        (chroma_dir, "chroma"),
-        (mcp_tools_dir, "mcp_tools"),
-        (skills_dir, "skills"),
-    ]:
+    legacy_mcp_tools = snapshot_dir / "mcp_tools"
+    if legacy_mcp_tools.exists():
+        shutil.rmtree(legacy_mcp_tools)
+
+    for src, dst_name in [(chroma_dir, "chroma"), (skills_dir, "skills")]:
         dst = snapshot_dir / dst_name
         if dst.exists():
             shutil.rmtree(dst)
@@ -58,7 +57,6 @@ def take_clean_snapshot(
 
 def restore_clean_snapshot(
     chroma_dir: Path,
-    mcp_tools_dir: Path,
     skills_dir: Path,
     *,
     snapshot_dir: Path = _SNAPSHOT_DIR,
@@ -79,11 +77,7 @@ def restore_clean_snapshot(
 
     snap_id: str = json.loads(meta_path.read_text())["id"]
 
-    for dst, src_name in [
-        (chroma_dir, "chroma"),
-        (mcp_tools_dir, "mcp_tools"),
-        (skills_dir, "skills"),
-    ]:
+    for dst, src_name in [(chroma_dir, "chroma"), (skills_dir, "skills")]:
         src = snapshot_dir / src_name
         if dst.exists():
             shutil.rmtree(dst)
