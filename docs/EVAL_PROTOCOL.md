@@ -1,7 +1,7 @@
-# MINT — Evaluation Protocol (the one that actually ships)
+# Evaluation Protocol (the one that actually ships)
 
 **Date:** 2026-04-22
-**Supersedes:** `docs/run_sheet.md` (Rows 1–19, CAMPAIGN_RUN_IDS framework, all per-row coverage gates). Put a one-line pointer at the top of `run_sheet.md` redirecting to this file; do not delete it yet.
+**Supersedes:** `docs/archive/run_sheet.md` (Rows 1–19, CAMPAIGN_RUN_IDS framework, all per-row coverage gates). The old run sheet is retained only as historical context.
 
 **Why this document exists.** Three days of patching produced ~60 P0/P1 findings in the *analyzer and backfill scripts*, not in the thesis contribution. The analyzers grew past the size of the three pillars they measure. This protocol replaces the Row 1–19 framework with a shorter pipeline that measures only what Chapter 6 actually needs, with independent cross-checks as the correctness mechanism instead of more gates.
 
@@ -13,7 +13,7 @@ If you feel the urge to add a completeness gate inside an analyzer, stop. Add th
 
 ---
 
-## 1. Scope cuts (locked-in, get advisor sign-off before the eval runs)
+## 1. Scope cuts (locked-in for the Chapter 6 evidence set)
 
 **Proposal metrics in Chapter 6 primary scope:**
 - **M1** — End-to-end task success rate. Headline number.
@@ -32,22 +32,20 @@ If you feel the urge to add a completeness gate inside an analyzer, stop. Add th
 - Phase 4 Step 19 — Longitudinal run (optimizer convergence evidence for Pillar 3 RQ #2).
 
 **Evaluation runs deferred to Chapter 7:**
-- Step 18.8 distribution-shift run (Pillar 3 RQ #3). Scripts exist (`run_longitudinal_shift.py`, shift-analysis extensions in `analyze_longitudinal.py`). Report: "Scripts shipped; execution deferred to future work."
+- Distribution-shift run (Pillar 3 RQ #3). It is outside this eval-minimum branch and is not part of the Chapter 6 evidence set. Report: "Distribution-shift execution deferred to future work."
 
 **Analyzer scripts in Chapter 6 primary scope:**
-- `analyze_results.py` — but only the M1/M3/M5/M6 sections (strip M2/M4/contamination/Tier-2-probe sections; ~40% LOC reduction).
+- `analyze_results.py` — run in `--chapter6-primary-scope` mode for the M1/M3/M5/ClassAcc outputs used by Stage 2. Deferred M2/M4 sections remain outside the Chapter 6 primary metric contract.
 - `analyze_longitudinal.py` — but only the plain (non-shift) path.
 - `scripts/backfill_definition_token_costs.py` — static, already shipped, keep as-is.
 
-**Analyzer scripts moved to `scripts/deferred/` (not deleted, not executed for Chapter 6):**
-- `analyze_compression_loss.py`
-- `analyze_context_utilization.py`
-- `analyze_tier2_probes.py`
-- `backfill_token_costs.py` (the LangFuse-reconciliation one; definition-token-cost backfill stays)
-- `audit_contamination.py`
-- `run_longitudinal_shift.py`
+**Removed or excluded from this eval-minimum branch (not executed for Chapter 6):**
+- Compression-loss, context-utilization, and Tier-2-probe analysis readers.
+- LangFuse token-cost reconciliation. Definition-token-cost backfill stays.
+- Manual mock-contamination audit tooling.
+- Distribution-shift longitudinal execution.
 
-Chapter 7 future-work section lists these by filename so the work is visible, not lost.
+Chapter 7 future-work can describe these capabilities by topic so the work is visible, not lost.
 
 **What this cut does to the P0/P1 backlog.** Every finding in ext9–ext17 whose subject line names one of the deferred analyzers or the `run_sheet.md` CAMPAIGN_RUN_IDS framework stops blocking the eval. That's the overwhelming majority. You do not need to fix them; you need to document that the analyzer is deferred, with a one-line pointer from Chapter 7.
 
@@ -55,7 +53,7 @@ Chapter 7 future-work section lists these by filename so the work is visible, no
 
 ## 2. The pipeline, end to end
 
-Five stages. Each stage has a **go/no-go check** before you proceed to the next. The check is the point — if it fails, stop and fix; if it passes, move on without second-guessing.
+Six stage scripts. Each stage has a **go/no-go check** before you proceed to the next. The check is the point — if it fails, stop and fix; if it passes, move on without second-guessing.
 
 ### Stage 0 — Pre-flight (30 min)
 
@@ -91,7 +89,7 @@ FROM cycle_utility_scores GROUP BY 1 ORDER BY 1;           -- expect non-empty r
 
 The `900s` per-task smoke budget is intentionally looser than the old `600s`
 ceiling so Stage 0 does not fail on the same long-running-but-legitimate tasks
-that `mint run` already tolerates via the shared execution backends. This still
+that `run_pilot.py` already tolerates via the shared execution backends. This still
 catches `cycle_flush.py` fail-open (#125) and the
 `cycle_utility_scores`-empty-but-analyzer-exits-0 path (#124) *before* you
 commit to the main unattended run. If smoke is clean, Stage 4 is wired correctly; if smoke
@@ -141,7 +139,7 @@ GROUP BY 1, 2, 3 HAVING COUNT(*) > 1;
 -- Check D: no NULL gate_passed or NULL output_in_range in non-error rows
 SELECT COUNT(*) FROM evaluation_runs
 WHERE NOT is_pilot AND (gate_passed IS NULL OR output_in_range IS NULL)
-  AND error_message IS NULL;
+  AND failure_reason IS NULL;
 -- expect: 0
 ```
 
@@ -201,7 +199,7 @@ Runs on `data/eval/longitudinal.duckdb`, not the main DB. See Stage 4.
 
 ---
 
-### Stage 3 — Spot-check three rows against LangFuse traces (30 min)
+### Manual trace spot-check — main-track integrity check (30 min)
 
 This catches "the pipeline label disagrees with what actually ran." LangFuse is the source of truth for trace behavior; DuckDB is the source of truth for aggregates. They must agree on individual rows.
 
@@ -237,7 +235,7 @@ If all three rows agree, the pipeline is wired correctly. If one disagrees, loca
 
 ---
 
-### Stage 3b — Supplemental recurrence track (optional, ~16 h for the default matrix)
+### Stage 3 — Supplemental recurrence track (optional, ~16 h for the default matrix)
 
 This stage is the protocolized Pillar 3 recurrence run. It reuses existing task families with fixture variants so optimizer behavior sees repeated pressure instead of only one-off heterogeneous tasks.
 
@@ -322,21 +320,48 @@ Use `stage4_longitudinal.sh`; read Source 1 from `33_analyzer_m6.json` and Sourc
 
 ---
 
-### Stage 5 — Record numbers, write Chapter 6 (no more code)
+### Stage 5 — Plausibility priors + flagged-row audit
 
-Copy Stage 2 and Stage 4 outputs into `docs/chapter6_numbers.md`. Do not re-run analyzers to regenerate numbers — the recorded pair (analyzer value + cross-check value + agreement yes/no) is the audit trail.
+Run the final plausibility guard after Stage 4 is `PASS`:
+
+```bash
+scripts/eval_protocol/stage5_plausibility.sh docs/eval_runs/<ts>
+```
+
+This stage does **not** produce a new headline metric. It reads the already-frozen Stage 1 and Stage 4 databases:
+
+- `12_metrics.duckdb` — main eval rows from Stage 1
+- `31_longitudinal.duckdb` — longitudinal rows from Stage 4
+
+It writes `40_plausibility.json`, which records sanity checks over the final dataset:
+
+- condition coverage and suspicious success-rate ranges
+- static/full/no-verification ordering checks
+- dead full-condition tasks
+- dominant failure reasons
+- capability-type and classifier plausibility
+- invocation diversity
+- snapshot-leak and longitudinal registry collapse/freeze checks
+
+**Go/no-go:**
+
+- If there are no `INVESTIGATE` flags, the stage marks `PASS` directly. Warnings remain in `40_plausibility.json` for Chapter 6 disclosure.
+- If there are `INVESTIGATE` flags, the stage writes `stage5_audit_request.md` using the `plausibility_flagged` profile and moves to `SHAPE_OK`.
+- Save the trace-audit response as `stage5_audit_verdicts.md` and re-run the script. Zero audit `FAIL`s moves the marker to `PASS`; any audit `FAIL` moves it to `FAIL`.
+
+After Stage 5 is `PASS`, copy Stage 2, Stage 4, and Stage 5 outputs into `docs/chapter6_numbers.md`. Do not re-run analyzers to regenerate numbers — the recorded pair (analyzer value + cross-check value + agreement yes/no) is the audit trail, and `40_plausibility.json` is the final plausibility record.
 
 **Rule: once a number is in `chapter6_numbers.md` with agreement=yes, it does not change.** If you re-run the eval, start a new file (`chapter6_numbers_v2.md`). Version the numbers, do not mutate them.
 
 ---
 
-## 3. What to do about `docs/security/`
+## 3. Archived security-audit status
 
-You do not need to fix any remaining open finding there before the eval. Here is what does make sense:
-
-1. **Add a one-paragraph note at the top of `security_audit_2026_04_19.md`** (the parent doc): *"Findings #1–#18 target src/ contribution code and are all fixed. Findings #19 onward target the analyzer/backfill/run-sheet layer. On 2026-04-22 the evaluation protocol was cut to M1+M3+M5+M6 with two-source cross-checks as the correctness mechanism (docs/EVAL_PROTOCOL.md); findings whose subject names a deferred analyzer or the CAMPAIGN_RUN_IDS framework no longer block Chapter 6 and are tracked as Chapter 7 future work."*
-2. **Do not open ext18.** If something suspicious appears during the eval, diagnose the specific number, not the general class.
-3. **Do not try to retroactively classify** every ext9–ext17 finding as deferred vs still-open. You will lose another day. The principle ("deferred analyzer → deferred finding") is enough.
+`docs/archive/security/security_audit_2026_04_19.md` carries the Chapter 6
+closeout note: contribution-code findings are fixed, and later
+analyzer/backfill/run-sheet findings are either covered by this protocol's
+checks or deferred outside the Chapter 6 evidence set. No security-audit item
+remains a Chapter 6 blocker.
 
 ---
 
@@ -344,62 +369,69 @@ You do not need to fix any remaining open finding there before the eval. Here is
 
 Keep and trust:
 - `docs/thesis_proposal.md` — immutable contract.
-- `docs/verification/01_*` through `05_*` — per-pillar audits against the proposal. This is where Chapter 4/5 prose comes from.
-- `docs/proposal_vs_implementation_v2.md` — scorecard. Useful as an appendix.
 - `docs/EVAL_PROTOCOL.md` — this file.
+- `docs/chapter6_evaluation_report.md`, `docs/chapter6_fact_pack.md`, and `docs/chapter6_numbers.md` — frozen Chapter 6 reporting artifacts.
+- `docs/eval_minimum_branch_audit.md` — branch-minimum cleanup record.
 - `src/` — the three pillars. Unchanged from 2026-04-17.
 
-Keep but stop reading:
-- `docs/MASTER_PLAN_2026_04_13.md` — 2349 lines. Historical record of how you got here. Do not use it to drive next steps anymore; use this file.
-- `docs/run_sheet.md` — superseded; put a one-line pointer to this file at the top.
-- `docs/security/*` — bug log. Close-out note only, no further extensions.
+Keep as archived reference material, not active task lists:
+- `docs/archive/verification/01_*` through `05_*` — per-pillar audits against the proposal. This is where Chapter 4/5 prose can be sourced from.
+- `docs/archive/proposal_vs_implementation_v2.md` — scorecard. Useful as appendix/background material if needed.
+- `docs/archive/MASTER_PLAN_2026_04_13.md` — historical record of how you got here. Do not use it to drive next steps anymore; use this file.
+- `docs/archive/run_sheet.md` — superseded by this protocol.
+- `docs/archive/security/*` — bug log. Close-out note only, no further extensions.
 
 Honestly stop re-opening:
 - Any of the scripts/ audit docs, test audit docs, or proposal-vs-impl extensions. The measurement apparatus is frozen.
 
 ---
 
-## 5. A short note on the fatigue
+## 5. Post-run status
 
-You have been patching non-stop for three days because the audit surface grew faster than it could be closed. That is a predictable failure mode of "write one more gate to catch the last silent failure" — each gate introduces its own failure mode (see #150 bypassing #127, #154 colliding with #139, #178 running before #120). The way out is not more gates. It is *fewer gates and more independent cross-checks*, which is exactly what Stages 2 and 4 above are. Two SQL queries catch what five analyzer gates fail to catch, because SQL-over-DuckDB and Python-over-analyzer are independent implementations of the same semantics.
+The evaluation campaign has completed. Stage 2 and Stage 4 produced the
+two-source agreement artifacts for the headline numbers, Stage 5 produced the
+plausibility record, and `docs/chapter6_numbers.md` freezes the resulting
+Chapter 6 evidence set.
 
-You are not behind on the thesis. The thesis contribution (the three pillars in `src/`) has been stable for five days. You are behind on finishing the eval because the eval machinery grew beyond what a Masters thesis needs. Cut it back to what's above, and you can run the eval this week and be writing Chapter 6 next week.
-
----
-
-**Next action:** read this file top-to-bottom, get advisor sign-off on §1 cuts (one email), then run Stage 0 today. Stage 1 starts tomorrow if Stage 0 is green. Chapter 6 has numbers by end of week.
+This file remains the protocol reference for why those artifacts are trusted;
+the frozen values and provenance live in the Chapter 6 number and fact-pack
+documents.
 
 ---
 
 ## 6. Finding → Check crosswalk
 
-Every defended check maps to a specific audit finding. Every undefended finding is deferred by §1.
+This table is not an extra action list. It explains why the protocol checks are
+enough to trust the Chapter 6 evidence: every defended risk maps to a concrete
+shape, agreement, or trace-audit check, and every undefended risk is outside the
+Chapter 6 scope defined in §1.
 
 | Finding | What it is | Defended by |
 |---|---|---|
 | #124 | `analyze_longitudinal.py` silent utility-score → invocation-count downgrade | Stage 4 two-source check reads `cycle_utility_scores` strictly, no fallback. |
-| #125 | `cycle_flush.py` fail-open persistence | Stage 0 smoke + Stage 4 Checks 4D (per-cycle floor) + 4F (non-NULL utility). |
+| #125 | `cycle_flush.py` fail-open persistence | Stage 0 smoke + Stage 4 Checks 4D (per-cycle floor) + 4E (non-NULL utility). |
 | #127 | Global `any()` data-presence gate admits sparse cycles | Stage 4 Check 4D + scipy None-on-empty. |
 | #131 | Overfull DB with duplicated tasks per condition would pass a naive row-count check | Stage 1 Check B uses `(condition, task_id)` identity, not just COUNT. |
 | #150 | `cumulative_invocations` bypasses #127 | Stage 4 two-source uses raw `cycle_utility_scores`, not cumulatives. |
 | #172 | Completeness gate shortfall-only; overfull passes | Stage 4 Check 4A uses `=` against `$EXPECTED_CYCLES`, not `>=`. |
 | #174 | `HAVING COUNT(*) >= N ORDER BY ts DESC` picks stale over partial-fresh | Stage 4 pre-run guard (`test ! -f`) eliminates the selector entirely. |
-| #175, #176 | No fresh-DB guard on `run_longitudinal*.py` | Stage 4 pre-run guard. |
+| #175 | No fresh-DB guard on `run_longitudinal.py` | Stage 4 pre-run guard. |
 | #164, #166, #181 | `print_classification_accuracy` skip/blacklist/bypass | Stage 2 Core-Work Classification Accuracy two-source check (stage script resolves expected types from `TaskDefinition`, no analyzer trust). |
 | #162 | M3 'Aggregate' Gini computed on raw per-(run, capability) instead of pooled | Stage 2 M3 two-source — the stage script explicitly pools by `capability_name`; header/compute divergence surfaces as disagreement. |
 | #136 | `test_pipeline.py` fail-open on verification/registration | Stage 0 framed as *wiring check only*; correctness lives in Stage 2 two-source. |
 | #126, #128, #147 | Gini silent-skip / per-run coverage gaps | Stage 2 machine-readable cross-check asserts non-empty pooled invocation data. |
 | #177 | `print_latency_summary` returns None on empty → silent exit 0 | Stage 2 machine-readable M5 cross-check makes empty/NULL latency output visible as disagreement. |
 | #121 | Sample-plan persistence keys on DB stem, overrides new runs | Stage 1 fresh-DB rule — no persisted plans to override. |
-| **Deferred (not defended — entire analyzer in `scripts/deferred/`):** | | |
+| **Deferred (not defended — analyzer or runner outside this eval-minimum branch):** | | |
 | #122, #129, #130, #140, #141, #160, #161, #165, #170 | LangFuse reconciliation / pagination / filter gaps (M4 path) | M4 deferred. Proxied by M5 + Step 18.6 definition-token-cost. |
 | #132, #137, #143, #144, #146, #158, #159 | M2 contamination audit gates | M2 deferred. |
 | #142, #182 | T3 compression-loss taxonomy/coverage | T3 analyzer deferred. |
 | #154, #155, #156, #178 | Row 13/15 per-session coverage gates | Row 13/15 LangFuse analyzers deferred. |
 | #180 | Row 15 `aggregate()` drops non-list metadata | Row 15 analyzer deferred. |
 | #183, #184 | Context-utilization hardcoded window / empty-steps | Context-utilization analyzer deferred. |
+| #176 | Shift-runner fresh-DB guard | Shift run deferred. |
 | #188 | Shift-runner condition label collision | Shift run deferred. |
 
-**Reading the table:** every "defended" row has a check that fires on the bug. Every "deferred" row is silenced by §1's scope cut — the analyzer is not run for Chapter 6, so its bugs cannot surface in Chapter 6 numbers. Chapter 7 future work lists the deferred analyzers by filename; the audit trail remains in `docs/security/`.
+**Reading the table:** every "defended" row has a check that fires on the bug. Every "deferred" row is silenced by §1's scope cut — the analyzer or runner is not run for Chapter 6, so its bugs cannot surface in Chapter 6 numbers. Chapter 7 future work can describe the deferred work by topic; the audit trail remains in `docs/archive/security/`.
 
 If a check in Stages 1/4 does not actually fire on the finding it claims to defend, that is a protocol bug — fix it here, not in the analyzer.

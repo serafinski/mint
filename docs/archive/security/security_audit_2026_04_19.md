@@ -1,5 +1,12 @@
 # Security / Robustness Audit — 2026-04-19
 
+**Chapter 6 closeout note:** Findings #1-#18 target the contribution code and
+are fixed. Later analyzer/backfill/run-sheet findings are handled by
+`docs/EVAL_PROTOCOL.md`: the Chapter 6 evidence set was cut to metrics with
+two-source agreement and trace-audit checkpoints, while analyzers or runners
+outside that scope are deferred to Chapter 7 future work. Those deferred
+findings do not block or alter the frozen Chapter 6 results.
+
 **Scope:** Eighteen findings surfaced during a focused audit of `sandbox/`, `scripts/`, `src/`, and `tools/`. Findings #1-#4 logged 2026-04-19; #5-#6 added 2026-04-20 (first extension); #7-#8 added 2026-04-20 (second extension); #9-#11 added 2026-04-20 (third extension); #12-#14 added 2026-04-20 (fourth extension, detail in `security_audit_2026_04_19_ext4.md`); #15-#18 added 2026-04-20 (fifth extension, detail in `security_audit_2026_04_19_ext5.md`). Issue #5's original framing was superseded by #8 — see the note inside the #5 section.
 **Status:** All eighteen reproduced and verified against the current `iter/6-execution-backends` tip. **All eighteen fixed 2026-04-20** across the two-session sweep.
 **Priority:** P0s were #12, #13, #15, #17, #18 — all eval-blocking (distorted `chain_success` reporting, escaped filesystem writes, false-positive split coverage, T19/T20 drop, corrupted per-cycle utility snapshots). Alongside #6, #7, #8, #9, #10, #11 they shipped before any longitudinal run. #16 was a P1 silent-failure (truncation → invalid JSON); #1, #2, #3, #4, #5, #14 were Tranche 2 (ship-when-convenient) and also shipped in the same sweep.

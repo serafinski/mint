@@ -1,8 +1,11 @@
 # MINT — Execution Run Sheet
 
+> Superseded by `docs/EVAL_PROTOCOL.md` for the Chapter 6 evaluation protocol.
+> This file is retained as historical context only.
+
 At-a-glance command sequence for the thesis evaluation pipeline (Phase 3 smoke → Phase 4 eval → Phase 4/5 analysis).
 
-**Source of truth:** `docs/MASTER_PLAN_2026_04_13.md` §6.1. This file is the distilled run sheet — if anything here disagrees with the master plan, the plan wins.
+**Source of truth:** `docs/EVAL_PROTOCOL.md`. This file is the older distilled run sheet.
 
 **Last updated:** 2026-04-21 (after security audit ext12 — 10 P0/HIGH findings #114-#123 closed; #114 balanced-per-condition CTE fix, #115/#119/#122 watchdog + exit-code contracts, #116/#118 longitudinal completeness + zero-evidence guards, #117 run-sheet completeness filter below, #120 Context Economy fetch-degraded flag, #121 audit sample-plan scope-hash, #123 distribution-shift marker retry + analyzer refusal). Unit suite: **1,974 passing** (1,925 → 1,974; +49 ext12 regression + e2e tests).
 
