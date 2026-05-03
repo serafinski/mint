@@ -4,7 +4,7 @@
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
-# Resolve / mint the capture dir.
+# Resolve or create the capture dir.
 resolve_eval_out() {
     local stage_name="$1"
     local arg_dir="$2"
@@ -79,16 +79,17 @@ banner() {
 
 # ---- Audit cycle helpers ----
 #
-# Each stage follows this state machine:
+# Audit-gated stages use this checkpoint flow after automated checks pass:
 #   (no marker) --run--> SHAPE_OK (audit request generated) --verdicts-arrive--> PASS
 #                                                            \--verdicts-fail--> FAIL
 #
-# "Verdicts arrive" = user pastes Claude's response into <stage>_audit_verdicts.md
+# "Verdicts arrive" = user pastes Claude's/Codex's response into <stage>_audit_verdicts.md
 # and re-runs the stage script. The script then calls check_audit_verdicts.
 
 # Generate an audit request file for a given stage+profile.
 #   $1: stage short name (e.g. "stage0", "stage1")
-#   $2: profile (smoke / main_sample / disagreement / longitudinal_sample / plausibility_flagged)
+#   $2: profile (smoke / main_sample / disagreement / recurrence_sample /
+#                longitudinal_sample / plausibility_flagged)
 #   $3: extra arg passed to audit_traces.sh (optional)
 generate_audit_request() {
     local stage="$1"; local profile="$2"; shift 2
@@ -97,7 +98,7 @@ generate_audit_request() {
     return $?
 }
 
-# Check whether Claude's verdict file for a given stage is present and clean.
+# Check whether Claude's/Codex's verdict file for a given stage is present and clean.
 #   $1: stage short name — reads ${stage}_audit_verdicts.md
 # Returns:
 #   0 = file present AND verdict summary shows 0 FAILs
@@ -125,7 +126,7 @@ check_audit_verdicts() {
     return 0
 }
 
-# Print the "hand off to Claude" banner that tells the user exactly what to do.
+# Print the "hand off to Claude/Codex" banner that tells the user exactly what to do.
 print_audit_handoff() {
     local stage="$1"
     local profile="$2"
@@ -138,13 +139,13 @@ print_audit_handoff() {
   ────────────────────────────────────────────────────────────────
 
   The automated shape/agreement/plausibility checks passed for this stage.
-  BEFORE advancing, a Claude+LangFuse audit must confirm the underlying
+  BEFORE advancing, a Claude/Codex+LangFuse audit must confirm the underlying
   traces show real agent work.
 
-  1. Open a Claude session with LangFuse MCP tools (this session works).
+  1. Open a Claude/Codex session with LangFuse MCP tools (this session works).
   2. Paste the contents of:
          $req
-  3. Save Claude's response to:
+  3. Save Claude's/Codex's response to:
          $ver
   4. Re-run this stage script. It will read the verdicts and advance the marker.
 

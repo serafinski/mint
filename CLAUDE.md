@@ -87,7 +87,7 @@ src/
 
 tests/    unit/ (1000+ tests), integration/ (Docker-required), evaluation/ (harness + tasks + fixtures)
 scripts/  run_pilot, run_longitudinal, run_recurrence_eval, analyze_results,
-          analyze_longitudinal, backfill_definition_token_costs, eval_protocol/,
+          analyze_longitudinal, analyze_recurrence, eval_protocol/,
           test_pipeline, test_verification, test_auto_optimizer, test_split_merge,
           test_registry_matching
 tools/    quick_validate.py (DeepAgents skill validation)

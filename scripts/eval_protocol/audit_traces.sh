@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shared audit-request generator. Invoked by stage scripts to prepare a
-# profile-specific Claude+LangFuse-MCP audit request.
+# profile-specific Claude/Codex+LangFuse-MCP audit request.
 #
 # Usage:
 #   audit_traces.sh --stage <name> --profile <profile> --eval-dir <path>
@@ -44,7 +44,7 @@ profile = os.environ["AUDIT_PROFILE"]
 
 random.seed(42)
 
-# Real evaluation_runs schema (verified 2026-04-22):
+# Real evaluation_runs schema used by the eval snapshots:
 #   id, run_id, condition, task_id, capability_type, gate_passed, output_in_range,
 #   attempt_latency_ms, failure_reason, langfuse_trace_id, timestamp, ...
 # NO: expected_type, error_message, capability_name, cycle_id
@@ -302,7 +302,14 @@ elif profile == "plausibility_flagged":
                       AND langfuse_trace_id IS NOT NULL LIMIT 1
                 """, [t]).fetchall()
                 for r in found:
-                    rows.append(_row_to_dict(r, bucket=code, check=f"Why did {t} fail 5/5 in full?"))
+                    rows.append(_row_to_dict(
+                        r,
+                        bucket=code,
+                        check=(
+                            f"Why did {t} have zero successes in full-condition "
+                            f"runs? Stage 5 flag: {msg}"
+                        ),
+                    ))
         elif code == "P5_dominant_error":
             top_err = ps.get("info", {}).get("top_errors", [])
             if top_err:
@@ -346,7 +353,7 @@ plan = {
 lines = [
     f"# LangFuse trace audit — {stage} ({profile})",
     "",
-    "**Paste this entire file into a Claude session with LangFuse MCP tools.**",
+    "**Paste this entire file into a Claude/Codex session with LangFuse MCP tools.**",
     "",
     f"- Capture dir: `{eval_out}`",
     f"- DB: `{db_path}`",

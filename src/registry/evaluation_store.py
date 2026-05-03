@@ -165,8 +165,8 @@ _MIGRATIONS = [
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_index INTEGER",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_name VARCHAR",
     # Step 13.8 — free-text reason string from CompositionalExecutor (§12 finding
-    # #12 schema-key violations + AGENT timeout/error). Needed to classify
-    # compression_loss_subtask failures in scripts/analyze_compression_loss.py.
+    # #12 schema-key violations + AGENT timeout/error). Preserved so analysis
+    # code can distinguish chain-step failures from validation failures.
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_reason VARCHAR",
     # Step 14.6 — output contract check
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_mismatch BOOLEAN",

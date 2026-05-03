@@ -1,6 +1,6 @@
 """Tests for ext7 #51 — eval-registry advisory lock.
 
-Prevents concurrent invocation of ``run_pilot.py`` + the longitudinal runners
+Prevents concurrent invocation of ``run_pilot.py`` + ``run_longitudinal.py``
 against shared ``data/eval/`` registry dirs, which pre-fix corrupted state
 (one runner's ``rmtree`` wipes the other's active registry; snapshot-hash
 mismatches raise RuntimeError mid-run).

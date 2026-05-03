@@ -42,22 +42,22 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+from dotenv import load_dotenv
+
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute Phase 4 eval's
+# to ``environment=test`` so they don't pollute protocol eval
 # ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
 # ambient .env values can't override. Same pattern as ``tests/conftest.py``.
-import os  # noqa: E402
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
-
-from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
@@ -290,8 +290,14 @@ def test_happy_path(verbose: bool = False) -> bool:
         rr = metrics.reuse_rate("broad-data-processor")
         sr = metrics.success_rate("broad-data-processor")
         print(f"    broad-data-processor: reuse={rr:.2f}, success={sr:.2f} (split: >0.6 AND <0.7)")
-        print(f"    csv-row-cleaner: reuse={metrics.reuse_rate('csv-row-cleaner'):.3f} (merge: <0.05)")
-        print(f"    tsv-row-cleaner: reuse={metrics.reuse_rate('tsv-row-cleaner'):.3f} (merge: <0.05)")
+        print(
+            "    csv-row-cleaner: "
+            f"reuse={metrics.reuse_rate('csv-row-cleaner'):.3f} (merge: <0.05)"
+        )
+        print(
+            "    tsv-row-cleaner: "
+            f"reuse={metrics.reuse_rate('tsv-row-cleaner'):.3f} (merge: <0.05)"
+        )
 
         # Check similarity for merge candidates
         results = registry.search("csv-row-cleaner", n_results=5)
@@ -300,7 +306,10 @@ def test_happy_path(verbose: bool = False) -> bool:
             if cap.name == "tsv-row-cleaner":
                 sim = score
                 break
-        print(f"    csv↔tsv similarity: {sim:.3f}" if sim else "    csv↔tsv similarity: NOT FOUND")
+        print(
+            f"    csv↔tsv similarity: {sim:.3f}"
+            if sim else "    csv↔tsv similarity: NOT FOUND"
+        )
 
         # ==================================================================
         # Run pipeline with optimizer (through the real pipeline path)
@@ -384,7 +393,7 @@ def test_happy_path(verbose: bool = False) -> bool:
         ]
         parent = registry.get("broad-data-processor")
         if split_success:
-            print(f"\n  SPLIT (success): 1 capability split")
+            print("\n  SPLIT (success): 1 capability split")
             if parent and parent.is_active:
                 print("    FAIL: Parent should be deactivated after split")
                 all_pass = False
@@ -402,11 +411,17 @@ def test_happy_path(verbose: bool = False) -> bool:
                 empty_variants = []
                 for cap_id, _, _ in created:
                     variant = registry.get(cap_id)
-                    content = (variant.metadata or {}).get("skill_content", "") if variant else ""
+                    content = (
+                        (variant.metadata or {}).get("skill_content", "")
+                        if variant else ""
+                    )
                     if not content.strip():
                         empty_variants.append(cap_id)
                 if empty_variants:
-                    print(f"    FAIL: Variants have empty skill_content: {empty_variants}")
+                    print(
+                        "    FAIL: Variants have empty skill_content: "
+                        f"{empty_variants}"
+                    )
                     all_pass = False
                 else:
                     print("    OK (all variants have non-empty skill_content)")
@@ -415,7 +430,7 @@ def test_happy_path(verbose: bool = False) -> bool:
                 all_pass = False
         elif split_rollback:
             # Atomic-rollback invariant: parent must stay active
-            print(f"\n  SPLIT (rollback): gate rejected variants")
+            print("\n  SPLIT (rollback): gate rejected variants")
             if not parent or not parent.is_active:
                 print("    FAIL: Parent should STAY active after split_rollback")
                 all_pass = False
@@ -440,7 +455,11 @@ def test_happy_path(verbose: bool = False) -> bool:
         merge_rollback = [e for e in events if e[1] == "verification_rollback"]
 
         if merge_created:
-            print(f"\n  MERGE (success): {len(parent_merge)} parent(s) merged, {len(merge_created)} new cap(s) created")
+            print(
+                "\n  MERGE (success): "
+                f"{len(parent_merge)} parent(s) merged, "
+                f"{len(merge_created)} new cap(s) created"
+            )
             merged_name = merge_created[0][0]
             merged = registry.get(merged_name)
             merged_content = (merged.metadata or {}).get("skill_content", "") if merged else ""
@@ -453,7 +472,7 @@ def test_happy_path(verbose: bool = False) -> bool:
             else:
                 print(f"    OK (merged '{merged_name}' has non-empty skill_content)")
         elif merge_rollback:
-            print(f"\n  MERGE (rollback): gate rejected merged cap")
+            print("\n  MERGE (rollback): gate rejected merged cap")
             csv_cap = registry.get("csv-row-cleaner")
             tsv_cap = registry.get("tsv-row-cleaner")
             if csv_cap and csv_cap.is_active and tsv_cap and tsv_cap.is_active:
@@ -566,16 +585,25 @@ def test_rollback(verbose: bool = False) -> bool:
         # are actually met before we run the pipeline, else the rollback
         # path can't be exercised regardless of whether the patch works.
         total_inv = metrics.invocation_count_total()
-        print(f"\n  Pre-flight diagnostics:")
+        print("\n  Pre-flight diagnostics:")
         print(f"    total invocations: {total_inv} (auto-enable: >= 20)")
-        print(f"    csv-row-cleaner reuse: {metrics.reuse_rate('csv-row-cleaner'):.3f} (merge: < 0.05)")
-        print(f"    tsv-row-cleaner reuse: {metrics.reuse_rate('tsv-row-cleaner'):.3f} (merge: < 0.05)")
+        print(
+            "    csv-row-cleaner reuse: "
+            f"{metrics.reuse_rate('csv-row-cleaner'):.3f} (merge: < 0.05)"
+        )
+        print(
+            "    tsv-row-cleaner reuse: "
+            f"{metrics.reuse_rate('tsv-row-cleaner'):.3f} (merge: < 0.05)"
+        )
         sim_pairs = registry.search("csv-row-cleaner", n_results=5)
         csv_tsv_sim = next(
             (score for cap, score in sim_pairs if cap.name == "tsv-row-cleaner"),
             None,
         )
-        print(f"    csv↔tsv cosine: {csv_tsv_sim:.3f}" if csv_tsv_sim else "    csv↔tsv cosine: NOT FOUND")
+        print(
+            f"    csv↔tsv cosine: {csv_tsv_sim:.3f}"
+            if csv_tsv_sim else "    csv↔tsv cosine: NOT FOUND"
+        )
 
         # Patch gate.verify to reject any merged artifact. The merge op
         # calls verify() on the newly-constructed merged descriptor;

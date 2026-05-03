@@ -1,8 +1,8 @@
-# Eval protocol scripts — with Claude+LangFuse audit checkpoints
+# Eval protocol scripts — with Claude/Codex+LangFuse audit checkpoints
 
-Five stage scripts plus one helper. Each stage runs automated gates then **refuses to advance** until a Claude-assisted LangFuse trace audit confirms the data is real. The full specification lives in [`docs/EVAL_PROTOCOL.md`](../../docs/EVAL_PROTOCOL.md).
+Six stage scripts plus one helper. Audit-gated stages run automated checks, then **refuse to advance** until a Claude/Codex-assisted LangFuse trace audit confirms the data is real. The full specification lives in [`docs/EVAL_PROTOCOL.md`](../../docs/EVAL_PROTOCOL.md).
 
-## The state machine each stage uses
+## The audit checkpoint flow
 
 ```
 (no marker)
@@ -11,7 +11,7 @@ Five stage scripts plus one helper. Each stage runs automated gates then **refus
     ▼
 SHAPE_OK ─── audit request generated at $EVAL_OUT/stage<N>_audit_request.md
     │
-    │ you paste request into Claude; Claude pulls traces via LangFuse MCP;
+    │ you paste request into Claude/Codex; the audit session pulls traces via LangFuse MCP;
     │ you save response to $EVAL_OUT/stage<N>_audit_verdicts.md;
     │ you re-run the stage script
     ▼
@@ -24,9 +24,9 @@ The next stage's `require_prior_stage` gate refuses to run until the marker is `
 
 ```bash
 # Stage 0 — preflight (pytest, pipeline smoke, verification smoke, 3-task longitudinal smoke)
-scripts/eval_protocol/stage0_preflight.sh                # mints capture dir
+scripts/eval_protocol/stage0_preflight.sh                # creates capture dir
 # → runs shape checks, writes stage0.marker = SHAPE_OK, generates stage0_audit_request.md
-# → paste stage0_audit_request.md into Claude+MCP, save response as stage0_audit_verdicts.md
+# → paste stage0_audit_request.md into Claude/Codex+MCP, save response as stage0_audit_verdicts.md
 scripts/eval_protocol/stage0_preflight.sh docs/eval_runs/<ts>    # re-run: reads verdicts → PASS
 
 # Stage 1 — main eval (240 records, roughly a day unattended; 32h hard ceiling)
@@ -62,18 +62,18 @@ scripts/eval_protocol/stage5_plausibility.sh docs/eval_runs/<ts>
 Each stage generates a file like `$EVAL_OUT/stage1_audit_request.md`. It contains:
 
 - The capture-dir path and DB path
-- The exact MCP tool calls Claude should make (`mcp__langfuse__fetch_trace`, etc.)
+- The exact LangFuse MCP tool calls the audit session should make (`mcp__langfuse__fetch_trace`, etc.)
 - A stratified sample of rows selected for that stage's profile
 - Per-row "what to check" guidance
-- The exact output format Claude must produce
+- The exact output format the audit response must use
 
-You paste it into a Claude session with LangFuse MCP tools (this session qualifies). Claude pulls each trace, reads the actual execution, and returns a verdict table. The mandatory summary line is:
+You paste it into a Claude/Codex session with LangFuse MCP tools. The audit session pulls each trace, reads the actual execution, and returns a verdict table. The mandatory summary line is:
 
 ```
 AUDIT SUMMARY: 12 OK / 2 SUSPICIOUS / 0 FAIL
 ```
 
-You save Claude's response as `$EVAL_OUT/stage1_audit_verdicts.md` and re-run the stage script. It greps for that summary line. Zero FAILs → marker flips to `PASS`. Any FAIL → marker flips to `FAIL` and the stage blocks.
+You save the response as `$EVAL_OUT/stage1_audit_verdicts.md` and re-run the stage script. It greps for that summary line. Zero FAILs → marker flips to `PASS`. Any FAIL → marker flips to `FAIL` and the stage blocks.
 
 ## Audit profiles (what each stage samples)
 
@@ -109,13 +109,13 @@ Use sparingly — this is why the automated gates exist. Every use of this escap
 
 ## The four defense layers
 
-Each layer catches a different failure class. The audit layer (Claude+MCP) is the critical addition — without it, the scripts only catch shape + agreement + plausibility, which misses "numbers look fine, agent fabricated output."
+Each layer catches a different failure class. The audit layer (Claude/Codex+MCP) is the critical addition — without it, the scripts only catch shape + agreement + plausibility, which misses "numbers look fine, agent fabricated output."
 
 | Layer | Mechanism | Catches | Misses |
 |---|---|---|---|
 | **Shape** | Stage 1/4 completeness queries | missing rows, NULL labels, dupes | values wrong but shaped right |
 | **Agreement** | Stage 2/4 two-source cross-check | analyzer bugs | both sides wrong the same way |
 | **Plausibility** | Stage 5 priors | impossibly-shaped numbers | plausible-but-wrong numbers |
-| **Semantic (trace)** | Claude+MCP at every stage | "agent fabricated output", "tool no-op", "silent swallow" | cohort-level systematic effects (advisor / committee catches these) |
+| **Semantic (trace)** | Claude/Codex+LangFuse audit | "agent fabricated output", "tool no-op", "silent swallow" | cohort-level systematic effects (advisor / committee catches these) |
 
 All four + one advisor read = thesis-level defensibility. That is the whole plan.

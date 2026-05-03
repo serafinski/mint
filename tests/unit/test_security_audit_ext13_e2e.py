@@ -170,26 +170,6 @@ def _insert_invocation_events(
         conn.close()
 
 
-def _insert_human_labels(
-    db_path: Path,
-    labels: list[dict],
-) -> None:
-    """Populate ``human_label`` directly on existing evaluation_runs rows."""
-    conn = duckdb.connect(str(db_path))
-    try:
-        for lb in labels:
-            conn.execute(
-                """
-                UPDATE evaluation_runs
-                SET human_label = ?
-                WHERE run_id = ? AND condition = ? AND task_id = ?
-                """,
-                [lb["human_label"], lb["run_id"], lb["condition"], lb["task_id"]],
-            )
-    finally:
-        conn.close()
-
-
 # ---------------------------------------------------------------------------
 # #124 — analyze_longitudinal refuses proxy-KL downgrade
 # ---------------------------------------------------------------------------
@@ -468,63 +448,6 @@ def test_ext13_131_refuses_single_task_inflation(tmp_path):
     assert "distinct tasks" in combined or "ext13 #131" in combined, (
         f"Expected ext13 #131 diagnostic in output. Got:\n{combined[-800:]}"
     )
-
-
-# ---------------------------------------------------------------------------
-# #132 — analyze_results per-condition M2 coverage
-# ---------------------------------------------------------------------------
-
-
-def test_ext13_132_exits_7_on_partial_m2_coverage(tmp_path):
-    """Canonical 400-row DB; human_label populated only for condition='full'.
-    print_contamination_rate should flag the partial coverage → exit 7.
-    """
-    db = tmp_path / "partial_m2.duckdb"
-    base = datetime(2026, 4, 21, 10, 0, 0)
-    conditions = ["full", "no_verification", "no_optimization", "static"]
-    rows: list[dict] = []
-    for ci, cond in enumerate(conditions):
-        for run_i in range(5):
-            for task_i in range(20):
-                rows.append({
-                    "run_id": f"{cond}_run_{run_i}",
-                    "condition": cond,
-                    "task_id": f"T{task_i+1:02d}",
-                    "timestamp": base + timedelta(
-                        seconds=ci * 10000 + run_i * 100 + task_i
-                    ),
-                })
-    _seed_evaluation_runs(db, rows=rows)
-    # Seed invocation_events for every condition so M3 doesn't also fire
-    # (we want to isolate the M2 path).
-    _insert_invocation_events(db, events=[
-        {
-            "run_id": f"{cond}_run_0", "condition": cond,
-            "task_id": f"T{t+1:02d}", "capability_id": "cap-a",
-            "occurred_at": base + timedelta(seconds=ci * 10000 + t),
-        }
-        for ci, cond in enumerate(conditions) if cond != "static"
-        for t in range(20)
-    ])
-    # Populate human_label ONLY for 'full'.
-    _insert_human_labels(db, labels=[
-        {"run_id": "full_run_0", "condition": "full",
-         "task_id": f"T{t+1:02d}", "human_label": "correct"}
-        for t in range(5)
-    ])
-
-    result = _run_script(
-        "analyze_results.py",
-        "--db", str(db),
-        "--per-condition-cap", "5",
-        "--expected-runs-per-condition", "5",
-    )
-    # ext13 #132 partial coverage → exit 7 (shared with #126).
-    assert result.returncode == 7, (
-        f"Expected exit 7 on partial M2. Got {result.returncode}. "
-        f"stderr tail:\n{result.stderr[-600:]}"
-    )
-    assert "M2 partial coverage" in result.stderr
 
 
 # ---------------------------------------------------------------------------

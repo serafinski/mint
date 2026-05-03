@@ -3,12 +3,11 @@
 Step 18.7 landed the persistent cycle-state tables (``invocation_events``,
 ``cycle_utility_scores``, ``cycle_events``) + wired ``EvaluationHarness.
 _execute_run`` to flush per-task data after each ``pipeline.invoke()``.
-Step 18.8 surfaced that ``scripts/run_longitudinal.py`` and the new
-``scripts/run_longitudinal_shift.py`` inline their own task loops — they
-bypass the harness — so without a shared helper they'd also bypass the
-flush hooks. This module factors the flush logic out so both the harness
-(``tests.evaluation.harness._execute_run``) and the longitudinal scripts
-call the exact same code path.
+Step 18.7 surfaced that standalone longitudinal runners inline their own
+task loops and bypass the harness, so without a shared helper they would
+also bypass the flush hooks. This module factors the flush logic out so
+both the harness (``tests.evaluation.harness._execute_run``) and
+longitudinal scripts call the exact same code path.
 
 Never-raises-but-surfaces contract: ext13 #125 (2026-04-21) — the three
 persistence writes (`invocation_events`, `cycle_utility_scores`,

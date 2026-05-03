@@ -1,7 +1,7 @@
 """End-to-end tests for security audit ext15 / ext16 / ext17 / tmp.md findings.
 
-Covers the high-leverage fixes in this remediation bundle:
-- ext15 #151-#173 (~23 findings, open pre-bundle)
+Covers the high-leverage active fixes in this remediation bundle:
+- ext15 #151-#173, excluding findings tied to deferred analyzer paths
 - ext16 #174-#187 (~14 findings)
 - ext17 #188 (shift-runner condition identity)
 - tmp.md (~25 additional findings)
@@ -98,7 +98,6 @@ def _seed_eval_runs(db_path: Path, rows: list[dict]) -> None:
             store.record_run(rec)
     finally:
         store.close()
-
 
 # ---------------------------------------------------------------------------
 # ext16 #185 — FailureReason enum must accept "output_shape_mismatch".
@@ -230,60 +229,6 @@ def test_ext15_172_longitudinal_overfull_cycles_exits_3(tmp_path):
         f"stderr: {result.stderr[:400]}"
     )
     assert "overfull" in result.stderr.lower()
-
-
-# ---------------------------------------------------------------------------
-# ext15 #160 — M4 silent-zero gate fires on ANY JIT condition below threshold.
-# ---------------------------------------------------------------------------
-
-
-def test_ext15_160_m4_gate_fires_when_one_jit_condition_is_zero(tmp_path):
-    """Pre-fix: max(jit_ratios) < 0.5 required EVERY condition below
-    threshold. Now ANY single zeroed JIT condition fires the gate.
-    """
-    db = tmp_path / "campaign.duckdb"
-    rows: list[dict] = []
-    # full: all non-zero cost (ratio 1.0)
-    for i in range(5):
-        rows.append({
-            "run_id": f"full_{i}", "condition": "full",
-            "task_id": f"T{i + 4:02d}", "token_cost": 100,
-            "generated_artifact_count": 1,
-        })
-    # no_verification + no_optimization: all zero (ratio 0.0)
-    for cond in ("no_verification", "no_optimization"):
-        for i in range(5):
-            rows.append({
-                "run_id": f"{cond}_{i}", "condition": cond,
-                "task_id": f"T{i + 4:02d}", "token_cost": 0,
-                "generated_artifact_count": 1,
-            })
-    # static: all zero (legitimate)
-    for i in range(5):
-        rows.append({
-            "run_id": f"static_{i}", "condition": "static",
-            "task_id": f"T{i + 4:02d}", "token_cost": 0,
-            "generated_artifact_count": 0, "capability_type": None,
-        })
-
-    _seed_eval_runs(db, rows)
-    result = _run_script(
-        "analyze_results.py",
-        "--db", str(db),
-        "--expected-conditions", "4",
-        "--expected-tasks", "5",
-        "--expected-runs-per-condition", "5",
-        "--allow-incomplete",  # don't block on task range mismatch
-        timeout=30,
-    )
-    # The M4 gate returns False → missing_metrics accumulates → exit 7.
-    # Accept exit 7 OR exit 2 (the canonical task-id check also fires
-    # on this synthetic dataset; both surface the same "something is
-    # wrong" signal).
-    assert result.returncode in (2, 7), (
-        f"expected exit 2 or 7 (some gate fired), got {result.returncode}. "
-        f"stderr: {result.stderr[:500]}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -469,30 +414,3 @@ def test_tmp_md_p1_update_human_label_optimistic_concurrency(tmp_path):
         assert store.update_human_label("nonexistent_id", "correct") is False
     finally:
         store.close()
-
-
-# ---------------------------------------------------------------------------
-# tmp.md P1 — backfill_definition_token_costs missing stores exit 4.
-# ---------------------------------------------------------------------------
-
-
-def test_tmp_md_p1_backfill_definition_token_costs_all_missing_exits_4(tmp_path):
-    """Every targeted store missing → previously exited 0 silently."""
-    # The script's ROOT-relative path defaults to data/eval/chroma. To isolate,
-    # we use the test-by-intent: if the default path happens to exist on this
-    # dev machine, the test is skipped. The assertion is the key one.
-    eval_chroma = ROOT / "data" / "eval" / "chroma"
-    if eval_chroma.exists():
-        pytest.skip(
-            "default ChromaDB store exists on this machine; "
-            "the all-missing branch can't be exercised deterministically."
-        )
-
-    result = _run_script(
-        "backfill_definition_token_costs.py",
-        timeout=15,
-    )
-    assert result.returncode == 4, (
-        f"expected exit 4 (all stores missing); got {result.returncode}. "
-        f"stderr: {result.stderr[:400]}"
-    )

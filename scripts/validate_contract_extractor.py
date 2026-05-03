@@ -1,14 +1,12 @@
 """Validate the OutputContract LLM extractor against authored T-task contracts.
 
-Step 14.6 — Fix B (extractor agreement validation).
-
 The free-form task path uses ``_extract_output_contract_llm`` to convert a
 natural-language task prompt into a typed ``OutputContract``. The eval harness
 mostly uses authored contracts directly. To make sure the eval results remain
-representative of the extractor behavior — and to apply the thesis's
-verification philosophy to its own measurement instrument — this script runs
-the LLM extractor on every T-task ``task_prompt`` and asserts agreement with
-the authored ``output_contract``.
+representative of the resolver's fallback behavior — and to apply the thesis's
+verification philosophy to its own measurement instrument — this script runs the
+LLM extractor on every T-task ``task_prompt`` and asserts agreement with the
+authored ``output_contract``.
 
 Usage::
 
@@ -20,10 +18,7 @@ The result gets recorded in the thesis appendix as evidence that the
 contract-extraction layer is calibrated. If N < 20, the disagreement cases
 are either fixed by tightening the extractor system prompt
 (``src/orchestrator/output_contract_resolver.py::_EXTRACTOR_SYSTEM_PROMPT``)
-or disclosed in Chapter 4 as known extractor/eval-contract differences.
-
-Aligned with ``docs/thesis_proposal.md`` §Pillar 2 (verification of LLM
-output before trust) and ``docs/MASTER_PLAN_2026_04_13.md`` §14.6 Part D.
+or disclosed as known extractor/eval-contract differences.
 """
 
 from __future__ import annotations
@@ -43,9 +38,9 @@ def _load_env() -> None:
         from dotenv import load_dotenv
     except ImportError:
         return
-    # Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-    # to ``environment=test`` so they don't pollute Phase 4 eval. Must be
-    # set BEFORE ``load_dotenv`` so ambient .env values can't override.
+    # Route dev-script LangFuse emissions to ``environment=test`` so they
+    # don't pollute protocol eval traces. Must be set BEFORE ``load_dotenv``
+    # so ambient .env values can't override.
     import os
     os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
     root = Path(__file__).resolve().parent.parent

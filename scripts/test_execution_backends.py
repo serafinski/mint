@@ -1,10 +1,10 @@
-"""Spot-check the three execution backends.
+"""Spot-check the SKILL and AGENT execution backends.
 
 Runs one SKILL task (T04) and one AGENT task (T16) directly through
 `execute_skill_artifact` / `execute_agent_artifact` with a MockArtifact,
 bypassing the generator and verification gate. Use this when eval execution
 behaves unexpectedly and you need to isolate whether the execution backends
-themselves still work.
+that changed from the original MCP-only sandbox path still work.
 
 Usage::
 
@@ -17,21 +17,21 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute Phase 4 eval's
+# to ``environment=test`` so they don't pollute protocol eval
 # ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
 # ambient .env values can't override. Same pattern as ``tests/conftest.py``.
-import os  # noqa: E402
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
-
-from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
@@ -39,14 +39,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
-logger = logging.getLogger("test_backends")
 
 
 def _test_skill() -> bool:
     """Test SKILL backend with T04 (inventory reorder)."""
     from tests.evaluation.execution import (
-        GenericResult,
-        T04Result,
         _read_fixture_contents,
         execute_skill_artifact,
     )
@@ -68,7 +65,8 @@ def _test_skill() -> bool:
             "1. Load the inventory CSV and reorder rules YAML.\n"
             "2. For each product, compute days_of_stock = current_stock / daily_usage.\n"
             "3. Identify products where days_of_stock < min_days_of_stock.\n"
-            "4. For products needing reorder: reorder_qty = ceil(daily_usage * reorder_days_supply), "
+            "4. For products needing reorder: reorder_qty = "
+            "ceil(daily_usage * reorder_days_supply), "
             "order_cost = reorder_qty * unit_cost, capped at max_order_value.\n"
             "5. Sum total_reorder_cost across all products needing reorder.\n"
             "6. Return product_count, items_below_threshold, total_reorder_cost.\n"

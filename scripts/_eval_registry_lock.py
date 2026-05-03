@@ -1,26 +1,25 @@
-"""Cross-runner lock on the shared eval registry directories (ext7 #51).
+"""Advisory lock for shared eval registry state (ext7 #51).
 
-`run_pilot.py`, `run_longitudinal.py`, and `run_longitudinal_shift.py` all
-mutate the same ``data/eval/chroma``, ``src/mcp_tools``, ``data/eval/skills``,
-and ``tests/evaluation/snapshots`` directories — via ``rmtree`` at startup
-(ext6 #31) and via ChromaDB collection writes throughout the run.
+``run_pilot.py`` and ``run_longitudinal.py`` both mutate shared eval state:
+``data/eval/chroma``, ``data/eval/skills``, and the clean snapshot under
+``tests/evaluation/snapshots``. Snapshot restore also touches
+``src/mcp_tools`` because it is part of the snapshot contract.
 
-Running any two concurrently corrupts the shared state: one runner's rmtree
-wipes the other's active registry; one runner's snapshot overwrites the
-other's, and when the first runner calls ``restore_clean_snapshot`` later it
-sees a different hash and raises ``RuntimeError: Snapshot ID mismatch``.
+Running both active eval runners concurrently can corrupt that state: one
+runner's cleanup can wipe the other's active registry, and one runner's
+snapshot can overwrite the other's expected clean baseline.
 
 The fix: an advisory file lock at ``data/eval/.eval_runner.lock``. Any
 subsequent runner that tries to start while another holds the lock refuses
-with exit code 2 and a pointer to this finding. The run sheet documents
-the serial execution order; this lock is belt-and-braces for when docs
-are ignored.
+with exit code 2. The protocol documents serial execution; this lock enforces
+that constraint at runtime.
 """
 
 from __future__ import annotations
 
 import fcntl
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -38,11 +37,9 @@ def acquire_runner_lock(
     (kept in a module-level variable or similar). Closing the process
     releases the lock via the OS.
 
-    Separate locks per data directory: callers running against fresh
-    per-runner ``--chroma-dir`` / ``--skills-dir`` overrides (the Chapter-7
-    genuinely-parallel path) set a distinct ``data_dir`` and get a distinct
-    lock file — so the mechanism doesn't block legitimate parallelism when
-    shared state isn't the issue.
+    Separate ``data_dir`` values get separate lock files. This keeps isolated
+    tests or developer experiments from contending when they do not share
+    runtime state.
     """
     lock_path = data_dir / ".eval_runner.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,17 +49,16 @@ def acquire_runner_lock(
     except OSError:
         logger.error(
             "Another eval runner holds the lock at %s — per ext7 #51, the "
-            "eval registry directories (%s, src/mcp_tools, snapshots) are "
-            "NOT safe for concurrent access. Either wait for the other run "
-            "to finish, or use per-runner --chroma-dir / --skills-dir / "
-            "--snapshot-dir overrides (Chapter 7 future work).",
+            "eval registry state (%s plus shared snapshots) is NOT safe for "
+            "concurrent access. Wait for the other run to finish, or run "
+            "against a separate data directory for isolated experiments.",
             lock_path, data_dir,
         )
         sys.exit(2)
 
     # Record who holds the lock for diagnostics.
     try:
-        lock_file.write(f"runner={runner_name}\npid={__import__('os').getpid()}\n")
+        lock_file.write(f"runner={runner_name}\npid={os.getpid()}\n")
         lock_file.flush()
     except OSError:
         pass

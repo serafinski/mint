@@ -39,8 +39,7 @@ from src.schemas.evaluation import EvaluationRecord  # noqa: E402
 def _reset_analyze_results_module_state():
     """ext7 #44/#52: reset module-level ``_SCOPE_SQL`` + ``_COMPLETENESS_BANNER``
     around each test so ``main()``-invoking tests don't poison siblings
-    (e.g., ``test_audit_contamination`` runs after us and saw empty DBs
-    because the scope was still ``AND run_id IN ('new_full')``).
+    because a prior test left a run-id scope active).
     """
     import scripts.analyze_results as _ar
 
@@ -771,7 +770,7 @@ def test_auto_select_no_scope_needed_when_few_runs():
 
 
 # ---------------------------------------------------------------------------
-# ext7 #44 — M2 + M3 queries must honor _SCOPE_SQL
+# ext7 #44 — M3 queries must honor _SCOPE_SQL
 # ---------------------------------------------------------------------------
 
 
@@ -832,53 +831,6 @@ def test_m3_gini_ignores_scope_when_empty(capsys):
     # Both conditions present — no scope filter dropped either run.
     assert "JIT + Verif + Opt" in output
     assert "Static" in output
-
-
-def test_m2_contamination_respects_scope_sql(capsys):
-    """Pre-fix, print_mock_contamination_rate's WHERE clause filtered by
-    is_pilot only; human labels from prior campaigns leaked into the current
-    M2 aggregate. Post-fix, _SCOPE_SQL constrains the query to the requested
-    run_ids, so Chapter 6 M2 columns reflect only the scoped campaign.
-    """
-    import scripts.analyze_results as ar
-    from scripts.analyze_results import print_contamination_rate
-
-    store, conn = _open_in_memory_store()
-    # Old campaign — 2 labeled rows (1 contaminated, 1 correct).
-    old_a = _record(condition="full", gate_passed=True, output_in_range=True,
-                    latency_ms=100, task_id="T04")
-    old_b = _record(condition="full", gate_passed=True, output_in_range=True,
-                    latency_ms=200, task_id="T04")
-    store.record_run(old_a)
-    store.record_run(old_b)
-    conn.execute(
-        "UPDATE evaluation_runs SET run_id = 'old_full', human_label = 'contaminated' "
-        "WHERE attempt_latency_ms = 100"
-    )
-    conn.execute(
-        "UPDATE evaluation_runs SET run_id = 'old_full', human_label = 'correct' "
-        "WHERE attempt_latency_ms = 200"
-    )
-    # New campaign — NO labels yet. M2 should report 0 sampled when scoped.
-    new = _record(condition="full", gate_passed=True, output_in_range=True,
-                  latency_ms=300, task_id="T04")
-    store.record_run(new)
-    conn.execute(
-        "UPDATE evaluation_runs SET run_id = 'new_full' WHERE attempt_latency_ms = 300"
-    )
-
-    ar._SCOPE_SQL = " AND run_id IN ('new_full')"
-    try:
-        print_contamination_rate(conn)
-    finally:
-        ar._SCOPE_SQL = ""
-    output = capsys.readouterr().out
-    # When scoped to new_full, there are no labeled rows — M2 should render
-    # the "audit not performed" fallback, NOT leak old_full's labels.
-    assert "audit not performed" in output.lower() or "no labels" in output.lower() or "n_sampled" not in output.lower() or "0" in output
-    # Pre-fix the output would have shown 1 contaminated + 1 correct; post-fix
-    # those rows are scope-excluded.
-    assert "contaminated" not in output.lower() or "1" not in output.split("contaminated")[-1][:50]
 
 
 def test_every_analyzer_query_applies_scope_or_is_exempt():
@@ -1013,7 +965,7 @@ def test_record_invocation_events_threads_is_pilot():
 
 def test_m3_gini_excludes_pilot_invocations(capsys):
     """ext7 #50: pilot invocation rows are structurally excluded from the Gini
-    computation. Pre-fix, pilot rows (Row 7 of run_sheet) silently deflated
+    computation. Pre-fix, pilot rows from preflight/pilot runs silently deflated
     Gini on the full campaign because the schema had no is_pilot marker.
     """
     store, conn = _open_in_memory_store()

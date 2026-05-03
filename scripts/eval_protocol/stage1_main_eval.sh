@@ -61,19 +61,19 @@ if [[ ! -f "$EVAL_OUT/$MARKER" ]]; then
     [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; exit 0; }
 
     rm -rf data/eval/chroma data/eval/skills
-    # State leak cleanup (2026-04-22 post-preflight audit):
-    # - `.eval_runner.lock`: stale lock from pre-flights would block run_pilot's
-    #   ext7 #51 lock acquisition. Safe to wipe here; we verified no eval
-    #   runner is running before launch.
+    # Runtime-state cleanup for a fresh Stage 1 launch:
+    # - `.eval_runner.lock`: stale locks from earlier eval commands would block
+    #   a new runner.
     # - `domains.json`: evolutionary taxonomy from pre-flights would give
     #   Stage 1 a warm-start the proposal's cold-start assumption doesn't
     #   match. Wipe for clean state.
-    # - `metrics_store*.duckdb`: MetricsStore persistence from pre-flights
-    #   would contaminate invocation counts used for M3 Gini.
+    # - Stage 1 MetricsStore persistence would contaminate invocation counts
+    #   used for M3 Gini; the pinned base path is removed below and run_pilot
+    #   --fresh-db clears derived per-condition stores.
     rm -f data/eval/.eval_runner.lock
     rm -f data/eval/domains.json
 
-    # Sanity-check no eval runner is currently running before wiping state.
+    # Sanity-check no eval runner is currently running before launching Stage 1.
     if pgrep -fl "run_pilot.py\|run_longitudinal.py" > /dev/null 2>&1; then
         echo "ERROR: an eval runner is currently running:"
         pgrep -fl "run_pilot.py\|run_longitudinal.py"
@@ -95,19 +95,13 @@ if [[ ! -f "$EVAL_OUT/$MARKER" ]]; then
     # 4 conditions × 8h = 32h hard ceiling — the campaign cannot hang past
     # that. Made explicit here so future default changes don't silently
     # extend the window.
-    # K=3 runs per cell (240 total records). Disclosure §11 note: reduced from
-    # the K=5 planning target after the 2026-04-22 pre-flight confirmed ~4-5min
-    # per run (projecting K=5 to 30h vs K=3 to 18h). Real wall-clock time can
-    # be higher once full-condition verification/retry costs are included; the
-    # 8h per-condition budget above is the operational guardrail. K=3 retains ±12.6pp CI at
-    # 50% success per condition — sufficient for cross-condition comparisons at
-    # >=10pp deltas. If deltas are muddy after this run, append K=2 more via
-    # --n-runs 2 --append for cumulative K=5.
+    # K=3 runs per cell (240 total records). This is the frozen Chapter 6
+    # evidence matrix; use a new versioned campaign rather than appending if
+    # a future run needs a larger sample.
     # caffeinate prevents macOS idle sleep during the unattended run.
     # -i = prevent idle sleep, -d = prevent display sleep, -s = prevent system
-    # sleep on AC. Without this, closed-lid or 15-min-idle pauses all Docker
-    # containers mid-run → condition SIGALRM watchdog fires against a stopped
-    # process → partial-condition aborts at wake-up.
+    # sleep on AC. Without this, closed-lid or idle sleep can pause all Docker
+    # containers during the unattended campaign and cause false watchdog aborts.
     nohup caffeinate -i -s uv run scripts/run_pilot.py \
         --all-tasks --all-conditions --n-runs 3 \
         --db "$PILOT_DB" --fresh-db \
@@ -147,7 +141,7 @@ fi
 
 cp "$PILOT_DB" "$EVAL_OUT/12_metrics.duckdb"
 
-banner "Stage 1 — four go/no-go queries"
+banner "Stage 1 — completeness go/no-go checks"
 uv run python - <<'PY' 2>&1 | tee "$EVAL_OUT/13_stage1_gate.json"
 import duckdb, json, os, sys
 eval_out = os.environ["EVAL_OUT"]

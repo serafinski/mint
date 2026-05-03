@@ -11,8 +11,8 @@ the formula can optimize for the proposal's "Context Economy" tension
 optimizer was blind to prompt bloat — whatever the observed registry
 evolution did, it wasn't optimizing for definition-token-cost even though
 the proposal names it as a core input. ``CapabilityDescriptor.
-definition_token_cost`` is populated by Row 12's
-``backfill_definition_token_costs.py`` (Step 18.6).
+definition_token_cost`` is populated when capabilities are registered
+(seeded, generated, loaded, or optimizer-created).
 """
 
 from __future__ import annotations

@@ -1,22 +1,16 @@
-"""Shared SIGALRM-based budget watchdog for long-running campaign scripts.
+"""SIGALRM-based budget watchdog for long-running eval tasks.
 
-Security audit ext12 #119 (2026-04-21): ``scripts/run_pilot.py`` wrapped each
-``harness.run_condition`` call in a SIGALRM-based watchdog that raised
-``BudgetExceeded`` on timeout (ext10 #103). Neither longitudinal runner
-inherited this safety: ``scripts/run_longitudinal.py`` and
-``scripts/run_longitudinal_shift.py`` called ``pipeline.invoke(...)`` in a
-naked per-task loop with no timeout. A single hung Docker container, a
-stalled LangFuse API, or a DeepAgent plateau at ``recursion_limit=50`` with
-no terminal output could freeze the whole row 9 / row 10 campaign with no
-abort signal — unattended overnight, the ~6-10h wall-clock budget could
-burn on a single stuck task.
+Security audit ext12 #119 (2026-04-21): the longitudinal runner called
+``pipeline.invoke(...)`` in a per-task loop with no timeout. A single hung
+Docker container, stalled LangFuse API call, or DeepAgent plateau at
+``recursion_limit=50`` could freeze the campaign with no abort signal.
 
-This module factors out the watchdog primitive so both the pilot runner
-and the two longitudinal runners apply the same semantics (fail-fast on
-timeout + non-zero exit code for orchestrator-level detection). Unix-only
-— SIGALRM is unavailable on Windows; on unsupported platforms the context
-manager is a no-op with a single WARNING so the caller sees the
-degradation.
+This module provides the watchdog primitive used by
+``scripts/run_longitudinal.py`` for per-task fail-fast behavior. The pilot
+and recurrence runners currently keep local condition-level watchdogs with
+similar semantics. Unix-only: SIGALRM is unavailable on Windows; on
+unsupported platforms the context manager is a no-op with a single WARNING
+so the caller sees the degradation.
 """
 
 from __future__ import annotations
@@ -31,11 +25,10 @@ from collections.abc import Iterator
 class BudgetExceeded(BaseException):
     """Raised by ``budget_watchdog`` when the wrapped block exceeds the budget.
 
-    Named to match ``scripts.run_pilot.BudgetExceeded`` (ext10 #103) so
-    callers can catch either import path uniformly. The two classes are
-    intentionally distinct (not a re-export) because ``run_pilot.py`` still
-    carries its own definition for backwards compat with any in-tree test
-    that imports from there.
+    Named to match ``scripts.run_pilot.BudgetExceeded`` (ext10 #103), but
+    intentionally not re-exported from there. ``run_longitudinal.py`` catches
+    this module's exception class; ``run_pilot.py`` keeps its local
+    condition-level watchdog and exception.
 
     Inherits from ``BaseException`` rather than ``Exception`` so a watchdog
     abort cannot be silently swallowed by broad third-party ``except

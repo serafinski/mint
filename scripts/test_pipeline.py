@@ -1,12 +1,12 @@
-"""Integration test for the full JIT capability pipeline (Pillar 1).
+"""Integration smoke for the base JIT capability pipeline (Pillar 1).
 
-Runs tasks through the complete 9-node pipeline and verifies every
+Runs tasks through the base pipeline and verifies every
 intermediate state: decomposition -> gap detection -> classification
 -> generation -> verification -> loading -> registration.
 
-Tests all three capability types with inline prompts (not imported from
-`tests/evaluation/tasks.py`), so this script is independent of testbed
-changes. Representative shapes:
+Uses inline prompts intended to exercise all three capability types
+(not imported from `tests/evaluation/tasks.py`), so this script is
+independent of testbed changes. Representative shapes:
 - MCP_TOOL: dirty CSV cleaning
 - SKILL: multi-source data integration
 - AGENT: anomaly investigation
@@ -28,26 +28,23 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute Phase 4 eval's
+# to ``environment=test`` so they don't pollute protocol eval
 # ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
 # ambient .env values can't override. Same pattern as ``tests/conftest.py``.
-import os  # noqa: E402
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 
-from dotenv import load_dotenv  # noqa: E402
-
 load_dotenv(ROOT / ".env")
-
-logger = logging.getLogger(__name__)
 
 FIXTURES_DIR = ROOT / "tests" / "evaluation" / "fixtures"
 
@@ -62,7 +59,7 @@ def run_pipeline_and_verify(
     expected_type: str,
     test_name: str,
     *,
-    validate_output: Any | None = None,
+    validate_output,
 ) -> bool:
     """Run a task through the full pipeline and verify each stage.
 
@@ -70,8 +67,7 @@ def run_pipeline_and_verify(
         task_prompt: The task description to send to the pipeline.
         expected_type: Expected capability type ("mcp_tool", "skill", "agent").
         test_name: Display name for the test.
-        validate_output: Optional callable(artifacts, registry) -> bool for
-            output validation. If None, skips execution validation.
+        validate_output: callable(artifacts) -> bool for output validation.
 
     Returns:
         True if all checks pass.
@@ -104,8 +100,8 @@ def run_pipeline_and_verify(
 
         # --- Run pipeline ---
         # Security audit finding #88 (2026-04-19, ext9): use the canonical
-        # builder so Phase 3 smoke tests exercise the same entry-point
-        # shape (contract-as-object) as Phase 4 production. Pre-fix
+        # builder so the Stage 0 smoke test exercises the same entry-point
+        # shape (contract-as-object) as protocol eval. Pre-fix
         # ``TaskState(task_description=...)`` bypassed contract injection
         # and the downstream writer-synthesis guard, so the smoke gate
         # tested a simpler path than production.
@@ -237,20 +233,17 @@ def run_pipeline_and_verify(
         else:
             print("     OK")
 
-        # --- 7. Output validation (optional) ---
-        if validate_output is not None:
-            print("\n  7. Output validation:")
-            try:
-                valid = validate_output(artifacts, registry)
-                if valid:
-                    print("     OK")
-                else:
-                    all_pass = False
-            except Exception as exc:
-                print(f"     FAIL: Validation raised: {exc}")
+        # --- 7. Output validation ---
+        print("\n  7. Output validation:")
+        try:
+            valid = validate_output(artifacts)
+            if valid:
+                print("     OK")
+            else:
                 all_pass = False
-        else:
-            print("\n  7. Output validation: SKIP (no validator provided)")
+        except Exception as exc:
+            print(f"     FAIL: Validation raised: {exc}")
+            all_pass = False
 
         loader.cleanup()
 
@@ -262,11 +255,11 @@ def run_pipeline_and_verify(
 
 
 # ---------------------------------------------------------------------------
-# MCP_TOOL test (T04: pipe-delimited CSV)
+# MCP_TOOL test (T05: dirty CSV cleaning)
 # ---------------------------------------------------------------------------
 
 
-def _validate_mcp_output(artifacts, registry) -> bool:
+def _validate_mcp_output(artifacts) -> bool:
     """Execute the generated MCP tool in sandbox and verify output."""
     from src.verification.behavioral import _extract_function_name
     from src.verification.sandbox_tool import resolve_extra_packages, sandbox_execute
@@ -375,7 +368,7 @@ def test_mcp_tool() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _validate_skill_output(artifacts, registry) -> bool:
+def _validate_skill_output(artifacts) -> bool:
     """Check that a SKILL artifact was produced with valid content."""
     skill_artifacts = [
         a for a in artifacts
@@ -402,7 +395,10 @@ def _validate_skill_output(artifacts, registry) -> bool:
     # Basic structural checks
     has_frontmatter = content.startswith("---")
     has_name = "name:" in content
-    print(f"     SKILL content: {len(content)} chars, frontmatter={has_frontmatter}, name={has_name}")
+    print(
+        f"     SKILL content: {len(content)} chars, "
+        f"frontmatter={has_frontmatter}, name={has_name}"
+    )
     print(f"     Preview: {content[:150]}...")
     return True
 
@@ -432,7 +428,7 @@ def test_skill() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _validate_agent_output(artifacts, registry) -> bool:
+def _validate_agent_output(artifacts) -> bool:
     """Check that an AGENT artifact was produced with valid config."""
     agent_artifacts = [
         a for a in artifacts

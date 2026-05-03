@@ -141,7 +141,7 @@ if len(run_index_trend) >= 3:
     if last_val - first_val > 0.3:  # 30pp jump from earliest to latest run index
         flag("INVESTIGATE","P10_snapshot_leak",
              f"full success rises {first_val:.2f}→{last_val:.2f} across run_index — "
-             "snapshot restore may be leaking state between runs (finding #10)")
+             "snapshot restore may be leaking state between runs")
 
 ca = None
 try:

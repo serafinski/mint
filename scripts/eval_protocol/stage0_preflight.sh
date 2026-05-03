@@ -77,10 +77,10 @@ if [[ -z "$FAIL_REASON" ]]; then
     run_logged "02_test_verification.log" uv run scripts/test_verification.py
     VERIF_RC=$?
     # This script is a high-level smoke against a hand-written reference MCP tool.
-    # The 2015 unit tests in tests/unit/test_verification/ are the authoritative
-    # coverage of Tier 0/1/1.5/2/3 logic. If the unit tests pass and test_pipeline.py
-    # exercised all three capability types end-to-end (both gating checks above),
-    # test_verification.py's outcome is informational — log it, do not block on it.
+    # The unit suite is the authoritative coverage for Tier 0/1/1.5/2/3 logic.
+    # If the unit tests pass and test_pipeline.py exercised all capability types
+    # end-to-end, test_verification.py's outcome is informational — log it, do
+    # not block on it.
     if [[ $VERIF_RC -ne 0 ]]; then
         echo "NOTE: test_verification.py exited non-zero ($VERIF_RC)." | tee -a "$EVAL_OUT/02_test_verification.log"
         echo "      Not treated as a blocker — unit tests + test_pipeline are authoritative." | tee -a "$EVAL_OUT/02_test_verification.log"
@@ -152,7 +152,7 @@ if [[ $AUDIT_RC -ne 0 ]]; then
     exit 1
 fi
 
-write_marker "$MARKER" "SHAPE_OK" "shape checks green; awaiting Claude+MCP audit verdicts"
+write_marker "$MARKER" "SHAPE_OK" "shape checks green; awaiting Claude/Codex+MCP audit verdicts"
 echo "STAGE 0: shape OK."
 print_audit_handoff "stage0" "smoke"
 exit 0

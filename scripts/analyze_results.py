@@ -7,7 +7,7 @@ Produces:
 - Exact binomial 95% confidence intervals
 - gate_passed and output_in_range as separate columns
 - Fisher's exact test (each JIT condition vs static, per task)
-- Per-task effect sizes
+- Per-task success details
 - Failure breakdown by condition
 
 Usage::
@@ -23,11 +23,11 @@ import argparse
 import sys
 from pathlib import Path
 
+import duckdb
+from scipy import stats
+
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
-
-import duckdb  # noqa: E402
-from scipy import stats  # noqa: E402
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -122,7 +122,7 @@ def load_data(db_path: str) -> duckdb.DuckDBPyConnection:
 # resolved at ``main()`` startup. Every SQL query appends this fragment
 # to its WHERE clause so analyzers operate on a single run-set. Empty
 # string when no scoping is requested (legacy behavior). Populated by
-# ``_apply_scope`` below.
+# ``_resolve_scope`` below.
 _SCOPE_SQL: str = ""
 
 # ext7 #52 (2026-04-20): banner to mark Chapter-6 output tables as
@@ -189,8 +189,6 @@ def _resolve_scope(
     Returns "" when no scoping is applied (legacy mode — unsafe on
     multi-run DBs).
     """
-    import sys as _sys
-
     if run_ids:
         safe_ids = [r.replace("'", "''") for r in run_ids]
         return " AND run_id IN ({})".format(
@@ -258,9 +256,9 @@ def _resolve_scope(
             f"ERROR: auto-select covered {len(selected_conditions)}/{condition_count} "
             f"conditions. Pass --run-ids explicitly to include all conditions, "
             f"or --per-condition-cap to adjust.",
-            file=_sys.stderr,
+            file=sys.stderr,
         )
-        _sys.exit(2)
+        sys.exit(2)
 
     if total_available > len(latest):
         print(
@@ -268,7 +266,7 @@ def _resolve_scope(
             f"auto-selected {len(latest)} total across {len(selected_conditions)} "
             f"conditions (target cap: {per_condition_cap} per condition). "
             f"Pass --run-ids to override.",
-            file=_sys.stderr,
+            file=sys.stderr,
         )
 
     safe_latest = [r.replace("'", "''") for r in latest]
@@ -296,10 +294,22 @@ def query_condition_summary(
         SELECT
             condition,
             COUNT(*) AS n,
-            SUM(CASE WHEN gate_passed AND output_in_range AND NOT COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS successes,
+            SUM(CASE
+                WHEN gate_passed
+                 AND output_in_range
+                 AND NOT COALESCE(output_shape_mismatch, FALSE)
+                THEN 1 ELSE 0
+            END) AS successes,
             SUM(CASE WHEN gate_passed THEN 1 ELSE 0 END) AS gate_passed,
-            SUM(CASE WHEN output_in_range AND NOT COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS output_in_range,
-            SUM(CASE WHEN COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS shape_mismatch
+            SUM(CASE
+                WHEN output_in_range
+                 AND NOT COALESCE(output_shape_mismatch, FALSE)
+                THEN 1 ELSE 0
+            END) AS output_in_range,
+            SUM(CASE
+                WHEN COALESCE(output_shape_mismatch, FALSE)
+                THEN 1 ELSE 0
+            END) AS shape_mismatch
         FROM evaluation_runs
         WHERE is_pilot = FALSE AND ({task_filter}){_SCOPE_SQL}
         GROUP BY condition
@@ -332,9 +342,18 @@ def query_per_task(conn: duckdb.DuckDBPyConnection) -> list[dict]:
         SELECT
             task_id, condition,
             COUNT(*) AS n,
-            SUM(CASE WHEN gate_passed AND output_in_range AND NOT COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS successes,
+            SUM(CASE
+                WHEN gate_passed
+                 AND output_in_range
+                 AND NOT COALESCE(output_shape_mismatch, FALSE)
+                THEN 1 ELSE 0
+            END) AS successes,
             SUM(CASE WHEN gate_passed THEN 1 ELSE 0 END) AS gate_passed,
-            SUM(CASE WHEN output_in_range AND NOT COALESCE(output_shape_mismatch, FALSE) THEN 1 ELSE 0 END) AS output_in_range
+            SUM(CASE
+                WHEN output_in_range
+                 AND NOT COALESCE(output_shape_mismatch, FALSE)
+                THEN 1 ELSE 0
+            END) AS output_in_range
         FROM evaluation_runs
         WHERE is_pilot = FALSE{_SCOPE_SQL}
         GROUP BY task_id, condition
@@ -527,10 +546,10 @@ def print_per_task_table(per_task: list[dict]) -> list[str]:
 
 
 def print_gate_vs_output_table(per_task: list[dict]) -> None:
-    """Show gate_passed and output_in_range as separate columns (Critique A recommendation)."""
+    """Show gate_passed and output_in_range as separate columns."""
     lines = [
         f"\n{'='*80}",
-        "  Gate Pass vs Output Validation (Separated) — Critique A Recommendation",
+        "  Gate Pass vs Output Validation (Separated)",
         f"{'='*80}",
     ]
 
@@ -612,10 +631,10 @@ def print_failure_breakdown(
 
 
 def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None:
-    """Frame JIT conditions as a cluster — Critique recommendation."""
+    """Frame JIT ablations as a cluster rather than a strict ranking."""
     lines = [
         f"\n{'='*80}",
-        "  JIT Cluster Analysis (Critique Recommendation: cluster, not ranking)",
+        "  JIT Cluster Analysis (cluster, not ranking)",
         f"{'='*80}",
     ]
 
@@ -702,7 +721,7 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
         jit_total_k, jit_total_n, static["successes"], static["n"]
     )
     lines.append("")
-    lines.append("  ===== DIAGNOSTIC ONLY — DO NOT CITE (Chapter 4.5) =====")
+    lines.append("  ===== DIAGNOSTIC ONLY — DO NOT CITE =====")
     lines.append(
         "  Pooled JIT vs Static — statistically fallacious (non-exchangeable"
     )
@@ -719,101 +738,6 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
 
     for line in lines:
         print(line)
-
-
-def print_token_cost_summary(conn: duckdb.DuckDBPyConnection) -> bool:
-    """Token cost per condition (from backfilled LangFuse data).
-
-    Security audit finding #100 (2026-04-19, ext10): pre-fix the
-    headline ``Avg/JIT Task`` column averaged ONLY over rows with
-    ``token_cost > 0``, excluding zero-cost tasks (retrieval-tasks,
-    static-matched tasks, tasks that failed before any LLM call) from
-    the denominator. For a condition with 20 tasks where 10 cost 1000
-    tokens and 10 are free, the reported avg was ``10000/10 = 1000``
-    when the actual per-task-across-the-condition cost was ``500`` —
-    a 2x over-report. Now reports BOTH ``Avg/Task`` (all rows,
-    proposal-correct denominator) AND ``Avg/Nonzero`` (filtered, the
-    pre-fix value, kept as a diagnostic). Chapter 6 M4 cites the
-    all-rows column.
-
-    ext14 #149 (2026-04-21): signature now returns ``bool``. Returns
-    False when ALL JIT conditions have <50% non-zero ``token_cost``
-    ratio — this detects campaigns where Row 11 backfill was skipped
-    or silently failed (ext14 #141 pagination truncation, ext12 #122
-    zero-generations, ext14 #145 partial CAMPAIGN_RUN_IDS). Pre-fix,
-    Row 17 printed uniform zeros and exited 0, silently manufacturing
-    infinite pro-JIT cost efficiency.
-    """
-    rows = conn.execute(
-        f"""
-        SELECT condition,
-               SUM(token_cost) AS total_tokens,
-               AVG(token_cost) AS avg_per_task,
-               AVG(CASE WHEN token_cost > 0 THEN token_cost ELSE NULL END) AS avg_per_nonzero_task,
-               COUNT(CASE WHEN token_cost > 0 THEN 1 END) AS n_with_cost,
-               COUNT(*) AS n_total
-        FROM evaluation_runs
-        WHERE is_pilot = FALSE{_SCOPE_SQL}
-        GROUP BY condition
-        ORDER BY condition
-        """
-    ).fetchall()
-    lines = [
-        f"\n{'='*80}",
-        "  Token Cost Summary (backfilled from LangFuse)",
-        f"{'='*80}",
-    ]
-    header = (
-        f"{'Condition':<22} {'Total Tokens':>14} {'Avg/Task':>12} "
-        f"{'Avg/Nonzero':>14} {'With Cost':>11}"
-    )
-    lines.append(header)
-    lines.append("-" * len(header))
-    for r in rows:
-        label = CONDITION_LABELS.get(r[0], r[0])
-        avg_all = f"{r[2]:,.0f}" if r[2] else "—"
-        avg_nz = f"{r[3]:,.0f}" if r[3] else "—"
-        lines.append(
-            f"{label:<22} {r[1]:>14,} {avg_all:>12} {avg_nz:>14} {r[4]:>5}/{r[5]}"
-        )
-    lines.append("")
-    lines.append(
-        "  Avg/Task = AVG over ALL rows (proposal-correct denominator; M4 headline). "
-        "Avg/Nonzero = AVG over rows with token_cost > 0 (diagnostic; pre-#100 behavior)."
-    )
-    for line in lines:
-        print(line)
-
-    # ext14 #149 (2026-04-21): M4 silent-zero gate. Static's token_cost=0
-    # is legitimate (no LLM calls in the retrieval path), so exempt it.
-    # JIT conditions MUST have a meaningful fraction of rows with non-zero
-    # cost — if every JIT condition is <50% non-zero, Row 11 backfill did
-    # not run cleanly, and the M4 headline is a silent zero lie.
-    jit_conditions = {"full", "no_verification", "no_optimization"}
-    by_cond = {r[0]: (int(r[4] or 0), int(r[5] or 0)) for r in rows}
-    jit_ratios: list[float] = []
-    for cond in jit_conditions:
-        nonzero, total = by_cond.get(cond, (0, 0))
-        if total > 0:
-            jit_ratios.append(nonzero / total)
-    # ext15 #160 (2026-04-22): per-condition gate, not max-pooled. A single
-    # healthy JIT condition must NOT mask two broken ones. Pre-fix,
-    # ``max(jit_ratios) < 0.5`` fired only when every JIT condition was
-    # below threshold — one healthy ratio (1.0) hid catastrophic
-    # Row-11 partial-failure on the other two. Post-fix the gate fires
-    # when ANY JIT condition is below threshold.
-    if not jit_ratios or any(r < 0.5 for r in jit_ratios):
-        ratios_str = ", ".join(f"{r:.2f}" for r in jit_ratios) or "(no JIT rows)"
-        print(
-            f"\n  ⚠ M4 silent zero: JIT conditions have non-zero ratios "
-            f"[{ratios_str}] (any < 0.5). Likely cause: Row 11 not run, "
-            f"or ext14 #141 pagination truncation / ext12 #122 partial-runs "
-            f"/ ext14 #145 partial CAMPAIGN_RUN_IDS silently zeroed this "
-            f"campaign's costs. ext14 #149 + ext15 #160.",
-            file=sys.stderr,
-        )
-        return False
-    return True
 
 
 def _gini_coefficient(counts: list[int]) -> float:
@@ -842,7 +766,7 @@ def _gini_coefficient(counts: list[int]) -> float:
     return (2.0 * cumulative) / (n * total) - (n + 1.0) / n
 
 
-def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
+def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> bool:
     """Gini coefficient of capability invocation counts per condition.
 
     Addresses proposal §Metrics item 3: *"Capability reuse distribution —
@@ -856,8 +780,9 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
     invocations pooled).
 
     Degenerate cases (empty counts, all zeros) → Gini 0.0. Conditions
-    with no invocation data skipped (happens if an old eval DB predates
-    Step 18.5 wiring).
+    with no invocation data are skipped (happens if an old eval DB
+    predates Step 18.5 wiring). Returns False when Gini evidence is
+    absent or incomplete.
     """
     # Check the table exists — old eval DBs won't have it.
     try:
@@ -870,7 +795,7 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
             f"  (skipped: invocation_events table not available — {exc.__class__.__name__}. "
             "Re-run the eval with Step 18.5 wiring to populate this.)"
         )
-        return
+        return False
 
     # Per-condition, per-run Gini
     # ext7 #44: filter by scope BEFORE grouping.
@@ -997,7 +922,10 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
     for cond in CONDITIONS:
         run_ginis = condition_ginis.get(cond, [])
         if not run_ginis:
-            print(f"  {CONDITION_LABELS.get(cond, cond):<22} {'—':>8} {'—':>10} {'—':>7} {'—':>7} {'—':>10}")
+            print(
+                f"  {CONDITION_LABELS.get(cond, cond):<22} "
+                f"{'—':>8} {'—':>10} {'—':>7} {'—':>7} {'—':>10}"
+            )
             continue
         mean = sum(run_ginis) / len(run_ginis)
         # ext15 #162: aggregate over capability totals (pooled by capability
@@ -1038,9 +966,9 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
     # check. ext13 #128's gate above fires only when an ENTIRE CONDITION
     # has no invocations. A complete evaluation_runs shape (3 runs/cond)
     # paired with invocation_events for only 1 run/cond silently passes
-    # that gate — Chapter 6's "N runs" column lies. Sibling of ext14 #144
-    # for M3. Cross-check per-condition invocation coverage against the
-    # expected per-condition run_id count in evaluation_runs.
+    # that gate — Chapter 6's "N runs" column lies. Cross-check
+    # per-condition invocation coverage against the expected
+    # per-condition run_id count in evaluation_runs.
     expected_per_condition = dict(conn.execute(
         f"""
         SELECT condition, COUNT(DISTINCT run_id)
@@ -1071,9 +999,9 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> None:
 def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
     """Core-Work Classification Accuracy — task-level primary-type match.
 
-    ext15 #164 (2026-04-22): returns ``bool`` — True on success, False on
-    skip — so Row 17 can accumulate into ``missing_metrics`` and exit 7.
-    Sibling retrofit to M2 (ext13 #126), M3 (ext13 #128), M4 (ext14 #149).
+    ext15 #164 (2026-04-22): returns ``bool`` — True on success, False
+    on skip — so main() can accumulate into ``missing_metrics`` and
+    exit 7 when this active Chapter 6 metric is absent.
 
 
     Operational proxy for proposal Pillar 1 RQ #1:
@@ -1136,17 +1064,6 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
     no_optimization / full) all exercise the classifier; their
     aggregate is the Chapter 6 headline number.
     """
-    # Import here to avoid circular-import friction at module load time.
-    try:
-        from tests.evaluation.tasks import ALL_TASKS
-    except Exception as exc:  # noqa: BLE001
-        print(f"\n{'='*80}")
-        print("  Core-Work Classification Accuracy — task-level primary-type match")
-        print("  (operational proxy for Pillar 1 RQ #1; see docstring for framing)")
-        print(f"{'='*80}")
-        print(f"  (skipped: couldn't import ALL_TASKS — {exc.__class__.__name__})")
-        return False  # ext15 #164
-
     expected_map: dict[str, str | None] = {t.task_id: t.expected_type for t in ALL_TASKS}
     scorable = {tid for tid, et in expected_map.items() if et is not None}
     if not scorable:
@@ -1241,8 +1158,15 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
     # Display columns: canonical three types, then any extras (e.g. "unclassified")
     columns = types + sorted(c for c in all_classified if c not in types)
 
-    print(f"\n  Confusion matrix (rows = expected, columns = classified, aggregated over JIT conditions):")
-    col_header = "  " + " " * 11 + " | " + " | ".join(f"{c:>12}" for c in columns) + " |  Row total   Accuracy"
+    print(
+        "\n  Confusion matrix "
+        "(rows = expected, columns = classified, aggregated over JIT conditions):"
+    )
+    col_header = (
+        "  " + " " * 11 + " | "
+        + " | ".join(f"{c:>12}" for c in columns)
+        + " |  Row total   Accuracy"
+    )
     print(col_header)
     print("  " + "-" * (len(col_header) - 2))
     for exp in types:
@@ -1259,7 +1183,7 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
         print(
             f"\n  Note: {excluded_registry_only} row(s) excluded from the "
             f"classification-accuracy denominator — pure registry-match rows "
-            f"where the classifier didn't run. Chapter 4.5 disclosure: the "
+            f"where the classifier didn't run. Disclose that the "
             f"Pillar 1 RQ #1 proxy is scored over classifier-invoked rows only."
         )
 
@@ -1271,8 +1195,7 @@ def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> bool:
 
     ext16 #177 (2026-04-22): returns ``bool`` — True if at least one JIT
     condition had a successful run to report on, False when no successful
-    runs exist in scope OR JIT-condition coverage is incomplete. Retrofit
-    to the M2/M3/M4 gate pattern.
+    runs exist in scope OR JIT-condition coverage is incomplete.
 
 
     Per proposal §Evaluation Strategy M5: *"Latency from task input to
@@ -1376,202 +1299,6 @@ def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> bool:
     return True
 
 
-def _clopper_pearson_ci(
-    successes: int, n: int, *, confidence: float = 0.95
-) -> tuple[float, float]:
-    """Return (lower, upper) bounds of a Clopper-Pearson binomial CI.
-
-    Uses scipy.stats.beta.ppf (exact method). Graceful on n=0 → (0, 0).
-    Graceful on successes=0 → (0, upper). Graceful on successes=n → (lower, 1).
-    """
-    if n == 0:
-        return (0.0, 0.0)
-    from scipy.stats import beta  # local import — heavy dep
-    alpha = 1.0 - confidence
-    lower = 0.0 if successes == 0 else float(beta.ppf(alpha / 2, successes, n - successes + 1))
-    upper = 1.0 if successes == n else float(beta.ppf(1 - alpha / 2, successes + 1, n - successes))
-    return (lower, upper)
-
-
-def print_contamination_rate(conn: duckdb.DuckDBPyConnection) -> None:
-    """M2 mock-contamination rate per condition (Step 18.10).
-
-    Reads ``human_label`` from ``evaluation_runs`` for non-pilot rows
-    under JIT conditions. Reports per-condition: n_sampled, n_correct,
-    n_contaminated, n_partial, contamination_rate, 95% Clopper-Pearson CI.
-
-    Proposal §Evaluation Strategy M2: *"What fraction of generated
-    capabilities contain hardcoded/fabricated elements? (Measured by
-    manual audit of a sample.)"* Graceful fallback when no labels are
-    populated yet: prints a single "audit not performed" line instead
-    of empty tables.
-    """
-    # ext7 #44: M2 must honor --run-ids / --since scope. Pre-fix, cross-campaign
-    # pooling silently consumed labels intended for prior campaigns into the
-    # current campaign's M2 aggregate.
-    rows = conn.execute(
-        f"""
-        SELECT condition,
-               SUM(CASE WHEN human_label = 'correct'      THEN 1 ELSE 0 END) AS n_correct,
-               SUM(CASE WHEN human_label = 'contaminated' THEN 1 ELSE 0 END) AS n_contaminated,
-               SUM(CASE WHEN human_label = 'partial'      THEN 1 ELSE 0 END) AS n_partial,
-               COUNT(*)                                                      AS n_sampled
-        FROM evaluation_runs
-        WHERE human_label IS NOT NULL
-          AND NOT is_pilot{_SCOPE_SQL}
-        GROUP BY condition
-        ORDER BY condition
-        """
-    ).fetchall()
-
-    print()
-    print("=" * 100)
-    print("  M2 Mock-Contamination Rate (manual audit of sampled capabilities)")
-    print("=" * 100)
-
-    if not rows:
-        print(
-            "  Audit not performed — `human_label` is unpopulated. "
-            "Run `uv run scripts/audit_contamination.py` after Step 18 to "
-            "label a stratified sample, then re-run this analyzer. "
-            "Chapter 6 §M2 should report as *deferred* until the audit lands."
-        )
-        # ext13 #126: thesis-critical metric absent; main() treats this
-        # as a missing-metric and exits 7.
-        return False
-
-    # Security audit finding #84 (2026-04-19, ext9): M2's
-    # proposal-literal definition is *"fraction containing fabricated
-    # elements"*. A ``partial`` label means the tool IS partially
-    # contaminated (it contains SOME fabricated elements), so per the
-    # proposal it MUST appear in the numerator. Pre-fix the rate used
-    # ``n_contam / n_sampled`` (strict) and reported ``n_partial``
-    # side-by-side without summing — under-reporting M2 by up to ~50
-    # percentage points depending on partial-label frequency. We now
-    # report BOTH the strict and proposal-literal rates. Chapter 6
-    # cites the proposal-literal column as the headline; the strict
-    # column is a diagnostic refinement.
-    header = (
-        f"{'Condition':<22} {'n':>4} {'Correct':>9} {'Contam.':>9} "
-        f"{'Partial':>9} {'Strict%':>9} {'Proposal%':>10} "
-        f"{'95% CI (proposal)':>22}"
-    )
-    print(header)
-    print("-" * len(header))
-
-    total_c, total_x, total_p, total_n = 0, 0, 0, 0
-    for condition, n_correct, n_contam, n_partial, n_sampled in rows:
-        label = CONDITION_LABELS.get(condition, condition)
-        strict_rate = 100.0 * n_contam / n_sampled if n_sampled else 0.0
-        proposal_num = int(n_contam) + int(n_partial)
-        proposal_rate = 100.0 * proposal_num / n_sampled if n_sampled else 0.0
-        lo, hi = _clopper_pearson_ci(proposal_num, int(n_sampled))
-        ci_str = f"[{lo * 100:.1f}%, {hi * 100:.1f}%]"
-        print(
-            f"{label:<22} {n_sampled:>4d} {n_correct:>9d} {n_contam:>9d} "
-            f"{n_partial:>9d} {strict_rate:>8.1f}% {proposal_rate:>9.1f}% "
-            f"{ci_str:>22}"
-        )
-        total_c += int(n_correct)
-        total_x += int(n_contam)
-        total_p += int(n_partial)
-        total_n += int(n_sampled)
-
-    # Pool across conditions only when there are multiple — a single-condition
-    # "pooled" row would just be a duplicate of the per-condition row.
-    if len(rows) > 1 and total_n > 0:
-        strict_rate = 100.0 * total_x / total_n
-        proposal_num = total_x + total_p
-        proposal_rate = 100.0 * proposal_num / total_n
-        lo, hi = _clopper_pearson_ci(proposal_num, total_n)
-        print("-" * len(header))
-        print(
-            f"{'Pooled':<22} {total_n:>4d} {total_c:>9d} {total_x:>9d} "
-            f"{total_p:>9d} {strict_rate:>8.1f}% {proposal_rate:>9.1f}% "
-            f"[{lo * 100:.1f}%, {hi * 100:.1f}%]"
-        )
-    print(
-        "\n  Strict% = n_contam / n_sampled (fully-contaminated only). "
-        "\n  Proposal% = (n_contam + n_partial) / n_sampled — per "
-        "proposal §M2 \"fraction containing fabricated elements\"."
-    )
-
-    print(
-        "\n  Methodology: manual audit of stratified random sample (Step 18.10). "
-        "Labels populated via `scripts/audit_contamination.py`. See master plan "
-        "§11 for the sampling protocol and labelling criteria."
-    )
-
-    # ext13 #132: per-condition coverage check. A DB with labels only
-    # in SOME conditions (e.g., only `full`) passes the rows-exist gate
-    # above but destroys the JIT-vs-static contamination comparison.
-    # Flag missing conditions so main() exits 7 on partial M2 coverage.
-    #
-    # ext14 #146 (2026-04-21): M2 is JIT-only per proposal §M2 — "fraction
-    # of generated artifacts that contain fabricated elements". Static rows
-    # have no generated artifacts by definition (they execute pre-seeded
-    # capabilities), so Row 16's default flow cannot label them. Dropping
-    # "static" from the expected-conditions set restores satisfiability of
-    # the contract; Chapter 4.5 discloses that static is structurally
-    # excluded from contamination auditing.
-    present_conditions = {r[0] for r in rows}
-    expected_conditions = set(CONDITIONS) - {"static"}
-    missing_conditions = expected_conditions - present_conditions
-    if missing_conditions:
-        print(
-            f"\n  ⚠ M2 partial coverage: labels missing for "
-            f"{len(missing_conditions)}/{len(expected_conditions)} conditions: "
-            f"{sorted(missing_conditions)} (static is JIT-only-excluded "
-            f"per proposal §M2; ext14 #146)",
-            file=sys.stderr,
-        )
-        return False
-
-    # ext14 #144 (2026-04-21): per-(condition, run_id) M2 completeness
-    # check. ext13 #132's gate above fires only when an ENTIRE CONDITION
-    # has no labels. A campaign with 3 runs/condition but labels for only
-    # 1 run/condition passes that gate because every JIT condition has
-    # ≥1 labeled row. Compounds with ext14 #143 (audit_contamination.py
-    # fail-open on per-run coverage) to silently half the effective M2
-    # sample. Check per-(condition, run_id) now.
-    per_cond_run = conn.execute(
-        f"""
-        SELECT condition, run_id, COUNT(*) AS n_labeled
-        FROM evaluation_runs
-        WHERE human_label IS NOT NULL
-          AND NOT is_pilot{_SCOPE_SQL}
-        GROUP BY condition, run_id
-        """
-    ).fetchall()
-    expected_per_condition = dict(conn.execute(
-        f"""
-        SELECT condition, COUNT(DISTINCT run_id)
-        FROM evaluation_runs
-        WHERE NOT is_pilot{_SCOPE_SQL}
-        GROUP BY condition
-        """
-    ).fetchall())
-    present_per_cond: dict[str, set[str]] = {}
-    for cond, rid, _n in per_cond_run:
-        present_per_cond.setdefault(cond, set()).add(rid)
-    per_run_gaps: list[tuple[str, int, int]] = []
-    for cond in (set(CONDITIONS) - {"static"}):
-        expected_n = expected_per_condition.get(cond, 0)
-        present_n = len(present_per_cond.get(cond, set()))
-        if expected_n > 0 and present_n < expected_n:
-            per_run_gaps.append((cond, present_n, expected_n))
-    if per_run_gaps:
-        gap_str = "; ".join(
-            f"{c}: {p}/{e} run_ids labeled" for c, p, e in per_run_gaps
-        )
-        print(
-            f"\n  ⚠ M2 partial per-run coverage: {gap_str} (ext14 #144)",
-            file=sys.stderr,
-        )
-        return False
-    return True
-
-
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -1593,14 +1320,14 @@ def main() -> int:
     parser.add_argument(
         "--per-condition-cap", type=int, default=_DEFAULT_PER_CONDITION_CAP,
         help=f"When auto-selecting (no --run-ids / --since), how many recent "
-             f"run_ids to pick per condition. Default matches run_sheet.md's "
+             f"run_ids to pick per condition. Default matches Stage 1's "
              f"--n-runs={_DEFAULT_PER_CONDITION_CAP}. ext7 #46.",
     )
     # ext7 #52: campaign completeness guard.
     parser.add_argument(
         "--expected-tasks", type=int, default=20,
         help="Expected number of distinct task_ids per condition (default: 20, "
-             "matches run_sheet.md T01-T20). ext7 #52.",
+             "matches the canonical T01-T20 evaluation set). ext7 #52.",
     )
     parser.add_argument(
         "--expected-runs-per-condition", type=int, default=3,
@@ -1618,22 +1345,20 @@ def main() -> int:
              "campaign shape. Every output table carries an [INCOMPLETE] banner. "
              "ext7 #52.",
     )
-    # ext13 #126: thesis-critical metrics (M2 contamination, M3 Gini)
-    # used to silently exit 0 when `human_label` / `invocation_events`
-    # were empty or had per-condition gaps. Track absences in a list and
-    # exit 7 unless the user opts in with --allow-missing-metrics.
+    # Track active Chapter 6 metric absences and exit 7 unless the user
+    # explicitly opts in with --allow-missing-metrics.
     parser.add_argument(
         "--allow-missing-metrics", action="store_true",
-        help="Proceed with exit 0 even when thesis-critical metrics "
-             "(M2 contamination, M3 Gini) cannot be computed or have "
-             "per-condition gaps. Chapter 4.5 disclosure REQUIRED. "
-             "Default: refuse with exit 7. ext13 #126 / #128 / #132.",
+        help="Proceed with exit 0 even when active Chapter 6 metrics "
+             "(M3 Gini, M5 latency, classification accuracy) cannot be "
+             "computed or have per-condition gaps. Default: refuse with "
+             "exit 7.",
     )
     parser.add_argument(
         "--chapter6-primary-scope", action="store_true",
         help="Protocol mode for EVAL_PROTOCOL.md Chapter 6 primary scope. "
-             "Skips deferred M2 contamination and M4 token-cost sections so "
-             "they do not print warnings or block Stage 2 headline runs.",
+             "Suppresses verbose per-task Fisher detail while keeping the "
+             "headline and Stage 2 diagnostic sections.",
     )
     args = parser.parse_args()
 
@@ -1832,21 +1557,8 @@ def main() -> int:
     condition_totals = {d["condition"]: d["n"] for d in all_data}
     print_failure_breakdown(failures, condition_totals)
 
-    # ── Token costs ──────────────────────────────────────────────────────
-    # EVAL_PROTOCOL.md moves M4 out of Chapter 6 primary scope. In that
-    # protocol mode we skip the section entirely instead of printing a stale
-    # "incomplete" warning for an intentionally deferred metric.
-    m4_ok = True
-    if not args.chapter6_primary_scope:
-        # ext14 #149 (2026-04-21): capture return value so missing_metrics
-        # below can flag silent-zero M4 campaigns (Row 11 skipped / truncated /
-        # partial) and exit 7 rather than emitting infinite pro-JIT manufactured
-        # evidence.
-        m4_ok = print_token_cost_summary(conn)
-
     # ── Latency summary ──────────────────────────────────────────────────
-    # ext16 #177 (2026-04-22): capture return value for missing_metrics
-    # accumulation (retrofit to the M2/M3/M4 gate pattern).
+    # ext16 #177 (2026-04-22): capture return value for missing_metrics.
     m5_ok = print_latency_summary(conn)
 
     # ── Core-work classification accuracy (Step 18.5) ────────────────────
@@ -1855,37 +1567,19 @@ def main() -> int:
     # ext15 #164 (2026-04-22): capture return value for missing_metrics.
     classification_ok = print_classification_accuracy(conn)
 
-    # ext13 #126 / #128 / #132 + ext14 #149: accumulate thesis-critical
-    # metric absences so we can exit 7 at the bottom rather than silently
-    # exiting 0 with the section skipped.
+    # Accumulate active metric absences so we can exit 7 at the bottom
+    # rather than silently exiting 0 with a missing section.
     missing_metrics: list[str] = []
 
     # ── Gini coefficient of capability invocation counts (§Metrics) ──────
     if not print_gini_summary(conn):
         missing_metrics.append("M3 (Gini / Pillar 3 RQ #1)")
 
-    # ── M2 mock contamination rate (Step 18.10, proposal §M2) ────────────
-    # EVAL_PROTOCOL.md defers M2 and M4 to future work / proxy treatment, so
-    # protocol-mode runs should not emit stale sections or missing-metric
-    # banners for them.
-    if not args.chapter6_primary_scope:
-        # Graceful fallback prints "audit not performed" when human_label
-        # column is unpopulated.
-        if not print_contamination_rate(conn):
-            missing_metrics.append("M2 (Contamination)")
-
-        # ext14 #149: M4 silent-zero gate sits in the same missing-metrics
-        # family as M2 / M3. Chapter 6 M4 is thesis-critical Pillar 3 Context
-        # Economy evidence; a uniform-zero campaign passes Row 17 without this
-        # gate (pre-fix behaviour).
-        if not m4_ok:
-            missing_metrics.append("M4 (Token Cost / Pillar 3 Context Economy)")
-
-    # ext16 #177: M5 latency — fifth instance of the retrofit gap.
+    # ext16 #177: M5 latency.
     if not m5_ok:
         missing_metrics.append("M5 (Latency / Chapter 6 time-to-correct)")
 
-    # ext15 #164: Classification Accuracy retrofitted into the gate family.
+    # ext15 #164: Classification Accuracy coverage check.
     if not classification_ok:
         missing_metrics.append("Classification Accuracy / Pillar 1 RQ #1")
 
@@ -1901,8 +1595,8 @@ def main() -> int:
             (out_dir / "per_task_detail.csv").write_text("\n".join(csv_per_task) + "\n")
         print(f"\nCSV files written to {out_dir}/")
 
-    # ext13 #126 / #128 / #132: exit 7 when any thesis-critical metric
-    # was absent or partial. Override via --allow-missing-metrics.
+    # Exit 7 when any active metric was absent or partial. Override via
+    # --allow-missing-metrics.
     if missing_metrics:
         msg = (
             "\n" + "!" * 80 + "\n"

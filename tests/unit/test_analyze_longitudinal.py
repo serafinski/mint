@@ -12,9 +12,7 @@ ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from scripts.analyze_longitudinal import (  # noqa: E402
-    _classify_adaptation,
     _detect_convergence,
-    _detect_shift_point,
     _kl_divergence_between_snapshots,
     _load_cycle_data,
     _table_exists,
@@ -285,78 +283,6 @@ class TestLoadCycleData:
 # ---------------------------------------------------------------------------
 
 
-class TestDetectShiftPoint:
-    """Step 18.8: shift-point detection from cycle_events."""
-
-    def test_no_shift_event_returns_none(self):
-        cycles = [
-            {"cycle": 1, "task_id": "T01", "events": []},
-            {"cycle": 2, "task_id": "T02", "events": [{"capability_id": "c", "event_type": "pruned", "details": ""}]},
-        ]
-        assert _detect_shift_point(cycles) is None
-
-    def test_shift_event_returns_cycle_number(self):
-        cycles = [
-            {"cycle": 1, "task_id": "T01", "events": []},
-            {"cycle": 5, "task_id": "T05", "events": [
-                {"capability_id": "__system__", "event_type": "distribution_shift",
-                 "details": "phase_a=[T01-T05], phase_b=[T06-T10]"},
-            ]},
-            {"cycle": 6, "task_id": "T06", "events": []},
-        ]
-        assert _detect_shift_point(cycles) == 5
-
-    def test_first_shift_wins_if_multiple(self):
-        # Shouldn't happen in practice but defensive behavior
-        cycles = [
-            {"cycle": 3, "task_id": "T03", "events": [
-                {"capability_id": "__system__", "event_type": "distribution_shift",
-                 "details": ""},
-            ]},
-            {"cycle": 5, "task_id": "T05", "events": [
-                {"capability_id": "__system__", "event_type": "distribution_shift",
-                 "details": ""},
-            ]},
-        ]
-        assert _detect_shift_point(cycles) == 3
-
-    def test_empty_cycles_list_returns_none(self):
-        assert _detect_shift_point([]) is None
-
-
-class TestClassifyAdaptation:
-    """Step 18.8: three-tier adaptation classifier."""
-
-    def test_graceful_adaptation_below_2x(self):
-        # Phase A converged at cycle 5; Phase B re-converged in 8 cycles → 1.6x
-        v = _classify_adaptation(5, 8)
-        assert "graceful" in v.lower()
-
-    def test_graceful_at_exactly_2x_boundary(self):
-        # 10 / 5 = 2.0 → graceful per the <= 2.0 rule
-        v = _classify_adaptation(5, 10)
-        assert "graceful" in v.lower()
-
-    def test_sluggish_between_2x_and_5x(self):
-        # Phase A converged at cycle 5; Phase B re-converged in 15 cycles → 3x
-        v = _classify_adaptation(5, 15)
-        assert "sluggish" in v.lower()
-
-    def test_collapse_leaning_above_5x(self):
-        # Phase A converged at cycle 5; Phase B re-converged in 30 cycles → 6x
-        v = _classify_adaptation(5, 30)
-        assert "collapse" in v.lower()
-
-    def test_collapse_when_phase_b_never_reconverged(self):
-        v = _classify_adaptation(5, None)
-        assert "collapse" in v.lower()
-        assert "never re-converged" in v.lower()
-
-    def test_indeterminate_when_phase_a_never_converged(self):
-        v = _classify_adaptation(None, 10)
-        assert "indeterminate" in v.lower()
-
-
 class TestEndToEnd:
     def test_analyzer_produces_cycles_with_all_fields(self):
         """Verify _load_cycle_data + downstream processing produces a
@@ -509,7 +435,7 @@ class TestRunIdIsolation:
     Pre-fix, `_load_cycle_data` queried `WHERE condition = 'longitudinal'`
     without a run_id filter — when the DB contained multiple runs, the
     analyzer merged them into one interleaved timeline, corrupting
-    KL convergence / shift detection / adaptation verdicts.
+    KL convergence and operation-count summaries.
     """
 
     def test_two_runs_each_analyzed_independently(self):

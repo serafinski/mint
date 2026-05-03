@@ -37,12 +37,14 @@ reads those tables directly:
 
 1. **Cycles-to-convergence** — first cycle N where the consecutive-snapshot
    utility-score KL divergence stays below ``--threshold`` (default 0.05)
-   for ``--min-consecutive`` (default 3) cycles in a row. Falls back to
-   invocation-count KL if utility scores aren't persisted (legacy DBs).
+   for ``--min-consecutive`` (default 3) cycles in a row. If utility scores
+   are missing, the analyzer refuses by default; ``--allow-proxy-kl`` makes
+   the invocation-count KL sensitivity path explicit.
 
 2. **Convergence curve** — per-cycle table of ``(cycle, task_id,
-   n_active_caps, kl_utility, kl_invocations, gini)``. CSV always written;
-   matplotlib PNG optional via ``--plot``. Chapter 6 figure source.
+   n_active_caps, kl_utility, kl_invocations, gini)``. CSV is written with
+   ``--csv`` or ``--plot``; matplotlib PNG is optional via ``--plot``.
+   Chapter 6 figure source.
 
 3. **Per-type operation counts per cycle** — prune / split / merge /
    verification_rollback counts from ``cycle_events``. Shows WHAT the
@@ -74,15 +76,14 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import duckdb
+import numpy as np
+from scipy.stats import entropy
+
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-import duckdb  # noqa: E402
-import numpy as np  # noqa: E402
-from scipy.stats import entropy  # noqa: E402
-
 from scripts.analyze_results import _gini_coefficient  # noqa: E402
-
 
 DEFAULT_DB = str(ROOT / "data" / "eval" / "longitudinal.duckdb")
 DEFAULT_OUTPUT_DIR = ROOT / "data" / "analysis"
@@ -160,8 +161,8 @@ def _resolve_longitudinal_run_id(
     """Pick the run_id to analyze.
 
     Security audit finding #24 (2026-04-20): when the DB contains
-    multiple longitudinal runs (re-run with different config, two shift
-    schedules, etc.), pre-fix merged all of them into one interleaved
+    multiple longitudinal runs (re-runs with different configs, appended
+    experiments, etc.), pre-fix merged all of them into one interleaved
     timeline. Now the analyzer picks a single run_id — the caller's
     ``--run-id`` value if provided, otherwise the most-recent
     longitudinal run, with a warning on the stderr if multiple exist.
@@ -169,16 +170,11 @@ def _resolve_longitudinal_run_id(
     Returns ``None`` if the DB has no longitudinal runs at all.
     """
     # Enumerate available longitudinal runs (newest first).
-    # ext17 #188 (2026-04-22): accept both 'longitudinal' (plain runner)
-    # and 'longitudinal_shift' (shift runner). Row 18/19 already scope
-    # by --db filesystem path; this expansion keeps the analyzer
-    # backwards-compatible with pre-#188 shift DBs (condition=longitudinal)
-    # while also recognizing the new condition label.
     available = conn.execute(
         """
         SELECT run_id, MAX(timestamp) AS last_ts
         FROM evaluation_runs
-        WHERE condition IN ('longitudinal', 'longitudinal_shift')
+        WHERE condition = 'longitudinal'
         GROUP BY run_id
         ORDER BY last_ts DESC
         """
@@ -226,10 +222,10 @@ def _load_cycle_data(
       - cumulative_invocations: {cap_name: int} — snapshot as of end of cycle
       - incremental_invocations: {cap_name: int} — this cycle only
       - active_cap_count: int — from cumulative_invocations keys
-      - utility_scores: {cap_name: float} — from cycle_utility_scores (or {}
-        if that table isn't populated — e.g. pre-Step-18.7-follow-up DB)
-      - events: [{capability_id, event_type, details}, ...] — from cycle_events
-        (or [] if that table isn't populated)
+      - utility_scores: {cap_name: float} — from cycle_utility_scores. Empty
+        when the table is missing or unpopulated.
+      - events: [{capability_id, event_type, details}, ...] — from
+        cycle_events. Empty when the table is missing or unpopulated.
 
     Returns an empty list if either ``evaluation_runs`` is empty or has
     no longitudinal rows.
@@ -238,7 +234,7 @@ def _load_cycle_data(
     to disambiguate across multiple longitudinal runs in the same DB.
     ``None`` auto-selects the most recent run with a stderr warning if
     multiple exist. Pre-fix the analyzer merged all run_ids into one
-    timeline, corrupting KL / shift-detection / adaptation verdicts
+    timeline, corrupting KL convergence and operation-count summaries
     whenever the DB had more than one longitudinal run.
     """
     # Resolve the run_id (may warn / raise on ambiguity).
@@ -275,27 +271,12 @@ def _load_cycle_data(
         # invocation_events table may not exist on old DBs (pre-Step-18.5).
         inv_rows = []
 
-    # Build per-task incremental invocation maps, keyed by (run_id, task_id)
-    # — a single task may run in multiple runs, and we need to disambiguate.
-    # The longitudinal runner uses ONE run_id for the whole sequence, so
-    # task_id alone is sufficient in practice. But we key by (run_id, task_id)
-    # for robustness.
-    #
-    # One subtlety: the same task_id CAN appear multiple times in the
-    # sequence (since task_sequence cycles through ALL_TASKS to fill
-    # n_tasks). Rather than trying to match incremental invocations to
-    # specific cycle instances (which would require ordered timestamps
-    # on both sides), we attribute ALL invocation_events with a given
-    # task_id to ALL cycles of that task_id — then cumulative aggregation
-    # naturally produces the right snapshot.
-    #
-    # Cleaner approach: use the task_row's (run_id, task_id, timestamp)
-    # as the boundary and attribute invocations whose occurred_at is
-    # within the task's execution window. But we don't have end-timestamps
-    # per task. So we approximate: each invocation is attributed to the
-    # most-recent task row whose timestamp <= the invocation's occurred_at.
-    #
-    # This gives per-cycle incremental counts that can be cumulated.
+    # Build per-cycle incremental invocation maps by timestamp window.
+    # A task_id can repeat within one longitudinal run, so task_id alone
+    # is not a safe bucket key. We use each evaluation_runs timestamp as
+    # the cycle boundary and attribute each invocation to the most recent
+    # task row whose timestamp is <= invocation occurred_at. This gives
+    # per-cycle increments that can be accumulated into snapshots.
     task_boundaries = [
         (task_ts, (run_id, task_id))
         for run_id, task_id, task_ts in task_rows
@@ -331,11 +312,9 @@ def _load_cycle_data(
     # window — same pattern as cycle_increment above. Pre-fix, keying by
     # task_id only merged all repetitions of the same task into one
     # lookup, so cycles 1 and 5 (both T01) both returned cycle 5's
-    # utility scores. That silently collapsed the per-cycle time series
-    # and made Step 18.8 shift-detection verdicts unreliable (always
-    # "graceful adaptation" because Phase A's last cycle read Phase B-
-    # era utility values). Under the default ``--n-tasks=40`` run every
-    # task repeats at least once, so the bug fires on every real eval.
+    # utility scores. That silently collapsed the per-cycle time series.
+    # Under the default ``--n-tasks=40`` run every task repeats at least
+    # once, so the bug fires on every real eval.
     cycle_utility: list[dict[str, float]] = [{} for _ in task_rows]
     if _table_exists(conn, "cycle_utility_scores"):
         util_rows = conn.execute(
@@ -567,18 +546,30 @@ def _emit_plot(
 
     has_utility = any(v is not None for v in kls_utility)
     if has_utility:
-        ax1.plot(cycles, _nan_mask(kls_utility), marker="o", markersize=3, linewidth=1,
-                 color="#1f77b4", label="KL utility scores (proposal-literal)")
-        ax1.plot(cycles, _nan_mask(kls_invocations), marker="s", markersize=2, linewidth=0.8,
-                 color="#888888", alpha=0.6, linestyle="--",
-                 label="KL invocation counts (sensitivity)")
+        ax1.plot(
+            cycles, _nan_mask(kls_utility), marker="o", markersize=3,
+            linewidth=1, color="#1f77b4",
+            label="KL utility scores (proposal-literal)",
+        )
+        ax1.plot(
+            cycles, _nan_mask(kls_invocations), marker="s", markersize=2,
+            linewidth=0.8, color="#888888", alpha=0.6, linestyle="--",
+            label="KL invocation counts (sensitivity)",
+        )
     else:
-        ax1.plot(cycles, _nan_mask(kls_invocations), marker="o", markersize=3, linewidth=1,
-                 color="#1f77b4", label="KL invocation counts")
-    ax1.axhline(threshold, color="red", linestyle="--", linewidth=1, label=f"threshold ({threshold})")
+        ax1.plot(
+            cycles, _nan_mask(kls_invocations), marker="o", markersize=3,
+            linewidth=1, color="#1f77b4", label="KL invocation counts",
+        )
+    ax1.axhline(
+        threshold, color="red", linestyle="--", linewidth=1,
+        label=f"threshold ({threshold})",
+    )
     if convergence_cycle is not None:
-        ax1.axvline(convergence_cycle, color="green", linestyle="--", linewidth=1,
-                    label=f"converged at cycle {convergence_cycle}")
+        ax1.axvline(
+            convergence_cycle, color="green", linestyle="--", linewidth=1,
+            label=f"converged at cycle {convergence_cycle}",
+        )
     ax1.set_ylabel("KL(cycle N || cycle N-1)")
     title = "Registry Convergence — KL divergence between consecutive snapshots"
     if primary_kl_source == "utility_scores":
@@ -591,16 +582,20 @@ def _emit_plot(
 
     # Bottom: Gini + active cap count
     ax2b = ax2.twinx()
-    line1 = ax2.plot(cycles, ginis, marker="s", markersize=3, linewidth=1,
-                     color="#ff7f0e", label="Gini (capability invocation distribution)")
-    line2 = ax2b.plot(cycles, n_caps, marker="^", markersize=3, linewidth=1,
-                      color="#2ca02c", label="# active capabilities")
+    line1 = ax2.plot(
+        cycles, ginis, marker="s", markersize=3, linewidth=1,
+        color="#ff7f0e", label="Gini (capability invocation distribution)",
+    )
+    line2 = ax2b.plot(
+        cycles, n_caps, marker="^", markersize=3, linewidth=1,
+        color="#2ca02c", label="# active capabilities",
+    )
     ax2.set_ylabel("Gini coefficient", color="#ff7f0e")
     ax2b.set_ylabel("# active capabilities", color="#2ca02c")
     ax2.set_xlabel("Cycle (task execution)")
     ax2.set_title("Gini trajectory + registry size")
     lines = line1 + line2
-    ax2.legend(lines, [l.get_label() for l in lines], loc="upper right")
+    ax2.legend(lines, [line.get_label() for line in lines], loc="upper right")
     ax2.grid(True, alpha=0.3)
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -613,7 +608,7 @@ def _emit_plot(
 # ext13 #124 + #127: banner state for section headers. Set in ``main()``
 # after the proxy-KL downgrade / sparse-telemetry gates decide whether to
 # proceed under an override flag. Every section header then interpolates
-# whichever banner is active, so Chapter 6 reviewers cannot skim past the
+# whichever banner is active, so report readers cannot skim past the
 # degraded-data annotation.
 _PROXY_BANNER: str = ""
 _SPARSE_BANNER: str = ""
@@ -627,68 +622,55 @@ def _print_header(title: str) -> None:
     print(f"{'=' * 80}")
 
 
-def _detect_shift_point(cycles: list[dict]) -> int | None:
-    """Return the 1-indexed cycle number at which a distribution_shift
-    event was recorded, or None if no such event exists.
-
-    Set by ``scripts/run_longitudinal_shift.py`` via a synthetic
-    ``cycle_events`` row with ``event_type='distribution_shift'`` and
-    ``capability_id='__system__'``. The marker is written AT cycle
-    ``shift_at`` (last Phase A task) — the shift effectively takes place
-    at the boundary between this cycle and the next.
-    """
-    for c in cycles:
-        for ev in c.get("events", []):
-            if ev["event_type"] == "distribution_shift":
-                return c["cycle"]
-    return None
-
-
-def _classify_adaptation(
-    phase_a_cycles_to_converge: int | None,
-    phase_b_cycles_to_reconverge: int | None,
-) -> str:
-    """Three-tier classifier for the Phase A → Phase B adaptation pattern.
-
-    - "graceful": Phase B re-converges within ≤ 2x Phase A's convergence time
-    - "sluggish": Phase B re-converges but takes 2x-5x Phase A's time
-    - "collapse": Phase B never re-converges (> 5x or None)
-    - "indeterminate": Phase A never converged; we can't make the comparison
-    """
-    if phase_a_cycles_to_converge is None:
-        return "indeterminate (Phase A never converged — can't compare)"
-    if phase_b_cycles_to_reconverge is None:
-        return "collapse (Phase B never re-converged)"
-    ratio = phase_b_cycles_to_reconverge / max(1, phase_a_cycles_to_converge)
-    if ratio <= 2.0:
-        return f"graceful adaptation ({ratio:.1f}x Phase A time)"
-    if ratio <= 5.0:
-        return f"sluggish adaptation ({ratio:.1f}x Phase A time)"
-    return f"collapse-leaning ({ratio:.1f}x Phase A time)"
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Longitudinal KL convergence analyzer (Step 18.7)",
     )
-    parser.add_argument("--db", default=DEFAULT_DB,
-                        help="Path to longitudinal eval DB (default: data/eval/longitudinal.duckdb)")
-    parser.add_argument("--threshold", type=float, default=0.05,
-                        help="KL threshold for convergence detection (default: 0.05)")
-    parser.add_argument("--min-consecutive", type=int, default=3,
-                        help="Number of consecutive sub-threshold cycles required (default: 3)")
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR),
-                        help="Directory for CSV + PNG outputs (default: data/analysis/)")
-    parser.add_argument("--csv", action="store_true",
-                        help="Emit per-cycle CSV (always written when --plot is passed too)")
-    parser.add_argument("--plot", action="store_true",
-                        help="Emit convergence PNG via matplotlib (if installed)")
-    parser.add_argument("--tail", type=int, default=0,
-                        help="Print only the last N cycles in the per-cycle table (0 = all, default)")
-    parser.add_argument("--run-id", default=None,
-                        help="Specific longitudinal run_id to analyze. Default: latest "
-                             "longitudinal run, with a WARNING on stderr if multiple are "
-                             "present. Security audit finding #24 (2026-04-20).")
+    parser.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        help="Path to longitudinal eval DB (default: data/eval/longitudinal.duckdb)",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.05,
+        help="KL threshold for convergence detection (default: 0.05)",
+    )
+    parser.add_argument(
+        "--min-consecutive",
+        type=int,
+        default=3,
+        help="Number of consecutive sub-threshold cycles required (default: 3)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Directory for CSV + PNG outputs (default: data/analysis/)",
+    )
+    parser.add_argument(
+        "--csv",
+        action="store_true",
+        help="Emit per-cycle CSV (always written when --plot is passed too)",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Emit convergence PNG via matplotlib (if installed)",
+    )
+    parser.add_argument(
+        "--tail",
+        type=int,
+        default=0,
+        help="Print only the last N cycles in the per-cycle table (0 = all, default)",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Specific longitudinal run_id to analyze. Default: latest "
+             "longitudinal run, with a WARNING on stderr if multiple are "
+             "present. Security audit finding #24 (2026-04-20).",
+    )
     # ext12 #116: completeness guard. Pre-fix, the analyzer accepted ANY
     # non-empty longitudinal DB and exited 0 whenever the convergence
     # detector fired. A 5-cycle stub from an aborted 40-cycle campaign
@@ -714,12 +696,12 @@ def main() -> int:
     # (proxy) and reported convergence as if it were the primary metric.
     # Now: refuse with exit 6 unless the user explicitly opts in to the
     # proxy. Override surfaces a [PROXY KL] banner on every section header
-    # so Chapter 4.5 disclosure isn't optional.
+    # so the downgrade remains visible in thesis text or manual reports.
     parser.add_argument(
         "--allow-proxy-kl", action="store_true",
         help="Proceed when cycle_utility_scores is empty, using the "
              "invocation-count KL proxy. Every section header is prefixed "
-             "[PROXY KL]. Chapter 4.5 disclosure REQUIRED. Default: refuse "
+             "[PROXY KL]. Thesis disclosure REQUIRED. Default: refuse "
              "with exit 6. ext13 #124.",
     )
     # ext13 #127: ext12 #118's data-presence gate is a global ``any()`` —
@@ -731,7 +713,7 @@ def main() -> int:
         "--allow-sparse-signal", action="store_true",
         help="Proceed with convergence analysis when per-cycle telemetry "
              "coverage is below --min-cycle-coverage. Every section header "
-             "is prefixed [SPARSE: N/M]. Chapter 4.5 disclosure REQUIRED. "
+             "is prefixed [SPARSE: N/M]. Thesis disclosure REQUIRED. "
              "Default: refuse with exit 8. ext13 #127.",
     )
     parser.add_argument(
@@ -745,7 +727,7 @@ def main() -> int:
     db_path = Path(args.db)
     if not db_path.exists():
         print(f"ERROR: DB not found at {db_path}")
-        print(f"       Run `uv run scripts/run_longitudinal.py` first to produce it.")
+        print("       Run `uv run scripts/run_longitudinal.py` first to produce it.")
         return 1
 
     conn = duckdb.connect(str(db_path), read_only=True)
@@ -758,7 +740,7 @@ def main() -> int:
         return 1
     if not cycles:
         print(f"ERROR: no longitudinal rows in {db_path}")
-        print(f"       (evaluation_runs has no rows with condition='longitudinal')")
+        print("       (evaluation_runs has no rows with condition='longitudinal')")
         conn.close()
         return 1
 
@@ -792,8 +774,8 @@ def main() -> int:
         )
         print(
             f"WARNING: {incomplete_banner} — Chapter 6 consumers must cite "
-            f"the shortfall/overrun; downstream convergence / adaptation "
-            f"claims are not directly comparable to complete-campaign numbers.",
+            f"the shortfall/overrun; downstream convergence claims are not "
+            f"directly comparable to complete-campaign numbers.",
             file=sys.stderr,
         )
 
@@ -860,7 +842,7 @@ def main() -> int:
                 f"    (b) metrics_store lost state mid-campaign\n"
                 f"    (c) registry/store sync broken at flush boundary\n"
                 f"  Pass --allow-sparse-signal to proceed with a "
-                f"[SPARSE: N/M] banner (Chapter 4.5 disclosure REQUIRED). "
+                f"[SPARSE: N/M] banner (thesis disclosure REQUIRED). "
                 f"Exit 8. ext13 #127.",
                 file=sys.stderr,
             )
@@ -869,9 +851,9 @@ def main() -> int:
         global _SPARSE_BANNER
         _SPARSE_BANNER = f"[SPARSE: {cycles_with_signal}/{len(cycles)}]"
         print(
-            f"WARNING: {_SPARSE_BANNER} — Chapter 4.5 must disclose the "
-            f"per-cycle coverage gap. Convergence / adaptation verdicts "
-            f"below are NOT directly comparable to full-coverage numbers.",
+            f"WARNING: {_SPARSE_BANNER} — thesis text must disclose the "
+            f"per-cycle coverage gap. Convergence results below are NOT "
+            f"directly comparable to full-coverage numbers.",
             file=sys.stderr,
         )
 
@@ -892,18 +874,18 @@ def main() -> int:
     if primary_kl_source == "invocation_counts":
         if not args.allow_proxy_kl:
             print(
-                f"ERROR: cycle_utility_scores is empty. The proposal-literal "
-                f"convergence metric (utility-score KL, per §Metrics item 6) "
-                f"cannot be computed. The invocation-count KL is a SENSITIVITY "
-                f"proxy, not the primary metric, so reporting convergence on "
-                f"it would be a methodology violation.\n"
-                f"  Likely causes:\n"
-                f"    (a) cycle_flush.py utility-flush failure (ext13 #125)\n"
-                f"    (b) DB predates Step 18.7 follow-up wiring (pre-2026-04-17)\n"
-                f"    (c) metrics_store / registry sync broken at flush time\n"
-                f"  Pass --allow-proxy-kl to proceed with a [PROXY KL] banner "
-                f"on every section header (Chapter 4.5 disclosure REQUIRED). "
-                f"Exit 6. ext13 #124.",
+                "ERROR: cycle_utility_scores is empty. The proposal-literal "
+                "convergence metric (utility-score KL, per §Metrics item 6) "
+                "cannot be computed. The invocation-count KL is a SENSITIVITY "
+                "proxy, not the primary metric, so reporting convergence on "
+                "it would be a methodology violation.\n"
+                "  Likely causes:\n"
+                "    (a) cycle_flush.py utility-flush failure (ext13 #125)\n"
+                "    (b) DB predates Step 18.7 follow-up wiring (pre-2026-04-17)\n"
+                "    (c) metrics_store / registry sync broken at flush time\n"
+                "  Pass --allow-proxy-kl to proceed with a [PROXY KL] banner "
+                "on every section header (thesis disclosure REQUIRED). "
+                "Exit 6. ext13 #124.",
                 file=sys.stderr,
             )
             conn.close()
@@ -913,7 +895,7 @@ def main() -> int:
         print(
             f"WARNING: {_PROXY_BANNER} — proceeding with invocation-count KL "
             f"proxy per --allow-proxy-kl. Every section header below is "
-            f"prefixed [PROXY KL]; Chapter 4.5 must disclose the downgrade.",
+            f"prefixed [PROXY KL]; thesis text must disclose the downgrade.",
             file=sys.stderr,
         )
 
@@ -937,9 +919,9 @@ def main() -> int:
         # cumulative the optimizer is genuinely stabilizing the
         # invocation distribution; if incremental stays high while
         # cumulative looks smooth, the smoothing is an artifact of
-        # cumulative anchoring. Chapter 6 figure should plot both
-        # trajectories; Chapter 4.5 should disclose which is the
-        # headline metric.
+        # cumulative anchoring. Reports keep cumulative Gini as the
+        # headline value and print incremental Gini as a diagnostic when
+        # it carries signal.
         gini_cumulative = (
             _gini_coefficient(list(snapshot.values())) if snapshot else 0.0
         )
@@ -992,8 +974,12 @@ def main() -> int:
     print(f"  Total cycles:    {len(cycles)}")
     print(f"  KL threshold:    {args.threshold}")
     print(f"  Min consecutive: {args.min_consecutive}")
-    print(f"  Primary KL:      {primary_kl_source}"
-          f" ({'proposal-literal' if primary_kl_source == 'utility_scores' else 'invocation-count proxy'})")
+    primary_label = (
+        "proposal-literal"
+        if primary_kl_source == "utility_scores"
+        else "invocation-count proxy"
+    )
+    print(f"  Primary KL:      {primary_kl_source} ({primary_label})")
     if not has_utility_scores:
         print("  (cycle_utility_scores empty — DB predates Step 18.7 follow-up wiring)")
     if not has_events:
@@ -1009,103 +995,6 @@ def main() -> int:
             finite_kls = [k for k in convergence_kls[1:] if np.isfinite(k)]
             if finite_kls:
                 print(f"     Final KL: {convergence_kls[-1]:.4f}, min KL: {min(finite_kls):.4f}")
-
-    # --- Distribution-shift analysis (Step 18.8, Pillar 3 RQ #3) ---
-    shift_cycle = _detect_shift_point(cycles)
-    # ext12 #123: detect shift-campaign DBs where the marker never landed.
-    # Pre-fix, a missing marker silently omitted the RQ #3 section and
-    # main() still exited 0 on convergence, making row 19 look successful
-    # with zero adaptation evidence. Now: if the DB path suggests a shift
-    # campaign ("shift" or "shifted" in the filename) AND no marker is
-    # present, refuse with exit 5. The DB-path heuristic is load-bearing
-    # because the shift runner writes ``condition="longitudinal"`` (not
-    # ``longitudinal_shift``) so the condition column alone can't
-    # disambiguate; the filename is the user's own intent signal.
-    is_shift_campaign_by_path = any(
-        token in db_path.name.lower() for token in ("shift", "shifted")
-    )
-    if is_shift_campaign_by_path and shift_cycle is None:
-        print(
-            f"ERROR: DB '{db_path.name}' names a shift campaign but no "
-            f"distribution_shift marker was found in cycle_events. RQ #3 "
-            f"analysis cannot proceed. Check that the runner completed "
-            f"the shift-marker write (ext12 #123) or manually insert a "
-            f"cycle_events row before re-running this analyzer.",
-            file=sys.stderr,
-        )
-        conn.close()
-        return 5
-    if shift_cycle is not None:
-        _print_header(
-            "Distribution-Shift Analysis — Pillar 3 RQ #3"
-        )
-        print(f"  Shift point detected at cycle {shift_cycle}")
-        print(f"  Phase A: cycles 1..{shift_cycle} ({shift_cycle} cycles)")
-        print(f"  Phase B: cycles {shift_cycle + 1}..{len(cycles)} "
-              f"({len(cycles) - shift_cycle} cycles)")
-
-        # Phase A convergence (within Phase A only)
-        phase_a_kls = convergence_kls[:shift_cycle]
-        phase_a_convergence_offset = (
-            _detect_convergence(
-                phase_a_kls[1:], args.threshold, args.min_consecutive,
-            )
-            if len(phase_a_kls) > 1 else None
-        )
-        phase_a_converged_cycle = (
-            phase_a_convergence_offset + 1 if phase_a_convergence_offset is not None else None
-        )
-
-        # KL spike magnitude in the window around the shift (shift_cycle and
-        # the 3 cycles post-shift). Helps Chapter 6 describe how disruptive
-        # the shift was.
-        spike_window = convergence_kls[shift_cycle:shift_cycle + 4]
-        finite_spike = [k for k in spike_window if np.isfinite(k)]
-        kl_spike = max(finite_spike) if finite_spike else None
-
-        # Phase B re-convergence (cycles after shift). Index into
-        # convergence_kls starts at shift_cycle; we run _detect_convergence
-        # on that slice, then offset back to 1-indexed full-sequence cycle.
-        phase_b_kls = convergence_kls[shift_cycle:]
-        phase_b_offset = (
-            _detect_convergence(phase_b_kls, args.threshold, args.min_consecutive)
-            if phase_b_kls else None
-        )
-        phase_b_reconverged_cycle = (
-            phase_b_offset + shift_cycle if phase_b_offset is not None else None
-        )
-        phase_b_reconverged_within = (
-            phase_b_reconverged_cycle - shift_cycle
-            if phase_b_reconverged_cycle is not None else None
-        )
-
-        print()
-        if phase_a_converged_cycle is not None:
-            print(f"  Phase A cycles-to-converge:       {phase_a_converged_cycle}")
-        else:
-            print(f"  Phase A cycles-to-converge:       (did not converge)")
-        if kl_spike is not None:
-            print(f"  KL spike magnitude at shift:      {kl_spike:.4f}")
-        else:
-            print(f"  KL spike magnitude at shift:      (unavailable)")
-        if phase_b_reconverged_within is not None:
-            print(f"  Phase B cycles-to-re-converge:    "
-                  f"{phase_b_reconverged_within} cycles post-shift"
-                  f" (at absolute cycle {phase_b_reconverged_cycle})")
-        else:
-            print(f"  Phase B cycles-to-re-converge:    (did not re-converge within window)")
-
-        print()
-        verdict = _classify_adaptation(
-            phase_a_converged_cycle,
-            phase_b_reconverged_within,
-        )
-        print(f"  Adaptation verdict: {verdict}")
-        print()
-        print("  Interpretation guide:")
-        print("    - graceful  (<= 2x Phase A time): registry adapts without structural collapse")
-        print("    - sluggish  (2x-5x):               registry adapts but slowly — possibly over-fit to Phase A")
-        print("    - collapse  (> 5x or never):       registry was Phase-A-specific — not a general optimizer")
 
     # --- Gini range + seeded-vs-evolved comparison (Pillar 3 RQ #1) ---
     if ginis:
@@ -1146,7 +1035,7 @@ def main() -> int:
             evolved_gini = ginis[-1]
             delta = evolved_gini - seeded_gini
             print()
-            print(f"  Seeded-vs-Evolved Gini (Pillar 3 RQ #1):")
+            print("  Seeded-vs-Evolved Gini (Pillar 3 RQ #1):")
             print(f"    Cycle 1 (seeded registry):   {seeded_gini:.3f}")
             print(f"    Final (evolved registry):    {evolved_gini:.3f}")
             print(f"    Delta:                       {delta:+.3f}")
@@ -1270,7 +1159,6 @@ def main() -> int:
     #   2  complete data but convergence not detected
     #   3  incomplete campaign (shortfall) — returned even with --allow-incomplete
     #   4  zero-evidence DB (rows present but no signal tables) — handled earlier
-    #   5  shift campaign missing distribution_shift marker (ext12 #123)
     #   6  proposal-literal KL unavailable, --allow-proxy-kl required (ext13 #124)
     #   8  sparse per-cycle telemetry, --allow-sparse-signal required (ext13 #127)
     if incomplete_banner is not None:

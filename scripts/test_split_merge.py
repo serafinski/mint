@@ -1,86 +1,67 @@
-"""Integration test for optimizer split and merge operations.
+"""Developer diagnostic for optimizer split and merge operations.
 
-Seeds a fresh ChromaDB registry and MetricsStore with synthetic invocations
-that satisfy the split/merge thresholds, then runs the operations with real
-LLM calls to verify end-to-end behavior.
+This script is not invoked by the frozen evaluation protocol. It seeds a fresh
+ChromaDB registry and MetricsStore with synthetic invocation histories that
+satisfy optimizer thresholds, then runs the real split/merge code with LLM
+generation and verification.
 
-Split trigger:  reuse_rate > 0.6 AND success_rate < 0.7 (SKILL or AGENT
-                in the auto-optimizer loop; MCP_TOOL supported via direct
-                invocation). All three types
-                dispatch through ``_split_tools`` / ``_split_skills`` /
-                ``_split_agents`` post-Step-8.
-Merge trigger:  reuse_rate < 0.05 AND description cosine >= 0.5 AND
-                schema Jaccard in [0.5, 1.0). All three types supported
-                post-Step-6 via ``_merge_tools`` / ``_merge_skills`` /
-                ``_merge_agents``. Cross-type merge raises ValueError
-                (Chapter 7 future work).
+Coverage:
+- Split: SKILL rollback canary, MCP_TOOL coverage verifier, AGENT budget canary.
+- Merge: SKILL rollback + happy-path scenarios, MCP_TOOL, and AGENT.
+- Full loop: prune + split + merge through ``create_optimization_loop()``.
 
-**Two merge scenarios, intentionally different in how they exercise the gate.**
+Split trigger:  reuse_rate > 0.6 AND success_rate < 0.7. SKILL and AGENT
+                fire through the optimizer loop; MCP_TOOL can be exercised by
+                direct invocation. All three types dispatch through
+                ``_split_tools`` / ``_split_skills`` / ``_split_agents``.
+Merge trigger:  reuse_rate < 0.05 AND description cosine >= 0.5 AND schema
+                Jaccard in [0.5, 1.0). All three types dispatch through
+                ``_merge_tools`` / ``_merge_skills`` / ``_merge_agents``.
+                Cross-type merge raises ValueError; that remains future work.
 
-``test_merge`` — CSV/TSV cleaners merged into a delimited-data cleaner. Realistic
-but inherently Tier-3-hostile: the scenario steers the LLM toward heuristic header
-detection (``csv.Sniffer.has_header``), and the adversarial prober's content-
-sensitivity and ground-truth attacks reliably find edge cases. This scenario
-**empirically validates the atomic rollback path** under Step 5 + Step 14.11 —
-gate rejection → ``merge()`` returns None → parents stay active → no orphan
-descriptor in the registry.
+The SKILL merge scenarios intentionally exercise different gate outcomes:
 
-``test_merge_stats`` — ``list-stats-basic`` (min/max/mean/count) merged with
-``list-stats-distribution`` (median/stdev/variance/count) into a single
-``list-stats`` capability. Deterministic reference outputs (statistics
-functions are pure and side-effect-free), so the adversarial prober's
-ground-truth probes can't find false-positive content-sensitivity. This
-scenario **empirically validates the happy path** — LLM produces clean
-stats code → gate passes → merged capability registered → parents
+``test_merge`` — CSV/TSV cleaners merged into a delimited-data cleaner. The
+scenario tends to produce heuristic header detection, so Tier 3 often rejects
+the result. That makes it a rollback canary: ``merge()`` returns None, parents
+stay active, and no orphan descriptor is left in the registry.
+
+``test_merge_stats`` — deterministic list-statistics SKILLs merged into one
+broader statistics capability. Pure arithmetic/statistics behavior gives the
+gate a stable happy-path target: merged capability registered, parents
 deactivated.
-
-Together the two scenarios cover both paths Step 5's
-``verify_and_register_or_rollback`` helper can take. See the commit message
-for commit `` (2026-04-15) for the rationale on why CSV/TSV is
-used as a rollback canary rather than a happy-path check.
 
 Usage::
 
-    # Run both split and merge tests
     uv run scripts/test_split_merge.py
-
-    # Run only split
     uv run scripts/test_split_merge.py --split-only
-
-    # Run only merge (both scenarios — CSV rollback-canary + stats happy-path)
     uv run scripts/test_split_merge.py --merge-only
+    uv run scripts/test_split_merge.py --loop-only
+    uv run scripts/test_split_merge.py --merge-mcp-only --verbose
 
-    # Run only the CSV/TSV merge (rollback-path canary)
-    uv run scripts/test_split_merge.py --merge-csv-only
-
-    # Run only the stats merge (happy-path check)
-    uv run scripts/test_split_merge.py --merge-stats-only
-
-    # Verbose logging
-    uv run scripts/test_split_merge.py --verbose
-
-Makes 2-6 LLM calls (~$0.02). No pipeline execution, no Docker.
+Use ``--help`` for all single-scenario flags. The script makes multiple real
+LLM calls and may invoke Docker-backed verification.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import tempfile
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute Phase 4 eval's
+# to ``environment=test`` so they don't pollute protocol eval's
 # ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
 # ambient .env values can't override. Same pattern as ``tests/conftest.py``.
-import os  # noqa: E402
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
-
-from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
@@ -89,9 +70,6 @@ from src.registry.metrics import MetricsStore  # noqa: E402
 from src.registry.store import SkillRegistry  # noqa: E402
 from src.schemas.capability import CapabilityDescriptor, CapabilityType  # noqa: E402
 from src.schemas.metrics import InvocationRecord  # noqa: E402
-
-logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -156,11 +134,10 @@ def test_split(verbose: bool = False) -> bool:
       name collision, LLM failure) rather than raising. Handles both
       outcomes as valid PASS as long as the atomic rollback invariant
       holds — the same dual-path pattern as ``test_merge``.
-    - SKILL coverage verification is vacuous per the MCP_TOOL-only scope
-      (see ``docs/MASTER_PLAN_2026_04_13.md`` §12 finding #5). This test
-      therefore only exercises the three-tier gate per variant, not
-      ``verify_coverage``. For the MCP_TOOL coverage path see
-      ``test_split_mcp_tool`` below.
+    - SKILL coverage verification is vacuous because ``verify_coverage`` is
+      MCP_TOOL-only. This test therefore only exercises the three-tier gate
+      per variant. For the MCP_TOOL coverage path see ``test_split_mcp_tool``
+      below.
     """
     print("\n" + "=" * 70)
     print("  SPLIT TEST — SKILL (rollback canary)")
@@ -381,12 +358,11 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
     2. ``{value: 150, low: 0, high: null}`` — null high bound, parent
        raises a ``TypeError`` on the ``>`` comparison with ``None``.
 
-    Both are error-cases. Under the Step 7 coverage verifier's semantics
-    (see §12 finding #5 in ``docs/MASTER_PLAN_2026_04_13.md``):
-    *"variant handles the error-case iff it runs on the recorded
-    input_args without raising"*. Correct variants — ones that validate
-    their bounds before comparing — will handle both cases by not
-    raising. Happy-path PASS is the expected outcome.
+    Both are error-cases. Under the coverage verifier's error-case semantics,
+    a variant handles the case if it runs on the recorded ``input_args``
+    without raising. Correct variants — ones that validate their bounds before
+    comparing — will handle both cases by not raising. Happy-path PASS is the
+    expected outcome.
 
     **Why both are error-cases and not one error + one wrong-output:**
     the wrong-output-case branch of ``_variant_handles_case`` has
@@ -495,9 +471,8 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
         # version of this test labeled a correct clamp output as
         # "wrong" and the coverage verifier correctly rolled back the
         # split because no correct variant could differentiate against
-        # a parent that was right. See §12 pre-registered finding
-        # 5d in docs/MASTER_PLAN_2026_04_13.md for the full analysis.
-        # The wrong-output-case branch remains unit-tested in
+        # a parent that was right. The wrong-output-case branch remains
+        # unit-tested in
         # tests/unit/test_coverage.py::TestVariantHandlesCase_WrongOutputCase.
         error_case_swapped_bounds = InvocationRecord(
             capability_id="clamp-integer",
@@ -1587,7 +1562,7 @@ def test_split_agent(verbose: bool = False) -> bool:
         )
         registry.add(parent_cap)
         print(f"\n  Registered: {parent_cap.name} ({parent_cap.capability_type.value})")
-        print(f"  Parent is solo (0 subagents)")
+        print("  Parent is solo (0 subagents)")
 
         # Seed high-reuse + low-success invocations.
         all_task_ids = [f"TASK_{i:02d}" for i in range(10)]
@@ -1675,7 +1650,7 @@ def test_split_agent(verbose: bool = False) -> bool:
         if parent and parent.is_active:
             print("  FAIL: Parent should be deactivated after split")
             return False
-        print(f"  Parent 'multi-domain-investigator' deactivated: OK")
+        print("  Parent 'multi-domain-investigator' deactivated: OK")
 
         # Verify every variant has non-empty agent_config AND compute the
         # total subagent count across all variants — must stay <= 8 per
@@ -2024,8 +1999,10 @@ def test_full_loop(verbose: bool = False) -> bool:
     in a single loop pass:
 
     - **Prune target**: "unused-formatter" — has zero invocations in the window
-    - **Split target**: "broad-data-processor" (SKILL) — high reuse (80%), low success (50%)
-    - **Merge targets**: "csv-row-cleaner" + "tsv-row-cleaner" (SKILLs) — low reuse, semantically similar
+    - **Split target**: "broad-data-processor" (SKILL) — high reuse (80%),
+      low success (50%)
+    - **Merge targets**: "csv-row-cleaner" + "tsv-row-cleaner" (SKILLs) —
+      low reuse, semantically similar
     - **Pinned (should survive)**: "core-tool" — has metadata={"pinned": "true"}
 
     Runs the full LangGraph optimization loop via create_optimization_loop().
@@ -2245,7 +2222,10 @@ def test_full_loop(verbose: bool = False) -> bool:
 
         # Split target: high reuse (80%), low success (50%)
         split_tasks = all_task_ids[:20]  # 20/25 = 80% reuse
-        _seed_invocations(metrics, "broad-data-processor", split_tasks, success_rate=0.5, n_per_task=5)
+        _seed_invocations(
+            metrics, "broad-data-processor", split_tasks,
+            success_rate=0.5, n_per_task=5,
+        )
 
         # Merge targets: low reuse (1 task each out of 25 = 4%)
         _seed_invocations(metrics, "csv-row-cleaner", ["TASK_00"], success_rate=0.8, n_per_task=3)
@@ -2267,7 +2247,10 @@ def test_full_loop(verbose: bool = False) -> bool:
             if cap_desc.name == "tsv-row-cleaner":
                 similarity = score
                 break
-        print(f"    csv↔tsv similarity: {similarity:.3f}" if similarity else "    csv↔tsv similarity: NOT FOUND")
+        if similarity:
+            print(f"    csv↔tsv similarity: {similarity:.3f}")
+        else:
+            print("    csv↔tsv similarity: NOT FOUND")
 
         # --- Compute utility scores (pre-loop) ---
         pre_scores = compute_all_utilities(registry, metrics)
@@ -2308,7 +2291,10 @@ def test_full_loop(verbose: bool = False) -> bool:
         split_results = result.get("split_results", {})
         print(f"\n  Split results: {split_results}")
         if "broad-data-processor" not in split_results:
-            print("  FAIL: 'broad-data-processor' should have been split (reuse=0.80, success=0.50)")
+            print(
+                "  FAIL: 'broad-data-processor' should have been split "
+                "(reuse=0.80, success=0.50)"
+            )
             return False
         variants = split_results["broad-data-processor"]
         # Security audit ext9 #4 (post-rerun refinement): the optimizer

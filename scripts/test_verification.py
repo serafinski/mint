@@ -1,8 +1,9 @@
-"""Integration test for the three-tier verification gate (Pillar 2).
+"""Integration smoke for the verification gate (Pillar 2).
 
-Runs real code through all three verification tiers with a real Docker
-sandbox and real adversarial DeepAgent. Tests both a known-good tool
-(fibonacci) and a known-bad tool (hardcoded return values).
+Runs real artifacts through the gate, including the proposal tiers and the
+implementation pre-checks around them. The MCP_TOOL good path exercises Docker
+sandbox execution and the adversarial DeepAgent. The rejection paths verify
+that known-bad artifacts fail before entering the registry.
 
 Usage::
 
@@ -17,35 +18,33 @@ Usage::
     # Verbose logging
     uv run scripts/test_verification.py --verbose
 
-Requires Docker running (for Tier 2 + Tier 3 sandbox execution).
-Makes 1-2 LLM calls per test for adversarial probing (~$0.02 total).
+Requires Docker for MCP_TOOL behavioral/adversarial sandbox execution. Slow
+paths make real LLM calls for adversarial probing.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute Phase 4 eval's
+# to ``environment=test`` so they don't pollute protocol eval's
 # ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
 # ambient .env values can't override. Same pattern as ``tests/conftest.py``.
-import os  # noqa: E402
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
-
-from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
 from src.schemas.capability import CapabilityType  # noqa: E402
 from src.schemas.task import GeneratedArtifact  # noqa: E402
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Test artifacts
@@ -160,7 +159,12 @@ GOOD_SKILL = GeneratedArtifact(
 def _format_findings(report) -> list[str]:
     """Format verification findings for display."""
     lines = []
-    tier_names = {0: "Tier 0 (structural)", 1: "Tier 1 (static)", 2: "Tier 2 (behavioral)", 3: "Tier 3 (adversarial)"}
+    tier_names = {
+        0: "Tier 0 (structural)",
+        1: "Tier 1 (static)",
+        2: "Tier 2 (behavioral)",
+        3: "Tier 3 (adversarial)",
+    }
     for f in report.findings:
         sev = str(f.severity).upper()
         tier = tier_names.get(f.tier, f"Tier {f.tier}")
@@ -234,7 +238,10 @@ def test_bad_mcp_tool() -> bool:
         return False
 
     if report.tier_reached > 1:
-        print(f"\n  WARN: Tier reached={report.tier_reached} — fail-fast should have stopped at Tier 1")
+        print(
+            f"\n  WARN: Tier reached={report.tier_reached} — "
+            "fail-fast should have stopped at Tier 1"
+        )
         # Not a hard failure — the gate might have run Tier 2 anyway
 
     print("\n  PASS: Bad tool correctly rejected (hardcoded data detected)")

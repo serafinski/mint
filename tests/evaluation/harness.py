@@ -1084,11 +1084,10 @@ def _extract_result_compositional(
     # actually reached terminal state. Pre-fix, a crashed chain (AGENT
     # timeout, sandbox exception, generation_failed) left
     # ``final_output=None`` but the contract check still ran — naturally
-    # failed against None → ``output_shape_mismatch=True`` →
-    # ``analyze_compression_loss.classify_failure`` priority 2 bucket
-    # (``compression_loss_task``) fired before priorities 3/4/7/8, silently
-    # misclassifying infrastructure/execution failures as Pillar 2 T3
-    # aggressive-compression evidence.
+    # failed against None → ``output_shape_mismatch=True`` → downstream
+    # failure-taxonomy priority for output-shape defects fired before
+    # infrastructure/execution buckets, silently misclassifying those failures
+    # as aggressive-compression evidence.
     if chain_result.chain_success and final_output is not None:
         shape_check = task.output_contract.check(
             final_output, chain_result.output_files,

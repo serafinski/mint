@@ -3,14 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import math
-import sys
-from pathlib import Path
 
-ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT))
-
-import duckdb  # noqa: E402
+import duckdb
 
 
 def _gini(values: list[int]) -> float:
@@ -47,7 +41,12 @@ def main() -> int:
         """
         SELECT condition,
                COUNT(*) AS n,
-               AVG(CAST(gate_passed AND output_in_range AND NOT output_shape_mismatch AS DOUBLE)) AS success_rate
+               AVG(CAST(
+                   gate_passed
+                   AND output_in_range
+                   AND NOT output_shape_mismatch
+                   AS DOUBLE
+               )) AS success_rate
         FROM evaluation_runs
         WHERE benchmark_track = 'recurrence'
         GROUP BY condition
@@ -62,7 +61,12 @@ def main() -> int:
         """
         SELECT condition, task_family_id,
                COUNT(*) AS n,
-               AVG(CAST(gate_passed AND output_in_range AND NOT output_shape_mismatch AS DOUBLE)) AS success_rate
+               AVG(CAST(
+                   gate_passed
+                   AND output_in_range
+                   AND NOT output_shape_mismatch
+                   AS DOUBLE
+               )) AS success_rate
         FROM evaluation_runs
         WHERE benchmark_track = 'recurrence'
         GROUP BY condition, task_family_id

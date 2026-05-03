@@ -35,13 +35,12 @@ If you feel the urge to add a completeness gate inside an analyzer, stop. Add th
 - Distribution-shift run (Pillar 3 RQ #3). It is outside this eval-minimum branch and is not part of the Chapter 6 evidence set. Report: "Distribution-shift execution deferred to future work."
 
 **Analyzer scripts in Chapter 6 primary scope:**
-- `analyze_results.py` — run in `--chapter6-primary-scope` mode for the M1/M3/M5/ClassAcc outputs used by Stage 2. Deferred M2/M4 sections remain outside the Chapter 6 primary metric contract.
+- `analyze_results.py` — run in `--chapter6-primary-scope` mode for the M1/M3/M5/ClassAcc outputs used by Stage 2. Deferred M2/M4 reporting has been removed from the active analyzer.
 - `analyze_longitudinal.py` — but only the plain (non-shift) path.
-- `scripts/backfill_definition_token_costs.py` — static, already shipped, keep as-is.
 
 **Removed or excluded from this eval-minimum branch (not executed for Chapter 6):**
 - Compression-loss, context-utilization, and Tier-2-probe analysis readers.
-- LangFuse token-cost reconciliation. Definition-token-cost backfill stays.
+- LangFuse token-cost reconciliation and legacy definition-token-cost backfill tooling. Current registration paths populate `definition_token_cost` directly.
 - Manual mock-contamination audit tooling.
 - Distribution-shift longitudinal execution.
 

@@ -3,7 +3,7 @@
 #
 # State machine:
 #   (no marker) --launch--> LAUNCHED
-#     --pid exits, six gates pass--> SHAPE_OK (audit on sampled cycles)
+#     --pid exits, verification checks pass--> SHAPE_OK (audit on sampled cycles)
 #     --verdicts--> PASS | FAIL
 #
 # Usage:
@@ -59,7 +59,7 @@ fi
 if [[ ! -f "$EVAL_OUT/$MARKER" ]]; then
     snapshot_git_state "30_stage4_launch"
     if [[ -f "$LIVE_DB" ]]; then
-        echo "ERROR: $LIVE_DB already exists (finding #175). Delete explicitly: rm -f $LIVE_DB"
+        echo "ERROR: $LIVE_DB already exists. Delete explicitly before a fresh longitudinal run: rm -f $LIVE_DB"
         exit 1
     fi
     echo "Launching longitudinal with EXPECTED_CYCLES=$EXPECTED_CYCLES."
@@ -425,7 +425,7 @@ banner "Stage 4 — generating audit request for sampled cycles"
 generate_audit_request "stage4" "longitudinal_sample"
 [[ $? -ne 0 ]] && { write_marker "$MARKER" "FAIL" "audit gen failed"; exit 1; }
 
-write_marker "$MARKER" "SHAPE_OK" "six gates green; awaiting audit"
+write_marker "$MARKER" "SHAPE_OK" "verification checks green; awaiting audit"
 echo "STAGE 4: shape OK."
 print_audit_handoff "stage4" "longitudinal_sample"
 exit 0

@@ -1,4 +1,4 @@
-"""End-to-end tests for security audit ext12 findings #114-#123.
+"""End-to-end tests for active security audit ext12 script findings.
 
 These tests invoke the analyzer / runner scripts via ``subprocess.run``
 (real process, real argparse, real ``sys.exit`` propagation) rather than
@@ -223,75 +223,6 @@ def test_analyze_longitudinal_exits_4_on_zero_evidence_db(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# #123 — shift-campaign DB without marker
-# ---------------------------------------------------------------------------
-
-
-def test_analyze_longitudinal_exits_5_on_shift_db_without_marker(tmp_path):
-    """ext12 #123: a DB whose filename names a shift campaign but has
-    no distribution_shift marker event must exit 5. Pre-fix the Shift
-    Analysis section was silently omitted and exit was 0 (if the
-    analyzer even detected convergence) or 2 (if it didn't).
-    """
-    db = tmp_path / "longitudinal_shifted.duckdb"
-    base_ts = datetime(2026, 4, 21, 10, 0, 0)
-    rows = [
-        {
-            "run_id": "shift_no_marker",
-            "condition": "longitudinal",
-            "task_id": f"T{(i % 20) + 1:02d}",
-            "timestamp": base_ts + timedelta(seconds=i),
-        }
-        for i in range(40)
-    ]
-    _seed_evaluation_runs(db, rows=rows)
-    # Also seed at least one invocation_event so we bypass the #118
-    # zero-evidence gate (exit 4 would precede exit 5 otherwise).
-    conn = duckdb.connect(str(db))
-    try:
-        conn.execute(
-            """
-            INSERT INTO invocation_events
-                (id, run_id, condition, task_id, capability_id,
-                 capability_type, success, occurred_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            ["ev-1", "shift_no_marker", "longitudinal", "T01",
-             "cap-a", "mcp_tool", True, base_ts],
-        )
-    finally:
-        conn.close()
-
-    # ext13 #124 (2026-04-21): the DB has no cycle_utility_scores rows,
-    # which the new proposal-literal-KL gate rejects with exit 6 before
-    # reaching the ext12 #123 shift-marker check. Pass --allow-proxy-kl
-    # so this test continues to exercise #123's code path.
-    #
-    # ext14 #150 (2026-04-21): the fixture seeds ONE invocation_event at
-    # cycle 1 but no utility/events in the remaining 39 cycles. Pre-#150
-    # the sparse-signal gate read `cumulative_invocations`, which carried
-    # the single event forward snapshot-by-snapshot and reported 40/40
-    # cycles-with-signal, letting the test reach the shift-marker gate
-    # cleanly. Post-#150 the gate reads `incremental_invocations`, so
-    # only cycle 1 counts as signal → 1/40 → exit 8 fires BEFORE the
-    # shift-marker gate. Pass --allow-sparse-signal so this test stays
-    # narrowly focused on #123's shift-marker code path rather than the
-    # sparse-signal code path.
-    result = _run_script(
-        "analyze_longitudinal.py",
-        "--db", str(db),
-        "--expected-cycles", "40",
-        "--allow-proxy-kl",
-        "--allow-sparse-signal",
-    )
-    assert result.returncode == 5, (
-        f"Expected exit 5 (shift campaign missing marker), got "
-        f"{result.returncode}. stderr:\n{result.stderr}\nstdout:\n{result.stdout}"
-    )
-    assert "distribution_shift marker" in result.stderr
-
-
-# ---------------------------------------------------------------------------
 # #115 — run_pilot.py --help exit code (smoke test for sys.exit wrapper)
 # ---------------------------------------------------------------------------
 
@@ -380,7 +311,7 @@ def test_analyze_results_auto_select_at_production_density_e2e(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# #115 / #119 / #123 — runner abort-path subprocess e2e
+# #115 / #119 — runner abort-path subprocess e2e
 #
 # The longitudinal runners + run_pilot do heavy setup at main() import time
 # (ChromaDB, snapshot take/restore, registry seeding). These tests use a

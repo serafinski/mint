@@ -32,8 +32,8 @@ class BaselineCondition(StrEnum):
     NO_OPTIMIZATION = "no_optimization"
     STATIC = "static"
     LONGITUDINAL = "longitudinal"
-    # ext17 #188 (2026-04-22): distinct condition for the distribution-
-    # shift protocol. Pre-fix, run_longitudinal_shift.py wrote
+    # ext17 #188 (2026-04-22): distinct condition reserved for the deferred
+    # distribution-shift protocol. Pre-fix, shifted longitudinal rows used
     # condition="longitudinal" identical to the plain runner. Under any
     # DB-boundary slip (#175 / #176 freshness-guard gap, ext7 #49
     # contract violation, accidental cross-DB append), plain + shift

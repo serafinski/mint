@@ -1,12 +1,12 @@
-"""Regression tests for security audit 2026-04-19 ext12 findings #114-#123.
+"""Regression tests for active security audit ext12 analyzer findings.
 
-See ``docs/security/security_audit_2026_04_19_ext12.md`` for full threat
+See ``docs/archive/security/security_audit_2026_04_19_ext12.md`` for full threat
 model + reproduction. These tests pin the fixes against silent-wrong-
 answer bugs across the Phase-5 eval analyzer pipeline.
 
 - #114 covered by ``test_analyze_results.py``
   (``test_auto_select_picks_n_distinct_run_ids_per_condition_at_production_density``).
-- #115 / #116 / #118 / #120 / #122 / #123 covered here.
+- #115 / #116 / #118 / #120 / #122 covered here.
 - #117 is a documentation / run-sheet change; the lint test below asserts
   the run-sheet carries the completeness filter.
 - #119 covered here (per-task budget → BudgetExceeded contract).
@@ -203,15 +203,3 @@ def test_analyze_longitudinal_main_supports_expected_cycles_flag():
     source = (ROOT / "scripts" / "analyze_longitudinal.py").read_text()
     assert "--expected-cycles" in source
     assert "--allow-incomplete" in source
-
-
-def test_analyze_longitudinal_refuses_shift_db_without_marker():
-    """ext12 #123 (analyzer side): when the DB filename names a shift
-    campaign (contains 'shift' or 'shifted') but no marker event is
-    present, the analyzer exits with code 5 rather than silently
-    omitting the RQ #3 section.
-    """
-    source = (ROOT / "scripts" / "analyze_longitudinal.py").read_text()
-    assert "is_shift_campaign_by_path" in source
-    # Exit code 5 is the new "shift campaign missing marker" class.
-    assert "return 5" in source

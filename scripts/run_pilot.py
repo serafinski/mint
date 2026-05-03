@@ -1,15 +1,16 @@
-"""Evaluation runner.
+"""Main evaluation runner.
 
-Runs tasks through the full pipeline and records results to
-data/eval/metrics.duckdb. Supports the 20-task testbed (T01-T20) across
-four baseline conditions. Use `--all-tasks` for the full eval and
-`--tasks T01,T07,...` for targeted runs.
+Runs tasks through the evaluation harness and records results to a
+campaign-scoped DuckDB. Supports the 20-task testbed (T01-T20) across
+the four baseline conditions. Use ``--all-tasks --all-conditions
+--n-runs 3`` for the frozen Stage 1 Chapter 6 matrix, and ``--tasks
+T01,T07,...`` for targeted recovery/debug runs.
 
 Usage::
 
     uv run scripts/run_pilot.py                                      # PILOT_TASKS subset
     uv run scripts/run_pilot.py --all-tasks --condition full         # 20 tasks, one condition
-    uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 5  # full eval (400 records)
+    uv run scripts/run_pilot.py --all-tasks --all-conditions --n-runs 3  # 240 records
 
 Optional flags::
 
@@ -20,7 +21,8 @@ Optional flags::
     --n-runs N         number of runs per condition (default: 1)
     --condition-budget-hours N  total wall-clock budget per condition (default: 6)
 
-Results are printed to stdout and persisted to data/eval/metrics.duckdb.
+Results are printed to stdout and persisted to either ``--db`` or a fresh
+``data/eval/metrics_<timestamp>.duckdb`` path.
 """
 
 from __future__ import annotations
@@ -28,17 +30,19 @@ from __future__ import annotations
 import argparse
 import contextlib
 import logging
+import random
 import signal
 import sys
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 # Ensure project root is on sys.path when run as a script
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
-
-from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
@@ -48,13 +52,6 @@ DATA_DIR = ROOT / "data"
 CHROMA_DIR = DATA_DIR / "eval" / "chroma"
 MCP_TOOLS_DIR = ROOT / "src" / "mcp_tools"
 SKILLS_DIR = DATA_DIR / "eval" / "skills"
-# ext7 #49 (2026-04-20): prior hardcoded ``data/eval/metrics.duckdb`` pooled
-# every invocation into the same file across sessions. Path is now a script
-# argument with a timestamped default; legacy hardcode is retained as a
-# canonical-location constant used only when the user explicitly asks for it
-# via ``--db auto``.
-_LEGACY_DB_PATH = str(DATA_DIR / "eval" / "metrics.duckdb")
-
 ALL_CONDITIONS = ["full", "no_verification", "no_optimization", "static"]
 
 
@@ -159,6 +156,8 @@ def main() -> int:
     - ``2`` — argument parsing / validation error (raised via ``sys.exit(2)``).
     - ``4`` — campaign produced zero records with no watchdog abort
       recorded (empty ``--tasks`` filter, harness setup failure, etc.).
+    - ``5`` — per-task cycle_flush telemetry partially failed and
+      ``--allow-partial-flush`` was not passed.
     - ``7`` — watchdog fired on a condition (ext10 #103 + ext12 #115).
       Partial records may have been persisted; downstream analyzers
       should gate on run-completeness before consuming. Distinct exit
@@ -196,7 +195,7 @@ def main() -> int:
         "--n-runs",
         type=int,
         default=1,
-        help="Number of runs per condition (default: 1 for pilot; use 8 for full eval)",
+        help="Number of runs per condition (default: 1; Stage 1 uses 3)",
     )
     parser.add_argument(
         "--log-file",
@@ -212,8 +211,7 @@ def main() -> int:
         default=None,
         help="DuckDB path (default: data/eval/metrics_<timestamp>.duckdb — a fresh "
              "campaign-scoped path). Use an explicit path to re-use or wipe an "
-             "existing DB (see --fresh-db / --append). Pass 'legacy' to use the "
-             "pre-fix shared path (NOT recommended). ext7 #49.",
+             "existing DB (see --fresh-db / --append). ext7 #49.",
     )
     parser.add_argument(
         "--fresh-db",
@@ -233,7 +231,7 @@ def main() -> int:
         default=None,
         help="MetricsStore DuckDB path. Default: derive a campaign-scoped path "
              "next to --db (e.g. metrics_<ts>_metrics_store.duckdb). Pass "
-             "'memory' to keep legacy in-memory behavior.",
+             "'memory' for a debug-only in-memory MetricsStore.",
     )
     # ext7 #48 (2026-04-20): condition-order randomization. Default is fixed
     # order (deterministic, easier to debug + reproduce); opt-in when the
@@ -255,20 +253,21 @@ def main() -> int:
              "#103: SIGALRM-based watchdog around the harness call so a "
              "hung Docker container or LangFuse-API stall can't silently "
              "block the campaign indefinitely. Default 6h is comfortable "
-             "for the 20-task × 5-runs eval; raise for slower hardware. "
+             "for direct runs; the frozen Stage 1 launcher passes 8h. "
              "Set to 0 to disable the watchdog (NOT recommended for "
              "unattended runs). Unix-only — no-op on Windows.",
     )
     # ext14 #148 (2026-04-21): propagate FlushResult signal from the
-    # harness path. Pre-fix, Row 8 exited 0 on partial per-task cycle_flush
-    # failures because the harness logged a WARNING but did not escalate.
+    # harness path. Pre-fix, the main eval runner exited 0 on partial
+    # per-task cycle_flush failures because the harness logged a WARNING
+    # but did not escalate.
     # Reuses exit code 5 from ext13 #125 (the sibling fix that landed for
     # longitudinal runners).
     parser.add_argument(
         "--allow-partial-flush",
         action="store_true",
         help="ext14 #148: proceed with exit 0 even when per-task cycle_flush "
-             "partially failed. Default: refuse with exit 5. Chapter 4.5 "
+             "partially failed. Default: refuse with exit 5. Thesis "
              "disclosure REQUIRED.",
     )
     args = parser.parse_args()
@@ -283,8 +282,6 @@ def main() -> int:
         db_path = DATA_DIR / "eval" / f"metrics_{ts}.duckdb"
         # Fresh timestamped path — guaranteed empty.
         print(f"ext7 #49: using fresh timestamped DB path: {db_path}")
-    elif args.db == "legacy":
-        db_path = Path(_LEGACY_DB_PATH)
     else:
         db_path = Path(args.db)
 
@@ -363,7 +360,6 @@ def main() -> int:
         # ext7 #48: deterministic shuffle keyed on base_seed so a given seed
         # always produces the same condition sequence — reproducible +
         # order-free.
-        import random
         rng = random.Random(42)  # matches HarnessConfig.base_seed
         rng.shuffle(conditions)
         logger.info(
@@ -382,7 +378,10 @@ def main() -> int:
     for condition, condition_metrics_store_path in condition_metrics_paths.items():
         if condition_metrics_store_path is None:
             continue
-        if condition_metrics_store_path.exists() and condition_metrics_store_path.stat().st_size > 0:
+        if (
+            condition_metrics_store_path.exists()
+            and condition_metrics_store_path.stat().st_size > 0
+        ):
             if args.fresh_db:
                 condition_metrics_store_path.unlink()
                 print(
@@ -433,7 +432,10 @@ def main() -> int:
                 else None
             )
             logger.info("=" * 60)
-            logger.info("Running condition: %s  (%d task(s), %d run(s))", condition, len(tasks), args.n_runs)
+            logger.info(
+                "Running condition: %s  (%d task(s), %d run(s))",
+                condition, len(tasks), args.n_runs,
+            )
             logger.info("=" * 60)
             logger.info(
                 "Condition %s using MetricsStore: %s",
@@ -531,7 +533,6 @@ def main() -> int:
         if total and summary_total == total:
             final_lines.append(f"Overall success rate: {n_success/total:.1%}")
             final_lines.append(f"Overall gate pass rate: {n_gate/total:.1%}")
-        from collections import Counter
         breakdown = Counter(r.failure_reason for r in all_records if r.failure_reason)
         if breakdown:
             final_lines.append("Failure breakdown:")
@@ -580,7 +581,7 @@ def main() -> int:
         return 4
 
     # ext14 #148 (2026-04-21): per-task cycle_flush health gate. ext13 #125
-    # wired FlushResult into the longitudinal runners but not the Row 8
+    # wired FlushResult into the longitudinal runners but not the main
     # harness path. The harness accumulates every task's FlushResult; we
     # snapshotted the list before the ``with`` block closed. Gate exit
     # code on the aggregate here.
@@ -588,7 +589,7 @@ def main() -> int:
     if partial_flushes:
         logger.error(
             "ext14 #148: %d/%d per-task cycle_flush operations partially "
-            "failed. Downstream M3 (Row 17), Pillar 3 RQ #2 (Row 18/19) "
+            "failed. Downstream M3 and longitudinal/plausibility checks "
             "will see partial telemetry. Consider re-running or inspecting "
             "flush errors in the log. First error sample: %s",
             len(partial_flushes), len(harness_flush_results),
@@ -597,7 +598,7 @@ def main() -> int:
         if not args.allow_partial_flush:
             logger.error(
                 "Exiting with code 5. Pass --allow-partial-flush to "
-                "proceed with exit 0 (Chapter 4.5 disclosure REQUIRED)."
+                "proceed with exit 0 (thesis disclosure REQUIRED)."
             )
             return 5
 

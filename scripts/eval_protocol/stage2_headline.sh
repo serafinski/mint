@@ -2,13 +2,14 @@
 # Stage 2 — Headline numbers with two-source agreement + conditional audit.
 #
 # The audit is conditional: if analyzer and SQL agree on every metric to 3 sig figs,
-# no audit is needed (shape + agreement gave confidence). If they disagree on any
-# metric, an audit is generated for the disagreement rows specifically.
+# no blocking audit is needed, though a main_sample audit request is still written
+# as a convenience artifact. If they disagree on any metric, an audit is generated
+# for the disagreement rows specifically.
 #
 # State machine:
-#   (no marker) --analyzer+SQL--> SHAPE_OK
-#     --if full agreement--> PASS automatically
-#     --if any disagreement--> audit generated, await verdicts
+#   (no marker) --analyzer+SQL agreement--> PASS
+#     --if any disagreement--> SHAPE_OK (audit request generated)
+#       --verdicts--> PASS | FAIL
 #
 # Usage:
 #     scripts/eval_protocol/stage2_headline.sh <path-to-eval-dir>
@@ -49,10 +50,8 @@ DB="$EVAL_OUT/12_metrics.duckdb"
 [[ ! -f "$DB" ]] && { echo "ERROR: DB snapshot missing: $DB"; exit 1; }
 
 banner "Stage 2.1 — analyzer (Source 1)"
-# EVAL_PROTOCOL.md narrows Chapter 6 scope to M1/M3/M5/ClassAcc (+ M6 in
-# Stage 4). M2 contamination and M4 token-cost are explicitly deferred, so
-# Stage 2 must not fail just because the legacy analyzer still reports those
-# metrics as missing.
+# Run the analyzer in Chapter 6 primary-scope mode. Stage 2 extracts only the
+# headline metrics from the Stage 1 DB and suppresses verbose per-task detail.
 run_logged "20_analyzer.log" uv run scripts/analyze_results.py --db "$DB" --allow-missing-metrics --chapter6-primary-scope
 ANALYZER_RC=$?
 uv run python - <<'PY' 2>&1 | tee "$EVAL_OUT/20_analyzer_metrics.json"

@@ -1,8 +1,8 @@
-"""Longitudinal optimizer test — 30-50 sequential tasks without snapshot reset.
+"""Longitudinal optimizer campaign without per-task snapshot reset.
 
-Tests whether the granularity optimizer improves registry performance when
-given accumulated invocation history (vs the single-run evaluation where
-it has no history to work with).
+Runs a sequence of evaluation tasks against one shared registry and one
+shared MetricsStore so optimizer state can accumulate across cycles. The
+resulting DuckDB is the input for the Stage 4 / M6 longitudinal analysis.
 
 Design:
 - ONE snapshot restore at the start
@@ -15,10 +15,11 @@ Design:
 Usage::
 
     uv run scripts/run_longitudinal.py
-    uv run scripts/run_longitudinal.py --n-tasks 50 --seed 42
-    uv run scripts/run_longitudinal.py --n-tasks 30 --db data/longitudinal.duckdb
+    uv run scripts/run_longitudinal.py --n-tasks 40 --seed 42 --fresh-db
+    uv run scripts/run_longitudinal.py \\
+        --n-tasks 3 --db data/eval/longitudinal_smoke.duckdb --fresh-db
 
-Compare with the main evaluation's `full` condition to show optimizer value.
+Analyze the resulting DB with ``scripts/analyze_longitudinal.py``.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sys
 import time
 import uuid
@@ -38,8 +40,6 @@ sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
-
-import random  # noqa: E402
 
 logger = logging.getLogger("run_longitudinal")
 
@@ -60,14 +60,25 @@ def main(argv: list[str] | None = None) -> int:
 
     Returns:
         0: campaign completed with all tasks attempted
+        2: output DB already contained rows and --append was not passed
         3: per-task watchdog fired (at least one task exceeded budget)
-        5: campaign-level deadline exceeded (total wall-clock budget)
+        5: campaign-level deadline exceeded or partial telemetry flush detected
     """
     parser = argparse.ArgumentParser(description="Longitudinal optimizer evaluation")
-    parser.add_argument("--n-tasks", type=int, default=40, help="Number of sequential tasks (default: 40)")
+    parser.add_argument(
+        "--n-tasks",
+        type=int,
+        default=40,
+        help="Number of sequential tasks (default: 40)",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for task ordering")
     parser.add_argument("--db", type=str, default=DEFAULT_DB, help="DuckDB output path")
-    parser.add_argument("--log-file", type=str, default=None, help="Log file path ('auto' for timestamped)")
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Log file path ('auto' for timestamped)",
+    )
     parser.add_argument(
         "--reuse-metrics-store",
         action="store_true",
@@ -200,7 +211,11 @@ def main(argv: list[str] | None = None) -> int:
     # every task in the sequence shares the same session.
     _campaign_start = datetime.now().strftime("%Y%m%d-%H%M%S")
     logger.info("Run ID: %s (campaign %s)", run_id, _campaign_start)
-    logger.info("Task sequence (%d tasks): %s", len(task_sequence), [t.task_id for t in task_sequence])
+    logger.info(
+        "Task sequence (%d tasks): %s",
+        len(task_sequence),
+        [t.task_id for t in task_sequence],
+    )
 
     # --- ONE snapshot restore ---
     import gc
@@ -298,13 +313,13 @@ def main(argv: list[str] | None = None) -> int:
     cumulative_success = 0
     cumulative_total = 0
 
+    from scripts._budget_watchdog import BudgetExceeded, budget_watchdog
+    from src.orchestrator.tracing import trace_context
     from tests.evaluation.cycle_flush import (
         FlushResult,
         flush_task_cycle_state,
         now_utc,
     )
-    from src.orchestrator.tracing import trace_context
-    from scripts._budget_watchdog import BudgetExceeded, budget_watchdog
 
     # ext12 #119: campaign-level wall-clock deadline. Per-task watchdog alone
     # can't bound total campaign time if many tasks each take just-under-budget.
@@ -349,7 +364,10 @@ def main(argv: list[str] | None = None) -> int:
             verification_enabled=True,
         ).compile()
 
-        _file_fmts = list({fp.suffix.lower().lstrip(".") for fp in task.fixture_paths}) if task.fixture_paths else []
+        _file_fmts = (
+            list({fp.suffix.lower().lstrip(".") for fp in task.fixture_paths})
+            if task.fixture_paths else []
+        )
         _lf_tags = [
             "longitudinal",
             # Treat longitudinal as its own "condition" so the
@@ -465,10 +483,8 @@ def main(argv: list[str] | None = None) -> int:
             # artifact / contract / snapshot fields were silently defaulted
             # (chain_length=1, chain_success=False, generated_artifact_count=0,
             # output_shape_mismatch=False, generated_artifact_sources=[]),
-            # which (a) excluded every longitudinal run from the M2 audit
-            # pool (audit_contamination.py filters on
-            # generated_artifact_count > 0) and (b) dumped output-contract
-            # violations into the generic bucket in analyze_compression_loss.
+            # hiding longitudinal contract and artifact evidence from
+            # downstream audits that inspect evaluation_runs directly.
             record = EvaluationRecord(
                 run_id=run_id,
                 condition="longitudinal",
@@ -508,9 +524,9 @@ def main(argv: list[str] | None = None) -> int:
 
             # Step 18.7 / 18.8 (2026-04-17): persist per-task cycle state
             # (invocation_events + cycle_utility_scores + cycle_events) for
-            # Chapter 6 KL convergence + per-type op-count analyses via
+            # Chapter 6 KL/Gini/convergence analysis via
             # scripts/analyze_longitudinal.py. Never-raises — flush failure
-            # must not break the longitudinal loop.
+            # is accumulated below and surfaces as a non-zero campaign exit.
             # ext13 #125: capture the FlushResult so partial flush surfaces
             # as a non-zero exit code at campaign end.
             fr = flush_task_cycle_state(
@@ -601,7 +617,7 @@ def main(argv: list[str] | None = None) -> int:
     # ext13 #125: surface partial flush at campaign end. The per-batch
     # `FlushResult` accumulated across the loop lets us distinguish
     # "telemetry fully landed" from "some batches silently dropped",
-    # which directly drives analyze_longitudinal.py's KL / Gini / shift
+    # which directly drives analyze_longitudinal.py's KL/Gini/convergence
     # conclusions downstream.
     n_bad_invocations = sum(1 for r in flush_results if not r.invocations_ok)
     n_bad_utility = sum(1 for r in flush_results if not r.utility_scores_ok)
@@ -613,8 +629,8 @@ def main(argv: list[str] | None = None) -> int:
         logger.error(
             "ext13 #125: per-task flush partial failures detected. "
             "invocations=%d/%d bad, utility=%d/%d bad, events=%d/%d bad. "
-            "Row 18/19 analysis (analyze_longitudinal.py) will see partial "
-            "telemetry; #124 may silently downgrade to proxy KL. "
+            "M6 analysis (analyze_longitudinal.py) will see partial "
+            "telemetry and may fail strict utility-score checks. "
             "Investigate transient causes or re-run this campaign.",
             n_bad_invocations, len(flush_results),
             n_bad_utility, len(flush_results),

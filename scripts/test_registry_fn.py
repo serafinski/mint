@@ -1,4 +1,4 @@
-"""Registry false-negative audit (proposal §Pillar 1 line 77).
+"""Registry false-negative audit for the Pillar 1 gap-detection claim.
 
 Closes the symmetric gap with ``scripts/test_registry_matching.py`` which
 audits **false positives** (superficial keyword matches that produce
@@ -8,7 +8,7 @@ claim in the proposal:
     "The registry uses hierarchical embeddings (domain → capability →
     specific skill) to prevent both false positives (superficial keyword
     matches) AND false negatives (semantically equivalent but differently
-    named skills)." — thesis_proposal.md, line 77
+    named skills)." — thesis_proposal.md, Pillar 1 gap-detection paragraph
 
 Methodology
 -----------
@@ -24,6 +24,13 @@ Methodology
      - top-3 lenient:  target cap anywhere in top-3
      - above-threshold: target cap above the default cosine threshold
    The **top-1 miss rate** is the proposal-literal FN metric.
+
+This is a lower-level registry audit, not a full eval-protocol
+``gap_detection_node`` simulation. The eval pipeline uses the same
+``SkillRegistry`` / ChromaDB search layer, but wraps it through
+``registry.detect_gaps()`` with slug+description dual-query retrieval,
+optional taxonomy filtering, and post-match compatibility checks. This
+script isolates the semantic-search false-negative question.
 
 Exit code 0 if aggregate top-3 recall >= 0.90 (the proposal's
 "hierarchical embeddings prevent FN" claim is empirically defensible at
@@ -49,8 +56,9 @@ Usage
     # Per-cap detail
     uv run scripts/test_registry_fn.py --verbose
 
-Cost: 1 LLM call per capability (~19 caps seeded by ``seed_registry``,
-~$0.02 at gpt-5-mini, temp=0.7 for paraphrase diversity). Runs in ~60s.
+Cost: 1 LLM call per seeded capability, using ``DEFAULT_LLM_MODEL`` with
+temperature 0.7 for paraphrase diversity. Runtime depends on the current
+``seed_registry()`` inventory and model latency.
 """
 
 from __future__ import annotations
@@ -62,17 +70,16 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Step 13.6 / Fix #1: route dev-script LangFuse emissions to test env.
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 
-from dotenv import load_dotenv  # noqa: E402
-
 load_dotenv(ROOT / ".env")
-
-from pydantic import BaseModel, Field  # noqa: E402
 
 from src.config import DEFAULT_LLM_MODEL  # noqa: E402
 from src.registry.store import SkillRegistry, seed_registry  # noqa: E402
@@ -246,7 +253,7 @@ def main() -> int:
     args = parser.parse_args()
 
     print("=" * 70)
-    print("  REGISTRY FALSE-NEGATIVE AUDIT (proposal §Pillar 1 line 77)")
+    print("  REGISTRY FALSE-NEGATIVE AUDIT (proposal §Pillar 1 gap detection)")
     print("=" * 70)
 
     # Seed an ephemeral registry so we don't touch any persistent state.

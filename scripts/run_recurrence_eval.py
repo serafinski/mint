@@ -1,12 +1,14 @@
-"""Run the Pillar 3 recurrence evaluation track.
+"""Run the Stage 3 supplemental recurrence evaluation track.
 
-Uses the existing taskbed contracts with generated fixture variants. The
-recommended default matrix is:
+Uses existing task-family contracts with generated fixture variants so the
+optimizer sees repeated pressure on related tasks. The protocol default is:
 
 - tasks: T04,T11,T13,T14,T15,T20
 - variants: 3 per task
 - conditions: full,no_verification,no_optimization,static
 - runs: 3
+
+That yields 216 recurrence records and writes them to a campaign-scoped DB.
 """
 
 from __future__ import annotations
@@ -20,10 +22,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
-
-from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
@@ -130,7 +132,11 @@ def main() -> int:
     )
 
     log_format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
-    logging.basicConfig(level=logging.INFO, format=log_format, handlers=[logging.StreamHandler()])
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        handlers=[logging.StreamHandler()],
+    )
 
     if args.db is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -141,7 +147,11 @@ def main() -> int:
         db_path.unlink()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    metrics_root = Path(args.metrics_root) if args.metrics_root else DATA_DIR / "eval" / "recurrence_metrics"
+    metrics_root = (
+        Path(args.metrics_root)
+        if args.metrics_root
+        else DATA_DIR / "eval" / "recurrence_metrics"
+    )
     metrics_root.mkdir(parents=True, exist_ok=True)
 
     if args.regenerate_fixtures or not RECURRENCE_MANIFEST_PATH.exists():
@@ -182,7 +192,10 @@ def main() -> int:
         try:
             with watchdog_cm:
                 for run_idx in range(args.n_runs):
-                    metrics_store_path = metrics_root / db_path.stem / condition / f"run_{run_idx:02d}.duckdb"
+                    metrics_store_path = (
+                        metrics_root / db_path.stem / condition
+                        / f"run_{run_idx:02d}.duckdb"
+                    )
                     metrics_store_path.parent.mkdir(parents=True, exist_ok=True)
                     if metrics_store_path.exists():
                         metrics_store_path.unlink()
@@ -200,12 +213,20 @@ def main() -> int:
                     with EvaluationHarness(config) as harness:
                         snap_id = harness.prepare()
                         logger.info(
-                            "Running recurrence condition=%s run=%02d tasks=%d snapshot=%s metrics_store=%s",
-                            condition, run_idx, len(recurrence_tasks), snap_id, metrics_store_path,
+                            "Running recurrence condition=%s run=%02d "
+                            "tasks=%d snapshot=%s metrics_store=%s",
+                            condition,
+                            run_idx,
+                            len(recurrence_tasks),
+                            snap_id,
+                            metrics_store_path,
                         )
                         records = harness.run_condition(condition, recurrence_tasks)
                         total_records += len(records)
-                        flush_failures += sum(0 if fr.all_ok else 1 for fr in harness.flush_results)
+                        flush_failures += sum(
+                            0 if fr.all_ok else 1
+                            for fr in harness.flush_results
+                        )
                         logger.info(
                             "Completed recurrence condition=%s run=%02d success=%d/%d",
                             condition, run_idx, sum(r.success for r in records), len(records),

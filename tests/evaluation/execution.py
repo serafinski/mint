@@ -1,8 +1,8 @@
-"""SKILL and AGENT artifact execution — three distinct backends.
+"""Evaluation artifact execution — three distinct runtime backends.
 
 Each capability type uses a different execution backend:
 
-- **MCP Tool**: sandbox code execution, no LLM at runtime (handled in harness.py)
+- **MCP Tool**: sandbox code execution, no LLM at runtime.
 - **SKILL**: constrained LLM with ``sandbox_execute`` tool calling (max 3 calls,
   no planning loop, no ``write_todos``). Prescribed workflow execution.
 - **AGENT**: full DeepAgent with ``sandbox_execute`` + native ``skills=`` parameter
@@ -1072,7 +1072,11 @@ async def _run():
         # Diagnostic: log what the tool receives and produces (stderr)
         import sys
         print(f"[CHAIN STEP {step_index}] Function: {func_name}", file=sys.stderr)
-        print(f"[CHAIN STEP {step_index}] _all_inputs keys: {{list(_all_inputs.keys())}}", file=sys.stderr)
+        print(
+            f"[CHAIN STEP {step_index}] _all_inputs keys: "
+            f"{{list(_all_inputs.keys())}}",
+            file=sys.stderr,
+        )
         print(f"[CHAIN STEP {step_index}] _fixture_paths: {{_fixture_paths}}", file=sys.stderr)
         print(f"[CHAIN STEP {step_index}] _kwargs keys: {{list(_kwargs.keys())}}", file=sys.stderr)
         for _k, _v in _kwargs.items():
@@ -1081,7 +1085,13 @@ async def _run():
 
         result = await {func_name}(**_kwargs)
 
-        print(f"[CHAIN STEP {step_index}] result keys: {{list(result.keys()) if isinstance(result, dict) else type(result).__name__}}", file=sys.stderr)
+        _result_keys = (
+            list(result.keys()) if isinstance(result, dict) else type(result).__name__
+        )
+        print(
+            f"[CHAIN STEP {step_index}] result keys: {{_result_keys}}",
+            file=sys.stderr,
+        )
 
         # Write output to workspace for downstream steps
         with open(f"/workspace/step_{step_index}_output.json", "w") as _out:
@@ -1106,7 +1116,7 @@ asyncio.run(_run())
 
     # Log chain step diagnostics from stderr (always, not just on failure)
     stderr = result.get("stderr") or ""
-    chain_diag = [l for l in stderr.splitlines() if "[CHAIN STEP" in l]
+    chain_diag = [line for line in stderr.splitlines() if "[CHAIN STEP" in line]
     if chain_diag:
         for line in chain_diag:
             logger.info("  %s", line)
