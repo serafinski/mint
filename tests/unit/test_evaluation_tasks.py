@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from tests.evaluation.tasks import (
@@ -67,6 +69,14 @@ class TestTaskRegistry:
             for p in task.fixture_paths:
                 assert p.exists(), f"Fixture missing for {task.task_id}: {p}"
 
+    def test_fixture_generator_matches_expected_values(self, tmp_path):
+        from tests.evaluation.fixtures.generate import generate_all_fixtures
+        from tests.evaluation.tasks import _EV
+
+        generated = generate_all_fixtures(tmp_path)
+
+        assert generated == _EV
+
 
 class TestT01Validator:
     def test_exact_match(self):
@@ -102,7 +112,12 @@ class TestT03Validator:
     def test_valid_word_count_and_readability(self):
         from tests.evaluation.tasks import _EV
         ev = _EV["T03"]
-        assert T03.validator({"word_count": ev["word_count"], "readability_score": ev["readability_score"]})
+        assert T03.validator(
+            {
+                "word_count": ev["word_count"],
+                "readability_score": ev["readability_score"],
+            }
+        )
 
     def test_word_count_slightly_off_passes(self):
         from tests.evaluation.tasks import _EV
@@ -119,7 +134,6 @@ class TestT03Validator:
         word_count or tolerance changes — any value that pushes
         |actual - expected| / expected strictly above the tol pct suffices.
         """
-        import math
         from tests.evaluation.tasks import _EV
         ev = _EV["T03"]
         wc = ev["word_count"]
@@ -360,7 +374,7 @@ class TestT12Validator:
 
 class TestT13Validator:
     def test_valid_investigation(self):
-        # ext6 #35: metric names must be real fixture columns.
+        # Metric names must be real fixture columns.
         anomalies = [{"timestamp": "2024-06-01", "metric": "cpu_usage", "value": 99.0}] * 5
         assert T13.validator({
             "anomaly_count": 5,
@@ -370,7 +384,7 @@ class TestT13Validator:
 
     def test_tolerant_anomaly_count(self):
         """Agent finding 3-7 anomalies should pass (threshold is >= 3)."""
-        # ext6 #35: each entry must reference a real fixture metric name.
+        # Each entry must reference a real fixture metric name.
         anomalies = [{"timestamp": "t", "metric": "memory_mb", "value": 1.0}] * 3
         assert T13.validator({
             "anomaly_count": 3,
@@ -584,8 +598,7 @@ class TestT19Validator:
     """Minimal coverage: happy path + one wrong-value rejection.
 
     T19 validator checks n_rows + n_categories + categories set-equality
-    against _EV["T19"]. Added 2026-04-19 after batch_07 coverage audit
-    flagged T19/T20 as having zero validator tests.
+    against _EV["T19"].
     """
 
     def test_valid_eda_output(self):
@@ -623,8 +636,7 @@ class TestT20Validator:
     """Minimal coverage: happy path + wrong-value rejections.
 
     T20 validator checks total_applications, eligible_count, ineligible_count,
-    rules_applied AND cross-invariant eligible + ineligible == total. Added
-    2026-04-19 after batch_07 coverage audit flagged T19/T20 as untested.
+    rules_applied, and the cross-invariant eligible + ineligible == total.
     """
 
     def test_valid_eligibility(self):
@@ -666,13 +678,11 @@ class TestT20Validator:
 
 
 # ---------------------------------------------------------------------------
-# Step 18.5 — TaskDefinition.expected_type invariants
+# TaskDefinition.expected_type invariants
 #
-# Added 2026-04-19 after Step 13.5 audit surfaced zero direct coverage for
-# the ``expected_type`` field (proposal Pillar 1 RQ #1 proxy input). These
-# tests pin the distribution claim in the §6.5 commit message ("8 mcp_tool
-# / 6 skill / 6 agent") and guard against silent drift when someone edits
-# a task definition.
+# These tests pin the expected primary-type distribution ("8 mcp_tool /
+# 6 skill / 6 agent") and guard against silent drift when someone edits a
+# task definition.
 # ---------------------------------------------------------------------------
 
 
@@ -695,33 +705,31 @@ class TestExpectedTypeInvariants:
         assert bad == [], f"Invalid expected_type labels: {bad}"
 
     def test_distribution_matches_step_18_5_claim(self):
-        """Step 18.5 commit (ad4908e) pinned the distribution at 8/6/6.
+        """The expected-type distribution is fixed at 8/6/6.
 
         If someone adjusts a task's type without updating this count,
-        the Classification Accuracy Chapter 6 number silently shifts.
+        the classification-accuracy result silently shifts.
         """
         counts: dict[str, int] = {"mcp_tool": 0, "skill": 0, "agent": 0}
         for t in ALL_TASKS:
             if t.expected_type in counts:
                 counts[t.expected_type] += 1
         assert counts == {"mcp_tool": 8, "skill": 6, "agent": 6}, (
-            f"Distribution drifted from the Step 18.5 claim (8/6/6): {counts}"
+            f"Distribution drifted from the expected 8/6/6 split: {counts}"
         )
 
     def test_total_task_count_is_20(self):
-        """Testbed is fixed at T01–T20 per CLAUDE.md + proposal §Testbed."""
+        """Testbed is fixed at T01-T20 for the evaluation protocol."""
         assert len(ALL_TASKS) == 20
 
 
 # ---------------------------------------------------------------------------
-# Security audit finding #33 — T07 + T11 file validators (2026-04-20)
+# T07 + T11 file validators
 # ---------------------------------------------------------------------------
 
 
 class TestT07FileValidatorFailsClosed:
-    """Pre-fix, ``_file_validate_t07`` fell back to dict-only validation
-    when ``output.csv`` was missing. Post-fix fails closed — the file
-    is contract-required."""
+    """Missing ``output.csv`` fails closed because the file is contract-required."""
 
     def test_missing_csv_fails_closed(self):
         from tests.evaluation.tasks import _file_validate_t07, _t07_ev
@@ -748,10 +756,11 @@ class TestT07FileValidatorFailsClosed:
 
 
 class TestT11FileValidatorFailsClosed:
-    """Pre-fix had two fail-open branches: missing-file returned True,
-    catch-all Exception returned True (masking BadZipFile /
-    InvalidFileException). Post-fix fails closed on both, with graceful
-    degradation only for the ImportError (openpyxl-missing) case."""
+    """Missing/corrupt ``output.xlsx`` files fail closed.
+
+    The only graceful degradation path is the ImportError case where openpyxl is
+    unavailable in a local developer environment.
+    """
 
     def _t11_good_output(self):
         from tests.evaluation.tasks import _t11_ev
@@ -777,10 +786,8 @@ class TestT11FileValidatorFailsClosed:
         ) is False
 
 
-class TestExt6Finding35TightenedValidators:
-    """ext6 #35: validators tightened on the 4 highest-risk tasks reject
-    hallucinated/minimal outputs that passed the pre-fix metadata predicates.
-    """
+class TestTightenedValidators:
+    """Tightened validators reject hallucinated/minimal outputs."""
 
     # -- T05 -----------------------------------------------------------------
 
@@ -933,10 +940,8 @@ class TestExt6Finding35TightenedValidators:
         assert _validate_t13(output) is True
 
 
-class TestExt6Finding35PermissiveDisclosure:
-    """ext6 #35: the permissive-validator set and one-time WARN log are
-    audit-trail artifacts backing the Chapter 4.5 disclosure.
-    """
+class TestPermissiveValidatorDisclosure:
+    """Permissive-validator set and one-time WARN log stay explicit."""
 
     def test_permissive_set_contents(self):
         from tests.evaluation.tasks import _PERMISSIVE_VALIDATOR_TASK_IDS

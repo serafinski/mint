@@ -9,7 +9,6 @@ import pytest
 from tests.evaluation.snapshots import (
     _hash_snapshot,
     restore_clean_snapshot,
-    snapshot_exists,
     take_clean_snapshot,
 )
 
@@ -94,17 +93,6 @@ class TestRestoreSnapshot:
         snap_dir = tmp_path / "no_snapshot_here"
         with pytest.raises(FileNotFoundError):
             restore_clean_snapshot(chroma, skills, snapshot_dir=snap_dir)
-
-
-class TestSnapshotExists:
-    def test_false_before_taking(self, tmp_path):
-        assert not snapshot_exists(snapshot_dir=tmp_path / "snapshots")
-
-    def test_true_after_taking(self, tmp_dirs, tmp_path):
-        chroma, skills = tmp_dirs
-        snap_dir = tmp_path / "snapshots"
-        take_clean_snapshot(chroma, skills, snapshot_dir=snap_dir)
-        assert snapshot_exists(snapshot_dir=snap_dir)
 
 
 class TestHashSnapshot:

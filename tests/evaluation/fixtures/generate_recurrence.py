@@ -22,7 +22,7 @@ _GENERATOR_MAP = {
     "T13": canonical._gen_t13,
     "T14": canonical._gen_t14,
     "T15": canonical._gen_t15,
-    "T20": canonical._gen_t20,
+    "T20": canonical._gen_t20_recurrence,
 }
 
 

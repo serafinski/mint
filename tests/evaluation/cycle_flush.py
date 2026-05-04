@@ -1,21 +1,15 @@
-"""Per-task cycle-state flush helper for longitudinal + harness runs.
+"""Per-task cycle-state flush helper for evaluation runs.
 
-Step 18.7 landed the persistent cycle-state tables (``invocation_events``,
-``cycle_utility_scores``, ``cycle_events``) + wired ``EvaluationHarness.
-_execute_run`` to flush per-task data after each ``pipeline.invoke()``.
-Step 18.7 surfaced that standalone longitudinal runners inline their own
-task loops and bypass the harness, so without a shared helper they would
-also bypass the flush hooks. This module factors the flush logic out so
-both the harness (``tests.evaluation.harness._execute_run``) and
-longitudinal scripts call the exact same code path.
+The eval harness and longitudinal runner both need to persist telemetry
+after each task: invocation events, utility-score snapshots, and optimizer
+capability events. This module keeps those writes on one shared path so the
+analyzers see the same tables across breadth, recurrence, and longitudinal
+tracks.
 
-Never-raises-but-surfaces contract: ext13 #125 (2026-04-21) — the three
-persistence writes (`invocation_events`, `cycle_utility_scores`,
-`cycle_events`) still each swallow exceptions so a transient DB hiccup
-doesn't break the surrounding 5-hour campaign, but the helper now returns
-a :class:`FlushResult` reporting per-batch success. Callers (longitudinal
-runners, harness) aggregate these and exit non-zero at campaign-end when
-any flush batch failed — partial flush is silent no longer.
+Contract: never raise while a task campaign is running. Each persistence
+write is isolated, and the returned :class:`FlushResult` reports which
+batches landed so runners can fail the campaign at the end if telemetry is
+partial.
 """
 
 from __future__ import annotations
@@ -32,10 +26,9 @@ logger = logging.getLogger(__name__)
 class FlushResult:
     """Per-batch success/failure tally for one ``flush_task_cycle_state`` call.
 
-    ext13 #125: the helper used to return ``None``, with broad-except
-    logging warnings internally — callers had no mechanism to detect
-    partial flush. Every batch now sets its own boolean and collected
-    errors; ``all_ok`` drives the runner's exit-code decision.
+    Every batch sets its own boolean and appends any error message. Callers
+    aggregate these results and use ``all_ok`` to decide whether a campaign
+    completed with complete telemetry.
     """
 
     invocations_ok: bool = False
@@ -67,17 +60,16 @@ def flush_task_cycle_state(
 
     Copies three batches from the in-memory ``metrics_store`` + fresh
     ``compute_all_utilities(registry, metrics_store)`` to the persistent
-    ``eval_store``, keyed by ``(run_id, condition, task_id)``:
+    ``eval_store``, keyed by run/condition/task identity:
 
     - ``invocation_events`` — all invocations recorded against ``task_id``
-      during this task's pipeline run (Step 18.5).
+      during this task's pipeline run.
     - ``cycle_utility_scores`` — per-capability utility snapshot computed
-      now; mirrors the online ``src.optimizer.loop._compute_kl_divergence``
-      input, enabling proposal-literal KL convergence analysis (Step 18.7).
+      now; this is the primary input for KL convergence analysis.
     - ``cycle_events`` — ``capability_events`` rows written during this
       task (prune / split / merged / verification_rollback / etc.), filtered
       via ``fetch_events_since(task_events_cutoff)``. Used for per-type
-      operation-count analysis (Step 18.7).
+      operation-count analysis.
 
     All three flushes are individually try/except-wrapped so one failure
     doesn't cascade. Caller must capture ``task_events_cutoff`` BEFORE the
@@ -88,7 +80,7 @@ def flush_task_cycle_state(
         metrics_store: MetricsStore instance (in-memory per run).
         registry: SkillRegistry instance (passed to compute_all_utilities).
         run_id: The run ID for this longitudinal/harness run.
-        condition: BaselineCondition value (e.g. "full", "longitudinal").
+        condition: Condition label (e.g. "full", "static", "longitudinal").
         task_id: Canonical task family ID for the just-completed task.
         task_family_id: Stable family-level identifier. Defaults to ``task_id``.
         task_instance_id: Concrete task-instance identifier. Defaults to ``task_id``.
@@ -100,20 +92,16 @@ def flush_task_cycle_state(
     Returns:
         A :class:`FlushResult` with per-batch ``*_ok`` flags and an
         ``errors`` list. Never raises; callers must inspect the result
-        (ext13 #125).
+        before declaring a campaign clean.
     """
     result = FlushResult()
 
     task_family_id = task_family_id or task_id
     task_instance_id = task_instance_id or task_id
 
-    # --- Invocation events (Step 18.5) ---
-    # Security audit finding #23 (2026-04-20): pass ``since=task_events_cutoff``
-    # so fetch returns only THIS cycle's invocations. Pre-fix the fetch
-    # returned all rows for the task_id, duplicating cycle-1 invocations
-    # into every subsequent flush when tasks repeated in the sequence
-    # (default `--n-tasks=40` over 20 testbed tasks). Gini + invocation-
-    # count KL were inflated.
+    # --- Invocation events ---
+    # Scope by cutoff so repeated task families in longitudinal/recurrence
+    # runs do not copy earlier invocations into later cycles.
     try:
         task_invocations = metrics_store.fetch_invocations_for_task(
             task_id, since=task_events_cutoff,
@@ -127,7 +115,7 @@ def flush_task_cycle_state(
             variant_id=variant_id,
             benchmark_track=benchmark_track,
             events=task_invocations,
-            is_pilot=is_pilot,  # ext7 #50
+            is_pilot=is_pilot,
         )
         result.invocations_ok = True
     except Exception as exc:  # noqa: BLE001
@@ -136,7 +124,7 @@ def flush_task_cycle_state(
         )
         result.errors.append(f"invocation_events: {exc}")
 
-    # --- Cycle utility scores (Step 18.7) ---
+    # --- Cycle utility scores ---
     try:
         from src.optimizer.utility import compute_all_utilities
         utilities = compute_all_utilities(registry, metrics_store)
@@ -157,7 +145,7 @@ def flush_task_cycle_state(
         )
         result.errors.append(f"cycle_utility_scores: {exc}")
 
-    # --- Cycle events (Step 18.7) ---
+    # --- Cycle events ---
     try:
         task_events = metrics_store.fetch_events_since(task_events_cutoff)
         eval_store.record_cycle_events(
@@ -177,11 +165,9 @@ def flush_task_cycle_state(
         )
         result.errors.append(f"cycle_events: {exc}")
 
-    # Step 13.7 Batch C2: emit a LangFuse cross-reference tag linking
-    # the active trace to the just-flushed DuckDB row keys. Chapter 5/6
-    # reviewers can then navigate LangFuse → DuckDB or vice versa
-    # without a timestamp join. Never raises; informational only so
-    # failure here doesn't flip any FlushResult flag.
+    # Emit a best-effort LangFuse cross-reference linking the active trace to
+    # the flushed DuckDB row keys. This is audit metadata only, so failure here
+    # does not affect any FlushResult flag.
     try:
         from src.orchestrator.tracing import emit_langfuse_event
         emit_langfuse_event(

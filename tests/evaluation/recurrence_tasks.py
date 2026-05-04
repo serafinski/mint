@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import io
 import json
-from functools import partial
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 from tests.evaluation.tasks import TaskDefinition, get_task
@@ -248,7 +248,10 @@ def build_recurrence_tasks(
             canonical,
             [ROOT / rel for rel in row["fixture_files"]],
         )
-        validator_updates = _VALIDATOR_FACTORY_MAP[task_family_id](row["expected_values"], canonical)
+        validator_updates = _VALIDATOR_FACTORY_MAP[task_family_id](
+            row["expected_values"],
+            canonical,
+        )
         built.append(
             replace(
                 canonical,

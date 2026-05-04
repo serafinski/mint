@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import pickle
 from dataclasses import replace
-from pathlib import Path
 
 import pytest
 
@@ -29,13 +28,21 @@ def test_condition_profiles_are_proposal_aligned():
 
     assert no_verification.jit_enabled is True
     assert no_verification.verification_enabled is False
-    assert no_verification.optimizer_enabled is True
+    assert no_verification.optimizer_config.prune == "auto"
+    assert no_verification.optimizer_config.split == "auto"
+    assert no_verification.optimizer_config.merge == "auto"
 
     assert no_optimization.jit_enabled is True
     assert no_optimization.verification_enabled is True
-    assert no_optimization.optimizer_enabled is False
+    assert no_optimization.optimizer_config.prune == "off"
+    assert no_optimization.optimizer_config.split == "off"
+    assert no_optimization.optimizer_config.merge == "off"
 
     assert static.jit_enabled is False
+    assert static.verification_enabled is False
+    assert static.optimizer_config.prune == "off"
+    assert static.optimizer_config.split == "off"
+    assert static.optimizer_config.merge == "off"
 
 
 def test_evaluation_store_roundtrips_variant_identity(tmp_path):

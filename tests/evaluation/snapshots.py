@@ -1,6 +1,6 @@
 """Registry snapshot utilities for evaluation run isolation.
 
-Strategy (per advisor doc):
+Strategy:
 - Take ONE clean snapshot before evaluation begins.
 - Restore it at the START of every run (not per-task, not per-condition).
 - Scope: ChromaDB persist dir + data/eval/skills/
@@ -27,7 +27,7 @@ def take_clean_snapshot(
     *,
     snapshot_dir: Path = _SNAPSHOT_DIR,
 ) -> str:
-    """Copy the three registry directories into a clean snapshot.
+    """Copy the registry state directories into a clean snapshot.
 
     Call ONCE before evaluation begins.  Returns the snapshot ID
     (same value for every run that starts from this state).
@@ -61,7 +61,7 @@ def restore_clean_snapshot(
     *,
     snapshot_dir: Path = _SNAPSHOT_DIR,
 ) -> str:
-    """Restore the clean snapshot into the three registry directories.
+    """Restore the clean snapshot into the registry state directories.
 
     Call at the START of every run, before processing Task 1.
     Returns the snapshot ID so callers can record it in EvaluationRecord.
@@ -87,21 +87,6 @@ def restore_clean_snapshot(
             dst.mkdir(parents=True, exist_ok=True)
 
     return snap_id
-
-
-def get_snapshot_id(*, snapshot_dir: Path = _SNAPSHOT_DIR) -> str:
-    """Return the ID of the existing clean snapshot without restoring."""
-    meta_path = snapshot_dir / "meta.json"
-    if not meta_path.exists():
-        raise FileNotFoundError(
-            "No clean snapshot found. Call take_clean_snapshot() first."
-        )
-    return json.loads(meta_path.read_text())["id"]
-
-
-def snapshot_exists(*, snapshot_dir: Path = _SNAPSHOT_DIR) -> bool:
-    """True if a clean snapshot has been taken."""
-    return (snapshot_dir / "meta.json").exists()
 
 
 # ---------------------------------------------------------------------------

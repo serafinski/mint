@@ -5,24 +5,17 @@ import os
 import pytest
 from dotenv import load_dotenv
 
-# Step 13.7 tagging audit (2026-04-18) — route all test-emitted LangFuse
-# events to environment="test" so Chapter 6 analysis can filter them out
-# at the project-level environment selector (LangFuse UI + REST API).
+# Route all test-emitted LangFuse events to environment="test" so they stay
+# separate from evaluation traces in the LangFuse UI and API.
 #
-# Rationale. Tests that exercise gate.verify() / sandbox_execute() /
-# emit_langfuse_event() / composition step spans / Pillar 3 operations
-# all emit real events. Without this isolation, every `uv run pytest`
-# invocation would land thousands of `verification.tier_*`,
-# `sandbox.execute`, `pillar3.*`, etc. events into the SAME LangFuse
-# project the 400-record eval writes to — polluting the Pillar 2
-# "empirically observed contamination patterns" evidence (proposal
-# line 152) with test-fixture data.
+# Tests that exercise gate.verify(), sandbox_execute(), emit_langfuse_event(),
+# composition spans, and optimizer operations can emit real events. Without
+# environment isolation, every pytest run would write test-fixture events into
+# the same LangFuse project used by evaluation runs.
 #
-# Why environment= rather than credential-clearing: environment="test"
-# keeps test integration coverage (tests still exercise the LangFuse
-# wire path, catching SDK regressions), while Chapter 6 filters
-# `environment="default"` natively via the first-class observation
-# field. LangFuse UI has a dedicated environment selector.
+# Use environment isolation rather than clearing credentials by default so tests
+# still exercise the LangFuse SDK path and catch integration regressions. Set
+# LANGFUSE_DISABLE_DURING_TESTS=true to disable tracing entirely.
 #
 # Must be set BEFORE load_dotenv() so any ambient LANGFUSE_TRACING_*
 # values from .env don't override. Set via os.environ directly rather
@@ -36,11 +29,9 @@ os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 load_dotenv()
 
 
-# Opt-out env-var: set LANGFUSE_DISABLE_DURING_TESTS=true to fall back
-# to the older "disable SDK entirely" behavior (e.g., for local test
-# runs that shouldn't hit LangFuse at all, or for CI where LangFuse
-# isn't reachable). Default is environment="test" which requires the
-# LangFuse service to be up.
+# Opt-out env-var for local or CI runs that should not contact LangFuse.
+# Default behavior is environment="test", which requires LangFuse to be
+# reachable when credentials are present.
 if os.environ.get("LANGFUSE_DISABLE_DURING_TESTS", "").lower() in ("true", "1", "yes"):
     os.environ.pop("LANGFUSE_PUBLIC_KEY", None)
     os.environ.pop("LANGFUSE_SECRET_KEY", None)
