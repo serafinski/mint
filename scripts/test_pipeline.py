@@ -99,12 +99,8 @@ def run_pipeline_and_verify(
         print(f"  Task: {task_prompt[:100]}...")
 
         # --- Run pipeline ---
-        # Security audit finding #88 (2026-04-19, ext9): use the canonical
-        # builder so the Stage 0 smoke test exercises the same entry-point
-        # shape (contract-as-object) as protocol eval. Pre-fix
-        # ``TaskState(task_description=...)`` bypassed contract injection
-        # and the downstream writer-synthesis guard, so the smoke gate
-        # tested a simpler path than production.
+        # Use the same entry-point shape as protocol eval: an output contract
+        # object is always present, even for prompt-only smoke tests.
         pipeline = create_pipeline(registry, loader).compile()
         initial_state = build_initial_state_from_prompt(task_prompt)
 
@@ -244,8 +240,6 @@ def run_pipeline_and_verify(
         except Exception as exc:
             print(f"     FAIL: Validation raised: {exc}")
             all_pass = False
-
-        loader.cleanup()
 
     if all_pass:
         print(f"\n  PASS: {test_name}")

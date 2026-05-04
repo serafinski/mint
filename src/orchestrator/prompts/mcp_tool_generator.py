@@ -1,7 +1,9 @@
 """Prompts for the MCP tool generator."""
+# ruff: noqa: E501 — prompt strings intentionally use long lines; line continuation
+# backslashes add noise to the LLM's view of the prompt.
 
 # ---------------------------------------------------------------------------
-# Step position directive (Step 14.7 — step-0 upstream_data false-required fix)
+# Step position directive for chain-position-specific function signatures
 # ---------------------------------------------------------------------------
 #
 # The MCP_TOOL generator occasionally emitted step-0 functions with
@@ -15,9 +17,10 @@
 # middle-step semantics in the LLM's understanding, overriding the
 # ``depends_on=[]`` signal.
 #
-# Fix: inject an explicit step-position block into the user prompt so the
-# LLM cannot confuse step role based on the gap name, plus a post-generation
-# AST check that flags signature/position mismatches for the repair pass.
+# The current generator injects an explicit step-position block into the user
+# prompt so the LLM cannot confuse step role based on the gap name. A
+# post-generation AST check also flags signature/position mismatches for the
+# repair pass.
 
 FIRST_STEP_DIRECTIVE = """\
 

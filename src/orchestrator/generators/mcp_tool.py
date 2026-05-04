@@ -52,7 +52,8 @@ class GeneratedToolCode(BaseModel):
     pip_packages: list[str] = Field(
         default_factory=list,
         description=(
-            "PyPI package names required by this tool (e.g. ['pyyaml', 'scikit-learn', 'openpyxl']). "
+            "PyPI package names required by this tool "
+            "(e.g. ['pyyaml', 'scikit-learn', 'openpyxl']). "
             "Use the pip install name, NOT the Python import name "
             "(e.g. 'pyyaml' not 'yaml', 'scikit-learn' not 'sklearn', 'Pillow' not 'PIL'). "
             "Omit stdlib and packages already in the base image (mcp, pydantic)."
@@ -197,11 +198,10 @@ def _validate_step_signature(
 ) -> str | None:
     """Validate the generated function's signature against its chain position.
 
-    Step 14.7 regression guard: catches step-0 functions that declare
-    ``upstream_data`` as a required parameter (the executor crashes with
-    ``missing 1 required positional argument: 'upstream_data'``), and
-    downstream functions that forget ``upstream_data`` entirely (the
-    executor falls through to per-key matching, which silently loses data).
+    Catches step-0 functions that declare ``upstream_data`` as a required
+    parameter and downstream functions that forget ``upstream_data`` entirely.
+    Those signatures do not match the compositional executor's calling
+    convention.
 
     Returns ``None`` when ``is_first_step`` is ``None`` (gap couldn't be
     matched to a subtask — no position information available), when the
@@ -471,7 +471,11 @@ def generate_mcp_tool(
         if skipped.query in existing_gap_queries:
             logger.info("  → skipping (already passed verification): %s", skipped.query)
 
-    logger.info("generate_mcp_tool: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(mcp_gaps) - len(gaps_to_generate))
+    logger.info(
+        "generate_mcp_tool: %d gap(s) to generate (%d skipped)",
+        len(gaps_to_generate),
+        len(mcp_gaps) - len(gaps_to_generate),
+    )
     task_context = build_task_context(state)
 
     # Build per-gap schema context from decomposer output_schema
@@ -502,13 +506,11 @@ def generate_mcp_tool(
                 raw_results.append((None, f"Generation failed for {gap.query!r}: {exc}"))
 
     # Merge after pool closes — sequential, no concurrent mutation
-    n_succeeded = 0
     failed_queries: list[str] = []
     for artifact, error in raw_results:
         if artifact is not None:
             artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
-            n_succeeded += 1
         if error is not None:
             errors.append(error)
             failed_queries.append(error[:80])
@@ -519,10 +521,9 @@ def generate_mcp_tool(
             len(failed_queries), len(gaps_to_generate), failed_queries,
         )
 
-    # Evolutionary taxonomy classification (B1 Step 3.5f). Tags each newly
-    # generated artifact with domain + is_generic so gap_detection can apply
-    # the domain filter with generic-cap bypass on subsequent runs. Never
-    # raises — failures leave artifact.domain=None and downstream code falls
+    # Tag generated artifacts with domain + is_generic so gap_detection can
+    # apply the domain filter with generic-cap bypass on subsequent runs. Never
+    # raises: failures leave artifact.domain=None and downstream code falls
     # back to "generated".
     from src.orchestrator.taxonomy import classify_and_tag_artifacts
     classify_and_tag_artifacts(artifacts)

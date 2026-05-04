@@ -1,10 +1,10 @@
-"""Verification gate — orchestrates all three tiers with tiered cost optimisation.
+"""Verification gate: orchestrates all three tiers with tiered cost optimisation.
 
 Tier structure (cheapest first, fail-fast):
 
   0    Skills only : ``quick_validate.py`` structural check          (~0 cost)
   1    MCP_TOOL    : AST + regex static scan                         (~0 cost)
-       SKILL/AGENT : regex-only scan (not Python — AST does not apply)
+       SKILL/AGENT : prose-safe static scan; Python fences get full scan
   1.5  MCP_TOOL    : Docker dry-run import with pip_packages         (~5-10s)
        SKILL/AGENT : in-process compile() of embedded python fences  (~0 cost)
   2    MCP_TOOL    : Behavioural testing in Docker sandbox   (moderate cost)
@@ -30,7 +30,6 @@ import hashlib
 import json
 import logging
 import re
-
 from collections import Counter
 
 from src.orchestrator.tracing import emit_langfuse_event
@@ -45,11 +44,10 @@ logger = logging.getLogger(__name__)
 def compute_artifact_hash(artifact: GeneratedArtifact) -> str:
     """Return a SHA-256 hash of the artifact's verification-relevant content.
 
-    Security audit finding #26 (2026-04-20): the retry-loop skip in
-    ``verification_node`` uses this hash to detect regenerated artifacts
-    with the same ``capability_name`` but modified content. Any change
-    to ``source_code`` / ``skill_content`` / ``agent_config`` produces
-    a different hash and forces re-verification.
+    ``verification_node`` uses this hash to skip only unchanged artifacts
+    that already passed verification. Any change to ``source_code``,
+    ``skill_content``, or ``agent_config`` produces a different hash and
+    forces re-verification.
     """
     payload = json.dumps(
         {
@@ -71,13 +69,12 @@ def _emit_tier_event(
     passed: bool,
     skipped_remaining: bool = False,
 ) -> None:
-    """Emit a LangFuse event summarising one tier's outcome (Step 13.7 Batch A1).
+    """Emit a LangFuse event summarising one tier's outcome.
 
     Never raises — uses emit_langfuse_event's silent-no-op contract.
     Event name ``verification.tier_<label>.<pass|reject>`` plus structured
-    metadata let Chapter 4.1 cite per-tier traces by category. The severity
-    distribution + category list are the keys Chapter 4.1 needs to
-    empirically ground the Pillar 2 novelty claim (proposal line 152).
+    metadata captures per-tier severity and category information for trace
+    inspection.
     """
     severity_dist = Counter(f.severity.value for f in findings)
     category_list = sorted({f.category for f in findings})
@@ -129,15 +126,21 @@ def _extract_python_fences(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _static_scan(artifact: GeneratedArtifact) -> VerificationReport:
+def _static_scan(
+    artifact: GeneratedArtifact,
+    *,
+    allow_network: bool = False,
+) -> VerificationReport:
     """Run the appropriate static scan for the artifact's capability type.
 
     * MCP_TOOL: full AST + regex scan on ``source_code``.
-    * SKILL: Tier 0 quick_validate then regex-only Tier 1 on ``skill_content``
-      (SKILL.md is YAML/markdown, not Python — AST SyntaxErrors are expected
-      and filtered out so a structurally valid skill is not incorrectly rejected).
-    * AGENT: regex-only scan on the JSON-serialised ``agent_config``
-      (no Python AST; JSON is not valid Python so SyntaxErrors are filtered).
+    * SKILL: Tier 0 quick_validate on ``skill_content``; prose is not scanned
+      by Python-source regexes, but Python code fences get the full MCP_TOOL scan.
+    * AGENT: prose-safe scan of the JSON-serialised ``agent_config``; Python
+      code fences in prompts or embedded skill content get the full MCP_TOOL scan.
+
+    ``allow_network`` affects the severity of Tier 1 missing-external-call
+    findings for MCP_TOOL code and Python code fences.
     """
     name = artifact.capability_name
 
@@ -146,10 +149,11 @@ def _static_scan(artifact: GeneratedArtifact) -> VerificationReport:
             source_code=artifact.source_code or "",
             capability_name=name,
             capability_type="mcp_tool",
+            allow_network=allow_network,
         )
 
     if artifact.capability_type == CapabilityType.SKILL:
-        # Tier 0 (quick_validate) + Tier 1 (regex-only — AST is skipped for
+        # Tier 0 (quick_validate) + prose-safe Tier 1; AST is skipped for
         # non-MCP_TOOL types inside static_scanner.scan()).
         report = static_scanner.scan(
             source_code=artifact.skill_content or "",
@@ -158,12 +162,13 @@ def _static_scan(artifact: GeneratedArtifact) -> VerificationReport:
         )
         # Layered check: extract Python fences from SKILL.md and run the
         # full MCP_TOOL AST + regex scan on each. Prose stays untouched
-        # (no T04-style false positives), but fenced code is scrutinised.
+        # (no prose false positives), but fenced code is scrutinised.
         for idx, snippet in enumerate(_extract_python_fences(artifact.skill_content or "")):
             fence_report = static_scanner.scan(
                 source_code=snippet,
                 capability_name=f"{name}#fence{idx}",
                 capability_type="mcp_tool",
+                allow_network=allow_network,
             )
             for f in fence_report.findings:
                 f.location = f"code_fence[{idx}]:{f.location or 'unknown'}"
@@ -194,6 +199,7 @@ def _static_scan(artifact: GeneratedArtifact) -> VerificationReport:
                 source_code=snippet,
                 capability_name=f"{name}#{source_label}#fence{idx}",
                 capability_type="mcp_tool",
+                allow_network=allow_network,
             )
             for f in fence_report.findings:
                 f.location = f"{source_label}/code_fence[{idx}]:{f.location or 'unknown'}"
@@ -218,21 +224,16 @@ def verify(
     Returns a ``VerificationReport`` summarising findings from every tier
     that was executed.  Always returns — never raises.
 
-    Step 14.12: when ``allow_network=True``, Tier 2 behavioral and Tier 3
-    adversarial probes run under ``--network bridge`` so the artifact is
-    verified in the same network-policy regime it will execute under.
-    Verifying a network-dependent artifact with network *disabled* would
-    spuriously fail Tier 2 (real API call errors) and make Tier 3's
-    network-disconnect attack trivially "suspicious" on every invocation.
+    When ``allow_network=True``, Tier 1 treats missing external-call evidence
+    as higher severity and later sandbox probes run under ``--network bridge``
+    so the artifact is verified in the same network-policy regime it will
+    execute under.
     """
     name = artifact.capability_name
     all_findings: list[VerificationFinding] = []
 
-    # Security audit finding #26 (2026-04-20): stamp the artifact's
-    # content hash so the retry loop's ``already_passed`` skip can
-    # detect regenerated-but-same-name artifacts. Computed BEFORE
-    # verification so the hash on the report matches the exact content
-    # that was verified.
+    # Compute before verification so the report hash matches the exact
+    # content that was verified.
     artifact_hash = compute_artifact_hash(artifact)
 
     # Track the current tier so the error handler can report accurately.
@@ -245,18 +246,11 @@ def verify(
         report.artifact_hash = artifact_hash
         return report
     except Exception as exc:  # noqa: BLE001
-        # Security audit finding #25 (2026-04-20): flipped from fail-open
-        # to fail-closed. §12 finding #14 committed Pillar 2 verification
-        # to fail-closed semantics, but the gate's own exception handler
-        # was left with ``overall_passed=True`` — silently overriding the
-        # verification_node's fail-safe path. Under the retry + sticky-
-        # flag contract, fail-closed is strictly safer: gate errors
-        # surface as a visible retry (the node regenerates on fresh
-        # code), not an invisible PASS that promotes unverified
-        # artifacts.
+        # The gate is fail-closed: unexpected verifier errors must not
+        # manufacture PASS verdicts for unverified artifacts.
         logger.error(
             "Verification gate error for '%s' at tier %d: %s — REJECTING "
-            "(fail-closed per §12 finding #14 + audit #25).",
+            "(fail-closed).",
             name, current_tier[0], exc,
         )
         return VerificationReport(
@@ -291,7 +285,7 @@ def _verify_inner(
     # Tier 0 + 1: Static scan (zero cost)
     # ------------------------------------------------------------------
     current_tier[0] = 1
-    t1_report = _static_scan(artifact)
+    t1_report = _static_scan(artifact, allow_network=allow_network)
     all_findings.extend(t1_report.findings)
 
     if not static_scanner.should_proceed_to_tier2(t1_report):
@@ -373,7 +367,6 @@ def _verify_inner(
     # Tier 2 clearance: if Tier 1 had HIGH findings but Tier 2 is clean,
     # the HIGHs were false alarms (code smells that don't affect behavior).
     # Downgrade them to MEDIUM so they don't block at the final gate.
-    # Per thesis proposal: "HIGH findings require Tier 2 clearance."
     t1_had_high = any(
         f.severity == Severity.HIGH and f.tier == 1 for f in all_findings
     )

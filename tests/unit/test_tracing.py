@@ -1,12 +1,12 @@
 """Unit tests for src/orchestrator/tracing.py.
 
-Covers the Step 13.7 tag-propagation fix (2026-04-19):
+Covers tracing metadata propagation:
 - ``trace_context`` context manager sets both ContextVar and module-global.
 - ``_read_trace_context`` prefers ContextVar but falls back to global.
 - ``emit_langfuse_event`` picks up fallback when get_config() returns nothing.
 - Cross-thread visibility (ThreadPoolExecutor doesn't propagate ContextVars
-  by default — the module-global path is what makes the fix work for
-  verification_node's gate / adversarial workers).
+  by default, so tracing uses explicit submit-context propagation and a
+  module-global fallback for worker emissions).
 """
 
 from __future__ import annotations
@@ -14,8 +14,6 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from src.orchestrator.tracing import (
     _has_active_parent_span,
@@ -250,12 +248,7 @@ class TestEmitLangfuseEventFallback:
 
 
 class TestOtelAwareWrapperSpan:
-    """Fix #2 (2026-04-19): OTel-aware parent detection so emits inside
-    LangChain-auto-traced pipeline nodes don't create redundant empty
-    wrapper SPANs. See ``docs/langfuse_redundancy_audit_2026_04_19.md``
-    for the empirical trail (6 event types confirmed the redundancy
-    pattern before this fix).
-    """
+    """OTel-aware parent detection for LangChain-auto-traced pipeline nodes."""
 
     def test_has_active_parent_span_detects_langfuse_sdk_contextvar(self):
         """When lf.current_trace_id is set, _has_active_parent_span returns True."""
@@ -330,7 +323,7 @@ class TestOtelAwareWrapperSpan:
         # (would create the empty wrapper SPAN)
         assert not mock_client.start_as_current_span.called, (
             "Wrapper SPAN should not be created when OTel parent is active — "
-            "this is Fix #2's whole point. If this test fails, the OTel-aware "
+            "this is the core expectation. If this test fails, the OTel-aware "
             "_has_active_parent_span check regressed and we're back to ~50% "
             "observation inflation."
         )
@@ -370,12 +363,7 @@ class TestOtelAwareWrapperSpan:
 
 
 class TestTraceIdFallback:
-    """Fix #4 (2026-04-19): trace_context carries trace_id so ThreadPool
-    workers' emit_langfuse_event calls attach events to the parent
-    pipeline trace (via TraceContext) instead of creating standalone
-    wrapper traces. See ``docs/langfuse_redundancy_audit_2026_04_19.md``
-    Fix #4.
-    """
+    """Trace ID fallback for worker events emitted under trace_context."""
 
     def test_trace_context_stores_trace_id(self):
         """trace_context accepts and stores trace_id."""

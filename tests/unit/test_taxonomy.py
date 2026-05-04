@@ -318,12 +318,8 @@ class TestLLMFailureHandling:
         assert tmp_taxonomy.get_for_query("some query", broken_llm) is None
 
 
-class TestExt8_69TaxonomyRetry:
-    """ext8 #69: get_for_query applies the 3x strict-gate retry pattern.
-    Pre-fix a single LLM failure (rate limit, 500, network flap) dropped
-    straight to unfiltered search — under high-concurrency eval load this
-    introduced uncontrolled noise into Pillar 1 retrieval metrics.
-    """
+class TestTaxonomyRetry:
+    """get_for_query retries transient LLM failures before bypassing filtering."""
 
     def test_retries_on_transient_failure_up_to_three_attempts(
         self, tmp_taxonomy: DomainTaxonomy,
@@ -346,8 +342,8 @@ class TestExt8_69TaxonomyRetry:
         ]
         result = tmp_taxonomy.get_for_query("parse sales csv", flaky_llm)
         assert result == "sales", (
-            "ext8 #69: taxonomy classifier must retry through transient "
-            "failures. Pre-fix returned None after a single exception."
+            "taxonomy classifier must retry through transient failures "
+            "before returning None"
         )
         assert flaky_llm.invoke.call_count == 3
 
@@ -375,7 +371,7 @@ class TestExt8_69TaxonomyRetry:
         assert any(
             "exhausted" in rec.getMessage() and rec.levelname == "ERROR"
             for rec in caplog.records
-        ), "ext8 #69: retry exhaustion must emit an ERROR log, not just WARN."
+        ), "retry exhaustion must emit an ERROR log, not just WARN."
 
     def test_first_attempt_success_does_not_retry(
         self, tmp_taxonomy: DomainTaxonomy,
@@ -556,7 +552,10 @@ class TestClassifyAndTagArtifacts:
 
         parse_artifact = _make_artifact(
             name="parse-eligibility-policy-and-applications-csv",
-            description="Parse eligibility policy JSON and applications CSV into structured records.",
+            description=(
+                "Parse eligibility policy JSON and applications CSV into "
+                "structured records."
+            ),
             source_code="async def parse_eligibility_policy_and_applications_csv():\n    return {}",
         )
         aggregate_artifact = _make_artifact(

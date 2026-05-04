@@ -397,8 +397,7 @@ def main(argv: list[str] | None = None) -> int:
                 "registry_size": registry.count,
             }
 
-        # ext7 #53 (2026-04-20): use shared builder so task.output_contract
-        # flows through and decomposition's writer-append validator fires
+        # Use the shared builder so task.output_contract flows through
         # identically with the harness path.
         from src.orchestrator.task_state_builder import build_initial_state
         initial_state = build_initial_state(task)

@@ -1,17 +1,11 @@
-"""Canonical TaskState construction for every pipeline entry point.
+"""Canonical TaskState construction for pipeline entry points.
 
-Security audit finding ext7 #53 (2026-04-20): the harness, longitudinal
-runners, shift runner, and any future runner must all build the initial
-TaskState the same way — most importantly, all must inject
-``output_contract`` so decomposition's writer-subtask append validator
-(``_ensure_file_writer_last_step`` at ``src/orchestrator/decomposition.py``)
-fires identically across pipelines. Pre-fix, the longitudinal runners
-omitted ``output_contract`` → the decomposer LLM was solely responsible for
-emitting a file-writer subtask; when it forgot, the chain silently ran
-without one and Pillar 3 RQ #1/#2/#3 measured a different pipeline than
-the headline row-8 eval.
+The eval harness, longitudinal runner, and retained smoke scripts should
+all enter the pipeline with the same ``TaskState`` shape. Most importantly,
+``TaskDefinition.output_contract`` must reach decomposition so required
+keys/files can influence planning and output validation consistently.
 
-Adding a new required field to TaskState becomes a one-site change here.
+Adding a new required task-entry field should be a one-site change here.
 """
 
 from __future__ import annotations
@@ -40,7 +34,7 @@ def build_initial_state(
 
     Callers: ``EvaluationHarness._run_jit`` and
     ``scripts/run_longitudinal.py``. Any new runner MUST use this helper
-    rather than constructing TaskState directly; a regression test
+    rather than constructing ``TaskState`` directly; a regression test
     (``tests/unit/test_task_state_builder.py``) asserts the contract field is
     always populated from ``task.output_contract``.
     """
@@ -60,16 +54,12 @@ def build_initial_state_from_prompt(
 ) -> TaskState:
     """Construct an initial TaskState from a bare task prompt.
 
-    Security audit finding #88 (2026-04-19, ext9): smoke scripts
-    (e.g. ``scripts/test_pipeline.py``) do not have a
-    ``TaskDefinition`` but must still thread the canonical entry-point
-    shape — ``output_contract`` as an object, not ``None`` — so their
-    pipeline path mirrors Phase 4 production. Callers that don't
-    declare any required keys/files can pass ``output_contract=None``
-    and this helper substitutes an empty ``OutputContract()``,
-    matching ``build_initial_state``'s contract-always-an-object
-    promise. Any inline-prompt script in ``scripts/`` should prefer
-    this helper over raw ``TaskState(task_description=...)``.
+    Smoke scripts such as ``scripts/test_pipeline.py`` do not have a
+    ``TaskDefinition`` but should still use the canonical entry-point shape:
+    ``output_contract`` as an object, not ``None``. Callers that do not
+    declare required keys/files can pass ``output_contract=None`` and this
+    helper substitutes an empty ``OutputContract()``, matching
+    ``build_initial_state``'s contract-always-an-object promise.
     """
     contract = output_contract if output_contract is not None else OutputContract()
     return TaskState(

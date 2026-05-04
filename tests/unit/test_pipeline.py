@@ -1,11 +1,11 @@
-"""Unit tests for the Iteration 2 Phase C LangGraph pipeline.
+"""Unit tests for the JIT capability LangGraph pipeline.
 
 These tests verify:
 - The pipeline compiles without errors given a registry and loader.
 - The pipeline graph contains all expected nodes.
 - The pipeline runs end-to-end with a seeded registry whose capabilities
   match the task (no LLM calls needed when there are no gaps — generators
-  are no-ops and the loading node has nothing to load).
+  are no-ops and the loading node has nothing to register).
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ def test_pipeline_contains_expected_nodes(seeded_registry, mock_loader):
 # When every required capability is found in the registry, state.gaps is []
 # after gap_detection.  The classifier receives no gaps to classify, and all
 # three generators are no-ops.  The loading_node finds no MCP_TOOL artifacts
-# and sets status=COMPLETED.  This path exercises the full graph without any
+# and sets status=COMPLETED. This path exercises the full graph without any
 # LLM call, making it a deterministic unit test.
 # ---------------------------------------------------------------------------
 
@@ -112,7 +112,7 @@ def test_pipeline_no_gaps_path_completes(seeded_registry, mock_loader):
                 TaskState(task_description="compute fibonacci number")
             )
 
-    # No gaps → all generators are no-ops → loading_node sees no artifacts and
+    # No gaps -> all generators are no-ops -> loading_node sees no artifacts and
     # no gaps → status = COMPLETED.
     assert result["status"] == TaskStatus.COMPLETED
     assert isinstance(result["errors"], list)
@@ -254,7 +254,7 @@ def test_loading_then_optimize_preserves_non_end_goto():
     )
     assert end_result.goto == "optimizer_node"
 
-    # Non-END goto → preserved as-is (future retry path)
+    # Non-END goto -> preserved as-is.
     retry_result = _loading_then_optimize(
         lambda s: Command(update={}, goto="generate_mcp_tool"), state
     )

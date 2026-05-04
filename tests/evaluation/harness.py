@@ -59,15 +59,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from src.orchestrator.output_contract_resolver import (
-    _extract_output_contract_llm,
-    resolve_output_contract,
-)
+from src.orchestrator.output_contract_resolver import _extract_output_contract_llm
 from src.orchestrator.tool_loader import ToolLoader
 from src.registry.evaluation_store import EvaluationStore
 from src.registry.store import SkillRegistry, seed_registry
 from src.schemas.evaluation import EvaluationRecord, GeneratedArtifactSnapshot
-from src.schemas.task import GeneratedArtifact, OutputContract, TaskState
+from src.schemas.task import GeneratedArtifact, TaskState
 from tests.evaluation.conditions import get_condition_profile
 from tests.evaluation.snapshots import restore_clean_snapshot, take_clean_snapshot
 from tests.evaluation.tasks import TaskDefinition
@@ -158,7 +155,7 @@ def _derive_condition_seed(condition: str, base_seed: int) -> int:
     reproducibility contract documented in CLAUDE.md and run_sheet.md.
     """
     import hashlib
-    key = f"{condition}|{int(base_seed)}".encode("utf-8")
+    key = f"{condition}|{int(base_seed)}".encode()
     return int.from_bytes(hashlib.sha256(key).digest()[:4], "big") % (2**31)
 
 
@@ -177,6 +174,7 @@ def _snapshot_artifacts(
     record_run. Empty list in / empty list out.
     """
     import json as _json
+
     from src.schemas.capability import CapabilityType
 
     if not artifacts:
@@ -809,20 +807,11 @@ class EvaluationHarness:
                 "allow_network": self._config.allow_network,
             }
 
-        # Step 14.6 — resolve the output contract via the shared boundary
-        # adapter. The harness path hits tier-1 (authored shortcut) by passing
-        # ``task_definition=task``; zero LLM calls. Free-form prompts go
-        # through the same function with ``task_definition=None`` and fall to
-        # the LLM extractor. Same code path, different inputs.
-        contract = resolve_output_contract(task.task_prompt, task_definition=task)
-
-        # Option 1 — token-cost honesty. The free-form path runs the
-        # LLM extractor at task entry, which costs tokens. The eval would
-        # under-count per-task token cost (one of the four thesis metrics)
-        # if the harness skipped this call. Run the extractor inside the
-        # LangFuse-tagged invocation context so its tokens count toward the
-        # per-task budget; discard the result. The authored ``contract``
-        # above remains the deterministic measurement instrument.
+        # Token-cost honesty. A free-form prompt path would run the LLM
+        # extractor at task entry, which costs tokens. Run the extractor inside
+        # the LangFuse-tagged invocation context so its tokens count toward the
+        # per-task budget; discard the result. The task's authored output
+        # contract remains the deterministic measurement instrument.
         try:
             _extract_output_contract_llm(task.task_prompt)
         except Exception as exc:  # noqa: BLE001
@@ -832,8 +821,8 @@ class EvaluationHarness:
                 exc,
             )
 
-        # ext7 #53: use the shared builder so every pipeline entry point stays
-        # in sync on which TaskState fields get populated.
+        # Use the shared builder so every pipeline entry point stays in sync
+        # on which TaskState fields get populated.
         from src.orchestrator.task_state_builder import build_initial_state
         initial_state = build_initial_state(
             task, allow_network=self._config.allow_network,
@@ -939,7 +928,6 @@ def _extract_result_compositional(
     subtasks: list,
     artifacts: list,
     matches: list,
-    classified_gaps: list,
     required_capabilities: list[str],
     verification_results: list,
     attempt_count: int,
@@ -983,7 +971,7 @@ def _extract_result_compositional(
 
     # Build resolution map
     resolution = build_resolution_map(
-        required_capabilities, matches, artifacts, classified_gaps,
+        required_capabilities, matches, artifacts,
     )
 
     # Determine primary capability type (highest priority in chain)
@@ -1181,7 +1169,6 @@ def _extract_result(
     verification_results = _get("verification_results", []) or []
     attempt_count = _get("attempt_count", 0)
     subtasks = _get("subtasks", []) or []
-    classified_gaps = _get("classified_gaps", []) or []
     decomposition_succeeded = bool(_get("decomposition_succeeded", True))
     # Step 14.12 — preserve task-level network policy through execution.
     allow_network = bool(_get("allow_network", False))
@@ -1241,7 +1228,6 @@ def _extract_result(
             subtasks=subtasks,
             artifacts=artifacts,
             matches=matches,
-            classified_gaps=classified_gaps,
             required_capabilities=required_capabilities,
             verification_results=verification_results,
             attempt_count=attempt_count,
@@ -1383,7 +1369,11 @@ def _extract_result(
                 try:
                     from src.schemas.metrics import InvocationRecord
                     first_match = matches[0]
-                    cap = first_match.capability if hasattr(first_match, "capability") else first_match.get("capability")
+                    cap = (
+                        first_match.capability
+                        if hasattr(first_match, "capability")
+                        else first_match.get("capability")
+                    )
                     cap_name = (
                         getattr(cap, "capability_name", None)
                         or (cap.get("capability_name") if isinstance(cap, dict) else None)
@@ -1626,7 +1616,8 @@ def _execute_artifact(
                 else:
                     content = host_path.read_text(encoding="utf-8", errors="replace")
                     fixture_preamble += (
-                        f"import pathlib as _pl\n_pl.Path({sandbox_path!r}).write_text({content!r})\n"
+                        "import pathlib as _pl\n"
+                        f"_pl.Path({sandbox_path!r}).write_text({content!r})\n"
                     )
                 # Replace the host path in fixture_inputs with the sandbox path
                 for k, v in fixture_inputs.items():
@@ -1712,8 +1703,7 @@ asyncio.run(_run())
                 str(parsed["error"])[:500],
             )
             return {}
-        # Security audit finding #11 (2026-04-19): preserve falsy / non-dict
-        # results via the shared helper.
+        # Preserve falsy / non-dict results via the shared helper.
         from src.orchestrator.output_coerce import extract_tool_result
         output = extract_tool_result(parsed)
         logger.info("Sandbox output for %s: %s", func_name, str(output)[:300])

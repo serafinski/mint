@@ -1,9 +1,8 @@
-"""Tests for the ext7 #53 shared TaskState builder.
+"""Tests for the shared TaskState entry-point builder.
 
-Security audit finding ext7 #53 (2026-04-20): longitudinal runners pre-fix
-omitted ``output_contract`` from TaskState, diverging from the harness
-pipeline semantics. The shared ``build_initial_state`` helper prevents
-future drift — every pipeline entry point MUST use it.
+The eval harness and longitudinal runner must construct initial
+``TaskState`` objects through the same helper so task-level output
+contracts and runner flags stay consistent across entry points.
 """
 
 from __future__ import annotations
@@ -21,9 +20,8 @@ from tests.evaluation.tasks import T01, T07  # noqa: E402
 
 def test_build_initial_state_threads_output_contract():
     """T07 carries a required_files contract (produces output.csv). The builder
-    MUST pass it through to TaskState — pre-ext7-#53 longitudinal pipeline
-    silently dropped this field and decomposition's writer-append guard
-    never fired.
+    must pass it through to TaskState so decomposition can plan and validate
+    required output files consistently.
     """
     state = build_initial_state(T07)
     assert state.output_contract is not None
@@ -50,12 +48,11 @@ def test_build_initial_state_sets_allow_network():
 
 
 def test_longitudinal_runners_use_shared_builder():
-    """ext7 #53 regression guard: grep the longitudinal runner + the
-    harness for ``TaskState(`` direct construction. There MUST be no bare
-    ``TaskState(task_description=...)`` without using ``build_initial_state``.
+    """Regression guard for direct runner/harness TaskState construction.
 
-    Pre-ext7-#53, longitudinal runners constructed TaskState directly and
-    omitted ``output_contract``. The shared builder prevents future drift.
+    There must be no bare ``TaskState(task_description=...)`` in the eval
+    harness or longitudinal runner; both entry points should use
+    ``build_initial_state`` so output-contract handling stays consistent.
     """
     import re
 
@@ -77,8 +74,7 @@ def test_longitudinal_runners_use_shared_builder():
             offenders.append(f"{path.name}:{lineno} — {line.strip()}")
 
     assert not offenders, (
-        "ext7 #53 regression: the following runner/harness sites construct "
-        "TaskState directly. Use "
+        "The following runner/harness sites construct TaskState directly. Use "
         "``from src.orchestrator.task_state_builder import build_initial_state`` "
         "instead:\n" + "\n".join(f"  {o}" for o in offenders)
     )

@@ -335,7 +335,6 @@ def test_happy_path(verbose: bool = False) -> bool:
             return False
 
         print("  Pipeline completed.")
-        loader.cleanup()
 
         # ==================================================================
         # Verify all three operations triggered
@@ -644,10 +643,8 @@ def test_rollback(verbose: bool = False) -> bool:
                 # even when the gate rejects. If it raises, that itself is
                 # a failure of the atomicity contract.
                 print(f"\n  FAIL: Pipeline raised under forced gate failure: {exc}")
-                loader.cleanup()
                 return False
 
-        loader.cleanup()
         print("  Pipeline completed (under forced failure).")
 
         all_pass = True

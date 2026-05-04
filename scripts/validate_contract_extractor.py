@@ -2,11 +2,10 @@
 
 The free-form task path uses ``_extract_output_contract_llm`` to convert a
 natural-language task prompt into a typed ``OutputContract``. The eval harness
-mostly uses authored contracts directly. To make sure the eval results remain
-representative of the resolver's fallback behavior — and to apply the thesis's
-verification philosophy to its own measurement instrument — this script runs the
-LLM extractor on every T-task ``task_prompt`` and asserts agreement with the
-authored ``output_contract``.
+uses authored contracts for measured outcomes, and calls the extractor only for
+token-accounting parity. This script checks that the extractor remains
+calibrated by running it on every T-task ``task_prompt`` and asserting
+agreement with the authored ``output_contract``.
 
 Usage::
 

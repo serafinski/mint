@@ -265,7 +265,7 @@ Import from these; avoid modifying unless explicitly required. These are the mod
 - **`src/verification/gate.py`** — `verify(artifact) -> VerificationReport` — never raises; fail-closed on gate errors (flipped from fail-open per §12 finding #14 + security audit #25, 2026-04-20 — internal exceptions produce a CRITICAL finding with `overall_passed=False` rather than silently passing). Verifies generated capabilities *as artifacts*; complemented by `src/orchestrator/output_contract_resolver.py::resolve_output_contract` (Step 14.6) which verifies *task outcomes* at the system boundary — orthogonal axes, both needed.
 - **`src/registry/store.py`** — `SkillRegistry` (CRUD + hierarchical embedding search); `seed_registry()`.
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + granularity metric queries).
-- **`src/config.py`** — `DEFAULT_LLM_MODEL` (env: `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env: `JIT_SANDBOX_IMAGE`), `FILE_SIZE_LIMIT_BYTES`, `BINARY_EXTENSIONS`, `AUTO_OPTIMIZER_THRESHOLD`.
+- **`src/config.py`** — `DEFAULT_LLM_MODEL` (env: `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env: `JIT_SANDBOX_IMAGE`), `DOCKER_PREINSTALLED`, `AUTO_OPTIMIZER_THRESHOLD`, `ADVERSARIAL_REASONING_EFFORT` (env: `JIT_ADVERSARIAL_REASONING`).
 - **`tests/evaluation/`** — `tasks.py` (`TaskDefinition`, `ALL_TASKS`, `PILOT_TASKS`), `harness.py` (`EvaluationHarness`), `execution.py` (`execute_skill_artifact`, `execute_agent_artifact`), `snapshots.py`.
 
 Other stable interfaces (optimizer loop, verification tiers, tool_loader, sandbox_tool, evaluation_store, schema_extraction) can be discovered by reading the corresponding source files.

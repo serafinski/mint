@@ -3,13 +3,19 @@
 Generates edge-case test inputs, executes them in the Docker sandbox,
 and detects behavioral contamination. No LLM calls — pure Python.
 
-Six test categories:
+Regular probes:
+  - Parameterless smoke: non-empty output from zero-input tools
   - Nonexistent entity: empty / missing / invalid inputs
-  - Consistency: same input twice must produce same output
-  - Boundary: min/max values, zero, negative, empty strings
-  - Timeout: execution must complete within a reasonable timeout (5s)
-  - Latency (variance): mock-smell detection — very fast AND very uniform
+  - Consistency: same input twice must produce the same output
+  - Boundary: zero, empty, negative, extreme numeric, and large inputs
+  - KNN CSV identifier column: valid fixture with an integer ID column
+  - Timeout: execution must complete within a reasonable timeout
+  - Latency variance: suspiciously fast and uniform execution
   - Output variation: different inputs should produce different outputs
+
+For artifacts declared as network-dependent, an optional network-disconnect
+differential compares online and offline behavior when the task permits
+network access.
 """
 
 import ast
@@ -58,18 +64,9 @@ def extract_parameter_schema(
 ) -> dict[str, dict]:
     """Extract {param_name: {"type": type_str}} from the target function signature.
 
-    Security audit finding #20 (2026-04-20): pre-fix used ``ast.walk`` and
-    returned the schema for the FIRST public async function — out of
-    agreement with the decorator-first ``_extract_function_name`` used to
-    resolve the entrypoint for sandbox execution. When an LLM generator
-    emits ``async def helper(a: int)`` before ``@mcp.tool async def
-    tool(df, window)``, the sandbox called ``tool(**kwargs)`` but the
-    probe kwargs were built from the helper's schema. Tier 2 either
-    crashed on TypeError or probed nothing realistic.
-
-    Post-fix: accepts an optional ``func_name``; when omitted, resolves
-    via the decorator-first ``_extract_function_name`` so both sides
-    agree.
+    When ``func_name`` is omitted, the function is resolved by
+    ``_extract_function_name`` so parameter generation and sandbox execution
+    use the same entrypoint.
     """
     try:
         tree = ast.parse(source_code)
@@ -88,14 +85,6 @@ def extract_parameter_schema(
 
 def _find_mcp_tool_function(source_code: str) -> str | None:
     """Return the name of the ``@mcp.tool``-decorated public async function.
-
-    Security audit finding #8 (2026-04-19): the decorator is the only
-    unambiguous signal that identifies the tool entrypoint in a FastMCP
-    module. Every pre-fix call site used an ordering heuristic (``dir()``
-    alphabetical in ``ToolLoader``, ``ast.walk`` source order elsewhere)
-    that silently picked the wrong function when a helper was defined
-    before the decorated entrypoint (reporter's repro:
-    ``helper_format_rows`` ordered before ``@mcp.tool summarize_sales``).
 
     Returns the function name when exactly one public async def carries
     an ``@mcp.tool`` / ``@mcp.tool()`` decorator. Returns ``None`` on
@@ -136,12 +125,9 @@ def _find_mcp_tool_function(source_code: str) -> str | None:
 def _extract_function_name(source_code: str) -> str | None:
     """Return the name of the MCP tool entrypoint in ``source_code``.
 
-    Resolution order (security audit finding #8, 2026-04-19):
-
+    Resolution order:
     1. **Decorator match** via :func:`_find_mcp_tool_function` — unambiguous,
-       uses the FastMCP ``@mcp.tool`` signal. This is the correct answer
-       for generator output and merge/split LLM output when the FastMCP
-       pattern is followed.
+       uses the FastMCP ``@mcp.tool`` signal.
     2. **Zero decorator matches, exactly one public async def** —
        legacy / non-FastMCP artifacts. Use that function, log a WARNING
        that the decorator was missing.
@@ -231,25 +217,21 @@ def _generate_negative_input_variants(
 ) -> list[tuple[str, dict[str, Any]]]:
     """Generate multiple negative / edge-case input variants.
 
-    Security audit finding #98 (2026-04-19, ext10): the pre-fix
-    ``_generate_negative_inputs`` only emitted ``-1`` / ``-1.0``,
-    leaving common numeric crash modes (large negatives, NaN, infinities,
-    near-underflow) un-probed. Tools that handled ``-1`` gracefully but
-    crashed on ``-2**31`` or ``float("nan")`` slipped through Tier 2 and
-    got registered. This helper returns ``(label, inputs)`` pairs so the
-    boundary probe can run each variant independently and label findings
-    by the specific edge case that triggered them. Chapter 4.5 probe-
-    coverage disclosure cites the resulting taxonomy.
+    Returns ``(label, inputs)`` pairs so the boundary probe can run each
+    variant independently and label findings by the specific edge case that
+    triggered them.
 
     Variants per type:
       - ``int``: ``-1``, ``-2**31`` (32-bit min), ``-2**62`` (very large)
-      - ``float``: ``-1.0``, ``-inf``, ``+inf``, ``NaN``, ``-1e308`` (near-underflow)
+      - ``float``: ``-1.0``, ``-inf``, ``+inf``, ``NaN``, ``-1e308``
       - non-numeric types: single representative (matches the back-compat
         shim's behaviour)
     """
-    import math
-
-    int_variants = [("int_neg_one", -1), ("int_neg_31bit", -(2**31)), ("int_neg_62bit", -(2**62))]
+    int_variants = [
+        ("int_neg_one", -1),
+        ("int_neg_31bit", -(2**31)),
+        ("int_neg_62bit", -(2**62)),
+    ]
     float_variants = [
         ("float_neg_one", -1.0),
         ("float_neg_inf", float("-inf")),
@@ -287,9 +269,6 @@ def _generate_negative_input_variants(
             int_variants if type_str == "int" else float_variants
         )
         for label, value in per_param_variants:
-            # NaN compares unequal to itself; skip variants that would
-            # short-circuit downstream comparisons. Keep them — the probe
-            # WANTS to see if the tool crashes on NaN.
             kwargs = dict(base)
             kwargs[param_name] = value
             # Fill OTHER numeric params with their primary -1/-1.0 so
@@ -298,11 +277,9 @@ def _generate_negative_input_variants(
                 if other_name == param_name:
                     continue
                 kwargs[other_name] = -1 if other_type == "int" else -1.0
+            # Keep the label as part of the variant identity rather than
+            # relying on dict equality; NaN compares unequal to itself.
             variants.append((f"{param_name}/{label}", kwargs))
-            # Defensive guard: NaN equality is always False; avoid a
-            # downstream `inputs == other_inputs` short-circuit by tagging
-            # the label rather than relying on dict equality.
-            _ = math.isnan if False else None  # noqa: E501 (intentionally referenced)
 
     return variants
 
@@ -353,7 +330,8 @@ def _build_sandbox_code(source_code: str, func_name: str, inputs: dict[str, Any]
                 print(json.dumps({{"result": repr(result), "elapsed": elapsed, "error": None}}))
             except Exception as exc:
                 elapsed = time.monotonic() - start
-                print(json.dumps({{"result": None, "elapsed": elapsed, "error": f"{{type(exc).__name__}}: {{exc}}"}}))
+                error = f"{{type(exc).__name__}}: {{exc}}"
+                print(json.dumps({{"result": None, "elapsed": elapsed, "error": error}}))
 
         asyncio.run(_run())
     """)
@@ -397,7 +375,8 @@ def _build_sandbox_code_with_tempfiles(
                 print(json.dumps({{"result": repr(result), "elapsed": elapsed, "error": None}}))
             except Exception as exc:
                 elapsed = time.monotonic() - start
-                print(json.dumps({{"result": None, "elapsed": elapsed, "error": f"{{type(exc).__name__}}: {{exc}}"}}))
+                error = f"{{type(exc).__name__}}: {{exc}}"
+                print(json.dumps({{"result": None, "elapsed": elapsed, "error": error}}))
 
         asyncio.run(_run())
     """)
@@ -406,11 +385,9 @@ def _build_sandbox_code_with_tempfiles(
 def _parse_sandbox_output(result: dict) -> dict | None:
     """Parse the JSON output from a sandbox execution. Returns None on failure.
 
-    Security audit finding #21 (2026-04-20): delegates to the shared
-    ``parse_sandbox_last_json_line`` helper which tolerates debug-print
-    prefixes before the final JSON line. Pre-fix used full-stdout
-    ``json.loads`` which failed on any non-JSON prefix (import warnings,
-    LLM-generated debug prints) and marked the probe inconclusive.
+    Delegates to the shared ``parse_sandbox_last_json_line`` helper so
+    import warnings or debug prints before the final JSON line do not make
+    the probe inconclusive.
     """
     from src.verification.sandbox_parse import parse_sandbox_last_json_line
     return parse_sandbox_last_json_line(result)
@@ -423,7 +400,11 @@ def _parse_sandbox_output(result: dict) -> dict | None:
 _TRIVIAL_RESULTS = {"None", "''", '""', "[]", "{}", "0", "False", "True"}
 
 
-def _test_parameterless_smoke(source_code: str, func_name: str, _sandbox=sandbox_execute) -> list[VerificationFinding]:
+def _test_parameterless_smoke(
+    source_code: str,
+    func_name: str,
+    _sandbox=sandbox_execute,
+) -> list[VerificationFinding]:
     """Smoke-test a parameterless tool: flag non-empty canned-looking output.
 
     A tool with no parameters cannot perform dynamic computation based on caller
@@ -542,7 +523,7 @@ def _test_output_variation(
     """Check that different inputs produce different outputs.
 
     Tools that ignore parameters and return canned data will produce identical
-    outputs regardless of inputs (B2.3 bypass).
+    outputs regardless of inputs.
     """
     findings: list[VerificationFinding] = []
     if not schema:
@@ -589,11 +570,8 @@ def _test_output_variation(
             == _normalize_for_variation(parsed_b.get("result"))
             and parsed_a.get("result") not in _TRIVIAL_RESULTS
         ):
-            # ext8 #72 (2026-04-20): compare NORMALIZED outputs (timestamps
-            # / UUIDs / counters stripped) so a contaminated tool that
-            # embeds a varying timestamp per-call doesn't bypass the probe.
-            # The raw outputs may differ by a timestamp but their canned
-            # core is identical.
+            # Compare normalized outputs so a canned response with a changing
+            # timestamp, UUID, or counter does not bypass the probe.
             findings.append(
                 VerificationFinding(
                     tier=2,
@@ -611,15 +589,10 @@ def _test_output_variation(
     return findings
 
 
-# ext8 #72 (2026-04-20): regex-based normalization. Strips embedded
-# timestamps, UUIDs, and counter-like fields before equality comparison in
-# the output-variation probe. A contaminated tool whose only inter-call
-# variation is an embedded ``datetime.now()`` / ``uuid.uuid4()`` / ``counter
-# += 1`` pattern gets flagged. False positives are tolerable (the probe is
-# MEDIUM severity + one of several detection signals) — better to false-
-# positive than false-negative on contamination.
+# Strips embedded timestamps, UUIDs, and counter-like fields before equality
+# comparison in the output-variation probe.
 _NORMALIZATION_PATTERNS = [
-    # ISO-8601 timestamps: 2026-04-20T14:32:17.123456+00:00 or Z.
+    # ISO-8601 timestamps with optional fractional seconds and timezone.
     (
         re.compile(
             r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?"
@@ -653,10 +626,8 @@ _NORMALIZATION_PATTERNS = [
 def _normalize_for_variation(result: Any) -> str:
     """Normalize a probe result string by stripping timestamps/UUIDs/counters.
 
-    Called by ``_test_output_variation`` (ext8 #72) before equality
-    comparison. Accepts any type — stringifies then applies the patterns.
-    Returns the normalized string; identical output (modulo the masked
-    fields) compares equal.
+    Accepts any type, stringifies it, and applies the normalization patterns.
+    Identical output modulo the masked fields compares equal.
     """
     s = result if isinstance(result, str) else repr(result)
     for pattern, replacement in _NORMALIZATION_PATTERNS:
@@ -779,12 +750,8 @@ def _test_boundary(
     if not schema:
         return findings
 
-    # Security audit finding #98 (2026-04-19, ext10): expand the
-    # negative-input case from a single ``-1`` / ``-1.0`` probe into
-    # a labeled-variants matrix (large-negative, NaN, ±inf, near-
-    # underflow per numeric parameter). Each variant runs as its own
-    # probe so findings attribute to the specific edge case. Keeps
-    # zero/empty and large intact.
+    # Run each negative numeric variant as its own probe so findings can
+    # identify the specific edge case that failed.
     test_cases = [
         ("zero/empty", _generate_boundary_inputs(schema)),
     ]
@@ -824,7 +791,10 @@ def _test_boundary(
                         message=(
                             f"Dependency install failed: {stderr[:300] or '(no stderr)'}"
                             if is_dep_failure
-                            else f"Tool crashed on {label} boundary inputs: {stderr[:200] or '(no stderr)'}"
+                            else (
+                                f"Tool crashed on {label} boundary inputs: "
+                                f"{stderr[:200] or '(no stderr)'}"
+                            )
                         ),
                         location="pip_packages" if is_dep_failure else f"boundary/{label}",
                     )
@@ -858,7 +828,10 @@ def _test_timeout(
                 tier=2,
                 category="timeout",
                 severity=Severity.MEDIUM,
-                message=f"Tool execution took {elapsed:.2f}s (timeout threshold: {TIMEOUT_THRESHOLD_S}s)",
+                message=(
+                    f"Tool execution took {elapsed:.2f}s "
+                    f"(timeout threshold: {TIMEOUT_THRESHOLD_S}s)"
+                ),
                 location="timeout",
             )
         )
@@ -873,7 +846,7 @@ def _test_latency(
 
     Real computation has timing that varies with input. Constant lookup tables /
     hash tricks have near-zero variance and very low mean. We flag only when
-    BOTH conditions hold to keep false positives near zero (proposal: section 4).
+    BOTH conditions hold to keep false positives near zero.
     """
     findings: list[VerificationFinding] = []
     if not schema:
@@ -915,12 +888,9 @@ def _test_latency(
     stdev = statistics.stdev(elapsed_samples)
     cv = (stdev / mean) if mean > 0 else 0.0
 
-    # ext8 #73 (2026-04-20): pre-fix gate required mean < 1ms AND cv < 0.10.
-    # For sub-millisecond means, natural Python GC/allocation jitter across
-    # a small (3-5) sample inflates cv to 0.2-0.5 routinely, so the probe
-    # under-fires on real mocks. Loosen to "very fast AND absolute stdev is
-    # small" — any tool with ≥ 10×mean variability is real computation,
-    # sub-10×mean variability at sub-millisecond is canned output.
+    # For sub-millisecond means, natural Python GC/allocation jitter across a
+    # small sample can inflate coefficient of variation. Use an absolute
+    # stdev guard so very fast and very uniform outputs still get flagged.
     absolute_stdev_threshold = max(2e-4, 0.5 * mean)  # 200µs or half the mean
     if mean < 0.001 and stdev < absolute_stdev_threshold:
         findings.append(
@@ -950,20 +920,18 @@ def run(
     *,
     allow_network: bool = False,
 ) -> list[VerificationFinding]:
-    """Run all six behavioral test categories on an MCP_TOOL artifact.
+    """Run behavioral probes on an MCP_TOOL artifact.
 
-    Categories: nonexistent entity, consistency, boundary, timeout,
-    latency (variance), and output variation.  SKILL/AGENT artifacts
-    have no ``source_code`` and are skipped with an INFO finding.
+    Parameterized tools run nonexistent-entity, consistency, boundary,
+    KNN CSV, timeout, latency-variance, and output-variation probes.
+    Parameterless tools use a smoke probe. SKILL/AGENT artifacts have no
+    ``source_code`` in this tier and are skipped with an INFO finding.
 
-    Step 14.12: when ``allow_network=True``, every sandbox execution inside
-    this tier runs with ``--network bridge`` instead of ``--network none``
-    so artifacts that legitimately require network access can be behavior-
-    tested. Additionally, when ``artifact.needs_network=True``, a
-    differential disconnect test fires: the tool is invoked twice (network
-    on, network off) and flagged if the offline run returns a plausible
-    dict rather than a clean error — a direct detector for the F2
-    "silent fallback" failure mode.
+    When ``allow_network=True``, sandbox execution runs with
+    ``--network bridge`` so network-dependent artifacts can be tested.
+    If ``artifact.needs_network=True`` as well, a differential disconnect
+    probe invokes the tool once online and once offline to detect silent
+    fallback behavior.
 
     Returns a list of ``VerificationFinding`` objects (tier=2).
     """
@@ -985,7 +953,10 @@ def run(
                 tier=2,
                 category="behavioral",
                 severity=Severity.MEDIUM,
-                message="No public async function found in source code — cannot run behavioral tests",
+                message=(
+                    "No public async function found in source code — "
+                    "cannot run behavioral tests"
+                ),
             )
         ]
 
@@ -994,21 +965,9 @@ def run(
     declared_pkgs = artifact.pip_packages if artifact.pip_packages else None
     extra_pkgs = declared_pkgs or resolve_extra_packages(source_code) or None
 
-    # Security audit finding #106 (2026-04-19, ext10): pre-fix every
-    # Tier 2 probe (smoke + consistency + boundary + timeout + latency
-    # + output_variation = 6+ sandbox invocations per task) created a
-    # new ephemeral image and ran ``uv pip install`` from scratch.
-    # For dependency-heavy artifacts (pandas + openpyxl) this added
-    # 3-6 minutes of pure install overhead per task; over 400 tasks
-    # the Phase 5 wall-clock budget would inflate from 18h to 40-60h.
-    # Now: when ``extra_pkgs`` is non-empty, build the image ONCE
-    # upfront, share it across every probe via
-    # ``sandbox_execute_with_cached_image`` (no reinstall), cleanup
-    # ONCE at the end. When no dependencies are declared, fall through
-    # to the bare ``sandbox_execute`` path — preserves back-compat for
-    # test mocks that patch ``src.verification.behavioral.sandbox_execute``
-    # and avoids the unnecessary cached-image overhead for the
-    # zero-deps case.
+    # When dependencies are required, build one cached sandbox image and reuse
+    # it across every probe. Dependency-free artifacts use the bare sandbox
+    # path, which also keeps unit-test monkeypatches straightforward.
     from src.verification.sandbox_tool import (
         cleanup_cached_image,
         prepare_cached_image,
@@ -1049,7 +1008,6 @@ def run(
 
         schema = extract_parameter_schema(source_code)
         if not schema:
-            # B2.1: run smoke test instead of silently skipping.
             return _test_parameterless_smoke(source_code, func_name, _sandbox)
 
         findings: list[VerificationFinding] = []
@@ -1061,11 +1019,8 @@ def run(
         findings.extend(_test_latency(source_code, func_name, schema, _sandbox))
         findings.extend(_test_output_variation(source_code, func_name, schema, _sandbox))
 
-        # Step 14.12: network-disconnect differential. Only fires when the
-        # generator declared the capability legitimately needs network AND the
-        # enclosing context allows network — otherwise the test is either
-        # vacuous (offline tool doesn't need network) or invalid (network
-        # should be blocked, so the on-comparison isn't meaningful).
+        # Only run the network differential when the artifact declares a
+        # network dependency and the enclosing task policy allows network.
         if allow_network and getattr(artifact, "needs_network", False):
             findings.extend(
                 _test_network_disconnect_differential(
@@ -1093,11 +1048,9 @@ def _test_network_disconnect_differential(
 ) -> list[VerificationFinding]:
     """Run the tool twice (network on, network off) and flag silent fallbacks.
 
-    Direct detector for proposal §Pillar 2 F2 (silent fallbacks). A tool that
-    claims to fetch live data but actually returns hardcoded values will
-    succeed identically under both network policies — that matches the
-    contaminated pattern. A legitimate network tool fails cleanly with a
-    socket-level error when network is disabled.
+    A tool that claims to fetch live data but actually returns hardcoded
+    values can succeed under both network policies. A legitimate network tool
+    should fail cleanly with a socket-level error when network is disabled.
 
     Flags:
       * CRITICAL — offline run returned plausible-looking output (dict, no
@@ -1107,18 +1060,13 @@ def _test_network_disconnect_differential(
       * INFO — offline run failed as expected and online run succeeded
         (legitimate network tool).
 
-    Step 14.12.
     """
     # Use boundary inputs as the canonical "normal" invocation.
     inputs = _generate_boundary_inputs(schema)
     code = _build_sandbox_code(source_code, func_name, inputs)
 
-    # Security audit finding #106 (2026-04-19, ext10): if the caller
-    # already prepared a cached image (the typical Tier 2 flow),
-    # reuse it for both runs — pip install runs ZERO times here, just
-    # two ``docker run`` invocations with different ``--network``
-    # flags. Falls back to the install-per-call path for legacy
-    # callers that don't pass ``cached_image_tag``.
+    # Reuse the cached image when available so the differential only changes
+    # Docker's network flag, not the package-install environment.
     if cached_image_tag is not None:
         from src.verification.sandbox_tool import sandbox_execute_with_cached_image
         on_result = sandbox_execute_with_cached_image(
@@ -1138,15 +1086,8 @@ def _test_network_disconnect_differential(
     def _parse(payload: dict) -> tuple[bool, dict | str]:
         """Return (produced_plausible_dict, parsed_value).
 
-        Security audit finding #19 (2026-04-20): pre-fix used
-        ``if "error" in parsed`` (key presence) to detect a failed
-        run. The sandbox contract at line ~246 above always emits
-        ``"error": None`` on success, so the key was always present
-        and the function always returned ``(False, ...)`` — making
-        the CRITICAL ``network_silent_fallback`` branch dead code.
-        Fixed to check the value: ``"error": None`` = success,
-        ``"error": "<string>"`` = failure. Closes the proposal
-        §Pillar 2 F2 detection gap.
+        The sandbox wrapper emits ``"error": None`` on success and a string
+        error on failure, so this checks the value rather than key presence.
         """
         if not payload.get("success"):
             return False, payload.get("stderr", "")[:300]
@@ -1178,7 +1119,7 @@ def _test_network_disconnect_differential(
                 message=(
                     "Tool declared needs_network=True but returned plausible "
                     "output with network disabled. Likely hardcoded data or "
-                    "silent fallback (proposal §Pillar 2 F2)."
+                    "silent fallback."
                 ),
                 location="network_disconnect_differential",
             )

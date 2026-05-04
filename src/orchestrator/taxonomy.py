@@ -1,41 +1,13 @@
-"""Evolutionary domain taxonomy for hierarchical capability retrieval (B1 Step 3.5f).
+"""Evolutionary domain taxonomy for capability retrieval.
 
-Implements the proposal's Pillar 1 line 77 hierarchical embedding mechanism
-(domain → capability → specific skill) as an **evolutionary** taxonomy that
-grows organically from capability generation and query classification — rather
-than as a fixed hardcoded vocabulary.
+The taxonomy is a file-backed vocabulary of domain categories used during
+capability registration and registry search. It starts empty for eval runs
+and grows when generated capabilities do not fit an existing category.
 
-Why evolutionary: the Business Analytics testbed uses business sub-domains
-(sales, inventory, transactions, operations, finance), but MINT should work
-across any business vertical it's used in (medical research, legal, education,
-etc.). A fixed taxonomy would silently fail on queries from unknown verticals.
-An evolutionary taxonomy starts empty and grows a category when no existing
-one fits — preventing vocabulary drift (the LLM must check existing categories
-first) while remaining open to new verticals.
-
-The file-backed taxonomy is stored as JSON alongside the ChromaDB registry,
-defaulting to ``data/eval/domains.json`` for evaluation runs.
-
-Both start empty and accumulate categories as MINT encounters new kinds of
-tasks. The file is the single source of truth for the vocabulary at any point
-in time and can be inspected, edited manually, or exported for the thesis.
-
-Generic-capability flag (design refinement from Phase E, 2026-04-14):
-Step 3.5b measured the strict-equality filter against the Business Analytics
-testbed and found it correctly caught 7/11 cross-sub-domain silent-poisoning
-cases, but produced 3 false recall losses on ``parse_csv_and_return_stats_7f373a``
-— a genuinely generic CSV parser labeled ``domain=data-processing``. The filter
-rejected it on queries inferred as ``inventory`` / ``operations`` because of
-strict domain equality. The fix: the LLM classifier emits an ``is_generic``
-flag alongside the domain label; generic capabilities bypass the domain filter
-entirely, because the filter's job is to catch business-context confusion and
-generic caps have no business context to confuse.
-
-Thesis framing: the taxonomy itself is a second evolutionary mechanism
-alongside Pillar 3. It evolves on a different axis (vocabulary categories)
-driven by different signals (LLM classification of new capabilities) but the
-organic-growth principle is the same. See master plan Step 3.5f + the
-methodology nuggets in the session handoff.
+Generated artifacts are classified into a domain and tagged with
+``is_generic``. Generic capabilities bypass the query-time domain filter
+because they do not carry business-specific assumptions; domain-specific
+capabilities are filtered to reduce cross-domain false matches.
 """
 
 from __future__ import annotations
@@ -44,6 +16,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 from datetime import UTC, datetime
@@ -57,9 +30,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ext8 #69 (2026-04-20): retry budget for the domain-classifier LLM call,
-# matching the strict-gate pattern used by decomposition (§12 #15),
-# classification (§12 #16), and verification (§12 #14).
+# Retry budget for query-domain classification. A transient LLM failure should
+# not immediately collapse taxonomy-aware retrieval to unfiltered search.
 _MAX_TAXONOMY_ATTEMPTS = 3
 
 
@@ -172,76 +144,114 @@ class QueryDomainChoice(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-_CLASSIFY_CAPABILITY_PROMPT = """You are classifying a newly-generated capability into a domain taxonomy that grows organically as MINT encounters new kinds of tasks.
+_CLASSIFY_CAPABILITY_PROMPT = (
+    "You are classifying a newly-generated capability into a domain taxonomy "
+    "that grows organically as MINT encounters new kinds of tasks.\n"
+    "\n"
+    "CURRENT TAXONOMY:\n"
+    "{taxonomy_list}\n"
+    "\n"
+    "CAPABILITY TO CLASSIFY:\n"
+    "\n"
+    "NAME: {name}\n"
+    "TYPE: {capability_type}\n"
+    "\n"
+    "DESCRIPTION:\n"
+    "{description}\n"
+    "\n"
+    "IMPLEMENTATION (may be truncated):\n"
+    "{implementation}\n"
+    "\n"
+    "Your job has two parts:\n"
+    "\n"
+    "PART 1 — Pick or create a domain:\n"
+    "\n"
+    "Read the IMPLEMENTATION carefully (not just the description — generic "
+    "descriptions can hide hardcoded business assumptions).\n"
+    "\n"
+    "If this capability fits any of the existing categories in the taxonomy "
+    "above, pick that category name and set is_new=False. Prefer an existing "
+    "category whenever reasonable — the taxonomy stays coherent only when we "
+    "avoid creating near-duplicate categories (e.g., don't create "
+    '"sales-data" if "sales" already exists).\n'
+    "\n"
+    "Important guardrail: shared FILE FORMATS or generic OPERATIONS are NOT "
+    "enough to reuse a category. Do NOT reuse an existing category just "
+    "because both capabilities mention CSV/JSON/XLSX/files or verbs like "
+    "parse/write/join/aggregate. Reuse an existing category only when the "
+    "underlying BUSINESS OBJECTS overlap materially (e.g., orders with "
+    "orders, eligibility with eligibility, monitoring metrics with "
+    "monitoring metrics). If the only overlap is file format or generic "
+    "data-processing mechanics, create a new category.\n"
+    "\n"
+    "If NO existing category fits — this capability is from a business "
+    "vertical or sub-domain not yet represented in the taxonomy — propose a "
+    "new category name (hyphen-case, 1-3 words) and set is_new=True with a "
+    "one-sentence new_description. Only do this when no existing category is "
+    "a reasonable fit.\n"
+    "\n"
+    "Special case: if the taxonomy is empty (no categories yet), always set "
+    "is_new=True and propose the first category.\n"
+    "\n"
+    "PART 2 — Set the is_generic flag:\n"
+    "\n"
+    "Is this capability genuinely GENERIC (zero hardcoded business vocabulary "
+    "in the implementation) or is it BOUND to a specific business context?\n"
+    "\n"
+    "GENERIC examples — is_generic=True:\n"
+    "- parse_csv_and_return_stats: reads any CSV, returns row_count and "
+    "column_names. No hardcoded column names. Uses stdlib csv.reader. → "
+    "is_generic=True\n"
+    "- fibonacci: pure math, no business context → is_generic=True\n"
+    "- format_date_string: any date, any format → is_generic=True\n"
+    "- word_count_and_readability: any text → is_generic=True\n"
+    "\n"
+    "NON-GENERIC examples — is_generic=False:\n"
+    "- parse_sales_csv_and_products_xlsx: hardcoded columns {{order_id, "
+    "product_id, quantity, unit_price, region}} → is_generic=False\n"
+    '- aggregate_reorder_summary: hardcodes upstream_data["inventory_with_'
+    'reorder"] and fields like "needs_reorder" → is_generic=False\n'
+    "- parse_inventory_csv_and_reorder_rules: hardcodes exact CSV columns and "
+    "YAML keys → is_generic=False\n"
+    "- compute_region_revenue_totals: accesses specific keys 'quantity', "
+    "'unit_price', 'region' → is_generic=False\n"
+    "\n"
+    "The test is simple: **if the implementation contains ANY hardcoded "
+    "column name, field name, business term, or schema assumption, "
+    "is_generic=False**. Otherwise True.\n"
+    "\n"
+    "Return a CapabilityDomainClassification with domain, is_new, "
+    "new_description (only if is_new), is_generic, and rationale.\n"
+)
 
-CURRENT TAXONOMY:
-{taxonomy_list}
 
-CAPABILITY TO CLASSIFY:
-
-NAME: {name}
-TYPE: {capability_type}
-
-DESCRIPTION:
-{description}
-
-IMPLEMENTATION (may be truncated):
-{implementation}
-
-Your job has two parts:
-
-PART 1 — Pick or create a domain:
-
-Read the IMPLEMENTATION carefully (not just the description — generic descriptions can hide hardcoded business assumptions).
-
-If this capability fits any of the existing categories in the taxonomy above, pick that category name and set is_new=False. Prefer an existing category whenever reasonable — the taxonomy stays coherent only when we avoid creating near-duplicate categories (e.g., don't create "sales-data" if "sales" already exists).
-
-Important guardrail: shared FILE FORMATS or generic OPERATIONS are NOT enough to reuse a category. Do NOT reuse an existing category just because both capabilities mention CSV/JSON/XLSX/files or verbs like parse/write/join/aggregate. Reuse an existing category only when the underlying BUSINESS OBJECTS overlap materially (e.g., orders with orders, eligibility with eligibility, monitoring metrics with monitoring metrics). If the only overlap is file format or generic data-processing mechanics, create a new category.
-
-If NO existing category fits — this capability is from a business vertical or sub-domain not yet represented in the taxonomy — propose a new category name (hyphen-case, 1-3 words) and set is_new=True with a one-sentence new_description. Only do this when no existing category is a reasonable fit.
-
-Special case: if the taxonomy is empty (no categories yet), always set is_new=True and propose the first category.
-
-PART 2 — Set the is_generic flag:
-
-Is this capability genuinely GENERIC (zero hardcoded business vocabulary in the implementation) or is it BOUND to a specific business context?
-
-GENERIC examples — is_generic=True:
-- parse_csv_and_return_stats: reads any CSV, returns row_count and column_names. No hardcoded column names. Uses stdlib csv.reader. → is_generic=True
-- fibonacci: pure math, no business context → is_generic=True
-- format_date_string: any date, any format → is_generic=True
-- word_count_and_readability: any text → is_generic=True
-
-NON-GENERIC examples — is_generic=False:
-- parse_sales_csv_and_products_xlsx: hardcoded columns {{order_id, product_id, quantity, unit_price, region}} → is_generic=False
-- aggregate_reorder_summary: hardcodes upstream_data["inventory_with_reorder"] and fields like "needs_reorder" → is_generic=False
-- parse_inventory_csv_and_reorder_rules: hardcodes exact CSV columns and YAML keys → is_generic=False
-- compute_region_revenue_totals: accesses specific keys 'quantity', 'unit_price', 'region' → is_generic=False
-
-The test is simple: **if the implementation contains ANY hardcoded column name, field name, business term, or schema assumption, is_generic=False**. Otherwise True.
-
-Return a CapabilityDomainClassification with domain, is_new, new_description (only if is_new), is_generic, and rationale.
-"""
-
-
-_CLASSIFY_QUERY_PROMPT = """You are picking a domain category for an incoming query, to filter the capability registry.
-
-CURRENT TAXONOMY (only these categories exist — you cannot invent new ones here):
-{taxonomy_list}
-
-QUERY:
-{query}
-
-Which existing category best matches the query's business context?
-
-If the query clearly belongs to ONE of the listed categories (e.g., "parse sales CSV" → "sales"), return that category name.
-
-If the query is ambiguous or doesn't clearly fit any existing category, return None. When domain=None, the gap-detection filter is bypassed and the unfiltered semantic search runs. This is the safe default for ambiguous queries.
-
-Do NOT invent new categories here. New categories are only created when a new capability is registered (via CapabilityDomainClassification, not this prompt).
-
-Return a QueryDomainChoice with domain (or None) and rationale.
-"""
+_CLASSIFY_QUERY_PROMPT = (
+    "You are picking a domain category for an incoming query, to filter the "
+    "capability registry.\n"
+    "\n"
+    "CURRENT TAXONOMY (only these categories exist — you cannot invent new "
+    "ones here):\n"
+    "{taxonomy_list}\n"
+    "\n"
+    "QUERY:\n"
+    "{query}\n"
+    "\n"
+    "Which existing category best matches the query's business context?\n"
+    "\n"
+    'If the query clearly belongs to ONE of the listed categories (e.g., "parse '
+    'sales CSV" → "sales"), return that category name.\n'
+    "\n"
+    "If the query is ambiguous or doesn't clearly fit any existing category, "
+    "return None. When domain=None, the gap-detection filter is bypassed and "
+    "the unfiltered semantic search runs. This is the safe default for "
+    "ambiguous queries.\n"
+    "\n"
+    "Do NOT invent new categories here. New categories are only created when a "
+    "new capability is registered (via CapabilityDomainClassification, not "
+    "this prompt).\n"
+    "\n"
+    "Return a QueryDomainChoice with domain (or None) and rationale.\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +530,7 @@ class DomainTaxonomy:
             domain filter and run unfiltered semantic search.
 
         Never raises on LLM errors: returns ``None`` on any exception, which
-        is the safe default (unfiltered search = pre-B1 behavior).
+        is the safe default for retrieval.
         """
         cats = self.list_categories()
         if not cats:
@@ -532,12 +542,9 @@ class DomainTaxonomy:
             taxonomy_list=taxonomy_list,
             query=query,
         )
-        # ext8 #69 (2026-04-20): retry per the strict-gate pattern used by
-        # decomposition (§12 #15), classification (§12 #16), and verification
-        # (§12 #14). Pre-fix a single LLM failure (rate limit, 500, network
-        # flap) demoted retrieval to unfiltered search, introducing random
-        # noise into Pillar 1 retrieval metrics under high-concurrency eval
-        # load. 3x retry matches the pattern's retry budget.
+        # Retry transient classifier failures before bypassing the domain
+        # filter. Bypass remains the safe fallback when the retry budget is
+        # exhausted.
         result: QueryDomainChoice | None = None
         last_exc: Exception | None = None
         for attempt in range(1, _MAX_TAXONOMY_ATTEMPTS + 1):
@@ -620,23 +627,12 @@ class DomainTaxonomy:
 _TAXONOMY_PATH: Path | None = None
 
 
-def set_taxonomy_path(path: Path | str) -> None:
-    """Override the default taxonomy file path.
-
-    Evaluation runs use ``data/eval/domains.json`` by default. This override
-    remains available for tests or custom runners that need an isolated
-    taxonomy file.
-    """
-    global _TAXONOMY_PATH  # noqa: PLW0603
-    _TAXONOMY_PATH = Path(path)
-
-
 def get_taxonomy_path() -> Path:
     """Return the currently-configured taxonomy file path.
 
-    Defaults to ``<project-root>/data/eval/domains.json`` if the path
-    has not been overridden via :func:`set_taxonomy_path`. The default keeps
-    evaluation runs hermetic without requiring harness-specific wiring.
+    Defaults to ``<project-root>/data/eval/domains.json``. Tests can
+    monkeypatch the private ``_TAXONOMY_PATH`` override to keep taxonomy
+    state isolated.
     """
     if _TAXONOMY_PATH is not None:
         return _TAXONOMY_PATH
@@ -700,11 +696,8 @@ def classify_and_tag_artifacts(artifacts: list[GeneratedArtifact]) -> None:
 
         from src.config import DEFAULT_LLM_MODEL
 
-        # reasoning_effort="minimal" drops gpt-5-mini latency on trivial
-        # classification from ~193s to ~10s per call (observed 2026-04-14
-        # on trace b4c2488d/obs 8dfb032e — 320 reasoning tokens on a single
-        # boolean + category pick). Taxonomy classification is pure pattern
-        # matching, not a creative task — reasoning mode is pure overhead.
+        # Taxonomy classification is a constrained category/boolean choice,
+        # so minimal reasoning avoids unnecessary latency.
         llm = init_chat_model(
             DEFAULT_LLM_MODEL, temperature=0, reasoning_effort="minimal"
         )
@@ -723,19 +716,15 @@ def classify_and_tag_artifacts(artifacts: list[GeneratedArtifact]) -> None:
         try:
             result = taxonomy.get_or_create_for_capability(artifact, structured_llm)
             artifact.domain = result.domain
-            # ext8 #76 (2026-04-20): defense-in-depth. If the LLM
-            # said is_generic=True but the artifact's source contains
-            # hardcoded domain-specific string literals, force
-            # is_generic=False. A mis-classified hardcoded tool
-            # flagged is_generic=True pollutes every domain's search
-            # results via the `$or` clause in registry.search —
-            # single LLM decision shouldn't have cascading effects.
+            # Defense in depth: if the LLM says is_generic=True but the
+            # artifact contains known domain-specific literals, keep it
+            # domain-filtered instead of allowing it into every search.
             is_generic = bool(result.is_generic)
             if is_generic and _contains_domain_specific_literals(artifact):
                 logger.warning(
-                    "ext8 #76: classifier said is_generic=True for '%s' but "
-                    "code contains domain-specific literals — forcing "
-                    "is_generic=False (defense-in-depth).",
+                    "Classifier said is_generic=True for '%s' but code "
+                    "contains domain-specific literals — forcing "
+                    "is_generic=False.",
                     artifact.capability_name,
                 )
                 is_generic = False
@@ -752,11 +741,9 @@ def classify_and_tag_artifacts(artifacts: list[GeneratedArtifact]) -> None:
             )
 
 
-# ext8 #76 (2026-04-20): literals that mark a capability as domain-specific.
-# If these appear as string literals in source_code / skill_content /
-# agent_config, is_generic=True is suspicious and gets overridden.
-# Scoped to the Business Analytics Pipeline testbed's vocabulary (the
-# classifier's known-failure mode per line 207-210 examples above).
+# Literals that mark a capability as domain-specific. If these appear as
+# quoted strings in source_code / skill_content / agent_config, is_generic=True
+# is suspicious and gets overridden.
 _DOMAIN_SPECIFIC_LITERALS = (
     "order_id", "product_id", "unit_price", "customer_id",
     "company_name", "reorder", "inventory",
@@ -810,17 +797,21 @@ def _taxonomy_priority(artifact: GeneratedArtifact) -> tuple[int, int, int]:
     to let domain-defining transforms seed the taxonomy before file-format-only
     helpers are classified.
     """
-    import re
-
     name = artifact.capability_name.lower()
     description = (artifact.description or "").lower()
     text = f"{name} {description}"
     tokens = set(re.findall(r"[a-z0-9]+", text))
 
     verb_score = 0
-    if any(name.startswith(f"{verb}-") or name.startswith(f"{verb}_") for verb in _DOMAIN_SEED_VERBS):
+    if any(
+        name.startswith(f"{verb}-") or name.startswith(f"{verb}_")
+        for verb in _DOMAIN_SEED_VERBS
+    ):
         verb_score += 3
-    if any(name.startswith(f"{verb}-") or name.startswith(f"{verb}_") for verb in _FORMAT_ONLY_VERBS):
+    if any(
+        name.startswith(f"{verb}-") or name.startswith(f"{verb}_")
+        for verb in _FORMAT_ONLY_VERBS
+    ):
         verb_score -= 3
 
     domain_token_score = sum(

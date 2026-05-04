@@ -1138,8 +1138,7 @@ asyncio.run(_run())
                 "Chain MCP_TOOL %s raised: %s", capability_name, str(parsed["error"])[:500]
             )
             return {}
-        # Security audit finding #11 (2026-04-19): preserve falsy / non-dict
-        # results via the shared helper.
+        # Preserve falsy / non-dict results via the shared helper.
         from src.orchestrator.output_coerce import extract_tool_result
         return extract_tool_result(parsed)
     except (json.JSONDecodeError, KeyError, IndexError):

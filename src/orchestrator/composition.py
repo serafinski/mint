@@ -1,8 +1,8 @@
-"""Compositional execution — dependency-ordered chain execution with workspace state passing.
+"""Compositional execution with dependency ordering and workspace state passing.
 
-Phase 3 of the pre-eval execution plan. Runs all N artifacts for a task
-in topological order, passing intermediate results via a shared workspace
-directory (``/tmp/mint_workspace_<task_id>/``).
+Runs every resolved capability for a decomposed task in topological order,
+passing intermediate results via a shared workspace directory
+(``/tmp/mint_workspace_<task_id>/``).
 
 Workspace layout::
 
@@ -13,8 +13,8 @@ Workspace layout::
         ...
 
 MCP_TOOL steps mount the workspace into Docker at ``/workspace`` and read/write
-step output files there.  SKILL and AGENT steps receive upstream outputs via
-``fixture_contents`` injection (no workspace mount needed — solves HP4).
+step output files there. SKILL and AGENT steps receive upstream outputs through
+``fixture_contents`` injection instead of a Docker workspace mount.
 """
 
 from __future__ import annotations
@@ -54,7 +54,6 @@ def build_resolution_map(
     required_capabilities: list[str],
     matches: list[MatchItem],
     artifacts: list[GeneratedArtifact],
-    classified_gaps: list | None = None,
 ) -> dict[str, CapabilityReference]:
     """Build a resolution map from pipeline state.
 
@@ -71,7 +70,7 @@ def build_resolution_map(
         if m.query:
             match_by_query[m.query] = m
         else:
-            # Backwards compat: old MatchItems without query field
+            # Compatibility fallback for MatchItems without a query field.
             match_by_query[m.capability.name] = m
 
     # Index artifacts by gap_query (the required_capability string that
@@ -84,11 +83,6 @@ def build_resolution_map(
         if art.agent_config and art.agent_config.get("subagent_gap_queries"):
             for sub_query in art.agent_config["subagent_gap_queries"]:
                 artifact_by_query[sub_query] = art
-
-    # Also build a classified_gaps lookup for type information
-    gap_type_by_query: dict[str, CapabilityType] = {}
-    for cg in classified_gaps or []:
-        gap_type_by_query[cg.query] = cg.classified_type
 
     for cap_name in required_capabilities:
         # Prefer registry match over generated artifact
@@ -137,19 +131,16 @@ class CompositionalExecutor:
         self.subtasks = subtasks
         self.resolution = resolution
         self.artifacts = artifacts
-        self.matches = matches
         self.fixture_paths = [Path(p) for p in fixture_paths]
         self.task = task
         self.metrics_store = metrics_store
         self.langfuse_tags = langfuse_tags
         self.langfuse_session_id = langfuse_session_id
-        # Step 13.7 Batch B2: allow the caller to override the default
-        # user_id. Eval harness runs pass their own user_id so traces can
-        # still be aggregated separately from ad-hoc programmatic runs.
+        # Eval harness runs can pass their own user_id so traces aggregate
+        # separately from direct programmatic runs.
         self.langfuse_user_id = langfuse_user_id or "runtime"
-        # Step 14.12: task-level network policy threaded into every step
-        # executor (MCP_TOOL / SKILL / AGENT) so downstream ``sandbox_execute``
-        # calls honor the same policy the caller resolved at task entry.
+        # Task-level network policy threaded into every step executor
+        # (MCP_TOOL / SKILL / AGENT).
         self.allow_network = allow_network
 
         # Index artifacts by gap_query for quick lookup
@@ -163,11 +154,9 @@ class CompositionalExecutor:
         for m in matches:
             self._match_by_name[m.capability.name] = m
 
-        # Step 13: per-step sticky failure reason (set by
-        # ``_execute_agent_step`` when the AGENT backend reports a
-        # timeout/error via thread-local meta). Reset at the start of
-        # every step in ``run()``; read by the failed-chain return
-        # path and propagated onto ``ChainResult.failed_step_reason``.
+        # Per-step sticky failure reason, set by backends that can report a
+        # structured timeout/error. Reset at the start of every step in
+        # ``run()`` and propagated onto ``ChainResult.failed_step_reason``.
         self._last_step_failure_reason: str | None = None
 
     # ------------------------------------------------------------------
@@ -177,21 +166,16 @@ class CompositionalExecutor:
     def build_execution_order(self) -> list[int] | None:
         """Return subtask indices in topological (dependency) order.
 
-        Security audit finding #12 (2026-04-20): fail-closed on invalid
-        DAGs rather than silently falling back to linear order or letting
-        out-of-range ``depends_on`` indices crash the execution loop.
-        Returns ``None`` on:
+        Invalid DAGs fail closed instead of falling back to linear order or
+        crashing the execution loop. Returns ``None`` on:
 
         - **Out-of-range index**: any ``depends_on`` value outside
-          ``0 <= idx < len(subtasks)`` (reporter's repros: ``[99]`` →
-          IndexError, ``[-1]`` → phantom execution of the last subtask).
+          ``0 <= idx < len(subtasks)``.
         - **Self-loop**: a subtask depending on itself.
         - **Cycle**: ``graphlib.CycleError`` from the topological sort.
 
         Callers must treat ``None`` as a chain-fatal error and record a
-        descriptive ``failed_step_reason`` — the old "fall back to linear
-        order on CycleError" path silently linearised cycles and reported
-        ``chain_success=True`` on what was actually a malformed plan.
+        descriptive ``failed_step_reason``.
         """
         n = len(self.subtasks)
         if n <= 1:
@@ -228,8 +212,7 @@ class CompositionalExecutor:
         except graphlib.CycleError as exc:
             logger.error(
                 "Cycle detected in subtask dependencies: %s. "
-                "Failing chain closed (no linear-order fallback). "
-                "Security audit finding #12.",
+                "Failing chain closed (no linear-order fallback).",
                 exc,
             )
             return None
@@ -240,11 +223,9 @@ class CompositionalExecutor:
         The decomposer's coherence contract is transitive: a downstream subtask
         may require keys produced by any ancestor reachable through
         ``depends_on``. MCP_TOOL generation is prompted with the same contract,
-        describing ``upstream_data`` as "all upstream data". To keep the
-        executor aligned with both layers while preserving the ext9 isolation
-        fix (avoid unrelated parallel-branch state), we pass the sandbox the
-        transitive closure of declared predecessors rather than only the direct
-        dependency list.
+        describing ``upstream_data`` as "all upstream data". To avoid unrelated
+        parallel-branch state while still honoring that contract, the sandbox
+        receives the transitive closure of declared predecessors.
 
         Returns ``None`` for invalid indices so callers can fall back to the
         pre-existing fail-safe behaviour.
@@ -309,23 +290,9 @@ class CompositionalExecutor:
         files written by the compositional executor itself) or the
         ``fixtures/`` directory.
 
-        **Pre-Step-12 behavior** (2026-04-12 to 2026-04-16): this method
-        filtered on ``candidate.stem == "output"``, only picking up files
-        named ``output.*`` (``output.csv``, ``output.xlsx``, ...). That
-        worked for the B3 era where the MCP_TOOL generator prompt told
-        last-step tools to write to ``/workspace/output.<ext>``.
-
-        **Post-Rule-15 behavior** (2026-04-16): the decomposer now appends
-        writer subtasks whose description explicitly names the requested
-        file (e.g., ``report.md``, ``incident_summary.md``). The MCP_TOOL
-        generator produces code that writes to exactly those filenames,
-        not ``output.*``. An empirical T16 run (2026-04-16 15:51) produced
-        a writer that correctly wrote ``/workspace/report.md`` but the
-        stem filter silently dropped it, ``cleanup_workspace`` deleted
-        it, and the user saw an empty mint_output dir despite the dict
-        output being correct. The fix broadens the collector to accept
-        any non-intermediate file — format-agnostic, matches whatever
-        filename the decomposer's ``required_files`` contract declared.
+        The collector is filename-agnostic: generated writer steps should emit
+        exactly the filename declared by the task's output contract, not just
+        ``output.*``.
         """
         output_files: dict[str, bytes] = {}
         try:
@@ -432,22 +399,16 @@ class CompositionalExecutor:
     def _match_to_artifact(match: MatchItem, ref: CapabilityReference) -> GeneratedArtifact:
         """Reconstruct a ``GeneratedArtifact`` proxy from a registry match.
 
-        Security audit finding #9 (2026-04-19): pre-fix this handed the
-        raw ``agent_config`` string from ChromaDB metadata straight into
-        the schema constructor, which crashes with ``ValidationError`` on
-        every registry-matched AGENT row. Now uses the shared
-        ``decode_agent_config_metadata`` helper so composition,
-        registry-match, and store snapshot construction all follow one
-        policy.
+        Registry metadata stores generated artifacts in descriptor form. This
+        method rebuilds the artifact object needed by the execution backends,
+        using the shared agent-config decoder so registry matches and generated
+        artifacts follow the same schema policy.
         """
         from src.schemas.task import decode_agent_config_metadata
 
         meta = getattr(match.capability, "metadata", {}) or {}
-        # Security audit finding #83 (2026-04-19, ext9): restore pip_packages
-        # from the descriptor so registry-matched MCP tools install their
-        # declared dependencies in the sandbox. Pre-fix this hardcoded `[]`,
-        # causing every registry-matched tool that needed non-base packages
-        # to crash on ImportError at execution time.
+        # Restore pip_packages from the descriptor so registry-matched MCP
+        # tools install their declared dependencies in the sandbox.
         pip_packages = list(getattr(match.capability, "pip_packages", []) or [])
         return GeneratedArtifact(
             capability_name=ref.capability_name,
@@ -476,10 +437,8 @@ class CompositionalExecutor:
         """Record a real invocation for this chain step in the metrics store.
 
         Populates ``input_args`` / ``actual_output`` / ``error_message`` so the
-        row survives ``MetricsStore.get_recent_failures`` (WHERE input_args
-        IS NOT NULL) and reaches the Pillar 3 Split coverage verifier +
-        failure-informed prompt. See
-        ``docs/invocation_recording_gap_2026_04_19.md`` for the drift history.
+        row survives ``MetricsStore.get_recent_failures`` and can be used by
+        the failure-informed optimizer path.
 
         ``input_args`` captures the upstream step outputs that feed this
         step — the closest Python-side proxy for the literal kwargs the
@@ -539,10 +498,8 @@ class CompositionalExecutor:
         else:
             meta = getattr(artifact_or_match.capability, "metadata", {}) or {}
             source_code = meta.get("source_code")
-            # Security audit finding #83 (2026-04-19, ext9): pip_packages
-            # is now a first-class CapabilityDescriptor field persisted by
-            # SkillRegistry; pull it back from the descriptor instead of
-            # silently using `[]` and crashing on ImportError.
+            # Registry-matched MCP tools need their persisted dependency list
+            # restored before sandbox execution.
             pip_packages = list(
                 getattr(artifact_or_match.capability, "pip_packages", []) or []
             )
@@ -553,11 +510,10 @@ class CompositionalExecutor:
             )
             return {}
 
-        # Security audit finding #91 (2026-04-19, ext9): restrict sandbox state
-        # to declared predecessors, not every prior step's output. Use the
-        # transitive closure rather than only direct dependencies so
-        # downstream MCP_TOOL writers receive the same "all upstream data"
-        # contract enforced by decomposition/generation.
+        # Restrict sandbox state to declared predecessors, not every prior
+        # step's output. Use the transitive closure rather than only direct
+        # dependencies so downstream MCP_TOOL writers receive the same "all
+        # upstream data" contract enforced by decomposition/generation.
         depends_on = (
             self._collect_transitive_depends_on(step_index)
             if subtask is not None
@@ -652,13 +608,11 @@ class CompositionalExecutor:
     ) -> dict[str, str] | None:
         """Union output_schemas across every subtask that resolves to this artifact.
 
-        §12 finding #12 refinement (2026-04-16 after T16 third-run
-        empirical failure). When a generated AGENT artifact covers
-        multiple decomposer gaps *and there are still downstream runtime
-        handoffs*, using just the currently-executing subtask's schema as
-        ``response_format`` is too narrow — the aggregated output must
-        contain whatever sibling handoff keys downstream steps will read.
-        This helper produces that union.
+        When a generated AGENT or SKILL artifact covers multiple decomposer
+        gaps and there are downstream runtime handoffs, using only the
+        currently-executing subtask's schema is too narrow. The aggregated
+        output must contain whatever sibling handoff keys downstream steps
+        will read.
 
         Fully-collapsed lead-with-subagents tasks are handled separately
         by :meth:`_is_fully_collapsed_lead_artifact`: those tasks do not
@@ -710,13 +664,11 @@ class CompositionalExecutor:
             else False
         )
 
-        # §12 finding #12: thread the decomposer-declared output_schema into
-        # the agent executor so it can build a dynamic Pydantic
-        # response_format when the agent's output is consumed by downstream
-        # runtime steps. Fully-collapsed lead-with-subagents tasks are the
-        # exception: there, the lead's output is validated only at the task
-        # boundary, not at conceptual subtask boundaries that never exist at
-        # runtime.
+        # Thread the decomposer-declared output_schema into the agent executor
+        # when downstream runtime steps consume the agent's output. Fully
+        # collapsed lead-with-subagents tasks are the exception: there, the
+        # lead's output is validated only at the task boundary, not at
+        # conceptual subtask boundaries that never exist at runtime.
         output_schema = None
         if subtask and not fully_collapsed_lead:
             output_schema = self._collect_union_output_schema(
@@ -739,9 +691,8 @@ class CompositionalExecutor:
             allow_network=self.allow_network,
         )
 
-        # Step 13: capture the sticky meta on failure so ``run()`` can
-        # tag the ChainResult with a structured failure reason
-        # (``agent_execution_timeout`` vs ``agent_execution_error``).
+        # Capture backend failure metadata so ``run()`` can tag the
+        # ChainResult with a structured failure reason.
         meta = get_last_agent_execution_meta()
         if meta is not None and not meta.succeeded:
             if meta.failure_reason == "timeout":
@@ -797,26 +748,15 @@ class CompositionalExecutor:
     # Main entry point
     # ------------------------------------------------------------------
 
-    def run(
-        self,
-        task_id: str | None = None,
-        on_step_start: Any | None = None,
-        on_step_end: Any | None = None,
-    ) -> ChainResult:
+    def run(self, task_id: str | None = None) -> ChainResult:
         """Execute the full chain in topological order.
 
         The final step's output is ``step_results[-1]``.
-
-        Optional callbacks:
-            on_step_start(position, total, ref): called before each step
-            on_step_end(position, total, ref, success, step_ms): called after each step
         """
         execution_order = self.build_execution_order()
 
-        # Security audit finding #12 (2026-04-20): None means the DAG is
-        # malformed (cycle, out-of-range depends_on, self-loop). Fail
-        # closed with a descriptive reason — the pre-fix code silently
-        # linearised cycles and reported chain_success=True.
+        # None means the DAG is malformed (cycle, out-of-range depends_on,
+        # self-loop). Fail closed with a descriptive reason.
         if execution_order is None:
             return ChainResult(
                 chain_length=max(1, len(self.subtasks)),
@@ -827,8 +767,7 @@ class CompositionalExecutor:
                 failed_step_reason=(
                     "Invalid compositional DAG — cycle, self-loop, or "
                     "out-of-range depends_on index detected by "
-                    "build_execution_order. Chain failed closed per "
-                    "security audit finding #12."
+                    "build_execution_order. Chain failed closed."
                 ),
             )
         if not execution_order:
@@ -853,29 +792,11 @@ class CompositionalExecutor:
             task_id, len(execution_order),
         )
 
-        # Fix #3 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
         # Capture the chain-executor's trace_id and set it in trace_context
-        # so SKILL/AGENT runtime paths (execution.py:589/1205 create their
-        # own CallbackHandler) attach their LLM GENERATIONs to THIS trace
-        # via TraceContext instead of creating fragmented sibling traces.
-        # The chain-executor span is active here (``_start_langfuse_chain_trace``
-        # called just above), so ``lf.current_trace_id`` IS set to the
-        # chain trace, even though we're outside a LangGraph node.
-        #
-        # Security audit finding #104 (2026-04-19, ext10): the
-        # ``getattr(lf, "current_trace_id")`` lookup is a SINGLETON-
-        # CLIENT read — it returns whichever trace was MOST RECENTLY
-        # activated on the global LangFuse client, not necessarily the
-        # one we just started. Under concurrent chain execution
-        # (currently masked by serial harness; uncovered if a future
-        # config enables parallelism), thread A can capture thread B's
-        # trace_id. The remediation is span-scoped capture: read the
-        # trace_id from the span object we explicitly started rather
-        # than the singleton client. ``_start_langfuse_chain_trace``
-        # was updated to expose ``span.trace_id`` via the returned
-        # context-manager metadata. Fall back to the singleton lookup
-        # for back-compat with older LangFuse SDK versions where the
-        # span object doesn't expose ``trace_id`` directly.
+        # so SKILL/AGENT runtime paths attach their LLM calls to this trace
+        # instead of creating fragmented sibling traces. Prefer the
+        # span-scoped trace_id; fall back to the singleton client for older
+        # LangFuse SDK versions.
         _chain_trace_id: str | None = None
         if lf is not None:
             try:
@@ -886,15 +807,16 @@ class CompositionalExecutor:
                     else None
                 )
                 if _chain_trace_id is None:
-                    # Back-compat fallback for SDKs without span.trace_id —
-                    # this path IS racy under concurrency (singleton-client
-                    # state); the warning is silent because the chain runs
-                    # serially today (ext7 #51).
+                    # Compatibility fallback for SDKs without span.trace_id.
                     _chain_trace_id = getattr(lf, "current_trace_id", None)
             except Exception:  # noqa: BLE001
                 pass
         if _chain_trace_id:
-            from src.orchestrator.tracing import _trace_context_var, _trace_context_global, _trace_context_lock
+            from src.orchestrator.tracing import (
+                _trace_context_global,
+                _trace_context_lock,
+                _trace_context_var,
+            )
             _chain_tc_prev_var = _trace_context_var.get()
             _chain_tc_merged = dict(_chain_tc_prev_var or {})
             _chain_tc_merged["trace_id"] = _chain_trace_id
@@ -909,10 +831,8 @@ class CompositionalExecutor:
 
         try:
             for position, step_idx in enumerate(execution_order):
-                # Step 13: reset the per-step failure reason so a
-                # successful step doesn't inherit a stale signal from
-                # an earlier agent that timed out inside a lead cache
-                # lookup or a resolved capability swap.
+                # Reset the per-step failure reason so successful steps do not
+                # inherit stale failure metadata from an earlier backend call.
                 self._last_step_failure_reason = None
 
                 subtask = self.subtasks[step_idx]
@@ -952,12 +872,6 @@ class CompositionalExecutor:
                     ref.source,
                 )
 
-                if on_step_start:
-                    try:
-                        on_step_start(position, len(execution_order), ref)
-                    except Exception:  # noqa: BLE001
-                        pass
-
                 # LangFuse: start step span
                 step_span = self._start_langfuse_step_span(
                     lf, chain_trace, position, len(execution_order),
@@ -966,11 +880,8 @@ class CompositionalExecutor:
 
                 # Lead dedup: if this artifact was already executed (lead-with-
                 # subagents covering multiple subtasks), reuse cached output.
-                # Security audit finding #29 (2026-04-20): track cache-hit
-                # so invocation recording can skip cache-hit subtasks —
-                # pre-fix, every subtask recorded an invocation regardless
-                # of whether the artifact actually ran, inflating Gini /
-                # per-cap invocation counts / M4 token cost.
+                # Track cache hits so invocation recording can skip conceptual
+                # subtasks whose lead artifact already ran.
                 t_step = time.monotonic()
                 cache_hit = ref.capability_name in _lead_cache
                 if cache_hit:
@@ -1017,20 +928,18 @@ class CompositionalExecutor:
                     )
                 )
 
-                # §12 finding #12: runtime output-schema compliance check.
-                # Layer 2 of the two-layer defense (Layer 1 is the dynamic
-                # response_format in execute_agent_artifact). Fails the chain
-                # when an AGENT step's output is missing keys the decomposer
-                # declared in output_schema — same keys that downstream
-                # MCP_TOOL/SKILL steps rely on via requires_upstream_keys.
-                # MCP_TOOL output is deterministic (whatever the function
-                # returns) so only enforce for AGENT/SKILL runtime outputs.
+                # Runtime output-schema compliance check. Fails the chain when
+                # an AGENT/SKILL step output is missing keys the decomposer
+                # declared in output_schema — the same keys downstream steps
+                # rely on via requires_upstream_keys. MCP_TOOL output is
+                # deterministic, so only enforce for AGENT/SKILL outputs.
                 if (
                     subtask.output_schema
                     and output
                     and not fully_collapsed_lead
                     and ref.capability_type in (
-                    CapabilityType.AGENT, CapabilityType.SKILL,
+                        CapabilityType.AGENT,
+                        CapabilityType.SKILL,
                     )
                 ):
                     expected = set(subtask.output_schema.keys())
@@ -1044,9 +953,8 @@ class CompositionalExecutor:
                             f"got: {sorted(actual)})"
                         )
                         logger.warning(
-                            "Step %d (%s): %s — failing chain per §12 "
-                            "finding #12 (AGENT/SKILL output_schema "
-                            "compliance enforcement).",
+                            "Step %d (%s): %s — failing chain on "
+                            "AGENT/SKILL output_schema compliance.",
                             step_idx, ref.capability_name, reason,
                         )
                         self._last_step_failure_reason = reason
@@ -1067,23 +975,14 @@ class CompositionalExecutor:
 
                 # Record real invocation in metrics store. Pass the upstream
                 # outputs as input_args so the row survives get_recent_failures'
-                # WHERE input_args IS NOT NULL filter and feeds the Pillar 3
-                # Split coverage verifier + failure-informed prompt.
-                # Security audit finding #29 (2026-04-20): skip recording on
-                # cache-hit subtasks — the artifact didn't actually run;
-                # recording a phantom row inflates per-cap counts by the
-                # lead-reuse factor.
+                # WHERE input_args IS NOT NULL filter and feeds
+                # failure-informed optimization. Skip cache-hit subtasks
+                # because the artifact did not actually run.
                 if not cache_hit:
                     self._record_step_invocation(
                         ref, output, step_ms, task_id or "",
                         upstream_outputs=executed_outputs,
                     )
-
-                if on_step_end:
-                    try:
-                        on_step_end(position, len(execution_order), ref, bool(output), step_ms)
-                    except Exception:  # noqa: BLE001
-                        pass
 
                 # Persist for downstream MCP_TOOL steps (Docker reads from host)
                 self._save_step_output(workspace, step_idx, output)
@@ -1115,12 +1014,8 @@ class CompositionalExecutor:
             # SKILL/AGENT steps can't write to the Docker workspace, so they
             # embed file content in the output dict using special keys.
             #
-            # Security audit finding #93 (2026-04-19, ext9): scan EVERY
-            # step's output, not just the terminal step. Pre-fix
-            # intermediate SKILL/AGENT steps that emitted
-            # ``_output_file_name`` / ``_output_file_content`` had their
-            # files silently discarded, restricting file-output
-            # capability to the last step only.
+            # Scan every step's output, not just the terminal step, because
+            # intermediate SKILL/AGENT steps can emit file payloads.
             _binary_exts = {".xlsx", ".xls", ".parquet", ".pkl", ".zip", ".gz"}
             for step_output in step_results:
                 if not isinstance(step_output, dict):
@@ -1157,16 +1052,14 @@ class CompositionalExecutor:
                 output_files=collected_files,
             )
         finally:
-            # Fix #3 (2026-04-19): reset the trace_context we set around
-            # the chain-executor so subsequent code outside run() isn't
-            # affected. Mirrors the ContextVar + module-global reset
-            # logic in ``trace_context`` context manager.
+            # Reset the trace_context set around chain execution so subsequent
+            # code outside run() is not affected.
             if _chain_tc_token is not None:
                 try:
                     from src.orchestrator.tracing import (
-                        _trace_context_var,
                         _trace_context_global,
                         _trace_context_lock,
+                        _trace_context_var,
                     )
                     _trace_context_var.reset(_chain_tc_token)
                     with _trace_context_lock:
@@ -1196,15 +1089,8 @@ class CompositionalExecutor:
             lf = Langfuse()
             span_cm = lf.start_as_current_span(name="chain-executor")
             span = span_cm.__enter__()
-            # Security audit finding #104 (2026-04-19, ext10): capture
-            # the span's trace_id IMMEDIATELY at span-start time, then
-            # stash it on the span_cm so the caller's race-free
-            # ``_chain_trace_id`` lookup can prefer this over the
-            # singleton-client ``lf.current_trace_id`` read (which is
-            # racy under concurrent execution). Different LangFuse SDK
-            # versions expose the trace_id in different ways; try the
-            # span object first, then the client. If neither yields a
-            # value, the caller falls back to the singleton path.
+            # Capture the span trace_id immediately so run() can prefer this
+            # span-scoped value over a singleton-client lookup.
             try:
                 _span_trace_id = (
                     getattr(span, "trace_id", None)
@@ -1235,10 +1121,8 @@ class CompositionalExecutor:
                 str(t) for t in (self.langfuse_tags or [])
                 if isinstance(t, str)
             ]
-            # Step 13.7 tagging audit (2026-04-18) — append per-capability-type
-            # tags so Chapter 6 analysis can filter "show me all traces that
-            # executed an AGENT step" natively in the LangFuse UI. One
-            # `capability_type:X` tag per distinct type present in the chain.
+            # Add one capability_type:X tag per distinct type present in the
+            # chain so LangFuse can filter traces by executed backend type.
             try:
                 _types = {
                     ref.capability_type.value
@@ -1301,9 +1185,8 @@ class CompositionalExecutor:
             return None
         try:
             cap_type = ref.capability_type.value
-            # Step 13.7 Batch C5: try typed observations (SDK v3) so
-            # LangFuse UI differentiates MCP_TOOL / SKILL / AGENT steps
-            # visually. Fall back to plain span on older SDK versions.
+            # Prefer typed observations when the SDK supports them so LangFuse
+            # can distinguish MCP_TOOL / SKILL / AGENT steps visually.
             _type_map = {"mcp_tool": "tool", "agent": "agent", "skill": "span"}
             _obs_type = _type_map.get(cap_type, "span")
             step_cm = None
@@ -1347,11 +1230,8 @@ class CompositionalExecutor:
     ) -> None:
         """Finalize a step span with outcome.
 
-        Step 13.7 Batch B1 (2026-04-18): include ``failed_step_reason``
-        (the §12 finding #12 schema-violation string or AGENT timeout
-        meta) on the step-span output so LangFuse UI shows what broke
-        without a DuckDB join. Read from ``self._last_step_failure_reason``
-        which is set at the step-failure site.
+        Includes ``failed_step_reason`` on failed step spans when a backend or
+        schema check set structured failure metadata.
         """
         if step_cm is None:
             return

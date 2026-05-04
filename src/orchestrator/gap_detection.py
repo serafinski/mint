@@ -1,4 +1,4 @@
-"""Gap detection — LangGraph node wrapping registry.detect_gaps().
+"""Gap detection - LangGraph node wrapping registry.detect_gaps().
 
 Searches the capability registry for each required capability and populates
 ``state.matches`` per matched capability. For each required capability that
@@ -6,15 +6,11 @@ does NOT match in the registry, produces one enumerated ``GapItem`` so the
 downstream per-gap classifier can classify each gap individually within the
 context of the whole task.
 
-This is a plain Python node — no LLM calls. As of Stage 1 of the
-compositional refactor, matches are NO LONGER recorded as fake invocations
-here; honest invocation records are written by the Stage 3 compositional
-executor after real chain execution.
-
-As of Stage 2 of the compositional refactor, the previous "single
-placeholder gap" collapse is removed: the classifier again receives N
-enumerated gaps (one per unmatched required capability) so generators can
-produce N artifacts, one per step of the workflow.
+The node uses deterministic registry lookup for ordinary matching. If the
+file-backed taxonomy already contains categories, it may use an LLM to pick a
+query domain before calling the registry. Match accounting intentionally stays
+out of this node: invocation records are written only after real chain
+execution.
 """
 
 from __future__ import annotations
@@ -39,10 +35,9 @@ def _is_match_compatible_with_subtask(
 ) -> tuple[bool, str | None]:
     """Return whether a registry match is compatible with a decomposed subtask.
 
-    The current guard has two parts:
+    The guard has two compatibility checks:
 
-    - if the subtask declares no ``output_schema``, preserve legacy behavior
-    - if the capability stores no ``output_schema``, preserve legacy behavior
+    - if either side has no ``output_schema``, allow the match
     - otherwise, require the capability's output keys to cover the subtask's
       declared output keys
     - for downstream MCP tools, require an input call-shape that the chain
@@ -76,8 +71,8 @@ def _is_match_compatible_with_subtask(
     if output_reason is not None:
         return False, output_reason
 
-    # Downstream MCP tools have a second compatibility dimension: can the
-    # chain executor actually call them? Steps 1+ pass either:
+    # Later-chain MCP tools have a second compatibility dimension: can the
+    # chain executor actually call them? Non-initial steps pass either:
     # - a single ``upstream_data`` dict, or
     # - named kwargs that match ``requires_upstream_keys`` exactly.
     #
@@ -126,21 +121,20 @@ def gap_detection_node(
         state: Current pipeline state with ``required_capabilities`` populated
             by ``decomposition_node``.
         registry: The capability registry to search.
-        metrics_store: Currently unused. Reserved for future use; the Stage 3
-            compositional executor records honest invocation records after
-            real chain execution. Kept on the signature for caller stability.
+        metrics_store: Currently unused. Kept on the signature for caller
+            stability; match accounting belongs to real execution, not
+            registry lookup.
 
     Returns:
         Command routing to ``classifier_node`` with updated matches and gaps.
     """
-    del metrics_store  # Stage 1: matches are no longer recorded as fake invocations.
+    del metrics_store  # Registry lookup must not record synthetic invocations.
     errors: list[str] = list(state.errors)
 
-    # Evolutionary taxonomy (B1 Step 3.5f): pick the best existing category
-    # for this task's description, then thread into detect_gaps with
-    # include_generic=True so generic caps bypass the filter. On any failure
-    # (empty taxonomy, LLM error) get_for_query returns None and detect_gaps
-    # runs unfiltered — the pre-3.5f behavior.
+    # Evolutionary taxonomy: pick the best existing category for this task's
+    # description, then thread it into detect_gaps with include_generic=True so
+    # generic capabilities bypass the filter. On empty taxonomy or classifier
+    # failure, selected_domain remains None and retrieval runs unfiltered.
     selected_domain: str | None = None
     try:
         from langchain.chat_models import init_chat_model
@@ -182,22 +176,19 @@ def gap_detection_node(
         )
         selected_domain = None
 
-    # Step 14.5 Part A — dual-query retrieval. The decomposer produces
-    # short hyphen-case slugs in ``required_capabilities`` which systematically
-    # fall below the 0.6 cosine threshold against the registry's prose-style
-    # ``_build_document()`` output (measured 0.5425 on csv-parser vs 0.7653
-    # for a natural-language description of the same task). Build an
-    # auxiliary-query list using ``SubTask.description`` for each slug —
-    # ``detect_gaps`` runs both searches and takes the max-scoring hit,
-    # which lifts seeded caps that would otherwise be undiscoverable.
+    # Dual-query retrieval. The decomposer produces short hyphen-case slugs in
+    # ``required_capabilities`` which can fall below the similarity threshold
+    # against the registry's prose-style ``_build_document()`` output. Build an
+    # auxiliary-query list using ``SubTask.description`` for each slug;
+    # ``detect_gaps`` runs both searches and takes the max-scoring hit.
     #
     # Association: each slug belongs to exactly one subtask. For each
     # subtask, every slug in its ``required_capabilities`` list uses the
     # SAME subtask description as its auxiliary. On the fallback path
     # (decomposition failed, ``state.subtasks`` is empty), every slug gets
-    # None as its auxiliary — the single-query behaviour is preserved.
+    # None as its auxiliary, preserving single-query behaviour.
     #
-    # See ``docs/registry_retrieval_fix_plan.md`` for the empirical
+    # See ``docs/archive/registry_retrieval_fix_plan.md`` for the empirical
     # evidence, ranked options, and methodology notes.
     slug_to_description: dict[str, str] = {}
     slug_to_subtask: dict[str, SubTask] = {}
@@ -244,15 +235,13 @@ def gap_detection_node(
             MatchItem(capability=cap, score=score, query=query)
         )
 
-    # Stage 1 of the compositional refactor: matches are NOT recorded as
-    # InvocationRecords here. Doing so inflated reuse counts (e.g., csv-parser
-    # in T14) without any real execution. The Stage 3 CompositionalExecutor
-    # writes honest invocation records after the chain actually runs.
-
-    # Stage 2 of the compositional refactor: produce N enumerated GapItems,
-    # one per unmatched required capability. The per-gap classifier downstream
-    # classifies each gap independently within the context of the whole task,
-    # which lets generators produce N artifacts (one per workflow step).
+    # Matches are not recorded as InvocationRecords here. Recording registry
+    # hits before execution would inflate reuse counts without any real call.
+    #
+    # Produce one enumerated GapItem per unmatched required capability. The
+    # per-gap classifier downstream classifies each gap independently within
+    # the context of the whole task, letting generators produce one artifact
+    # per workflow step.
     all_gaps_raw = [*gaps_raw, *demoted_gaps]
     gaps: list[GapItem] = [
         GapItem(

@@ -1,7 +1,7 @@
-"""Integration tests for the task-level capability classifier.
+"""Integration tests for the per-gap capability classifier.
 
 These tests invoke the real LLM (openai:gpt-5-mini) to verify that the
-classification prompt produces correct, reproducible task-level classifications
+classification prompt produces correct, reproducible per-gap classifications
 with ``temperature=0``.
 
 Requires OPENAI_API_KEY environment variable to be set.
@@ -13,9 +13,9 @@ import os
 
 import pytest
 
-from src.orchestrator.classifier import classify_task
+from src.orchestrator.classifier import classify_gap
 from src.schemas.capability import CapabilityType
-from src.schemas.task import ClassifiedGap
+from src.schemas.task import ClassifiedGap, GapItem
 
 _has_api_key = bool(os.environ.get("OPENAI_API_KEY"))
 
@@ -35,14 +35,25 @@ def _reset_classifier_llm():
     mod._classifier_llm = None
 
 
-class TestClassifyTaskLive:
+class TestClassifyGapLive:
     def test_classify_mcp_tool(self):
-        """A clear atomic operation should classify as MCP_TOOL."""
+        """A clear atomic gap should classify as MCP_TOOL."""
         task = (
             "Parse a JSON configuration file and return a dictionary mapping "
             "section names to their key-value pairs."
         )
-        result = classify_task(task, required_capabilities=["parse-json", "extract-sections"])
+        gap = GapItem(
+            query="parse-json-sections",
+            description=(
+                "Parse the JSON configuration file and extract section names "
+                "with their key-value pairs."
+            ),
+        )
+        result = classify_gap(
+            gap=gap,
+            task_description=task,
+            required_capabilities=["parse-json", "extract-sections"],
+        )
 
         assert isinstance(result, ClassifiedGap)
         assert result.classified_type == CapabilityType.MCP_TOOL
@@ -50,44 +61,7 @@ class TestClassifyTaskLive:
         assert len(result.rationale) > 0
 
     def test_classify_skill_subtask_per_gap(self):
-        """Per-gap classification (modern primary path) of a SKILL-shaped subtask.
-
-        Replaces the deleted ``test_classify_skill`` (root-cause
-        traced 2026-04-21):
-
-        The deleted test asked the LEGACY ``classify_task`` wrapper
-        to whole-task-classify the multi-step *"Build an inventory
-        reorder pipeline ... compute days of stock ... sum total
-        cost"* prompt as SKILL. That made sense in the **pre-Stage-2
-        world** (commit ``cab813a``, 2026-04-13) where the classifier
-        ran ONCE per task. Stage 2 pivoted to **per-gap
-        classification** — multi-step tasks are now decomposed FIRST,
-        then each subtask is independently classified via
-        ``classify_gap``. In production the inventory-reorder task
-        would be decomposed into three deterministic-compute gaps
-        (parse, apply rules, sum), each correctly classifying as
-        MCP_TOOL. There is no longer a "whole task is a SKILL"
-        classification step in the production path for multi-step
-        tasks.
-
-        Empirical confirmation (2026-04-21 reproduction):
-        ``classify_task`` on a SKILL-shaped prompt now returns either
-        ``MCP_TOOL`` (compute-pipeline anti-pattern, classifier prompt
-        explicitly excludes those) OR ``AGENT`` (multi-step + judgment
-        + adaptation language, which the prompt rewards). The legacy
-        wrapper has no robust SKILL niche left for non-trivial
-        prompts. Coverage of the legacy single-gap fallback wrapper is
-        already provided indirectly by ``test_classify_mcp_tool`` /
-        ``test_classify_agent`` which use trivial single-purpose
-        prompts that the wrapper still handles cleanly.
-        """
-        from src.orchestrator.classifier import classify_gap
-        from src.schemas.task import GapItem
-
-        # Parent task is procedural-with-domain-expertise. The
-        # subtask is the "apply rubric" step — clearly SKILL because
-        # the rubric application is per-team domain expertise, not
-        # raw compute.
+        """A domain-procedure gap should classify as SKILL."""
         parent_task = (
             "Run a structured data quality review following our team's "
             "data-cleaning SOP: profile the dataset against our quality "
@@ -127,7 +101,7 @@ class TestClassifyTaskLive:
         assert result.confidence >= 0.7
 
     def test_classify_agent(self):
-        """An open-ended investigation task should classify as AGENT."""
+        """An open-ended investigation gap should classify as AGENT."""
         task = (
             "Investigate a service degradation incident. Examine metrics "
             "around the onset time, identify which metric changed first "
@@ -135,8 +109,17 @@ class TestClassifyTaskLive:
             "onset times across metrics. Requires adaptive investigation "
             "where the path depends on intermediate findings."
         )
-        result = classify_task(
-            task,
+        gap = GapItem(
+            query="investigate-service-degradation",
+            description=(
+                "Investigate the service degradation, decide which metrics "
+                "to inspect next based on intermediate findings, and identify "
+                "the root-cause cascade."
+            ),
+        )
+        result = classify_gap(
+            gap=gap,
+            task_description=task,
             required_capabilities=[
                 "profile-metrics",
                 "root-cause-analysis",
@@ -150,25 +133,52 @@ class TestClassifyTaskLive:
         assert len(result.rationale) > 0
 
     def test_confidence_above_threshold(self):
-        """All clear-cut task examples should have confidence >= 0.7."""
-        clear_cut_tasks = [
-            "Compute the SHA-256 hash of a string and return the hex digest.",
+        """All clear-cut gap examples should have confidence >= 0.7."""
+        clear_cut_cases = [
             (
-                "Build an ETL pipeline that extracts sales data from CSV, "
-                "transforms it with currency normalization and validation "
-                "rules, and loads it into a cleaned output file."
+                "Compute the SHA-256 hash of a string and return the hex digest.",
+                GapItem(
+                    query="compute-sha256-hash",
+                    description="Compute the SHA-256 hash and return the hex digest.",
+                ),
+                ["compute-sha256-hash"],
+            ),
+            (
+                "Apply the team's invoice reconciliation SOP to flag mismatches "
+                "using the approved policy thresholds.",
+                GapItem(
+                    query="apply-reconciliation-policy",
+                    description=(
+                        "Apply the approved invoice reconciliation policy "
+                        "thresholds and flag mismatches using the team's SOP."
+                    ),
+                ),
+                ["apply-reconciliation-policy"],
             ),
             (
                 "Autonomously monitor system logs, detect failure patterns, "
                 "investigate their root causes by following leads across "
                 "related log sources, and adapt the search strategy based on "
-                "what is discovered."
+                "what is discovered.",
+                GapItem(
+                    query="investigate-log-failures",
+                    description=(
+                        "Investigate related log sources, follow leads from "
+                        "intermediate findings, and adapt the search strategy."
+                    ),
+                ),
+                ["investigate-log-failures"],
             ),
         ]
-        for task in clear_cut_tasks:
-            result = classify_task(task, required_capabilities=[])
+        for task, gap, required_capabilities in clear_cut_cases:
+            result = classify_gap(
+                gap=gap,
+                task_description=task,
+                required_capabilities=required_capabilities,
+            )
+            assert result is not None
             assert result.confidence >= 0.7, (
-                f"Task {task[:40]!r} classified as "
+                f"Gap {gap.query!r} classified as "
                 f"{result.classified_type} with low confidence "
                 f"{result.confidence}: {result.rationale}"
             )

@@ -1,10 +1,9 @@
 """Unit tests for the gap detection LangGraph node.
 
-As of Stage 2 of the compositional refactor, ``gap_detection_node`` produces
-N enumerated ``GapItem``s (one per unmatched required capability) so the
-downstream per-gap classifier can classify each step independently within
-the context of the whole task. Per-capability registry matching is preserved
-(populating ``state.matches`` for each match).
+``gap_detection_node`` produces N enumerated ``GapItem``s, one per unmatched
+required capability, so the downstream per-gap classifier can classify each
+step independently within the context of the whole task. Per-capability
+registry matching is preserved by populating ``state.matches`` for each match.
 """
 
 from __future__ import annotations
@@ -173,7 +172,7 @@ def test_empty_required_capabilities():
 def test_passes_required_capabilities_to_registry():
     """Slugs are threaded to detect_gaps. When no subtasks carry descriptions
     (empty subtasks list, fallback path), auxiliary_queries is a list of Nones
-    — the single-query pre-Step-14.5 behaviour is preserved.
+    so single-query retrieval is preserved.
     """
     registry = _make_registry()
     state = TaskState(
@@ -192,7 +191,7 @@ def test_passes_required_capabilities_to_registry():
 
 
 # ---------------------------------------------------------------------------
-# Step 14.5 Part A — dual-query wiring: gap_detection_node builds
+# Dual-query retrieval wiring: gap_detection_node builds
 # auxiliary_queries from state.subtasks descriptions
 # ---------------------------------------------------------------------------
 
@@ -393,7 +392,7 @@ def test_compatible_registry_match_preserved_for_subtask():
     assert cmd.update["gaps"] == []
 
 
-def test_no_subtasks_preserves_legacy_match_behavior():
+def test_no_subtasks_preserves_direct_match_behavior():
     """Direct retrieval flows without decomposition must remain unchanged."""
     cap = _make_descriptor(
         "sales-integration-report",
@@ -408,7 +407,7 @@ def test_no_subtasks_preserves_legacy_match_behavior():
         matches=[(cap, 0.70, "parse-sales-products-and-targets")],
     )
     state = TaskState(
-        task_description="legacy direct retrieval",
+        task_description="direct retrieval",
         required_capabilities=["parse-sales-products-and-targets"],
         subtasks=[],
     )
@@ -548,13 +547,12 @@ def test_empty_errors_when_none_prior():
 
 
 # ---------------------------------------------------------------------------
-# MetricsStore is NOT touched by gap_detection (Stage 1 compositional refactor)
+# MetricsStore is NOT touched by gap_detection
 #
-# Previously this node wrote fake InvocationRecords for every match (token=0,
-# latency=0) so matches wouldn't be pruned as idle. That inflated reuse counts
-# (e.g., csv-parser in T14) without any real execution. Stage 1 of the
-# compositional refactor strips those writes — honest invocations are now
-# recorded by the Stage 3 CompositionalExecutor after real chain execution.
+# Historical versions wrote synthetic InvocationRecords for every match
+# (token=0, latency=0) so matches would not be pruned as idle. That inflated
+# reuse counts without any real execution. Honest invocations are now recorded
+# only after chain execution.
 # ---------------------------------------------------------------------------
 
 

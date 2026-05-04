@@ -1,31 +1,17 @@
-"""Schema extraction helpers for populating CapabilityDescriptor I/O schemas.
+"""Schema extraction helpers for capability registry entries.
 
-Closes the long-standing TODO in ``src/orchestrator/tool_loader.py:310``
-that left ``input_schema`` and ``output_schema`` as empty dicts on every
-generated capability. This module provides:
+Generated capabilities should enter the registry with meaningful
+``input_schema`` and ``output_schema`` fields because optimizer merge and
+reuse decisions compare structural compatibility, not just prose
+descriptions. Generators normally attach schemas from the decomposed
+``SubTask``. These helpers provide registration-time fallbacks:
 
-1. ``extract_mcp_tool_signature`` — AST-based extractor that walks generated
-   MCP tool source code, finds the ``@mcp.tool()`` decorated ``async def``,
-   and returns its parameter names and types (``input_schema``). Return
-   annotations are typically the generic ``dict`` literal and carry no
-   structural information — output schemas should come from the decomposer's
-   ``SubTask.output_schema`` instead, via ``find_subtask_for_gap``.
-
-2. ``find_subtask_for_gap`` — match a gap query against a list of subtasks
-   using the same rule already used by ``build_schema_context`` in
-   ``generators/utils.py``: the first subtask whose ``required_capabilities``
-   contains the query.
-
-3. ``derive_input_schema_from_upstream`` — for SKILL / AGENT artifacts in
-   a compositional chain, merge the upstream subtasks' output_schemas as
-   the effective input contract.
-
-Why this matters: the proposal's Pillar 3 Merge clause requires
-"overlapping input schemas" as one of two conjunctive similarity criteria.
-Without populated schemas, that conjunct is vacuous and Merge falls back
-to prose-only clustering — which Phase D (2026-04-13) showed cannot
-distinguish structurally-similar capabilities across business verticals.
-See ``docs/archive/b1_enriched_embedding_plan.md`` for the full rationale.
+1. ``extract_mcp_tool_signature`` parses generated MCP tool source with
+   ``ast`` and recovers parameter types plus literal return-dict keys.
+2. ``find_subtask_for_gap`` matches a generated artifact's gap query to
+   the decomposed subtask that produced it.
+3. ``derive_input_schema_from_upstream`` derives SKILL / AGENT input
+   contracts from predecessor subtasks in a compositional chain.
 """
 
 from __future__ import annotations
@@ -49,13 +35,13 @@ def extract_mcp_tool_signature(
     with ``@mcp.tool(...)`` (or ``@mcp.tool``). Extracts parameter names
     and annotation text, unwrapping ``Annotated[T, ...]`` wrappers to
     expose the inner type. Reads the return annotation if present, but
-    this is usually the generic ``dict`` literal and is returned as-is
-    in the output schema (callers typically override with the
-    decomposer's ``SubTask.output_schema``).
+    this is often a generic ``dict`` literal. Literal return-dict keys
+    are preferred when present; otherwise the generic return annotation
+    is exposed as ``{"result": "<type>"}``.
 
     This function never raises. On any parse error, returns two empty
-    dicts — callers fall back to empty schemas, which is the pre-B1
-    behaviour.
+    dicts so callers can preserve the generated artifact's explicit
+    schemas or safely register without inferred schemas.
 
     Examples::
 
@@ -76,8 +62,8 @@ def extract_mcp_tool_signature(
         {'result': 'dict'}
 
     The output schema ``{"result": "dict"}`` is a generic placeholder
-    that says "this function returns a dict" — use the decomposer's
-    per-subtask ``output_schema`` for the real output contract.
+    that says "this function returns a dict"; artifact-provided schemas
+    remain the preferred source when available.
     """
     try:
         tree = ast.parse(source_code)
@@ -318,8 +304,7 @@ def derive_input_schema_from_upstream(
 
     For a middle or last step in a compositional chain, the input contract
     is the union of its dependencies' output_schemas. For a first step
-    (no depends_on), returns an empty dict — the caller is expected to
-    fall back to an AST extraction or leave empty.
+    with no dependencies, returns an empty dict.
     """
     if not subtask.depends_on:
         return {}

@@ -4,11 +4,11 @@ Wraps a DeepAgent (``create_deep_agent``) in a LangGraph node function.
 The agent uses ``write_todos`` for planning and ``response_format`` for
 structured subtask output.
 
-Operational boundaries (from CLAUDE.md):
+Operational boundaries:
 - ``recursion_limit=50`` (max steps)
-- Node-level timeout: 120 s
+- Node-level timeout: 240 s
 - Graph is a stateless CompiledStateGraph; state is fresh per ``.invoke()`` call
-- On timeout / error: return partial results with error flag
+- On repeated timeout/error/empty output: fail closed with ``decomposition_succeeded=False``
 """
 
 from __future__ import annotations
@@ -34,24 +34,11 @@ logger = logging.getLogger(__name__)
 # Operational boundaries
 # ---------------------------------------------------------------------------
 
-# Bumped 120 → 240 on 2026-04-14 after an eval run surfaced repeated
-# timeouts on the T04 5-stage inventory reorder task. Empirical data (LangFuse
-# traces across April 7 → April 14) shows the DeepAgent routinely completes
-# its real work in 87–180s of LLM wall time on complex tasks, but tail variance
-# in gpt-5-mini reasoning mode pushes wall clock to 200–400s intermittently.
-# The 120s ceiling was tipping over on the unlucky tail. Reducing reasoning
-# effort on the decomposer itself was rejected because it affects every task
-# (including the easy ones that currently work) with quality impact on the
-# entire downstream pipeline. Bumping the timeout is surgical — only the tail
-# pays. See docs/perf_fixes_2026_04_14.md §2b.
+# Complex decompositions can take several minutes of LLM wall time, so the
+# timeout is intentionally higher than the rest of the synchronous nodes.
 DECOMPOSITION_TIMEOUT_S = 240
 DECOMPOSITION_RECURSION_LIMIT = 50
-# §12 finding #15 (2026-04-16): retry the decomposer up to 3 times on
-# timeout / exception / empty result before failing closed. Matches the
-# 3-strike pattern used by verification_node (finding #14). Previously
-# a single failure fell through to a single-sentence fallback path;
-# that was drift from the proposal's "orchestrator agent breaks the
-# input task into subtasks" contract.
+# Retry timeout / exception / empty result before failing closed.
 MAX_DECOMPOSITION_ATTEMPTS = 3
 
 # Two-stage circuit breaker for capability count.
@@ -63,7 +50,7 @@ MAX_CAPS_HARD = 8
 
 
 # ---------------------------------------------------------------------------
-# Agent factory — creates a fresh agent per invocation
+# Agent factory
 # ---------------------------------------------------------------------------
 
 
@@ -71,9 +58,8 @@ def _get_agent():
     """Create a fresh decomposition DeepAgent for each invocation.
 
     A new ``CompiledStateGraph`` is returned on every call so no state is
-    carried between pipeline runs (CLAUDE.md: "Fresh every invocation —
-    No state carried between calls").  ``create_deep_agent()`` compiles a
-    LangGraph graph without making any API calls, so the overhead is minimal.
+    carried between pipeline runs. ``create_deep_agent()`` compiles a
+    LangGraph graph without making API calls, so the overhead is minimal.
     """
     from src.config import DEFAULT_LLM_MODEL
 
@@ -86,7 +72,7 @@ def _get_agent():
 
 
 # ---------------------------------------------------------------------------
-# Chain coherence validation (Phase 2 Step 14 — decomposition coherence check)
+# Chain coherence validation
 # ---------------------------------------------------------------------------
 #
 # The decomposer can produce a DAG of subtasks that is internally incoherent:
@@ -95,12 +81,6 @@ def _get_agent():
 # passes verification in isolation, but the chain crashes at execution time
 # with errors like ``upstream_data must include a 'transactions' key``.
 #
-# The canonical failure (T14 TSV task):
-#   Step 1 ``parse-csv-file`` → output_schema={'departments': ...}
-#   Step 2 ``aggregate-by-department`` with depends_on=[0],
-#          requires_upstream_keys=['departments', 'transactions'].
-#          Step 1 produces 'departments' but nothing produces 'transactions'.
-#
 # Implementation: **structured contract**, not prose parsing. The subtask
 # schema carries an explicit ``requires_upstream_keys: list[str]`` field.
 # The decomposer fills it in; validation is a set comparison against the
@@ -108,17 +88,11 @@ def _get_agent():
 # natural-language heuristics.
 #
 # This aligns with the "Structured State Communication" section of the
-# thesis proposal (docs/thesis_proposal.md): typed contracts over lossy
-# natural-language parsing. An earlier version of this check parsed
-# subtask descriptions for ``upstream_data['key']`` patterns, which
-# false-positived on nested accesses (T04 inventory, 2026-04-14) and was
-# fundamentally brittle — the LLM could defeat the check by rephrasing
-# the same dependency in prose. The structured field removes that failure
-# mode entirely.
+# thesis proposal: typed contracts over lossy natural-language parsing.
 #
 # Fail-open semantics: validation failures append to ``state.errors`` and
-# set ``decomposition_succeeded=False`` (Fix 2b sticky flag), but the
-# pipeline continues so downstream nodes can produce partial results.
+# set ``decomposition_succeeded=False``, but the pipeline continues so
+# downstream nodes can produce partial results.
 
 
 def _collect_transitive_upstream_keys(
@@ -143,9 +117,8 @@ def _collect_transitive_upstream_keys(
             continue
         visited.add(i)
         if i < 0 or i >= len(subtasks):
-            # Invalid depends_on index — skip. The circuit breaker earlier
-            # in decomposition_node doesn't validate indices, so a pathological
-            # decomposition could reference a non-existent predecessor.
+            # Keep this helper defensive; structural DAG validation reports
+            # invalid indices separately.
             continue
         predecessor = subtasks[i]
         upstream_keys.update(predecessor.output_schema.keys())
@@ -156,18 +129,6 @@ def _collect_transitive_upstream_keys(
 
 def _validate_depends_on_indices(subtasks: list[SubTask]) -> list[str]:
     """Return a list of structural DAG violations in ``subtasks``.
-
-    Security audit finding #12 (2026-04-20), layer (A): the decomposition
-    LLM can emit ``depends_on`` values that reference non-existent or
-    cyclic predecessors. Pre-fix these passed through the chain-coherence
-    validator (which only checks ``requires_upstream_keys`` semantics)
-    and reached the execution-order builder, where they either crashed
-    (``[99]`` → IndexError at the run loop), phantom-executed
-    (``[-1]`` re-runs the last subtask), or silently linearised (cycle
-    → ``[0, 1, 2]`` ignoring the dependency). This validator catches
-    them at the decomposition layer so the §12 finding #15 strict-gate
-    pattern actually fires: violation → ``decomposition_succeeded=False``
-    → 3x retry → terminal failure on exhaustion.
 
     Checks:
     - Every ``depends_on`` index ``dep`` must satisfy ``0 <= dep < len(subtasks)``.
@@ -206,17 +167,12 @@ def _validate_depends_on_indices(subtasks: list[SubTask]) -> list[str]:
 
 
 def _validate_single_capability_per_subtask(subtasks: list[SubTask]) -> list[str]:
-    """Return a list of subtasks that declare more than one required capability.
+    """Return warnings for subtasks that declare more than one capability.
 
-    Security audit finding #92 (2026-04-19, ext9): the executor's
-    ``CompositionalExecutor._resolve_step`` returns only the FIRST
-    capability that resolves, so multi-capability subtasks silently
-    drop capabilities 2..N. The design intent (and the decomposer
-    prompt) is one-cap-per-subtask; the LLM occasionally deviates and
-    the silent drop causes downstream chain incompleteness. Flagging
-    multi-cap subtasks as a decomposition-layer violation surfaces
-    the deviation (and routes it through the §12 finding #15 retry
-    loop on bad-shape attempts).
+    The executor resolves one capability per subtask. Multi-capability
+    subtasks are therefore risky, but they are currently treated as soft
+    warnings because multi-file writer cases can legitimately produce more
+    than one writer capability.
     """
     violations: list[str] = []
     for i, st in enumerate(subtasks):
@@ -360,14 +316,11 @@ def _ensure_file_writer_last_step(
 ) -> list[SubTask]:
     """Ensure the chain ends in a deterministic file-writer step per Rule 15.
 
-    **Why this exists.** `docs/thesis_proposal.md` §Pillar 1 classifies
-    file writing as *"deterministic + stateless → MCP tool"*. SKILL and
-    AGENT executors cannot write to the Docker workspace, so a chain ending
-    in a SKILL or AGENT last step cannot produce file outputs. The
-    decomposer prompt Rule 15 instructs the LLM to always append a writer
-    subtask when the task requires a file output; this helper is the
-    safety net for decomposer non-compliance — it appends a synthetic
-    writer subtask when the LLM forgot.
+    File writing is deterministic and must run as an MCP tool because SKILL
+    and AGENT executors cannot write to the Docker workspace that the chain
+    collector scans. The decomposer prompt instructs the LLM to append a
+    writer subtask when the task requires a file output; this helper enforces
+    that rule structurally when the LLM forgets.
 
     **When it fires.**
     - ``required_files`` is non-empty (task declared file outputs)
@@ -378,7 +331,7 @@ def _ensure_file_writer_last_step(
     - ``description``: ``"Write the upstream result to <filename> as
       <format>."``
     - ``required_capabilities``: ``["write-<ext>-file"]`` — short, reusable,
-      and a natural merge candidate under Pillar 3.
+      and a natural registry reuse candidate.
     - ``depends_on``: ``[<index of the original last subtask>]`` — every
       writer depends on the SAME original predecessor in parallel
       (NOT chained writer-after-writer). For multi-file asks each writer
@@ -389,26 +342,11 @@ def _ensure_file_writer_last_step(
       file"}``.
     - ``requires_upstream_keys``: the TOP-LEVEL keys of the original
       predecessor's ``output_schema`` (satisfies the chain coherence
-      contract from Rule 13 / ``_validate_chain_coherence``).
+      contract enforced by ``_validate_chain_coherence``).
 
-    **Why parallel and not chained.** An earlier version chained writers
-    so that writer N+1's ``depends_on=[writer_N]`` and
-    ``requires_upstream_keys=['output_file']``. That broke multi-file
-    end-to-end: writer 2 only saw the FILEPATH STRING of writer 1's
-    output, not the original data, and could not serialize its own
-    format. Empirically untested at the time because every authored
-    eval task asks for at most one file (T07: output.csv, T11:
-    output.xlsx, T16: report.md). Surfaced 2026-04-16 by a static
-    review during Phase 2 closeout. See §12 finding #13 for the full
-    write-up.
-
-    **Why a helper instead of prompt-only.** Per §12 finding #10, relying
-    on prompt compliance alone is the Option-A-as-fallback pattern that
-    drifted. The validator makes the rule structurally enforced: either
-    the decomposer does it (happy path — Rule 15 fires) or this helper
-    does it (rescue path). Either way, the chain ends in an MCP_TOOL
-    writer that goes through Pillar 2 verification and enters the
-    registry as a reusable, Pillar-3-eligible capability.
+    **Why parallel and not chained.** Multiple file writers need the same
+    original upstream data. Chaining writers would make writer N+1 consume
+    only writer N's ``output_file`` path instead of the original result.
     """
     if not required_files or not subtasks:
         return subtasks
@@ -443,18 +381,8 @@ def _ensure_file_writer_last_step(
         ext = "".join(Path(filename).suffixes[-1:]).lower() or ""
         ext_slug = ext.lstrip(".") or "file"
         fmt_label = _EXT_TO_FORMAT.get(ext, ext_slug.upper())
-        # Security audit finding #98 (2026-04-20, ext9 follow-up):
-        # explicitly include the ``/workspace/`` prefix in the writer
-        # description so the downstream MCP_TOOL generator emits an
-        # ``open("/workspace/<filename>", ...)`` call rather than
-        # ``open("/<filename>", ...)``. Pre-fix the bare filename in the
-        # description coupled with the generator-prompt example
-        # ``/workspace/output.<ext>`` led the LLM to occasionally
-        # produce ``open("/report.md", ...)`` (filesystem root) — the
-        # Docker sandbox correctly rejected the privileged-path write
-        # with ``PermissionError`` and the chain failed at the writer
-        # step. The MCP-tool prompt is now reinforced at the call site
-        # so generators don't have to guess where the workspace lives.
+        # Include the /workspace prefix so the MCP tool generator writes
+        # inside the sandbox mount that the compositional executor collects.
         writer = SubTask(
             description=(
                 f"Write the upstream result to /workspace/{filename} as "
@@ -463,8 +391,7 @@ def _ensure_file_writer_last_step(
                 f"path. The file MUST be written to /workspace/{filename} "
                 "(NOT /{filename} or any other absolute path) so the "
                 "compositional executor can collect it from the sandbox "
-                "and ship it to the host's data/<env>/mint_output/<run>/ "
-                "directory."
+                "and expose it through ChainResult.output_files."
             ),
             required_capabilities=[f"write-{ext_slug}-file"],
             depends_on=[original_predecessor_index],
@@ -487,8 +414,8 @@ def _detect_upstream_key_collisions(subtasks: list[SubTask]) -> list[str]:
     Earlier producers' values for the colliding key are silently dropped.
 
     **These are soft warnings, not hard violations.** A colliding chain can
-    accidentally work at runtime if the downstream subtask happens to want
-    the last-writing producer's value. The check is still useful because:
+    still work at runtime if the downstream subtask happens to want the
+    last-writing producer's value. The check is still useful because:
 
     - It surfaces decomposition-quality issues (two predecessors naming
       different semantic outputs the same top-level key).
@@ -504,10 +431,8 @@ def _detect_upstream_key_collisions(subtasks: list[SubTask]) -> list[str]:
     and 3 both have 0 and 1 as transitive predecessors and 0/1 collide on
     key ``'records'``, the collision is reported at subtask 2 only.
 
-    See ``docs/MASTER_PLAN_2026_04_13.md`` §14.10 for the full rationale
-    and the Option A vs Option B decision. Current implementation is
-    Option A (warning-only); post-eval data will determine whether to
-    upgrade to Option B (hard violation).
+    The current behavior is warning-only so legitimate chains are not blocked
+    by a collision that may be harmless for the downstream consumer.
     """
     warnings_list: list[str] = []
 
@@ -571,9 +496,9 @@ def decomposition_node(
 ) -> Command[Literal["gap_detection"]]:
     """Decompose a task into subtasks using a DeepAgent.
 
-    The agent is invoked with a 120 s timeout and a recursion limit of 50.
-    On timeout or error the node returns partial results (empty subtasks)
-    with the error recorded in ``state.errors``.
+    The agent is invoked with the module-level timeout and recursion limit.
+    Retryable failures are retried; exhaustion leaves subtasks empty, records
+    errors in state, and flips ``decomposition_succeeded`` to ``False``.
     """
     agent = _get_agent()
 
@@ -614,19 +539,11 @@ def decomposition_node(
     required_caps: list[str] = []
     errors: list[str] = list(state.errors)
 
-    # §12 finding #15: retry the decomposer up to MAX_DECOMPOSITION_ATTEMPTS
-    # times on timeout / exception / empty structured response before giving
-    # up. Same 3-strike pattern as verification_node (finding #14). Each
-    # attempt uses a fresh ThreadPoolExecutor and the full
-    # DECOMPOSITION_TIMEOUT_S budget. The pool is manually managed so we can
-    # shutdown(wait=False) on timeout — the context-manager form calls
-    # shutdown(wait=True) from __exit__, which blocks until the thread
-    # finishes even after TimeoutError is raised.
-    # Security audit finding #104 (2026-04-19, ext10): use
-    # ``submit_with_context`` so the decomposer DeepAgent's worker
-    # thread inherits the parent's ContextVar state. The agent's
-    # internal LangChain @tool callbacks emit LangFuse events that
-    # need the parent trace's tags / session_id to nest correctly.
+    # Retry timeout / exception / empty structured response before giving up.
+    # Each attempt uses a fresh ThreadPoolExecutor and the full timeout budget.
+    # The pool is manually managed so timeout can call shutdown(wait=False);
+    # the context-manager form would wait for the worker thread to finish.
+    # submit_with_context propagates tracing ContextVars into the worker thread.
     from src.orchestrator.tracing import submit_with_context
     for attempt in range(1, MAX_DECOMPOSITION_ATTEMPTS + 1):
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -662,15 +579,8 @@ def decomposition_node(
                     )
                     attempt_caps.extend(item.required_capabilities)
 
-                # Security audit finding #90 (2026-04-19, ext9): validate
-                # the DAG structure inside the retry loop so malformed
-                # DAGs (cycles, out-of-range indices, self-loops) get
-                # the full ``MAX_DECOMPOSITION_ATTEMPTS`` retry budget.
-                # Pre-fix the validator only ran AFTER the loop, so a
-                # malformed DAG on attempt 1 immediately flipped the
-                # sticky flag without any retry. Any genuine LLM
-                # nondeterminism (forgetting the DAG constraint once)
-                # now self-corrects within the budget.
+                # Validate DAG structure inside the retry loop so malformed
+                # outputs get the full retry budget.
                 attempt_dag_violations = _validate_depends_on_indices(
                     attempt_subtasks
                 )
@@ -800,15 +710,9 @@ def decomposition_node(
         )
 
     if len(required_caps) > MAX_CAPS_HARD:
-        # Security audit finding #89 (2026-04-19, ext9): pre-fix the
-        # truncation dropped entries from ``required_caps`` but left
-        # ``subtasks`` untouched, so any subtask referencing a dropped
-        # cap reached ``CompositionalExecutor._resolve_step`` and crashed
-        # the chain with "Step N has no resolved capability". The
-        # circuit-breaker intent (cap LLM cap-list inflation) is
-        # preserved, but now the subtask list is pruned consistently and
-        # ``depends_on`` is remapped so survivors keep their DAG indices
-        # valid for the post-truncation validators below.
+        # Prune required_caps and subtasks consistently. Any surviving
+        # depends_on indices are remapped so the post-truncation DAG remains
+        # structurally valid.
         dropped_caps = set(required_caps[MAX_CAPS_HARD:])
         original_cap_count = len(required_caps)
         required_caps = required_caps[:MAX_CAPS_HARD]
@@ -861,41 +765,18 @@ def decomposition_node(
             },
         )
 
-    # §12 finding #15 (2026-04-16): if no subtasks were produced after
-    # MAX_DECOMPOSITION_ATTEMPTS retries, FAIL CLOSED per the proposal's
-    # Pillar 1.1 contract ("An orchestrator agent breaks the input task
-    # into subtasks"). Previously this branch ran a single-sentence
-    # fallback ("first sentence as capability query") that degraded
-    # silently into a Pillar-1-incompatible single-gap pipeline. The
-    # fallback was engineering-pragma UX, not proposal-aligned. Under the
-    # new contract: empty subtasks + empty required_caps means the
-    # downstream pipeline sees no work to do, reaches a terminal state
-    # cleanly via the never-raises contract, and the sticky
-    # decomposition_succeeded=False flag surfaces the failure at the
-    # terminal boundary (failure_reason=generation_failed with
-    # decomposition-fail distinction). No silent degraded output.
+    # If no subtasks were produced after retries, fail closed instead of
+    # synthesizing a fallback single-gap decomposition.
     decomposition_succeeded = bool(subtasks)
 
-    # Chain coherence validation (Phase 2 Step 14). Only meaningful when we
-    # have a real multi-subtask decomposition to validate. Walks the DAG and
-    # flags subtasks that reference ``upstream_data`` keys no predecessor
-    # produces. On violation: extend errors, clear the sticky success flag,
-    # and emit a LangFuse event — but KEEP the subtasks so the pipeline can
-    # still run through classification + generation and surface whatever
-    # partial output is achievable. This matches the Fix 2b fail-open design:
-    # decomposition failures are visible, not silent, but they don't abort
-    # the pipeline mid-flight.
+    # Chain coherence validation is meaningful only when we have a real
+    # decomposition. Violations append errors, clear the sticky success flag,
+    # and emit LangFuse events, but the subtasks are kept so downstream nodes
+    # can still surface partial output.
     if decomposition_succeeded:
-        # Phase 3 Step 12 / §12 finding #10: if the task's OutputContract
-        # declares required_files and the decomposer's last subtask doesn't
-        # mention any of them, append a deterministic writer subtask. The
-        # appended writer becomes a regular gap — classified as MCP_TOOL
-        # (file writing is deterministic), generated by the MCP_TOOL
-        # generator, verified by the three-tier gate, and registered for
-        # reuse. This keeps file output inside the proposal's Pillar 1 + 2
-        # + 3 story instead of short-circuiting it with executor-level
-        # synthesis. See master plan §12 finding #10 for the pivot
-        # rationale (Option A → Option B).
+        # If the task declares required_files and the decomposer's last
+        # subtask does not mention them, append deterministic writer subtasks.
+        # Each appended writer becomes a normal MCP_TOOL gap.
         if state.output_contract is not None and state.output_contract.required_files:
             augmented = _ensure_file_writer_last_step(
                 subtasks, state.output_contract.required_files,
@@ -922,14 +803,8 @@ def decomposition_node(
                 subtasks = augmented
                 required_caps = list(dict.fromkeys(required_caps))
 
-        # Security audit finding #12 (2026-04-20), layer (A): validate
-        # the DAG's structural integrity BEFORE the semantic coherence
-        # check. Out-of-range depends_on indices and cycles are caught
-        # here so the §12 #15 decomposition strict-gate retry loop fires
-        # on malformed DAGs — pre-fix these reached the execution layer
-        # and phantom-executed / silently linearised. This mirrors the
-        # coherence-check pattern below: violations flip the sticky flag
-        # and emit a LangFuse event.
+        # Validate structural DAG integrity before semantic coherence.
+        # Violations flip the sticky flag and emit a LangFuse event.
         dag_violations = _validate_depends_on_indices(subtasks)
         if dag_violations:
             decomposition_succeeded = False
@@ -947,26 +822,9 @@ def decomposition_node(
                 },
             )
 
-        # Security audit finding #92 (2026-04-19, ext9): flag
-        # multi-capability subtasks as a SOFT warning. Pre-fix the
-        # executor's ``_resolve_step`` silently used cap[0] only and
-        # dropped caps 2..N. The audit recommended hard rejection
-        # ("Option A1") for design-intent enforcement; in practice the
-        # decomposer legitimately emits multi-cap subtasks for
-        # parallel multi-file-output tasks (e.g., ``['write-markdown-
-        # report', 'write-csv-file']`` on a "write report.md AND
-        # metrics.csv" task). Hard-rejecting these regressed
-        # AGENT-YAML-incident with a loud "DECOMPOSITION FAILED"
-        # whereas the chain previously executed the first cap and
-        # produced partial output. Soft-warning preserves the loud
-        # signal (errors list + LangFuse WARNING event) so we can
-        # tighten later via Option A2 (auto-split into parallel
-        # single-cap subtasks) once the depends_on-remap edge cases
-        # are covered, without blocking legitimate multi-file chains
-        # in the meantime. Mirrors the
-        # ``_detect_upstream_key_collisions`` soft-warning pattern
-        # below: visible but doesn't trip ``decomposition_succeeded=
-        # False``.
+        # Multi-capability subtasks are soft warnings. The executor resolves
+        # one capability per subtask, but parallel multi-file writer cases can
+        # legitimately carry multiple writer capabilities.
         multi_cap_violations = _validate_single_capability_per_subtask(subtasks)
         if multi_cap_violations:
             for violation in multi_cap_violations:
@@ -1021,13 +879,8 @@ def decomposition_node(
                     },
                 )
 
-        # Soft warnings — upstream key collisions that won't necessarily
-        # break the chain but indicate silent last-write-wins data loss at
-        # runtime. Reported as warnings in the errors list and logged, but
-        # deliberately do NOT trip ``decomposition_succeeded=False`` (Option
-        # A per master plan §14.10). If post-eval data shows colliding
-        # chains actually firing in production, upgrade to Option B (hard
-        # violation).
+        # Upstream key collisions are soft warnings: they indicate possible
+        # last-write-wins data loss but may be harmless for the consumer.
         collision_warnings = _detect_upstream_key_collisions(subtasks)
         if collision_warnings:
             for warning in collision_warnings:

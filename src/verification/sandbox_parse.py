@@ -1,18 +1,11 @@
-"""Shared sandbox-stdout parser used by behavioral + coverage paths.
+"""Shared sandbox-stdout parser used by behavioral and coverage checks.
 
-Security audit findings #21 + #22 (2026-04-20): two parsers in
-``src/verification/`` were fragile — both called ``json.loads(stdout)``
-on the full stdout string and failed on any non-JSON prefix (debug
-prints from the LLM-generated tool, pandas/matplotlib deprecation
-warnings routed to stdout, etc.). A third parser in the same file
-(``_parse`` inside ``_check_network_disconnect_differential``)
-correctly used ``stdout.splitlines()[-1]`` — three parsers, one
-contract, different robustness.
+Sandbox snippets emit their result as a final JSON line, but generated tools
+may print debug output, warnings, or diagnostics before that line. This module
+centralizes the parser contract: parse the last non-empty stdout line as JSON
+and return ``None`` on any failure.
 
-This module factors the correct semantics: parse the last non-empty
-line of stdout as JSON, returning ``None`` on any failure. Shared
-across ``behavioral._parse_sandbox_output``,
-``behavioral._check_network_disconnect_differential._parse``, and
+Used by ``behavioral._parse_sandbox_output`` and
 ``coverage._parse_replay_output``.
 """
 

@@ -41,9 +41,7 @@ def registry():
 
 @pytest.fixture
 def loader():
-    ldr = ToolLoader()
-    yield ldr
-    ldr.cleanup()
+    return ToolLoader()
 
 
 class TestPipelineE2E:

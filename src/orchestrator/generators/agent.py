@@ -95,7 +95,10 @@ class LeadWithSubagentsResult(BaseModel):
     """
 
     agent_name: str = Field(..., description="Hyphen-case lead agent identifier (max 64 chars)")
-    system_prompt: str = Field(..., description="Lead agent system prompt — must use task() for delegation")
+    system_prompt: str = Field(
+        ...,
+        description="Lead agent system prompt; must use task() for delegation",
+    )
     node_name: str = Field(..., description="Snake_case LangGraph node function name")
     model: str = Field(default="", description="LLM model identifier (empty = system default)")
     description: str = Field(..., description="One-sentence summary of the lead agent's role")
@@ -590,7 +593,11 @@ def generate_agent(
         if skipped.query in existing_gap_queries:
             logger.info("  → skipping (already passed verification): %s", skipped.query)
 
-    logger.info("generate_agent: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(agent_gaps) - len(gaps_to_generate))
+    logger.info(
+        "generate_agent: %d gap(s) to generate (%d skipped)",
+        len(gaps_to_generate),
+        len(agent_gaps) - len(gaps_to_generate),
+    )
 
     if not gaps_to_generate:
         return Command(
@@ -643,12 +650,15 @@ def generate_agent(
                         err = f"Generation failed for agent {gap.query!r}: {exc}"
                         art = None
                     if art is not None:
-                        artifacts = [a for a in artifacts if a.capability_name != art.capability_name]
+                        artifacts = [
+                            a for a in artifacts
+                            if a.capability_name != art.capability_name
+                        ]
                         artifacts.append(art)
                     if err is not None:
                         errors.append(err)
     else:
-        # Single AGENT gap → standalone agent (existing behavior)
+        # Single AGENT gap: generate one standalone agent.
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
             futures = {
                 pool.submit(
@@ -671,8 +681,7 @@ def generate_agent(
                 if err is not None:
                     errors.append(err)
 
-    # Evolutionary taxonomy classification (B1 Step 3.5f). Tags each newly
-    # generated artifact with domain + is_generic. Never raises.
+    # Tag generated artifacts with domain + is_generic. Never raises.
     from src.orchestrator.taxonomy import classify_and_tag_artifacts
     classify_and_tag_artifacts(artifacts)
 

@@ -41,9 +41,10 @@ SKILLS_OUTPUT_DIR = _PROJECT_ROOT / "data" / "eval" / "skills"
 def set_skills_output_dir(path: Path) -> None:
     """Override the directory where generated skills are written.
 
-    Evaluation runs write to ``data/eval/skills`` by default. Tests and
-    custom runners can override the path to isolate generated artifacts.
-    Also updates ``agent.py``'s ``SKILLS_OUTPUT_DIR`` to stay in sync.
+    Protocol runs write to ``data/eval/skills`` by default. Tests and custom
+    runners can override the path to isolate generated artifacts. The agent
+    generator writes agent artifacts into the same skill directory format, so
+    this helper updates its mirrored ``SKILLS_OUTPUT_DIR`` too.
     """
     global SKILLS_OUTPUT_DIR  # noqa: PLW0603
     SKILLS_OUTPUT_DIR = path
@@ -414,7 +415,11 @@ def generate_skill(
         if skipped.query in existing_gap_queries:
             logger.info("  → skipping (already passed verification): %s", skipped.query)
 
-    logger.info("generate_skill: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(skill_gaps) - len(gaps_to_generate))
+    logger.info(
+        "generate_skill: %d gap(s) to generate (%d skipped)",
+        len(gaps_to_generate),
+        len(skill_gaps) - len(gaps_to_generate),
+    )
     task_context = build_task_context(state)
 
     from src.orchestrator.generators.utils import build_schema_context
@@ -452,8 +457,7 @@ def generate_skill(
             len(failed_queries), len(gaps_to_generate), failed_queries,
         )
 
-    # Evolutionary taxonomy classification (B1 Step 3.5f). Tags each newly
-    # generated artifact with domain + is_generic. Never raises.
+    # Tag each newly generated artifact with domain + is_generic. Never raises.
     from src.orchestrator.taxonomy import classify_and_tag_artifacts
     classify_and_tag_artifacts(artifacts)
 

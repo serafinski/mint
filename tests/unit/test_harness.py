@@ -106,7 +106,10 @@ class TestRunStatic:
         mock_registry.get.return_value = mock_cap
 
         with patch("tests.evaluation.harness._run_static_implementation") as mock_impl:
-            mock_impl.return_value = {"row_count": 50, "column_names": ["id", "name", "age", "city"]}
+            mock_impl.return_value = {
+                "row_count": 50,
+                "column_names": ["id", "name", "age", "city"],
+            }
             result = harness._run_static(T01, mock_registry)
 
         assert result["gate_passed"] is True
@@ -327,7 +330,13 @@ class TestExtractResult:
         from src.schemas.task import SubTask
 
         state = _make_state(
-            artifacts=[_make_artifact(name="lead", cap_type=CapabilityType.AGENT, source_code=None)],
+            artifacts=[
+                _make_artifact(
+                    name="lead",
+                    cap_type=CapabilityType.AGENT,
+                    source_code=None,
+                ),
+            ],
             reports=[_make_report(passed=True)],
             decomposition_succeeded=False,
             required_capabilities=["parse-timeseries", "assemble-report"],
@@ -399,7 +408,6 @@ class TestExtractResultCompositionalAgentFailure:
                 subtasks=self._subtasks(),
                 artifacts=[art],
                 matches=[],
-                classified_gaps=[],
                 required_capabilities=["investigate"],
                 verification_results=[],
                 attempt_count=1,

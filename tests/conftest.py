@@ -1,8 +1,6 @@
 """Shared pytest configuration and fixtures."""
 
 import os
-import tempfile
-from pathlib import Path
 
 import pytest
 from dotenv import load_dotenv
@@ -55,7 +53,7 @@ def _isolate_taxonomy_path(tmp_path, monkeypatch):
 
     Keeps unit tests hermetic: without this, any test that runs
     ``gap_detection_node`` or a generator node would write to (and read
-    from) ``data/cli/domains.json``, and an existing taxonomy would
+    from) ``data/eval/domains.json``, and an existing taxonomy would
     trigger real LLM calls via ``get_for_query``. The fixture is
     autouse so no individual test needs to opt in.
     """

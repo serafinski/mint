@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from typing import TYPE_CHECKING
 
@@ -17,23 +18,19 @@ if TYPE_CHECKING:
 def slugify_gap(query: str, contract_fingerprint: str | None = None) -> str:
     """Derive a stable, collision-free snake_case name from a gap query string.
 
-    Since the classifier now emits semantic capability names with a hash
-    suffix already (e.g., ``xml-revenue-extractor-abc123``), this function
-    primarily re-formats hyphens to underscores for Python identifier
-    compatibility. A 6-character sha256 suffix is still appended to ensure
-    collision safety if a caller passes a raw non-suffixed query.
+    Classifier gap names may already include a semantic hash suffix
+    (e.g., ``xml-revenue-extractor-abc123``), so this function primarily
+    reformats hyphens to underscores for Python identifier compatibility.
+    A 6-character sha256 suffix is still appended to keep raw or repeated
+    queries collision-safe.
 
     When ``contract_fingerprint`` is provided, it is mixed into the suffix
     hash. This keeps the human-readable base stable while preventing
     semantically different subtasks with the same ``gap.query`` from
     claiming the same registry slot.
 
-    The previous implementation truncated to 40 chars BEFORE stripping
-    trailing underscores, which could produce names with a trailing
-    underscore followed by the hash separator (e.g.,
-    ``parse_this_xml_report_data_and_find_the__6b415a`` with a double
-    underscore). This version strips underscores AFTER truncation, so the
-    output always has a single underscore before the suffix.
+    Truncation happens before the trailing-underscore strip so the output
+    always has a single underscore before the suffix.
 
     Examples:
         "xml-revenue-extractor-abc123"  ->  "xml_revenue_extractor_abc123_<hash>"
@@ -94,18 +91,9 @@ def find_subtask_for_gap(
 ) -> SubTask | None:
     """Return the FIRST subtask whose ``required_capabilities`` contains the gap query.
 
-    Used by both :func:`build_schema_context` and :func:`is_first_step_for_gap`
-    so the lookup lives in one place.
-
-    Security audit finding #101 (2026-04-19, ext10): when a capability
-    is referenced by MULTIPLE subtasks (e.g. a CSV reader reused at
-    step 0 AND step 3), this function returns only the FIRST match.
-    Callers that need to reason about multi-position reuse should use
-    :func:`find_all_subtasks_for_gap` and check for mixed-position
-    cases (some matches with ``depends_on=[]``, others with non-empty
-    deps). The kept first-only signature preserves back-compat for
-    callers (``build_schema_context``) that only need a single
-    representative context block.
+    Used by :func:`build_schema_context`, which needs one representative
+    context block for the prompt. Callers that need to reason about capability
+    reuse across multiple subtasks should use :func:`find_all_subtasks_for_gap`.
     """
     for st in subtasks:
         if gap.query in st.required_capabilities:
@@ -119,9 +107,8 @@ def find_all_subtasks_for_gap(
 ) -> list[SubTask]:
     """Return ALL subtasks whose ``required_capabilities`` contains the gap query.
 
-    Security audit finding #101 (2026-04-19, ext10): companion to
-    :func:`find_subtask_for_gap` for callers that need to detect
-    capability reuse across positions. Returns an empty list when no
+    This companion to :func:`find_subtask_for_gap` supports callers that need
+    to detect capability reuse across positions. Returns an empty list when no
     subtask matches.
     """
     return [st for st in subtasks if gap.query in st.required_capabilities]
@@ -231,14 +218,11 @@ def is_first_step_for_gap(
     subtask (in which case callers should skip position-specific directives
     and validators).
 
-    Security audit finding #101 (2026-04-19, ext10): when a capability
-    is reused at MIXED positions (some subtasks have ``depends_on=[]``,
-    others have non-empty deps), this function emits a WARNING log so
-    the generator-prompt drift becomes visible — the resulting tool
-    needs to handle BOTH first-step and downstream invocations, but the
-    prompt steers toward whichever position the first match indicated.
-    Returning the first-match's value is back-compat; the WARNING is
-    the loud signal for future remediation.
+    When a capability is reused at mixed positions (some subtasks have
+    ``depends_on=[]`` and others have non-empty dependencies), this function
+    logs a warning. The prompt still uses the first match's position, so the
+    warning makes the potential signature mismatch visible during eval/debug
+    runs.
     """
     matches = find_all_subtasks_for_gap(gap, subtasks)
     if not matches:
@@ -247,15 +231,13 @@ def is_first_step_for_gap(
     if len(positions) > 1:
         # Mixed-position reuse: the LLM-generated tool will only have
         # the shape appropriate for the FIRST match's position. Other
-        # invocations may break. Loud-log so the drift is visible in
-        # Phase 5 logs.
-        import logging
+        # invocations may break, so log the drift where runners can see it.
         logger = logging.getLogger(__name__)
         logger.warning(
             "Capability '%s' reused across mixed positions: %d subtask(s) "
             "as first-step (depends_on=[]) and %d subtask(s) as downstream. "
             "Generator prompt will produce a single signature; the unused "
-            "position's invocation may fail. Security audit ext10 #101.",
+            "position's invocation may fail.",
             gap.query,
             sum(1 for st in matches if not st.depends_on),
             sum(1 for st in matches if st.depends_on),
@@ -274,7 +256,7 @@ def build_schema_context(
     its upstream dependencies into a human-readable contract block.
 
     Returns an empty string if no matching subtask is found or if the subtask
-    has no ``output_schema`` defined (backward-compatible with old decompositions).
+    has no ``output_schema`` defined; generators then omit the schema section.
     """
     target_subtask = find_subtask_for_gap(gap, subtasks)
     if target_subtask is None or not target_subtask.output_schema:
@@ -284,20 +266,12 @@ def build_schema_context(
 
     # Input contract: transitive upstream steps' output_schema.
     #
-    # Security audit finding #102 (2026-04-19, ext10): when two
-    # predecessors emit the SAME output-key (e.g., both produce
-    # ``"count": int`` with different semantics), the pre-fix code
-    # appended both verbatim to a flat list — the LLM saw
-    # ``- "count": rows`` AND ``- "count": errors`` with no
-    # provenance, and silently picked one or worse generated code
-    # assuming both were available. Now: tag each key with its
-    # source step (``from step N``) and emit an explicit
-    # ``**COLLISION**`` marker when two predecessors produce the
-    # same key, listing both descriptions so the LLM can disambiguate.
+    # When two predecessors emit the same output key (e.g. both produce
+    # ``"count": int`` with different semantics), tag each key with its
+    # source step and emit an explicit ``**COLLISION**`` marker so the LLM can
+    # disambiguate.
     # Mirrors the executor's last-write-wins merge order via the
-    # depends_on iteration (also caught by
-    # ``_detect_upstream_key_collisions`` at the decomposition layer
-    # as a soft warning per ext6 #13).
+    # depends_on iteration.
     transitive_depends_on = _collect_transitive_depends_on(target_subtask, subtasks)
     if transitive_depends_on:
         input_parts: list[str] = []

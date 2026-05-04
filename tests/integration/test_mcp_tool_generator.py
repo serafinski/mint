@@ -1,8 +1,8 @@
 """Integration tests for the MCP tool generator (real LLM calls).
 
 Verifies that the MCP tool generator produces valid FastMCP code using the
-real LLM (openai:gpt-5-mini), that generated tools can be loaded and executed
-via ToolLoader, and that all calls appear in LangFuse.
+real LLM (openai:gpt-5-mini), that generated tools can be registered for
+sandbox execution, and that all calls appear in LangFuse.
 
 Requires OPENAI_API_KEY environment variable to be set.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -59,21 +60,14 @@ class TestMcpToolGeneratorLive:
         compile(artifact.source_code, "<generated>", "exec")
         assert "Annotated" in artifact.source_code
 
-        # Verify tool name is valid snake_case without leading underscore
-        # (required by tool_loader — underscore-prefixed names are skipped by the runner)
+        # Verify tool name is valid snake_case without a leading underscore.
         import re
         assert re.match(r"^[a-z][a-z0-9_]*$", artifact.capability_name), (
             f"capability_name '{artifact.capability_name}' is not valid snake_case"
         )
 
-    def test_generate_and_execute_tool(self):
-        """Generate a tool, load it, and execute it with test inputs.
-
-        Uses inspect.signature() to discover actual parameter names so the test
-        is robust to LLM variation in naming (x/y, a/b, num1/num2, etc.).
-        """
-        import inspect
-
+    def test_generate_and_register_tool(self):
+        """Generate a tool and register it without host-side code execution."""
         gap = ClassifiedGap(
             description="Multiply two numbers and return their product",
             query="multiply two numbers",
@@ -87,23 +81,12 @@ class TestMcpToolGeneratorLive:
         assert artifact is not None
 
         loader = ToolLoader()
-        try:
-            loaded = loader.load_tool(artifact)
+        registry = MagicMock()
+        descriptor = loader.register_tool(artifact, registry)
 
-            # Discover actual parameter names from the generated function signature
-            sig = inspect.signature(loaded.tool_fn)
-            param_names = list(sig.parameters.keys())
-            assert len(param_names) >= 2, (
-                f"Expected at least 2 parameters, got {param_names}"
-            )
-            inputs = {param_names[0]: 7, param_names[1]: 6}
-
-            result = loader.execute_tool(loaded, inputs)
-
-            assert result.success is True, f"Execution failed: {result.error}"
-            assert result.result == 42
-        finally:
-            loader.cleanup()
+        registry.add.assert_called_once()
+        assert descriptor.name == artifact.capability_name
+        assert descriptor.metadata["source_code"] == artifact.source_code
 
     def test_generate_mcp_tool_node(self):
         """generate_mcp_tool node processes MCP_TOOL gaps end-to-end with a real LLM."""
