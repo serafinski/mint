@@ -43,19 +43,13 @@ class VerificationReport(BaseModel):
         default_factory=lambda: datetime.now(UTC),
         description="When the verification was performed",
     )
-    # Security audit finding #26 (2026-04-20): content hash stamped by
-    # ``src.verification.gate.verify`` so the retry loop's
-    # ``already_passed`` skip can compare artifact content, not just
-    # capability_name. Pre-fix the skip used name-identity only —
-    # regenerated artifacts with the same name but modified content
-    # inherited the old PASS report and bypassed the three-tier gate.
-    # Empty string on pre-fix rows (migrate-by-default).
     artifact_hash: str = Field(
         default="",
         description=(
             "SHA-256 of the verified artifact's content "
             "(source_code + skill_content + agent_config). "
-            "Used by the retry-loop skip to detect changed artifacts."
+            "Used by retry logic to skip only unchanged artifacts. "
+            "Empty values force re-verification for legacy reports."
         ),
     )
 

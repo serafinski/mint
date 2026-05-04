@@ -1,20 +1,13 @@
-"""Per-operation optimizer configuration (§12 finding #8).
+"""Per-operation optimizer configuration.
 
 Replaces the single ``run_optimizer: bool`` switch with granular per-operation
-controls. Each Pillar 3 operation (prune / split / merge) is independently
+controls. Each optimizer operation (prune / split / merge) is independently
 configurable as ``auto`` (threshold-gated), ``on`` (always), or ``off``
 (never).
 
-**Proposal alignment.** This is a configuration/tuning parameter not derived
-from the proposal's formal framework (same category as
-``AUTO_OPTIMIZER_THRESHOLD``). The underlying Pillar 3 mechanics (prune,
-split, merge semantics) are unchanged; this only controls **whether** each
-operation fires on a given invocation. Classified as 🟢 Kept deviation in
-``docs/MASTER_PLAN_2026_04_13.md`` §12 finding #8.
-
-**Phase 5 eval compatibility.** The evaluation harness continues to use
-``run_optimizer: bool`` which is translated via :meth:`OptimizerConfig.from_run_optimizer_bool`:
-``True`` → all-on, ``False`` → all-off. No eval-harness changes required.
+The evaluation harness and older callers may still pass ``run_optimizer:
+bool``. ``OptimizerConfig.from_run_optimizer_bool`` translates that legacy
+surface to all-on or all-off so call sites can migrate gradually.
 """
 
 from __future__ import annotations
@@ -27,20 +20,19 @@ OperationSetting = Literal["auto", "on", "off"]
 
 
 class OptimizerConfig(BaseModel):
-    """Per-operation enable/disable settings for the Pillar 3 optimizer.
+    """Per-operation enable/disable settings for the optimizer.
 
     Each operation has three possible states:
 
-    - ``"auto"`` (default) — operation runs when
+    - ``"auto"`` (default): operation runs when
       ``metrics_store.invocation_count_total() >= AUTO_OPTIMIZER_THRESHOLD``.
-      Reproduces the pre-finding-#8 behavior exactly for all-``auto``
-      configs.
-    - ``"on"`` — operation runs on every invocation regardless of
+      This is the evaluation-profile default for optimizer-enabled
+      conditions.
+    - ``"on"``: operation runs on every invocation regardless of
       invocation count. Useful for debugging or for users who want
       aggressive optimization from day one.
-    - ``"off"`` — operation never runs. Useful when a user finds a
-      specific operation too expensive (e.g., split's 60-120s cost
-      post-Step-8) or wants to isolate behavior.
+    - ``"off"``: operation never runs. Useful when a user finds a
+      specific operation too expensive or wants to isolate behavior.
 
     The three operations are gated independently, so a short ad-hoc run
     might set ``prune=auto, split=off,
@@ -59,7 +51,7 @@ class OptimizerConfig(BaseModel):
         description=(
             "Split operation control. Same semantics as prune. Note that "
             "split is the most expensive operation (~60-120s + ~$0.10-0.15 "
-            "per firing post-Step-8) so 'off' is common for short runs."
+            "per firing) so 'off' is common for short runs."
         ),
     )
     merge: OperationSetting = Field(
@@ -105,9 +97,10 @@ class OptimizerConfig(BaseModel):
     def any_enabled(self, *, invocation_count: int, threshold: int) -> bool:
         """Return True if at least one operation would fire this cycle.
 
-        Used by ``create_pipeline`` to decide whether to wire the optimizer
-        node at all — if all three operations resolve to off, we skip the
-        optimizer subgraph entirely rather than running an empty loop.
+        This is a convenience helper for callers that already know the current
+        invocation count. ``create_pipeline`` cannot use it directly at graph
+        build time because the final invocation count is only known when the
+        optimizer loop runs.
         """
         return any(
             self.is_enabled(op, invocation_count=invocation_count, threshold=threshold)
@@ -121,7 +114,7 @@ class OptimizerConfig(BaseModel):
         """Build a config with all three operations forced on.
 
         Used by the backward-compatibility path when a caller passes
-        ``run_optimizer=True`` (typically the evaluation harness) — the
+        ``run_optimizer=True``. The
         old ``bool`` semantics of "optimizer on" means all operations run.
         """
         return cls(prune="on", split="on", merge="on")
@@ -131,7 +124,7 @@ class OptimizerConfig(BaseModel):
         """Build a config with all three operations forced off.
 
         Used by the backward-compatibility path when a caller passes
-        ``run_optimizer=False`` — the old ``bool`` semantics of "optimizer
+        ``run_optimizer=False``. The old ``bool`` semantics of "optimizer
         off" means no operations run.
         """
         return cls(prune="off", split="off", merge="off")

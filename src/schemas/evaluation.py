@@ -1,7 +1,8 @@
-"""Evaluation schemas for Iteration 5 end-to-end testing.
+"""Schemas for persisted evaluation records.
 
-Separate from the operational InvocationRecord — evaluation records track
-experimental outcomes across the five baseline conditions.
+Separate from the operational InvocationRecord; evaluation records track
+task-level outcomes across the ablation, longitudinal, and recurrence
+evaluation runs.
 """
 
 from __future__ import annotations
@@ -15,16 +16,13 @@ from src.schemas.capability import CapabilityType
 
 
 class BaselineCondition(StrEnum):
-    """The evaluation conditions compared in the thesis.
+    """Evaluation conditions persisted in ``evaluation_runs``.
 
-    The first four are the proposal's four ablation baselines (§Evaluation
-    Strategy). ``LONGITUDINAL`` is added for ``scripts/run_longitudinal.py``
-    — it's not one of the four ablation conditions, it's a separate
-    sequencing protocol (one snapshot restore, 40 sequential tasks, shared
-    registry + metrics — exercises Pillar 3 convergence under accumulated
-    history). Analysis pipelines MUST filter by condition explicitly when
-    computing per-baseline metrics (see ``analyze_results.py``'s exclusion
-    of ``static`` in classification accuracy for analogous reasoning).
+    The first four values are the ablation conditions. ``LONGITUDINAL`` is
+    a separate sequential protocol with one registry and metrics store
+    shared across task executions. Analyzers filter by condition explicitly
+    because the ablation, static, and longitudinal populations answer
+    different questions.
     """
 
     FULL = "full"
@@ -32,15 +30,9 @@ class BaselineCondition(StrEnum):
     NO_OPTIMIZATION = "no_optimization"
     STATIC = "static"
     LONGITUDINAL = "longitudinal"
-    # ext17 #188 (2026-04-22): distinct condition reserved for the deferred
-    # distribution-shift protocol. Pre-fix, shifted longitudinal rows used
-    # condition="longitudinal" identical to the plain runner. Under any
-    # DB-boundary slip (#175 / #176 freshness-guard gap, ext7 #49
-    # contract violation, accidental cross-DB append), plain + shift
-    # populations became indistinguishable at the row level, corrupting
-    # Chapter 6 RQ #2 (convergence on stable workload) vs RQ #3
-    # (adaptation to distribution shift). Row-level first-class labeling
-    # closes the architectural gap.
+    # Reserved for the deferred distribution-shift protocol. Keeping a
+    # distinct label prevents shifted rows from being confused with the
+    # plain longitudinal condition if historical or future DBs are read.
     LONGITUDINAL_SHIFT = "longitudinal_shift"
 
 
@@ -63,32 +55,19 @@ class FailureReason(StrEnum):
     OUTPUT_REJECTED = "output_rejected"
     NO_SOURCE_CODE = "no_source_code"
     CHAIN_STEP_FAILED = "chain_step_failed"
-    # Step 13 (2026-04-15): distinguish an AGENT execution timeout from
-    # a generic chain step failure. The harness sets this when
-    # ChainResult.failed_step_reason == "agent_execution_timeout", which
-    # is populated from the thread-local meta recorded by
-    # execute_agent_artifact on the concurrent.futures TimeoutError path.
+    # Distinguish AGENT execution failures from generic chain-step failures.
     AGENT_EXECUTION_TIMEOUT = "agent_execution_timeout"
     AGENT_EXECUTION_ERROR = "agent_execution_error"
-    # ext16 #185 (2026-04-22): harness writer sites (lines 647, 1054, 1369)
-    # assign failure_reason="output_shape_mismatch" when the task's
-    # OutputContract detects missing keys/files. Pre-fix that string was
-    # NOT in this enum → Pydantic ValidationError crashed the campaign
-    # mid-run. Now a first-class enum member.
+    # OutputContract failures are first-class campaign outcomes because they
+    # indicate shape mismatch even when a value validator is permissive.
     OUTPUT_SHAPE_MISMATCH = "output_shape_mismatch"
-    # ext12 #119 (2026-04-21): distinct failure class for per-task
-    # SIGALRM watchdog aborts in longitudinal runners. Semantically
-    # distinct from ``agent_execution_timeout`` (that's a chain-step
-    # timeout on AGENT artefacts specifically) — the watchdog bounds
-    # the WHOLE pipeline.invoke call, including decomposition /
-    # classification / MCP_TOOL execution. Chapter 6 failure
-    # breakdown should report this separately so "hung Docker
-    # container" incidents don't pollute the AGENT-execution signal.
+    # Per-task watchdog aborts bound the whole pipeline invocation, not only
+    # AGENT artifact execution.
     WATCHDOG_ABORT = "watchdog_abort"
 
 
 class HumanLabel(StrEnum):
-    """Manual audit label populated in Iteration 6."""
+    """Optional manual audit label for deferred contamination review."""
 
     CORRECT = "correct"
     CONTAMINATED = "contaminated"
@@ -96,36 +75,35 @@ class HumanLabel(StrEnum):
 
 
 class GeneratedArtifactSnapshot(BaseModel):
-    """Record-write-time snapshot of a generated capability's source (Step 18.10).
+    """Record-write-time snapshot of a generated capability's source.
 
-    Persisted inside ``EvaluationRecord.generated_artifact_sources`` so the
-    proposal §M2 manual contamination audit can read full source bodies
-    from the DB without depending on the registry's snapshot-isolated
-    state (which wipes generated capabilities between runs).
+    Persisted inside ``EvaluationRecord.generated_artifact_sources`` so
+    manual contamination review and provenance checks can read full source
+    bodies from the DB without depending on registry state that may be
+    snapshot-restored between runs.
 
     The ``source_body`` is polymorphic by ``capability_type``:
 
-    * ``MCP_TOOL``  → raw Python ``source_code``.
-    * ``SKILL``     → full ``skill_content`` (SKILL.md body incl. YAML).
-    * ``AGENT``     → ``json.dumps(agent_config)`` — keeps system_prompt
+    * ``MCP_TOOL``: raw Python ``source_code``.
+    * ``SKILL``: full ``skill_content`` (SKILL.md body incl. YAML).
+    * ``AGENT``: ``json.dumps(agent_config)``; keeps system_prompt
       plus any subagent configs the parent delegates to.
 
-    Not a place for truncation. M2 audit requires human reading of the
-    complete source to catch contamination patterns (hardcoded literals
-    buried deep in a function, silent try/except blocks, mock-contamination
-    keyed off task phrasing) that an automated scanner misses.
+    Not a place for truncation. Manual source review needs the complete
+    artifact body to catch hardcoded literals, silent try/except blocks, and
+    task-phrasing contamination that automated scans can miss.
     """
 
     capability_name: str = Field(..., description="Registry name of the generated capability")
     capability_type: CapabilityType = Field(
-        ..., description="MCP_TOOL / SKILL / AGENT — discriminates source_body semantics"
+        ..., description="MCP_TOOL / SKILL / AGENT; discriminates source_body semantics"
     )
     source_body: str = Field(
         ...,
         description=(
             "Full source body. Polymorphic by capability_type: Python source "
             "(MCP_TOOL), SKILL.md text (SKILL), or json.dumps(agent_config) "
-            "(AGENT). Never truncated — M2 audit requires complete inspection."
+            "(AGENT). Never truncated; manual audit requires complete inspection."
         ),
     )
     domain: str | None = Field(
@@ -138,7 +116,7 @@ class GeneratedArtifactSnapshot(BaseModel):
 class EvaluationRecord(BaseModel):
     """One pipeline run on one task under one baseline condition.
 
-    Written by the evaluation harness; read by the Iteration 6 analysis.
+    Written by the evaluation harness and read by the Chapter 6 analyzers.
     """
 
     # --- Experimental identifiers ---
@@ -153,7 +131,10 @@ class EvaluationRecord(BaseModel):
     )
     task_instance_id: str | None = Field(
         default=None,
-        description="Concrete task instance identifier (e.g. 'T11.v02'); equals task_id for breadth",
+        description=(
+            "Concrete task instance identifier (e.g. 'T11.v02'); equals "
+            "task_id for breadth"
+        ),
     )
     variant_id: str | None = Field(
         default=None,
@@ -208,7 +189,7 @@ class EvaluationRecord(BaseModel):
         None, description="FK to operational invocations table (populated when available)"
     )
 
-    # --- Decomposition/registry analysis (Iter 6 task-level classification) ---
+    # --- Decomposition/registry analysis ---
     required_capability_count: int = Field(
         default=0,
         ge=0,
@@ -226,7 +207,7 @@ class EvaluationRecord(BaseModel):
         ),
     )
 
-    # --- Compositional execution (Stage 1: defaults; Stage 3: real values) ---
+    # --- Compositional execution ---
     chain_length: int = Field(
         default=1,
         ge=1,
@@ -265,21 +246,21 @@ class EvaluationRecord(BaseModel):
         default=None,
         description=(
             "Free-text reason string produced by the compositional "
-            "executor when a chain step fails — specifically the "
+            "executor when a chain step fails, specifically the "
             "'<type> output missing declared schema keys [...]' message "
-            "from the §12 finding #12 AGENT/SKILL output_schema "
+            "from the AGENT/SKILL output_schema "
             "compliance check, or 'agent_execution_timeout' / "
             "'agent_execution_error' for AGENT-specific failure modes. "
-            "Persisted (Step 13.8) so post-hoc analyzers can distinguish "
+            "Persisted so post-hoc analyzers can distinguish "
             "compression-loss-at-handoff failures from generic chain "
-            "failures — `failure_reason` enum flattens all three into "
+            "failures; `failure_reason` enum flattens all three into "
             "'chain_step_failed' by necessity, but the free-text string "
             "carries the signal needed to classify the T3 "
             "aggressive-compression failure mode."
         ),
     )
 
-    # --- Output contract (Step 14.6) ---
+    # --- Output contract ---
     # Records the result of comparing the pipeline's final output against
     # the task's authored OutputContract (`required_keys` + `required_files`).
     # Independent of `output_in_range` (which checks value correctness via the
@@ -293,7 +274,8 @@ class EvaluationRecord(BaseModel):
             "required_keys, OR the chain output_files mapping was missing "
             "one or more required_files declared in the task's "
             "OutputContract. Default False covers legacy rows from before "
-            "Step 14.6 landed and runs where no contract was declared."
+            "output contracts were persisted and runs where no contract "
+            "was declared."
         ),
     )
     output_shape_missing_keys: list[str] = Field(
@@ -313,30 +295,29 @@ class EvaluationRecord(BaseModel):
         ),
     )
 
-    # --- M2 audit source persistence (Step 18.10 Option B) ---
+    # --- Generated artifact source persistence ---
     generated_artifact_sources: list[GeneratedArtifactSnapshot] = Field(
         default_factory=list,
         description=(
             "Record-write-time snapshots of every generated capability's "
-            "source body. Enables proposal §M2 manual contamination audit "
-            "post-eval without depending on the registry's snapshot-isolated "
-            "state (restore_clean_snapshot wipes caps between runs). Empty "
-            "list for runs that generated no artifacts (static, registry-"
-            "match T01-T03), for legacy rows from before Step 18.10 landed, "
-            "and — by design — for runs that failed before generation."
+            "source body. Enables manual contamination audit and provenance "
+            "checks without depending on snapshot-isolated registry state. "
+            "Empty list for runs that generated no artifacts, legacy rows "
+            "without persisted snapshots, and runs that failed before "
+            "generation."
         ),
     )
 
-    # --- Observability cross-reference (Step 13.7 Batch B6) ---
+    # --- Observability cross-reference ---
     langfuse_trace_id: str | None = Field(
         default=None,
         description=(
             "LangFuse root trace ID captured at record write time. Enables "
-            "jump-navigation from DuckDB eval row → LangFuse trace UI without "
+            "jump-navigation from DuckDB eval row to LangFuse trace UI without "
             "a timestamp/session join. Read from ``handler.last_trace_id`` "
             "after pipeline.invoke completes; None when LangFuse is disabled "
             "or handler lookup failed. Does not affect DuckDB-native metric "
-            "computation; pure convenience for Chapter 6 debugging."
+            "computation; pure convenience for debugging."
         ),
     )
 
@@ -346,9 +327,14 @@ class EvaluationRecord(BaseModel):
         default=False, description="True for pilot runs used to calibrate task difficulty"
     )
 
-    # --- Manual audit (Iteration 6) ---
+    # --- Manual audit ---
     human_label: HumanLabel | None = Field(
-        None, description="Manually assigned correctness label; populated in Iteration 6 audit"
+        None,
+        description=(
+            "Optional manually assigned correctness label. The manual "
+            "contamination audit was deferred, but the field remains for "
+            "compatibility and future review."
+        ),
     )
 
     timestamp: datetime = Field(
@@ -356,9 +342,8 @@ class EvaluationRecord(BaseModel):
         description=(
             "When this record was written. Set at task-END time by the "
             "default_factory; the EvaluationRecord(...) constructor is "
-            "called AFTER _run_jit / _run_static returns. ext8 #56 flagged "
-            "that analyze_longitudinal's per-cycle attribution uses this as "
-            "an END timestamp (not a start), so the bucketing loop uses "
+            "called after the task runner returns. Longitudinal analysis "
+            "treats this as an end timestamp, so cycle attribution uses "
             "half-open intervals with the current-cycle boundary as the "
             "upper bound."
         ),
@@ -367,7 +352,7 @@ class EvaluationRecord(BaseModel):
     model_config = {"extra": "forbid"}
 
     @model_validator(mode="after")
-    def _default_task_identity(self) -> "EvaluationRecord":
+    def _default_task_identity(self) -> EvaluationRecord:
         """Backfill breadth rows created before recurrence identity existed."""
         if self.task_family_id is None:
             self.task_family_id = self.task_id
@@ -383,17 +368,13 @@ class EvaluationRecord(BaseModel):
         output_in_range: bool,
         output_shape_mismatch: bool = False,
     ) -> bool:
-        """Canonical M1 success predicate — ext8 #59/#64 single source of truth.
+        """Canonical Chapter 6 M1 success predicate.
 
         Every site that reports M1 (DuckDB SQL predicate, LangFuse
-        ``m1.success`` score, this class's ``success`` property) MUST route
-        through this predicate so the two stores never diverge.
-
-        Pre-ext8-#59/#64, the LangFuse score used ``gate_passed * output_in_range``
-        (pre-ext6-#32 formula) while DuckDB SQL had been tightened to also
-        exclude ``output_shape_mismatch`` — the two stores disagreed on
-        every shape-mismatched row. A single classmethod + one-line call
-        at each consumer closes the gap.
+        ``m1.success`` score, and this class's ``success`` property) should
+        use this predicate so the stores do not diverge. A run succeeds only
+        when the verification gate passed, the value validator accepted the
+        output, and the output contract shape was satisfied.
         """
         return gate_passed and output_in_range and not output_shape_mismatch
 
@@ -401,8 +382,8 @@ class EvaluationRecord(BaseModel):
     def success(self) -> bool:
         """Composite success: gate accepted AND output in range AND shape ok.
 
-        Delegates to ``is_success`` (ext8 #59/#64) so this property and every
-        other M1 consumer share one predicate.
+        Delegates to ``is_success`` so this property and every other M1
+        consumer share one predicate.
         """
         return self.__class__.is_success(
             gate_passed=self.gate_passed,

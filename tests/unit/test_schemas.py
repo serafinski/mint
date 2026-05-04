@@ -10,7 +10,6 @@ from src.schemas.task import (
     DecompositionResult,
     GapItem,
     GeneratedArtifact,
-    GeneratorInput,
     MatchItem,
     OutputContract,
     StepTiming,
@@ -132,7 +131,7 @@ def test_capability_descriptor_roundtrip_with_new_fields():
 
 
 def test_capability_descriptor_is_generic_default_and_roundtrip():
-    """Step 3.5f: is_generic defaults False and survives roundtrip."""
+    """is_generic defaults False and survives roundtrip."""
     default_cap = CapabilityDescriptor(
         name="domain-thing",
         description="Domain specific",
@@ -152,7 +151,7 @@ def test_capability_descriptor_is_generic_default_and_roundtrip():
 
 
 def test_capability_descriptor_definition_token_cost_default_and_bounds():
-    """Step 18.6: definition_token_cost defaults to 0, rejects negatives, roundtrips."""
+    """definition_token_cost defaults to 0, rejects negatives, roundtrips."""
     default_cap = CapabilityDescriptor(
         name="t",
         description="t",
@@ -219,7 +218,6 @@ def test_task_status_values():
     assert TaskStatus.CLASSIFYING.value == "classifying"
     assert TaskStatus.GENERATING.value == "generating"
     assert TaskStatus.VERIFYING.value == "verifying"
-    assert TaskStatus.EXECUTING.value == "executing"
     assert TaskStatus.COMPLETED.value == "completed"
     assert TaskStatus.FAILED.value == "failed"
 
@@ -240,7 +238,6 @@ def test_subtask_valid():
     assert st.description == "Load CSV data"
     assert st.required_capabilities == ["csv-parser"]
     assert st.depends_on == []
-    assert st.status == TaskStatus.PENDING
 
 
 def test_subtask_with_dependencies():
@@ -248,10 +245,8 @@ def test_subtask_with_dependencies():
         description="Train model",
         required_capabilities=["ml-trainer"],
         depends_on=[0, 1],
-        status=TaskStatus.EXECUTING,
     )
     assert st.depends_on == [0, 1]
-    assert st.status == TaskStatus.EXECUTING
 
 
 def test_subtask_rejects_extra():
@@ -271,7 +266,7 @@ def test_subtask_roundtrip():
 
 
 def test_subtask_b1_fields_default_and_roundtrip():
-    """B1 Step 3.5c: output_schema + requires_upstream_keys default empty and roundtrip."""
+    """Subtask I/O contract fields default empty and roundtrip."""
     default_st = SubTask(description="root", required_capabilities=["a"])
     assert default_st.output_schema == {}
     assert default_st.requires_upstream_keys == []
@@ -431,7 +426,7 @@ def test_generated_artifact_description_field():
 
 
 def test_generated_artifact_post_b1_fields_defaults():
-    """Post-B1 fields default to empty / None / False."""
+    """Generated-artifact optional metadata fields default empty / None / False."""
     art = GeneratedArtifact(
         capability_name="t",
         capability_type=CapabilityType.MCP_TOOL,
@@ -448,7 +443,7 @@ def test_generated_artifact_post_b1_fields_defaults():
 
 def test_generated_artifact_all_fields_roundtrip():
     """Full-field roundtrip covering pip_packages, input/output_schema,
-    gap_query, domain, is_generic, needs_network (Step 14.12)."""
+    gap_query, domain, is_generic, and needs_network."""
     art = GeneratedArtifact(
         capability_name="csv-stats",
         capability_type=CapabilityType.MCP_TOOL,
@@ -474,7 +469,7 @@ def test_generated_artifact_all_fields_roundtrip():
 
 
 def test_generated_artifact_needs_network_populated():
-    """Step 14.12: needs_network True survives roundtrip."""
+    """needs_network True survives roundtrip."""
     art = GeneratedArtifact(
         capability_name="http-fetcher",
         capability_type=CapabilityType.MCP_TOOL,
@@ -980,7 +975,7 @@ def test_task_state_attempt_count_roundtrip():
 
 
 def test_task_state_sticky_flags_default_true():
-    """§12 findings #14/#15/#16: sticky success flags default True (never been tripped)."""
+    """Sticky success flags default True."""
     state = TaskState(task_description="test")
     assert state.decomposition_succeeded is True
     assert state.classification_succeeded is True
@@ -1002,13 +997,13 @@ def test_task_state_sticky_flags_false_roundtrip():
 
 
 def test_task_state_output_contract_default_none():
-    """Step 14.6: output_contract defaults to None (legacy fall-through)."""
+    """output_contract defaults to None for callers without a declared contract."""
     state = TaskState(task_description="test")
     assert state.output_contract is None
 
 
 def test_task_state_output_contract_populated_roundtrip():
-    """Step 14.6: OutputContract populated roundtrip preserves required_keys + required_files."""
+    """OutputContract roundtrip preserves required_keys and required_files."""
     contract = OutputContract(
         required_keys=["report", "summary"],
         required_files=["output.csv"],
@@ -1021,7 +1016,7 @@ def test_task_state_output_contract_populated_roundtrip():
 
 
 def test_task_state_allow_network_default_and_roundtrip():
-    """Step 14.12: allow_network defaults False and roundtrips."""
+    """allow_network defaults False and roundtrips."""
     state = TaskState(task_description="test")
     assert state.allow_network is False
 
@@ -1125,8 +1120,7 @@ def test_match_item_requires_capability():
 
 
 def test_subtask_item_valid_construction():
-    """Happy-path construction accepts all declared fields (B1 output_schema +
-    requires_upstream_keys)."""
+    """Happy-path construction accepts all declared contract fields."""
     item = SubTaskItem(
         description="Aggregate sales data",
         required_capabilities=["aggregator"],
@@ -1209,61 +1203,7 @@ def test_classification_result_rejects_extra():
         )
 
 
-# --- GeneratorInput ---
-
-
-def test_generator_input_valid():
-    gap = ClassifiedGap(
-        description="Parse CSV",
-        query="parse CSV",
-        classified_type=CapabilityType.MCP_TOOL,
-        confidence=0.9,
-        rationale="Atomic operation",
-    )
-    gi = GeneratorInput(gap=gap, task_context="Analyse sales data")
-    assert gi.gap.classified_type == CapabilityType.MCP_TOOL
-    assert gi.task_context == "Analyse sales data"
-
-
-def test_generator_input_default_context():
-    gap = ClassifiedGap(
-        description="Sort numbers",
-        query="sort numbers",
-        classified_type=CapabilityType.MCP_TOOL,
-        confidence=0.9,
-        rationale="Deterministic",
-    )
-    gi = GeneratorInput(gap=gap)
-    assert gi.task_context == ""
-
-
-def test_generator_input_rejects_extra():
-    gap = ClassifiedGap(
-        description="Sort numbers",
-        query="sort numbers",
-        classified_type=CapabilityType.MCP_TOOL,
-        confidence=0.9,
-        rationale="Deterministic",
-    )
-    with pytest.raises(ValueError):
-        GeneratorInput(gap=gap, unknown_field="oops")
-
-
-def test_generator_input_roundtrip():
-    gap = ClassifiedGap(
-        description="Data pipeline",
-        query="data pipeline",
-        classified_type=CapabilityType.SKILL,
-        confidence=0.85,
-        rationale="Multi-step",
-    )
-    gi = GeneratorInput(gap=gap, task_context="Build analytics")
-    roundtripped = GeneratorInput.model_validate_json(gi.model_dump_json())
-    assert roundtripped.gap.classified_type == CapabilityType.SKILL
-    assert roundtripped.task_context == "Build analytics"
-
-
-# --- CapabilityReference (Stage 1 compositional) ---
+# --- CapabilityReference ---
 
 
 def test_capability_reference_registry_source():
@@ -1320,7 +1260,7 @@ def test_capability_reference_roundtrip():
     assert roundtripped.score == 0.42
 
 
-# --- ChainResult (Stage 1 compositional) ---
+# --- ChainResult ---
 
 
 def test_chain_result_minimal_success():
@@ -1374,7 +1314,7 @@ def test_chain_result_roundtrip():
 
 
 def test_chain_result_post_b1_fields_default():
-    """Step 13 + Step 14.12: failed_step_reason, step_timings, output_files default None/empty."""
+    """failed_step_reason, step_timings, and output_files default None/empty."""
     cr = ChainResult(chain_length=1, chain_success=True)
     assert cr.failed_step_reason is None
     assert cr.step_timings == []
@@ -1382,8 +1322,7 @@ def test_chain_result_post_b1_fields_default():
 
 
 def test_chain_result_all_fields_roundtrip():
-    """Full-field roundtrip including failed_step_reason (Step 13),
-    step_timings, and output_files."""
+    """Full-field roundtrip including failed_step_reason, timings, and files."""
     timing = StepTiming(
         step_index=0,
         capability_name="csv-parser",
@@ -1410,7 +1349,7 @@ def test_chain_result_all_fields_roundtrip():
 
 
 # ---------------------------------------------------------------------------
-# Security audit finding #9 — decode_agent_config_metadata helper (2026-04-19)
+# decode_agent_config_metadata helper
 # ---------------------------------------------------------------------------
 
 

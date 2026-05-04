@@ -37,41 +37,14 @@ class SkillRegistry:
         (``raw_description``); this summary is used only for the embedding
         document so that search-time token costs stay bounded.
 
-        50-word cap keeps typical documents well under the 256-token
-        all-MiniLM-L6-v2 limit even with the B1 inputs/outputs lines.
-        Reducing the cap further (tried 30) measurably hurt Phase A
-        recall because it diluted the summary signal relative to the
-        added schema tokens.
+        The 50-word cap keeps typical embedding documents compact while
+        preserving enough prose signal for seed retrieval. Shorter caps
+        reduced recall in retrieval probes.
         """
         words = description.split()
         if len(words) <= max_words:
             return description
         return " ".join(words[:max_words]) + "…"
-
-    @staticmethod
-    def _format_signature(schema: dict | None) -> str:
-        """Format a schema dict as a comma-separated list of parameter names.
-
-        B1 (enriched hierarchical embedding): flattens an input or output
-        schema into a compact list of identifiers for inclusion in the
-        embedding document. **Only the parameter/output names are
-        emitted, not their types.** Type tokens like ``int``, ``str``,
-        ``list``, ``dict`` carry almost no semantic signal for realistic
-        caller queries (which rarely mention types explicitly) and their
-        inclusion measurably dilutes prose-query recall — an earlier
-        ``name:type`` format regressed Phase A recall by 6-12pp on
-        probes whose semantics aligned with the description.
-
-        Accepts:
-          - ``None`` or empty dict → returns ``""``
-          - ``{"file_path": "str"}`` → ``"file_path"``
-          - ``{"row_count": "int", "column_names": "list[str]"}``
-            → ``"row_count, column_names"``
-          - ``{"n": {"type": "int"}}`` → ``"n"`` (JSON-Schema-ish input)
-        """
-        if not schema:
-            return ""
-        return ", ".join(str(name) for name in schema.keys())
 
     @staticmethod
     def _build_document(capability: CapabilityDescriptor) -> str:
@@ -82,22 +55,12 @@ class SkillRegistry:
         The description is truncated to ~50 words for embedding efficiency;
         the full description is kept in metadata (``raw_description``).
 
-        **B1 design decision (2026-04-13):** the embedding document
-        remains prose-only. We tried three variants of enriching the
-        document with structural signatures (multi-line labeled,
-        single-line with ``||`` delimiter, and natural-prose
-        ``Parameters:`` / ``Returns:``) and all regressed Phase A
-        recall by 6-12pp because the added tokens dilute the prose
-        signal for borderline-threshold probes. Instead, the
-        structural signal is exposed through ``input_schema`` /
-        ``output_schema`` on ``CapabilityDescriptor`` (already
-        persisted in ChromaDB metadata), and consumed directly by
-        (a) Pillar 3 Merge's Jaccard similarity over schema keys,
-        and (b) gap detection's optional post-filter that cross-checks
-        query/capability schema overlap after embedding fires. This
-        preserves prose-query recall while still delivering the
-        proposal's "overlapping input schemas" Merge criterion and
-        catching silent-poisoning matches.
+        The embedding text intentionally stays prose-only. Structural
+        contract fields are persisted as ``input_schema`` / ``output_schema``
+        metadata and consumed directly by merge scoring and gap-detection
+        compatibility checks. Keeping schema keys out of the embedding avoids
+        diluting semantic retrieval while preserving the contract signal for
+        code paths that need it.
         """
         domain = getattr(capability, "domain", "general")
         summary = SkillRegistry._summarize_description(capability.description)
@@ -117,7 +80,8 @@ class SkillRegistry:
             "version": capability.version,
             "created_at": capability.created_at.isoformat(),
             "raw_description": capability.description,
-            # New fields — use getattr for schema compatibility
+            # Optional descriptor fields are read defensively for compatibility
+            # with older persisted rows and test descriptors.
             "domain": getattr(capability, "domain", "general"),
             "is_generic": getattr(capability, "is_generic", False),
             "is_active": getattr(capability, "is_active", True),
@@ -157,7 +121,7 @@ class SkillRegistry:
             except (ValueError, TypeError):
                 kwargs["created_at"] = datetime.now(UTC)
 
-        # Conditionally add fields the schema supports
+        # Conditionally add fields the schema supports.
         if "domain" in model_fields and "domain" in meta:
             kwargs["domain"] = meta["domain"]
         if "is_generic" in model_fields and "is_generic" in meta:
@@ -182,7 +146,9 @@ class SkillRegistry:
         if "pip_packages" in model_fields and "pip_packages" in meta:
             try:
                 raw_pp = json.loads(meta["pip_packages"])
-                kwargs["pip_packages"] = [str(p) for p in raw_pp] if isinstance(raw_pp, list) else []
+                kwargs["pip_packages"] = (
+                    [str(p) for p in raw_pp] if isinstance(raw_pp, list) else []
+                )
             except (ValueError, TypeError):
                 kwargs["pip_packages"] = []
         if "metadata" in model_fields and "extra_metadata" in meta:
@@ -262,7 +228,8 @@ class SkillRegistry:
         Args:
             capability_type: Filter by type (MCP_TOOL, SKILL, AGENT).
             domain: Filter by domain string.
-            is_active: Filter by active status (default True = active only). Pass None to include all.
+            is_active: Filter by active status. The default returns active
+                capabilities only; pass ``None`` to include all.
         """
         where_conditions: list[dict] = []
         if capability_type is not None:
@@ -313,20 +280,16 @@ class SkillRegistry:
             domain: Optional domain filter. When set, restricts results to
                 capabilities whose ``domain`` metadata matches (with the
                 ``include_generic`` exception below). When ``None`` (default)
-                no domain filtering is applied — pre-B1 behaviour preserved.
-                Realises the proposal's "hierarchical embeddings (domain →
-                capability → specific skill)" criterion as a cheap pre-filter.
+                no domain filtering is applied. This realizes hierarchical
+                retrieval as a cheap pre-filter.
             include_generic: When ``True`` (default), capabilities flagged
                 ``is_generic=True`` are always included in results regardless
                 of the ``domain`` filter. This handles the generic-capability
-                edge case surfaced by Phase E (B1 Step 3.5b): a genuinely
-                generic cap like ``parse_csv_and_return_stats`` would be
-                falsely rejected by strict domain-equality filtering on
-                queries inferred as ``inventory`` / ``operations`` / etc.,
-                even though the cap's implementation has zero hardcoded
-                business assumptions. Set ``False`` to disable the bypass
-                (useful for diagnostic measurements). Has no effect when
-                ``domain`` is ``None``.
+                edge case where a genuinely generic cap like
+                ``parse_csv_and_return_stats`` would be falsely rejected by
+                strict domain-equality filtering on business-domain queries.
+                Set ``False`` to disable the bypass for diagnostic
+                measurements. Has no effect when ``domain`` is ``None``.
         """
         query_kwargs: dict = {"query_texts": [query], "n_results": n_results}
         if domain is not None:
@@ -382,7 +345,7 @@ class SkillRegistry:
                 the auxiliary description — and takes the MAX score for the
                 threshold check. Strictly additive: setting an auxiliary to
                 None or passing ``auxiliary_queries=None`` reproduces the
-                pre-fix single-query behaviour exactly. Use this to work
+                single-query behaviour exactly. Use this to work
                 around the short-slug-vs-prose-document embedding asymmetry
                 where short slugs systematically fall below the 0.6
                 threshold against prose-style ``_build_document()`` output
@@ -395,7 +358,7 @@ class SkillRegistry:
             include_generic: Threaded through to :meth:`search`. When True
                 (default), capabilities flagged ``is_generic=True`` bypass
                 the domain filter. See :meth:`search` docstring for the
-                Phase E rationale.
+                generic-capability rationale.
 
         Returns:
             matches: list of (capability, score, original_query) above threshold.
@@ -408,7 +371,7 @@ class SkillRegistry:
         matches: list[tuple[CapabilityDescriptor, float, str]] = []
         gaps: list[tuple[str, str]] = []
 
-        # Normalise auxiliary_queries to the same length as queries. None
+        # Normalize auxiliary_queries to the same length as queries. None
         # entries are treated as "no auxiliary — single-query behaviour".
         if auxiliary_queries is None:
             aux_list: list[str | None] = [None] * len(queries)
@@ -526,22 +489,15 @@ def seed_registry(registry: SkillRegistry) -> None:
         if agent_config is not None:
             metadata["agent_config"] = agent_config
 
-        # Compute Pillar 3 M3 definition-string token cost (Step 18.6).
-        # Build a throwaway GeneratedArtifact snapshot so the same tokenizer
-        # helper the JIT / optimizer paths use also runs on seeded caps —
-        # keeps seeded-vs-evolved Chapter-5 comparisons apples-to-apples.
-        # Security audit finding #9 (2026-04-19): use the shared
-        # ``decode_agent_config_metadata`` helper.
+        # Compute the definition-string token cost for seeded capabilities
+        # using the same serializer as generated artifacts. This keeps seeded
+        # and evolved capabilities comparable in Chapter 6 analysis.
         from src.schemas.task import decode_agent_config_metadata
 
         agent_config_dict = decode_agent_config_metadata(agent_config)
         if agent_config_dict is None and isinstance(agent_config, str) and agent_config:
-            # Preserve the pre-fix behaviour at THIS site: when the string
-            # isn't valid JSON, wrap it as a bare system_prompt so the
-            # tokenizer still sees something. (Other sites prefer None —
-            # they're reconstruction paths that need a proper dict or
-            # nothing; this site is a tokenization snapshot that's fine
-            # with a best-effort wrapper.)
+            # This path only builds a tokenizer snapshot, so a non-JSON agent
+            # prompt can be represented as a bare system prompt.
             agent_config_dict = {"system_prompt": agent_config}
         snapshot = GeneratedArtifact(
             capability_name=name,
@@ -625,7 +581,8 @@ def seed_registry(registry: SkillRegistry) -> None:
                 '    with open(file_path) as f:\n'
                 '        reader = csv.DictReader(f)\n'
                 '        rows = list(reader)\n'
-                '        return {"row_count": len(rows), "column_names": list(reader.fieldnames or [])}\n'
+                '        return {"row_count": len(rows), '
+                '"column_names": list(reader.fieldnames or [])}\n'
                 'if __name__ == "__main__":\n'
                 '    mcp.run()\n'
             ),
@@ -676,9 +633,8 @@ def seed_registry(registry: SkillRegistry) -> None:
             domain="data-processing",
             input_schema={"config_path": "str", "schema_path": "str"},
             output_schema={"errors": "list[str]"},
-            # Security audit finding #83 (2026-04-19, ext9): declare the
-            # jsonschema runtime dependency explicitly so registry-matched
-            # uses of this seed install it in the sandbox.
+            # Declare the jsonschema runtime dependency explicitly so
+            # registry-matched uses of this seed install it in the sandbox.
             pip_packages=["jsonschema"],
             source_code=(
                 "from typing import Annotated\n"
@@ -717,7 +673,9 @@ def seed_registry(registry: SkillRegistry) -> None:
                 'import re\n'
                 'mcp = FastMCP("text-statistics")\n'
                 '@mcp.tool()\n'
-                'async def text_statistics(file_path: Annotated[str, "Path to text file"]) -> dict:\n'
+                'async def text_statistics(\n'
+                '    file_path: Annotated[str, "Path to text file"]\n'
+                ') -> dict:\n'
                 '    """Compute word count and Flesch readability score."""\n'
                 '    text = open(file_path).read()\n'
                 '    words = re.findall(r"\\b\\w+\\b", text)\n'
@@ -727,7 +685,8 @@ def seed_registry(registry: SkillRegistry) -> None:
                 '    n_w = len(words)\n'
                 '    n_s = max(len(sentences), 1)\n'
                 '    n_syl = sum(syllables(w) for w in words)\n'
-                '    score = round(max(0.0, min(100.0, 206.835 - 1.015*(n_w/n_s) - 84.6*(n_syl/max(n_w,1)))), 2)\n'
+                '    raw_score = 206.835 - 1.015*(n_w/n_s) - 84.6*(n_syl/max(n_w, 1))\n'
+                '    score = round(max(0.0, min(100.0, raw_score)), 2)\n'
                 '    return {"word_count": n_w, "readability_score": score}\n'
                 'if __name__ == "__main__":\n'
                 '    mcp.run()\n'

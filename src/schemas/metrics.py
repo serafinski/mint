@@ -14,16 +14,14 @@ class InvocationRecord(BaseModel):
     error_message: str | None = Field(
         default=None, description="Error message if the invocation failed"
     )
-    # Step 4 (B1 Pillar 3): inputs + outputs for failure-case replay.
-    # Step 8's split operation pulls recent failures via
-    # ``MetricsStore.get_recent_failures`` and feeds them to the Tier 4
-    # coverage verifier as real test inputs. Without these two fields
-    # the split variants cannot be evaluated against the input
-    # subspaces where the parent was failing. Serialization is
-    # JSON-as-string by convention — the caller is responsible for
-    # producing stable JSON. Old rows from before 2026-04-15 have
-    # both fields NULL; the DuckDB migration in metrics.py adds
-    # the columns with defaults so old databases keep working.
+    # Inputs and outputs are captured for failure-case replay. Split
+    # operations pull recent failures via ``MetricsStore.get_recent_failures``
+    # and feed them to the coverage verifier as concrete test inputs. Without
+    # these fields, split variants cannot be evaluated against the input
+    # subspaces where the parent failed. Serialization is JSON-as-string by
+    # convention; the caller is responsible for producing stable JSON. Legacy
+    # rows may have both fields NULL, and the DuckDB migration in
+    # ``src.registry.metrics`` keeps those databases readable.
     input_args: str | None = Field(
         default=None,
         description=(

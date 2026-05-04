@@ -106,7 +106,7 @@ class TestEvaluationRecord:
             assert r.task_tier == tier
 
     def test_all_failure_reasons_valid(self):
-        for reason in ["none", "generation_failed", "tier1", "tier2", "tier3", "output_rejected", "no_source_code"]:
+        for reason in FailureReason:
             r = EvaluationRecord(**{**_BASE, "failure_reason": reason})
             assert r.failure_reason == reason
 
@@ -122,17 +122,10 @@ class TestStrEnums:
         assert BaselineCondition.NO_VERIFICATION == "no_verification"
         assert BaselineCondition.NO_OPTIMIZATION == "no_optimization"
         assert BaselineCondition.STATIC == "static"
-        # Step 18.7 (2026-04-17): LONGITUDINAL added for run_longitudinal.py.
-        # Not one of the four proposal ablation conditions — it's a separate
-        # sequencing protocol. Analyzers filter by condition explicitly.
         assert BaselineCondition.LONGITUDINAL == "longitudinal"
 
     def test_longitudinal_accepted_on_evaluation_record(self):
-        """run_longitudinal.py writes condition='longitudinal'; this pins
-        that the schema accepts the value without raising. Pre-Step-18.7
-        this would raise ValidationError and run_longitudinal.py would
-        crash on first record_run — a latent bug surfaced by Step 18.7's
-        sanity check."""
+        """Longitudinal records use a distinct accepted condition label."""
         rec = EvaluationRecord(
             run_id="longitudinal_test",
             condition="longitudinal",
@@ -162,8 +155,6 @@ class TestStrEnums:
         assert FailureReason.TIER3 == "tier3"
         assert FailureReason.OUTPUT_REJECTED == "output_rejected"
         assert FailureReason.NO_SOURCE_CODE == "no_source_code"
-        # Post-Step-13 additions (2026-04-15): chain-step / agent-execution failure reasons
-        # surfaced by the compositional executor's sticky failure meta.
         assert FailureReason.CHAIN_STEP_FAILED == "chain_step_failed"
         assert FailureReason.AGENT_EXECUTION_TIMEOUT == "agent_execution_timeout"
         assert FailureReason.AGENT_EXECUTION_ERROR == "agent_execution_error"

@@ -16,11 +16,10 @@ tests.
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
@@ -264,10 +263,10 @@ def test_ext15_164_classification_accuracy_returns_false_on_skip_path():
     can append "Classification Accuracy" to missing_metrics.
     """
     sys.path.insert(0, str(ROOT))
+
     from scripts.analyze_results import print_classification_accuracy
 
-    import duckdb as _duckdb
-    conn = _duckdb.connect(":memory:")
+    conn = duckdb.connect(":memory:")
     try:
         # Create minimal schema with no rows — triggers skip path.
         conn.execute(
@@ -290,10 +289,10 @@ def test_ext15_164_classification_accuracy_returns_false_on_skip_path():
 
 def test_ext16_177_latency_summary_returns_false_on_no_successful_runs():
     sys.path.insert(0, str(ROOT))
+
     from scripts.analyze_results import print_latency_summary
 
-    import duckdb as _duckdb
-    conn = _duckdb.connect(":memory:")
+    conn = duckdb.connect(":memory:")
     try:
         conn.execute(
             "CREATE TABLE evaluation_runs ("
@@ -377,11 +376,11 @@ def test_tmp_md_p1_persist_utility_scores_empty_map_is_noop(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# tmp.md P1 — update_human_label optimistic concurrency + result tracking.
+# Deferred manual-audit helper: update_human_label optimistic concurrency.
 # ---------------------------------------------------------------------------
 
 
-def test_tmp_md_p1_update_human_label_optimistic_concurrency(tmp_path):
+def test_update_human_label_optimistic_concurrency(tmp_path):
     sys.path.insert(0, str(ROOT))
     from src.registry.evaluation_store import EvaluationStore
     from src.schemas.evaluation import EvaluationRecord

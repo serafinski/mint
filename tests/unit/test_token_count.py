@@ -1,6 +1,6 @@
 """Unit tests for src.registry.token_count.
 
-Covers Pillar 3 M3 definition-string token cost (Step 18.6):
+Covers static definition-token cost:
   - Per-capability-type dispatch (MCP_TOOL / SKILL / AGENT)
   - Stable ordering via sort_keys (JSON output is deterministic)
   - Empty/missing-field fallback returns 0
@@ -12,10 +12,15 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from src.registry.store import SkillRegistry, seed_registry
-from src.registry.token_count import count_definition_tokens
+from src.registry.token_count import _tiktoken_model_name, count_definition_tokens
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
+
+
+def test_tiktoken_model_name_strips_known_provider_prefixes():
+    assert _tiktoken_model_name("openai:gpt-5-mini") == "gpt-5-mini"
+    assert _tiktoken_model_name("azure:gpt-35-turbo") == "gpt-35-turbo"
+    assert _tiktoken_model_name("gpt-5-mini") == "gpt-5-mini"
 
 
 # ---------------------------------------------------------------------------
@@ -55,14 +60,14 @@ def test_mcp_tool_token_count_stable_across_schema_key_ordering():
 
 
 def test_mcp_tool_with_empty_fields_returns_nonzero():
-    """Even an empty schema produces non-zero output because the JSON wrapper carries structural tokens."""
+    """Even an empty schema has structural JSON tokens."""
     artifact = GeneratedArtifact(
         capability_name="x",
         capability_type=CapabilityType.MCP_TOOL,
         description="",
     )
     n = count_definition_tokens(artifact)
-    # The dict {"description": "", "input_schema": {}, "output_schema": {}} still tokenizes.
+    # The wrapper dict still tokenizes even when all payload fields are empty.
     assert n > 0
 
 
@@ -206,6 +211,8 @@ def test_serialization_failure_returns_zero(caplog):
 
 
 def test_seed_registry_populates_definition_token_cost():
+    from src.registry.store import SkillRegistry, seed_registry
+
     registry = SkillRegistry()
     seed_registry(registry)
 
@@ -222,6 +229,8 @@ def test_seed_registry_populates_definition_token_cost():
 
 def test_definition_token_cost_survives_chromadb_round_trip():
     """Persistence check: value written by add() must come back through get()."""
+    from src.registry.store import SkillRegistry, seed_registry
+
     registry = SkillRegistry()
     seed_registry(registry)
 
