@@ -349,8 +349,7 @@ class SkillRegistry:
                 around the short-slug-vs-prose-document embedding asymmetry
                 where short slugs systematically fall below the 0.6
                 threshold against prose-style ``_build_document()`` output
-                even when semantically equivalent. See
-                ``docs/registry_retrieval_fix_plan.md`` Part A.
+                even when semantically equivalent.
             threshold: Minimum similarity score to count as a match.
             domain: Optional domain filter threaded through to :meth:`search`.
                 When ``None`` (default) the search is unrestricted. See
@@ -491,7 +490,7 @@ def seed_registry(registry: SkillRegistry) -> None:
 
         # Compute the definition-string token cost for seeded capabilities
         # using the same serializer as generated artifacts. This keeps seeded
-        # and evolved capabilities comparable in Chapter 6 analysis.
+        # and evolved capabilities comparable in evaluation analysis.
         from src.schemas.task import decode_agent_config_metadata
 
         agent_config_dict = decode_agent_config_metadata(agent_config)

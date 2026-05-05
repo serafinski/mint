@@ -81,8 +81,8 @@ def test_capability_descriptor_roundtrip():
     assert roundtripped.capability_type == cap.capability_type
 
 
-def test_capability_descriptor_new_fields_defaults():
-    """New fields should have defaults for backward compatibility."""
+def test_capability_descriptor_metadata_defaults():
+    """Optional descriptor metadata fields have stable defaults."""
     cap = CapabilityDescriptor(
         name="test",
         description="test",
@@ -96,7 +96,7 @@ def test_capability_descriptor_new_fields_defaults():
     assert cap.metadata == {}
 
 
-def test_capability_descriptor_new_fields_populated():
+def test_capability_descriptor_metadata_fields_populated():
     cap = CapabilityDescriptor(
         name="csv-parser",
         description="Parse CSV files",
@@ -115,7 +115,7 @@ def test_capability_descriptor_new_fields_populated():
     assert cap.metadata["author"] == "system"
 
 
-def test_capability_descriptor_roundtrip_with_new_fields():
+def test_capability_descriptor_metadata_fields_roundtrip():
     cap = CapabilityDescriptor(
         name="enricher",
         description="Enrich data",
@@ -408,7 +408,7 @@ def test_generated_artifact_roundtrip():
 
 
 def test_generated_artifact_description_field():
-    """description field is stored and None by default (Bug 1 fix)."""
+    """description is stored when provided and defaults to None."""
     art_no_desc = GeneratedArtifact(
         capability_name="add-numbers",
         capability_type=CapabilityType.MCP_TOOL,
@@ -425,7 +425,7 @@ def test_generated_artifact_description_field():
     assert art_with_desc.description == "Adds two integers"
 
 
-def test_generated_artifact_post_b1_fields_defaults():
+def test_generated_artifact_optional_metadata_defaults():
     """Generated-artifact optional metadata fields default empty / None / False."""
     art = GeneratedArtifact(
         capability_name="t",
@@ -720,7 +720,7 @@ def test_invocation_record_roundtrip():
 
 
 def test_invocation_record_failure_replay_fields_default_and_roundtrip():
-    """Step 4: input_args + actual_output default None and roundtrip as JSON strings."""
+    """Replay input/output fields default None and roundtrip as JSON strings."""
     default_rec = InvocationRecord(
         capability_id="cap-123",
         task_id="task-456",
@@ -845,8 +845,8 @@ def test_task_state_minimal():
     assert state.gaps == []
 
 
-def test_task_state_backward_compat():
-    """All new fields have defaults, so old-style construction still works."""
+def test_task_state_defaults():
+    """TaskState optional pipeline fields have stable defaults."""
     state = TaskState(task_description="test task")
     assert state.subtasks == []
     assert state.classified_gaps == []
@@ -880,7 +880,7 @@ def test_task_state_with_matches_and_gaps():
 
 
 def test_task_state_full_pipeline():
-    """Test TaskState with all new fields populated."""
+    """TaskState accepts the fields populated across the current pipeline."""
     cap = CapabilityDescriptor(
         name="csv-parser",
         description="Parse CSV files",
@@ -1313,7 +1313,7 @@ def test_chain_result_roundtrip():
     assert len(roundtripped.step_results) == 2
 
 
-def test_chain_result_post_b1_fields_default():
+def test_chain_result_diagnostic_fields_default():
     """failed_step_reason, step_timings, and output_files default None/empty."""
     cr = ChainResult(chain_length=1, chain_success=True)
     assert cr.failed_step_reason is None

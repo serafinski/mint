@@ -41,12 +41,10 @@ class TestSlugifyGap:
         assert "-" in slug
 
     def test_no_double_underscore_when_truncating_mid_separator(self):
-        """Regression: old code stripped trailing underscores BEFORE truncating,
-        leaving a trailing underscore at position 40 that then got concatenated
-        with ``_<hash>`` — producing names like
-        ``parse_this_xml_report_data_and_find_the__6b415a`` (double underscore).
+        """Truncation must not leave a separator before the hash suffix.
 
-        The fix strips trailing underscores AFTER truncation.
+        The helper strips trailing underscores after truncation, avoiding names
+        like ``parse_this_xml_report_data_and_find_the__6b415a``.
         """
         # A 46-char input where position 39 is an underscore
         query = "parse-this-xml-report-data-and-find-the-95c8e9"

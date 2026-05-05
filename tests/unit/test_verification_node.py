@@ -195,9 +195,7 @@ def test_max_attempts_drops_failed_artifacts():
 
 
 def test_max_attempts_sets_sticky_fail_flag():
-    """§12 finding #14: sticky verification_succeeded flag flips to False
-    so terminal callers classify the task as VERIFICATION_FAILED.
-    """
+    """Sticky verification_succeeded flips to False on verification exhaustion."""
     state = TaskState(
         task_description="t",
         generated_artifacts=[_artifact("bad")],
@@ -406,7 +404,7 @@ def test_status_is_verifying():
 
 
 # ---------------------------------------------------------------------------
-# Fix 6: Parallel verification
+# Parallel verification
 # ---------------------------------------------------------------------------
 
 

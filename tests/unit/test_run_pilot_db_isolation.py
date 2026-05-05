@@ -1,13 +1,8 @@
-"""Tests for ext7 #49 — ``run_pilot.py`` DB isolation semantics.
+"""Tests for ``run_pilot.py`` DB and MetricsStore isolation semantics.
 
-Pre-fix, ``run_pilot.py`` hardcoded ``data/eval/metrics.duckdb``. Every
-invocation appended into the same file, silently pooling across sessions.
-
-Post-fix:
-- ``--db`` script arg (default: a fresh timestamped path).
-- ``--fresh-db`` wipes an existing path.
-- ``--append`` opts into appending to an existing path.
-- Refuses (exit 2) to run against an existing non-empty DB without either flag.
+The runner must use a campaign-scoped DuckDB path by default, refuse accidental
+reuse of non-empty DBs, and isolate optimizer MetricsStore files between
+ablation conditions unless the caller explicitly chooses append/reuse behavior.
 
 The tests below invoke the runner's argument plumbing without actually running
 the harness (which would require Docker + LLM). We import ``main`` and drive
@@ -18,12 +13,8 @@ imports so the exit happens before the expensive paths.
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 import pytest
-
-ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(ROOT))
 
 
 def _make_stub_harness(monkeypatch):
@@ -71,7 +62,7 @@ def _make_stub_harness(monkeypatch):
 
 
 def test_refuses_to_run_against_non_empty_db_without_flag(tmp_path, monkeypatch):
-    """An existing non-empty DB + no --fresh-db + no --append → exit 2."""
+    """An existing non-empty DB without --fresh-db or --append exits 2."""
     rp = _make_stub_harness(monkeypatch)
 
     db = tmp_path / "existing.duckdb"
@@ -130,7 +121,7 @@ def test_fresh_db_and_append_are_mutually_exclusive(tmp_path, monkeypatch):
 
 
 def test_default_db_path_is_timestamped(tmp_path, monkeypatch, capsys):
-    """No --db → a fresh timestamped path is announced at startup."""
+    """No --db announces a fresh timestamped path at startup."""
     rp = _make_stub_harness(monkeypatch)
     monkeypatch.setattr(rp, "DATA_DIR", tmp_path)
 

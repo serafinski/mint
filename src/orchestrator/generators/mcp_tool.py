@@ -97,9 +97,9 @@ def _get_llm():
 
 # NOTE: Intentional asymmetry with ``agent._SNAKE_CASE_RE`` (which is
 # ``r"^[a-z_][a-z0-9_]*$"`` — leading underscore allowed). MCP tool names are
-# used as Python module names by ``tool_loader.load_tool`` in the sandbox
-# runner script, so they must follow PyPI-/import-safe conventions and cannot
-# start with an underscore. Agent node names are LangGraph/DeepAgent
+# used as public Python function/module identifiers during sandbox execution,
+# so they must follow PyPI-/import-safe conventions and cannot start with an
+# underscore. Agent node names are LangGraph/DeepAgent
 # identifiers where ``_private_subagents``-style names are meaningful, hence
 # the looser rule there. Any future unifier should preserve this difference —
 # see ``tests/unit/test_mcp_tool_generator.py::TestValidateToolName::test_starts_with_underscore``
@@ -110,9 +110,9 @@ _SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 def _validate_tool_name(tool_name: str) -> str | None:
     """Validate the tool_name field from the LLM response.
 
-    Returns an error string or None if valid.  Invalid names break
-    ``tool_loader.load_tool`` because the name is used as a Python module
-    name in the sandbox runner script.
+    Returns an error string or None if valid. Invalid names break sandbox
+    execution because generated MCP tools are addressed through public Python
+    identifiers.
     """
     if not tool_name.strip():
         return "tool_name must be non-empty"
@@ -154,9 +154,8 @@ def _validate_code(source_code: str) -> str | None:
     # excluding private helpers whose names start with "_").
     # - ast.iter_child_nodes avoids nested defs (e.g. a coroutine defined inside
     #   the tool body) that never appear in dir(module).
-    # - The "_" filter mirrors the tool runner's dir(module) filter so that a
-    #   module-level private helper (async def _helper()) doesn't trigger a false
-    #   positive; the runner skips it alphabetically and always picks the public tool.
+    # - The "_" filter mirrors sandbox execution so that a module-level private
+    #   helper (async def _helper()) doesn't trigger a false positive.
     async_def_count = sum(
         1
         for n in ast.iter_child_nodes(tree)
@@ -167,7 +166,7 @@ def _validate_code(source_code: str) -> str | None:
     elif async_def_count > 1:
         errors.append(
             f"Found {async_def_count} public top-level async def functions; exactly 1 is required "
-            "(tool runner picks the first non-private async function alphabetically)"
+            "(sandbox execution requires one unambiguous public async function)"
         )
     # Collect all imported names via AST — substring search would match docstrings/comments
     # and produce false positives for code that mentions but does not import these names.

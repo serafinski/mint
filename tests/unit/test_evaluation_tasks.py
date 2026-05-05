@@ -1,4 +1,4 @@
-"""Unit tests for tests/evaluation/tasks.py — validators and task registry."""
+"""Tests for evaluation task definitions, validators, and registry invariants."""
 
 from __future__ import annotations
 
@@ -704,7 +704,7 @@ class TestExpectedTypeInvariants:
         ]
         assert bad == [], f"Invalid expected_type labels: {bad}"
 
-    def test_distribution_matches_step_18_5_claim(self):
+    def test_distribution_matches_classification_accuracy_design(self):
         """The expected-type distribution is fixed at 8/6/6.
 
         If someone adjusts a task's type without updating this count,

@@ -100,7 +100,7 @@ def get_items(x, y, z):
         assert len(findings) == 0
 
     def test_hardcoded_list_via_variable_indirection(self):
-        """B1.2: data = ['a','b','c']; return data must be flagged."""
+        """Indirect literal lists returned via variables must be flagged."""
         code = '''\
 def get_cities():
     data = ["New York", "London", "Tokyo"]
@@ -113,7 +113,7 @@ def get_cities():
         assert findings[0].severity == Severity.CRITICAL
 
     def test_hardcoded_dict_via_variable_indirection(self):
-        """B1.2: config = {'a':1,'b':2,'c':3}; return config must be flagged."""
+        """Indirect literal dicts returned via variables must be flagged."""
         code = '''\
 def get_config():
     config = {"host": "localhost", "port": "8080", "db": "test"}
@@ -145,7 +145,7 @@ def summarize(rows):
         assert len(findings) == 0
 
     def test_small_variable_list_not_flagged(self):
-        """B1.2: small indirect lists (< 3 items) should not be flagged."""
+        """Small indirect lists with fewer than 3 items should not be flagged."""
         code = '''\
 def get_pair():
     data = ["a", "b"]
@@ -156,7 +156,7 @@ def get_pair():
         assert len(findings) == 0
 
     def test_async_hardcoded_list_via_variable_indirection(self):
-        """B1.2 fix applies to async functions too."""
+        """Indirect hardcoded-list detection applies to async functions too."""
         code = '''\
 async def get_users():
     users = ["alice", "bob", "charlie"]
@@ -265,7 +265,7 @@ class TestMockArtifacts:
         assert findings[0].severity == Severity.CRITICAL
 
     def test_mock_in_compound_word_not_flagged(self):
-        """'mock' inside a compound like 'mock_data' is NOT flagged (H4 fix)."""
+        """'mock' inside a compound like 'mock_data' is NOT flagged."""
         code = "mock_data = [1, 2, 3]\n"
         report = scan(code, "mock-tool")
         findings = [f for f in report.findings if f.category == "mock_artifact"]
@@ -285,7 +285,7 @@ class TestMockArtifacts:
         assert len(findings) >= 1
 
     def test_placeholder_in_compound_not_flagged(self):
-        """'placeholder' inside 'placeholder_value' is NOT flagged (H4 fix)."""
+        """'placeholder' inside 'placeholder_value' is NOT flagged."""
         code = "placeholder_value = 42\n"
         report = scan(code, "placeholder-tool")
         findings = [f for f in report.findings if f.category == "mock_artifact"]
@@ -311,7 +311,7 @@ class TestMockArtifacts:
         assert len(findings) >= 1
 
     def test_demo_in_compound_not_flagged(self):
-        """'DEMO' inside 'DEMO_MODE' is NOT flagged (H4 fix: no more
+        """'DEMO' inside 'DEMO_MODE' is NOT flagged, avoiding
         false positives on 'demographics', 'remediation', etc.)."""
         code = 'DEMO_MODE = True\n'
         report = scan(code, "demo-tool")
@@ -319,7 +319,7 @@ class TestMockArtifacts:
         assert len(findings) == 0
 
     def test_demographics_not_flagged(self):
-        """H4: 'demographics' must NOT be flagged."""
+        """'demographics' must NOT be flagged."""
         code = 'demographics_data = load("demographics.csv")\n'
         report = scan(code, "demographics-tool")
         findings = [f for f in report.findings if f.category == "mock_artifact"]
@@ -611,13 +611,19 @@ def fetch_data():
 
 
 # ===================================================================
-# scan with non-MCP types — regex-only scan for non-Python content
-# (formerly scan_text_only, now handled by scan() with capability_type)
+# scan with non-MCP types: skip Python AST/regex checks for prose/config content
 # ===================================================================
 
 class TestScanNonMcpTypes:
     def test_clean_text_returns_empty_findings(self):
-        text = "---\nname: my-skill\ndescription: Loads CSV data from disk.\n---\n\n## Overview\n\nThis skill reads files.\n"
+        text = (
+            "---\n"
+            "name: my-skill\n"
+            "description: Loads CSV data from disk.\n"
+            "---\n\n"
+            "## Overview\n\n"
+            "This skill reads files.\n"
+        )
         report = scan(text, "my-skill", "skill")
         assert report.findings == []
         assert report.overall_passed is True
@@ -630,7 +636,13 @@ class TestScanNonMcpTypes:
         leave placeholder values", "this is not a mock implementation").
         Mock detection is scoped to MCP_TOOL Python source only.
         """
-        text = "---\nname: my-skill\ndescription: Loads data.\n---\n\nThis is a mock of the real API.\n"
+        text = (
+            "---\n"
+            "name: my-skill\n"
+            "description: Loads data.\n"
+            "---\n\n"
+            "This is a mock of the real API.\n"
+        )
         report = scan(text, "my-skill", "skill")
         mock_findings = [f for f in report.findings if f.category == "mock_artifact"]
         assert mock_findings == []
@@ -649,7 +661,14 @@ class TestScanNonMcpTypes:
 
     def test_no_ast_syntax_error_for_non_python(self):
         """YAML/markdown content must not produce a syntax error finding."""
-        yaml_text = "---\nname: test-skill\ndescription: A skill.\n---\n\n## Body\n\nSome markdown content.\n"
+        yaml_text = (
+            "---\n"
+            "name: test-skill\n"
+            "description: A skill.\n"
+            "---\n\n"
+            "## Body\n\n"
+            "Some markdown content.\n"
+        )
         report = scan(yaml_text, "test-skill", "skill")
         syntax_findings = [f for f in report.findings if f.category == "syntax"]
         assert len(syntax_findings) == 0
@@ -689,10 +708,7 @@ class TestScanNonMcpTypes:
         assert report.overall_passed is True
 
     def test_skill_with_placeholder_in_instructions_passes(self):
-        """Regression for T04 false positive: skills routinely use the word
-        'placeholder' in their instructions (e.g., "do not leave placeholder
-        values in the output"). The Tier 1 mock-artifact regex was firing on
-        these legitimate prose uses and rejecting otherwise-valid skills.
+        """Skills can use 'placeholder' in prose without failing verification.
         """
         skill = (
             "---\n"
@@ -709,8 +725,9 @@ class TestScanNonMcpTypes:
         assert [f for f in report.findings if f.category == "mock_artifact"] == []
 
     def test_skill_with_mock_word_in_instructions_passes(self):
-        """Regression for T04: 'mock' as a domain term in skill prose must
-        not block verification. Skills often reference mocking as a concept
+        """'mock' as a domain term in skill prose must not block verification.
+
+        Skills often reference mocking as a concept
         (e.g., "this is not a mock — call the real API")."""
         skill = (
             "---\n"
@@ -737,7 +754,7 @@ class TestScanNonMcpTypes:
 
 
 # ===================================================================
-# A1: Mock library imports (CRITICAL)
+# Mock library imports (CRITICAL)
 # ===================================================================
 
 class TestMockImports:
@@ -788,7 +805,7 @@ class TestMockImports:
 
 
 # ===================================================================
-# A1: random.seed(<literal>) determinism artifact (HIGH)
+# random.seed(<literal>) determinism artifact (HIGH)
 # ===================================================================
 
 class TestRandomSeed:
@@ -850,7 +867,7 @@ def get_value():
 
 
 # ===================================================================
-# A1: Lorem ipsum placeholder text (HIGH)
+# Lorem ipsum placeholder text (HIGH)
 # ===================================================================
 
 class TestLoremIpsum:
@@ -859,7 +876,10 @@ class TestLoremIpsum:
         report = scan(code, "tool")
         findings = [f for f in report.findings if f.category == "synthetic_data"]
         # At least one finding should mention lorem ipsum
-        assert any("Lorem ipsum" in f.message or "lorem ipsum" in f.message.lower() for f in findings)
+        assert any(
+            "Lorem ipsum" in f.message or "lorem ipsum" in f.message.lower()
+            for f in findings
+        )
 
     def test_lorem_ipsum_case_insensitive(self):
         code = 'def get_text():\n    return "LOREM IPSUM"\n'

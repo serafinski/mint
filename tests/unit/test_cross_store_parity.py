@@ -1,14 +1,11 @@
-"""Cross-store metric parity (ext8 #59 + #64 + #67).
+"""Cross-store metric parity tests.
 
 DuckDB (``evaluation_runs`` + ``analyze_results.py``) and LangFuse
-(``m1.success`` / ``m5.latency_ms`` scores) both publish Chapter-6 headline
-metrics. Pre-ext8, the two stores drifted on shape-mismatched rows
-(LangFuse M1 scored 1.0 while DuckDB excluded the row) and every LangFuse
-M5 score was 0 (the scoring path read a nonexistent key).
-
-These tests lock the post-fix parity: a single predicate
-(``EvaluationRecord.is_success``) feeds both stores, and the latency source
-is a real local variable, not a stale dict-key lookup.
+(``m1.success`` / ``m5.latency_ms`` scores) both publish evaluation
+headline metrics. These tests lock the current parity contract:
+``EvaluationRecord.is_success`` feeds both stores, shape-mismatched rows
+are failures everywhere, and the latency score uses the measured JIT
+elapsed time.
 """
 
 from __future__ import annotations
@@ -23,7 +20,7 @@ from src.schemas.evaluation import EvaluationRecord  # noqa: E402
 
 
 class TestIsSuccessPredicate:
-    """ext8 #59/#64: EvaluationRecord.is_success is the single source of truth."""
+    """EvaluationRecord.is_success is the single source of truth."""
 
     def test_happy_path_returns_true(self):
         assert EvaluationRecord.is_success(
@@ -31,7 +28,7 @@ class TestIsSuccessPredicate:
         ) is True
 
     def test_shape_mismatch_rejects_even_with_happy_validator(self):
-        """The ext6 #32 / ext7 #44 tightening: shape_mismatch → M1=fail."""
+        """A shape mismatch fails M1 even when the value validator passed."""
         assert EvaluationRecord.is_success(
             gate_passed=True, output_in_range=True, output_shape_mismatch=True,
         ) is False
@@ -47,10 +44,7 @@ class TestIsSuccessPredicate:
         ) is False
 
     def test_default_output_shape_mismatch_is_false(self):
-        """ext8 #59 parity: legacy rows without the field must pass when the
-        other two predicates pass. Default shape_mismatch=False preserves
-        backward-compat for any caller that pre-dates ext6 #32.
-        """
+        """Default shape_mismatch=False preserves older caller compatibility."""
         assert EvaluationRecord.is_success(
             gate_passed=True, output_in_range=True,
         ) is True
@@ -91,16 +85,15 @@ class TestEvaluationRecordSuccessProperty:
 
 
 class TestLangFuseScoreFormulaMatchesDuckDB:
-    """ext8 #59 + #64: the LangFuse scoring site in harness.py uses
-    ``EvaluationRecord.is_success`` so a shape-mismatched row scores 0.0 in
-    LangFuse (matching the DuckDB SQL predicate).
+    """The LangFuse M1 formula uses the same predicate as DuckDB.
+
+    Shape-mismatched rows must score 0.0 in LangFuse, matching the
+    DuckDB success predicate used by the analyzers.
     """
 
     def test_shape_mismatched_row_scores_zero_in_langfuse_formula(self):
-        """Simulate the harness's LangFuse scoring call with a shape-mismatched
-        result dict. The computed ``success_val`` MUST be 0.0.
-        """
-        # Mirror the harness's post-fix scoring formula at harness.py:718.
+        """A shape-mismatched result dict scores zero."""
+        # Mirror the harness scoring formula.
         result = {
             "gate_passed": True,
             "output_in_range": True,
@@ -112,12 +105,16 @@ class TestLangFuseScoreFormulaMatchesDuckDB:
             output_shape_mismatch=bool(result.get("output_shape_mismatch", False)),
         ) else 0.0
         assert success_val == 0.0, (
-            "ext8 #59/#64: a shape-mismatched row must score 0.0 in LangFuse "
-            "(matching the DuckDB predicate), not 1.0 as pre-fix."
+            "A shape-mismatched row must score 0.0 in LangFuse, matching "
+            "the DuckDB predicate."
         )
 
     def test_genuine_success_scores_one(self):
-        result = {"gate_passed": True, "output_in_range": True, "output_shape_mismatch": False}
+        result = {
+            "gate_passed": True,
+            "output_in_range": True,
+            "output_shape_mismatch": False,
+        }
         success_val = 1.0 if EvaluationRecord.is_success(
             gate_passed=bool(result.get("gate_passed", False)),
             output_in_range=bool(result.get("output_in_range", False)),
@@ -127,14 +124,15 @@ class TestLangFuseScoreFormulaMatchesDuckDB:
 
 
 class TestHarnessShapeMismatchFlipsOutputInRange:
-    """ext8 #64: the shape-mismatch promotion sites in harness.py MUST flip
-    ``output_in_range=False`` alongside setting ``failure_reason=
-    'output_shape_mismatch'``. Pre-fix, they promoted failure_reason but
-    left output_in_range=True → LangFuse M1 scored success.
+    """Shape-mismatch promotion sites also flip ``output_in_range=False``.
+
+    This keeps every store aligned on the canonical success predicate
+    after the harness promotes ``failure_reason`` to
+    ``"output_shape_mismatch"``.
     """
 
     def test_compositional_extract_flips_output_in_range_on_shape_mismatch(self):
-        """Regression guard for the compositional branch (~line 922)."""
+        """Every shape-mismatch promotion site flips output_in_range nearby."""
         import re
 
         harness_src = (
@@ -156,19 +154,20 @@ class TestHarnessShapeMismatchFlipsOutputInRange:
                 or "in_range = False" in window
             )
             assert has_flip, (
-                "ext8 #64: every `failure_reason = \"output_shape_mismatch\"` "
+                "Every `failure_reason = \"output_shape_mismatch\"` "
                 "site in harness.py MUST be followed by "
                 "`output_in_range = False` / `in_range = False` (within ~3 "
-                "lines). Found one that isn't — LangFuse M1 score will "
+                "lines). Found one that isn't - LangFuse M1 score will "
                 "disagree with DuckDB. Offending context:\n"
                 f"{harness_src[max(0, m.start()-100):m.end()+200]}"
             )
 
 
 class TestM5LatencyKeyFix:
-    """ext8 #67: the LangFuse `m5.latency_ms` score MUST read from a real
-    local variable (``jit_elapsed_ms``), not from a dict key that never
-    exists (``chain_result_attempt_latency_ms``).
+    """The LangFuse M5 latency score reads the measured JIT latency.
+
+    The harness should use ``jit_elapsed_ms`` rather than an unpopulated
+    result-dict key.
     """
 
     def test_harness_no_longer_reads_chain_result_attempt_latency_ms(self):
@@ -176,8 +175,8 @@ class TestM5LatencyKeyFix:
             ROOT / "tests" / "evaluation" / "harness.py"
         ).read_text()
         assert "chain_result_attempt_latency_ms" not in harness_src, (
-            "ext8 #67: harness.py must not read `chain_result_attempt_latency_ms` "
-            "— that key was never populated. Use `jit_elapsed_ms` (measured "
+            "harness.py must not read `chain_result_attempt_latency_ms`; "
+            "use `jit_elapsed_ms` (measured "
             "around pipeline.invoke) instead."
         )
 
@@ -186,10 +185,10 @@ class TestM5LatencyKeyFix:
             ROOT / "tests" / "evaluation" / "harness.py"
         ).read_text()
         assert "jit_elapsed_ms = int(" in harness_src, (
-            "ext8 #67: harness.py must measure `jit_elapsed_ms` around "
+            "harness.py must measure `jit_elapsed_ms` around "
             "pipeline.invoke. Measurement assignment missing."
         )
         assert "float(jit_elapsed_ms" in harness_src, (
-            "ext8 #67: harness.py LangFuse `m5.latency_ms` must read from "
+            "harness.py LangFuse `m5.latency_ms` must read from "
             "`jit_elapsed_ms`."
         )

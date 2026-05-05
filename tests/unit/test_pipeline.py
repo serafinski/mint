@@ -38,7 +38,7 @@ def seeded_registry(registry):
 
 @pytest.fixture
 def mock_loader():
-    """A ToolLoader mock — no real subprocess execution."""
+    """A ToolLoader mock with no real subprocess execution."""
     loader = MagicMock(spec=ToolLoader)
     return loader
 
@@ -167,8 +167,6 @@ def test_classifier_produces_one_classified_gap_per_unmatched(seeded_registry, m
     ClassifiedGap per unmatched required capability, and that distinct types
     can be assigned across gaps in the same task (mixed-type workflow).
     """
-    from unittest.mock import patch
-
     from src.orchestrator.classifier import classifier_node
     from src.orchestrator.gap_detection import gap_detection_node
     from src.schemas.capability import CapabilityType
@@ -229,33 +227,40 @@ def test_classifier_produces_one_classified_gap_per_unmatched(seeded_registry, m
     assert types == {CapabilityType.MCP_TOOL, CapabilityType.SKILL, CapabilityType.AGENT}
 
 
-def test_loading_then_optimize_preserves_non_end_goto():
-    """_loading_then_optimize logic: END → optimizer_node, anything else → preserved.
+def test_optimizer_loading_node_routes_through_real_pipeline_node(
+    seeded_registry, mock_loader
+):
+    """Optimizer-enabled loading_node rewrites only successful completion.
 
-    Tests the conditional goto logic directly rather than via LangGraph internals,
-    since StateNodeSpec is not directly callable from builder.nodes.
+    This exercises the actual closure installed by ``create_pipeline`` instead
+    of duplicating the routing logic in the test.
     """
     from langgraph.graph import END
     from langgraph.types import Command
 
+    from src.registry.metrics import MetricsStore
     from src.schemas.task import TaskState
 
-    # Replicate the _loading_then_optimize logic from pipeline.py
-    def _loading_then_optimize(loading_node_fn, state):
-        cmd = loading_node_fn(state)
-        next_node = "optimizer_node" if cmd.goto == END else cmd.goto
-        return Command(update=cmd.update, goto=next_node)
+    cases = [
+        (END, "optimizer_node"),
+        ("generate_mcp_tool", "generate_mcp_tool"),
+    ]
 
-    state = TaskState(task_description="test")
+    for loading_goto, expected_goto in cases:
+        state = TaskState(task_description=f"test {expected_goto}")
+        update = {"marker": expected_goto}
+        with patch(
+            "src.orchestrator.pipeline.loading_node",
+            return_value=Command(update=update, goto=loading_goto),
+        ) as mocked_loading:
+            builder = create_pipeline(
+                seeded_registry,
+                mock_loader,
+                run_optimizer=True,
+                metrics_store=MetricsStore(),
+            )
+            cmd = builder.nodes["loading_node"].runnable.invoke(state)
 
-    # END goto → replaced with optimizer_node
-    end_result = _loading_then_optimize(
-        lambda s: Command(update={}, goto=END), state
-    )
-    assert end_result.goto == "optimizer_node"
-
-    # Non-END goto -> preserved as-is.
-    retry_result = _loading_then_optimize(
-        lambda s: Command(update={}, goto="generate_mcp_tool"), state
-    )
-    assert retry_result.goto == "generate_mcp_tool"
+        assert cmd.goto == expected_goto
+        assert cmd.update == update
+        mocked_loading.assert_called_once_with(state, mock_loader, seeded_registry)

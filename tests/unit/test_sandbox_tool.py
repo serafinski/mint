@@ -1,7 +1,6 @@
 """Unit tests for src/verification/sandbox_tool.py.
 
-All tests mock subprocess.run — no Docker required.
-Integration tests that actually invoke Docker are marked @pytest.mark.integration.
+All tests mock subprocess.run; no Docker daemon is required.
 """
 
 import logging
@@ -430,8 +429,7 @@ class TestSandboxExecuteWithPackages:
     def test_extra_packages_triggers_install_phase(self):
         """With extra_packages, runs the 5-command install→commit→rm→exec→rmi sequence.
 
-        Tightened 2026-04-19: previously only asserted ``len >= 3`` which would
-        pass even if commit/rm/rmi were silently dropped. The install path in
+        The install path in
         ``_sandbox_execute_with_install`` must perform all five docker operations
         to commit the pip-installed layer and clean up the ephemeral image.
         """
@@ -475,7 +473,7 @@ class TestSandboxExecuteWithPackages:
 
 
 # ---------------------------------------------------------------------------
-# Step 14.12 — allow_network plumbing
+# allow_network plumbing
 # ---------------------------------------------------------------------------
 
 
@@ -498,9 +496,7 @@ class TestAllowNetworkFlag:
         assert captured[idx + 1] == "bridge"
 
     def test_allow_network_false_passes_none(self):
-        """Default (offline): ``--network none``. Regression guard for the
-        silent-revert scenario — if the flag defaults change, this fires.
-        """
+        """Default offline execution uses ``--network none``."""
         captured: list[str] = []
 
         def capture(*args, **kwargs):
@@ -515,8 +511,7 @@ class TestAllowNetworkFlag:
         assert captured[idx + 1] == "none"
 
     def test_allow_network_with_extra_packages_bridge_on_exec_phase(self):
-        """When extra_packages are installed, Phase 1 (install) always uses
-        bridge; Phase 2 (exec) honors allow_network.
+        """Package install uses bridge; code execution honors allow_network.
         """
         calls: list[list[str]] = []
 
@@ -539,17 +534,17 @@ class TestAllowNetworkFlag:
 
 
 # ---------------------------------------------------------------------------
-# Security audit finding #6 — PEP 508 requirement validation (2026-04-19)
+# PEP 508 requirement validation
 # ---------------------------------------------------------------------------
 
 
 class TestPep508RequirementValidation:
-    """The pre-fix regex false-rejected legitimate PEP 508 forms (compound
-    versions, extras, environment markers) and fell through to a no-install
-    ``sandbox_execute`` when ALL entries were rejected, masking the cause as
-    ``ModuleNotFoundError`` in the generated code. Post-fix uses
-    ``packaging.requirements.Requirement`` and loud-fails with a
-    ``pip_requirement_rejected`` field instead of silently falling through.
+    """Package validation accepts PEP 508 syntax and loud-fails invalid input.
+
+    Legitimate forms such as compound versions, extras, and environment markers
+    must reach the install path. Completely malformed inputs must return a
+    ``pip_requirement_rejected`` field instead of falling through to a
+    no-install sandbox run that would mask the dependency failure.
     """
 
     @pytest.mark.parametrize(
@@ -557,14 +552,14 @@ class TestPep508RequirementValidation:
         [
             "pandas",
             "pandas>=2.0",
-            "pandas>=2.0,<3",                  # compound version — regex rejected
-            "pydantic[email]",                 # extras — regex rejected
+            "pandas>=2.0,<3",
+            "pydantic[email]",
             "scikit-learn",
             "Flask-Login",
             "zope.interface",
             "package~=1.2",
-            'requests; python_version>="3.8"', # env marker — regex rejected
-            "pkg[a,b]>=1.0",                   # extras + version — regex rejected
+            'requests; python_version>="3.8"',
+            "pkg[a,b]>=1.0",
             "numpy==1.24.*",
         ],
     )
@@ -636,6 +631,7 @@ class TestPep508RequirementValidation:
         docker_cmds = [c for c in calls if c and c[0] == "docker"]
         # Install still fires (good subset is non-empty).
         assert len(docker_cmds) == 5
+        assert result["success"] is True
 
         # Install command's argv should carry pandas but not the malformed entry.
         install_cmd = docker_cmds[0]
@@ -683,16 +679,12 @@ class TestImportCheckSurfacesPipRequirementRejection:
 
 
 class TestSandboxExecuteInWorkspaceLoudFailsOnInvalidPackages:
-    """Security audit finding #14 (2026-04-20) — confirmation test that
-    the workspace-mount-drop fallback was closed as a side-effect of the
-    #6 fix. Pre-fix, ``sandbox_execute_in_workspace`` with all-invalid
-    extra_packages silently fell through to
-    ``sandbox_execute(code, timeout, allow_network)`` — **without** the
-    workspace mount — causing downstream code to fail with
-    FileNotFoundError inside the sandbox. Post-#6 the path returns a
-    ``pip_requirement_rejected`` loud-fail dict instead. This test locks
-    that invariant so a future refactor can't re-introduce the silent
-    fall-through."""
+    """Workspace execution loud-fails when all package requirements are invalid.
+
+    All-invalid ``extra_packages`` must return a ``pip_requirement_rejected``
+    dict before any Docker command runs. That keeps the mounted-workspace path
+    from silently degrading into an unmounted no-install execution.
+    """
 
     def test_all_invalid_packages_return_loud_fail_not_workspace_drop(self, tmp_path):
         from src.verification.sandbox_tool import sandbox_execute_in_workspace
@@ -712,13 +704,11 @@ class TestSandboxExecuteInWorkspaceLoudFailsOnInvalidPackages:
 
         # Loud-fail path: no docker commands, pip_requirement_rejected set.
         assert not any(c and c[0] == "docker" for c in calls), (
-            "Pre-#6, all-invalid packages silently dropped workspace "
-            "and called sandbox_execute(code, ...). Post-#6, no docker "
-            "call should fire at all — the loud-fail dict is returned "
-            "before any sandbox execution."
+            "All-invalid packages should return the loud-fail dict before any "
+            "sandbox execution."
         )
         assert result.get("pip_requirement_rejected"), (
-            "Missing pip_requirement_rejected — the #14 regression guard "
-            "requires the loud-fail dict shape."
+            "Missing pip_requirement_rejected; invalid package requirements "
+            "must be visible to callers."
         )
         assert result["success"] is False

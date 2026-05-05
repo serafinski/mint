@@ -149,9 +149,9 @@ _HYPHEN_CASE_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 # ``r"^[a-z][a-z0-9_]*$"`` — no leading underscore). Agent *node names* appear
 # as LangGraph node identifiers and as DeepAgent subagent keys where a
 # ``_private_subagents`` / ``_helper`` convention is meaningful, so a leading
-# underscore is allowed. MCP tool names must be PyPI-/import-safe module
-# identifiers (``tool_loader.load_tool`` uses them as Python module names in
-# the sandbox runner), which forbids leading underscores. Any future unifier
+# underscore is allowed. MCP tool names must stay import-safe because the
+# sandbox runner materializes generated source as Python modules, which
+# forbids leading underscores. Any future unifier
 # should preserve this difference — see
 # ``tests/unit/test_agent_generator.py::test_node_name_with_leading_underscore_is_valid``
 # and ``tests/unit/test_mcp_tool_generator.py::TestValidateToolName::test_starts_with_underscore``.

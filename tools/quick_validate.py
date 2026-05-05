@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Quick validation script for skills - minimal version.
+"""Validate generated Agent SKILL.md files.
 
-DeepAgents local skills are commonly located at:
-~/.deepagents/<agent>/skills/<skill-name>/
+The validator is used before generated skill content is accepted by the
+runtime. It can also be run directly against a skill directory.
 
 Example:
 ```python
-python quick_validate.py ~/.deepagents/agent/skills/my-skill
+python quick_validate.py data/eval/skills/my-skill
 ```
 """
 
@@ -18,7 +18,10 @@ import yaml
 
 
 def validate_skill(skill_path):
-    """Basic validation of a skill.
+    """Validate a directory containing a SKILL.md file.
+
+    Args:
+        skill_path: Path to a skill directory.
 
     Returns:
         Tuple of (is_valid, message) where is_valid is bool and message
@@ -43,22 +46,19 @@ def validate_skill(skill_path):
 
     frontmatter_text = match.group(1)
 
-    # ext8 #75 (2026-04-20): reject bodies containing bare-line '---'
-    # delimiters beyond the 2 frontmatter markers. DeepAgents' skill loader
-    # (or any downstream tool using ``yaml.safe_load_all``) splits on
-    # ``\n---\n`` → body content after the 3rd delimiter can be silently
-    # dropped. Count bare-line '---' occurrences; expect exactly 2 (open
-    # + close of frontmatter).
+    # Reject extra bare-line '---' delimiters beyond the two frontmatter
+    # markers. YAML document splitters can treat later delimiters as document
+    # boundaries and silently ignore body content after them.
     bare_delim_count = sum(
         1 for line in content.splitlines() if line.strip() == "---"
     )
     if bare_delim_count > 2:
         return False, (
             f"SKILL body contains {bare_delim_count - 2} extra bare-line "
-            "'---' delimiter(s) beyond the frontmatter markers. DeepAgents "
-            "may interpret body content after these as separate YAML "
-            "documents and drop it silently. Use '***' or "
-            "indented '---' for horizontal rules."
+            "'---' delimiter(s) beyond the frontmatter markers. Skill "
+            "loaders may interpret body content after these as separate "
+            "YAML documents and drop it silently. Use '***' or indented "
+            "'---' for horizontal rules."
         )
 
     # Parse YAML frontmatter
@@ -157,9 +157,9 @@ def validate_skill(skill_path):
                 ),
             )
 
-    # Tier 0 prose checks: hard-fail on patterns that are never legitimate
-    # in skill bodies. Deliberately literal — broad patterns like 'placeholder'
-    # would re-introduce the T04 false positive.
+    # Prose checks: hard-fail on patterns that are never legitimate in skill
+    # bodies. Deliberately literal so words like 'placeholder' remain valid
+    # when used in normal instructions.
     body_match = re.match(r"^---\n.*?\n---\n?(.*)$", content, re.DOTALL)
     body = body_match.group(1) if body_match else content
     if re.search(r"\blorem ipsum\b", body, re.IGNORECASE):
@@ -170,7 +170,7 @@ def validate_skill(skill_path):
         return False, "Skill body contains literal '# placeholder return' marker"
 
     # Body length warning (per Agent Skills spec: < 500 lines recommended).
-    # Does not fail validation — appended to the success message.
+    # Does not fail validation; appended to the success message.
     warnings: list[str] = []
     body_lines = body.count("\n") + (1 if body and not body.endswith("\n") else 0)
     if body_lines > 500:

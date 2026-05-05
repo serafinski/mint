@@ -1,8 +1,7 @@
 """Unit tests for the per-gap capability classifier.
 
-LLM-calling behaviour is covered by ``tests/integration/test_classifier.py``
-with real OpenAI calls.  These tests cover schema validation and the
-classifier node's routing logic (patching ``classify_gap``, not the LLM).
+These tests cover schema validation, mocked LLM success/failure paths, and
+the classifier node's routing logic.
 
 ``classifier_node`` iterates over ``state.gaps`` and calls ``classify_gap``
 per gap.
@@ -16,6 +15,7 @@ import pytest
 
 from src.orchestrator.classifier import (
     MAX_CLASSIFICATION_ATTEMPTS,
+    _enforce_file_writer_mcp_tool,
     classifier_node,
     classify_gap,
 )
@@ -24,6 +24,7 @@ from src.schemas.task import (
     ClassificationResult,
     ClassifiedGap,
     GapItem,
+    OutputContract,
     TaskState,
     TaskStatus,
 )
@@ -65,7 +66,7 @@ class TestClassificationResult:
         assert roundtripped.capability_name == "exploratory-analyzer"
 
     def test_capability_name_required(self):
-        """capability_name is a required field — missing it must raise."""
+        """capability_name is required; missing it must raise."""
         with pytest.raises(ValueError):
             ClassificationResult(
                 classified_type=CapabilityType.MCP_TOOL,
@@ -75,7 +76,7 @@ class TestClassificationResult:
 
 
 # ---------------------------------------------------------------------------
-# classify_gap — LLM success and failure paths (mocking _get_llm)
+# classify_gap: LLM success and failure paths (mocking _get_llm)
 # ---------------------------------------------------------------------------
 
 
@@ -162,7 +163,7 @@ class TestClassifyGap:
         """classify_gap does not pass a per-node callbacks config to structured_llm.invoke.
 
         The pipeline-level LangFuse CallbackHandler propagates automatically via
-        LangChain's contextvar inheritance — no per-node handler is needed.
+        LangChain's contextvar inheritance, so no per-node handler is needed.
         """
         mock_response = ClassificationResult(
             classified_type=CapabilityType.MCP_TOOL,
@@ -261,7 +262,7 @@ class TestClassifyGap:
 
 
 # ---------------------------------------------------------------------------
-# Classifier node — routing logic (patches classify_gap, not the LLM)
+# Classifier node: routing logic (patches classify_gap, not the LLM)
 # ---------------------------------------------------------------------------
 
 
@@ -383,7 +384,7 @@ class TestClassifierNode:
 
         mock_classify.assert_not_called()
         # No-op early-return path in classifier_node: the Command update
-        # contains only `status` — classified_gaps is NOT emitted, so the
+        # contains only `status`; classified_gaps is NOT emitted, so the
         # pre-existing state.classified_gaps (empty by default) stays intact.
         assert "classified_gaps" not in cmd.update
         assert cmd.update["status"] == TaskStatus.CLASSIFYING
@@ -466,7 +467,7 @@ class TestClassifierNode:
 
     def test_partial_classification_failure_flips_sticky_flag(self):
         """Mixed outcome: one gap classifies successfully, one fails retries.
-        Sticky flag still flips — any classification failure fails the task.
+        Sticky flag still flips because any classification failure fails the task.
         """
         state = TaskState(
             task_description="Parse CSV and summarize",
@@ -503,7 +504,7 @@ class TestClassifierNode:
         When ``state.gaps`` is empty, the node takes the no-op early-return
         branch (classifier.py lines 401-407) and emits only ``{"status": ...}``.
         It does NOT include ``errors`` in the Command update, which means
-        LangGraph keeps whatever ``state.errors`` held before the node ran —
+        LangGraph keeps whatever ``state.errors`` held before the node ran,
         i.e. the decomposition error stays on the task. This test locks in
         that exact non-overwrite contract.
         """
@@ -516,7 +517,7 @@ class TestClassifierNode:
 
         cmd = classifier_node(state)
 
-        # No-op branch does not touch errors — the key is absent from the
+        # No-op branch does not touch errors; the key is absent from the
         # Command update, so pre-existing errors on state survive untouched.
         assert "errors" not in cmd.update
 
@@ -661,7 +662,7 @@ class TestClassifierNode:
 
 
 # ---------------------------------------------------------------------------
-# File-writer override — structural safety net
+# File-writer override: structural safety net
 # ---------------------------------------------------------------------------
 
 
@@ -669,8 +670,6 @@ class TestEnforceFileWriterMcpTool:
     """Direct unit tests for the override helper."""
 
     def test_no_required_files_noop(self):
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
         gaps = [
             ClassifiedGap(
                 query="write-xlsx-file",
@@ -681,20 +680,16 @@ class TestEnforceFileWriterMcpTool:
             ),
         ]
         out, warnings = _enforce_file_writer_mcp_tool(gaps, [])
-        assert out == gaps  # identity — no mutation
+        assert out == gaps  # identity, no mutation
         assert warnings == []
 
     def test_empty_gaps_noop(self):
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
         out, warnings = _enforce_file_writer_mcp_tool([], ["output.csv"])
         assert out == []
         assert warnings == []
 
     def test_writer_classified_agent_gets_overridden(self):
-        """The T16 drift case — parent-task bias folded writer into AGENT."""
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
+        """Parent-task bias can fold a writer gap into AGENT."""
         gaps = [
             ClassifiedGap(
                 query="incident-triage-agent",
@@ -724,8 +719,6 @@ class TestEnforceFileWriterMcpTool:
         assert "Parent is agent-task" in out[1].rationale  # original preserved
 
     def test_writer_classified_skill_gets_overridden(self):
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
         gaps = [
             ClassifiedGap(
                 query="write-csv-file",
@@ -740,9 +733,7 @@ class TestEnforceFileWriterMcpTool:
         assert out[0].classified_type == CapabilityType.MCP_TOOL
 
     def test_writer_already_mcp_tool_noop(self):
-        """The T11 happy path — writer correctly classified; don't touch."""
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
+        """A writer already classified as MCP_TOOL is left unchanged."""
         gaps = [
             ClassifiedGap(
                 query="write-xlsx-file",
@@ -755,13 +746,11 @@ class TestEnforceFileWriterMcpTool:
         out, warnings = _enforce_file_writer_mcp_tool(gaps, ["output.xlsx"])
         assert warnings == []
         assert out[0].classified_type == CapabilityType.MCP_TOOL
-        # Rationale unchanged — no override note added.
+        # Rationale unchanged; no override note added.
         assert "override" not in out[0].rationale.lower()
 
     def test_non_writer_gap_not_touched(self):
         """Non-writer gaps (any classification) are left alone."""
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
         gaps = [
             ClassifiedGap(
                 query="parse-sales-csv",
@@ -784,8 +773,6 @@ class TestEnforceFileWriterMcpTool:
         assert out[1].classified_type == CapabilityType.SKILL
 
     def test_case_insensitive_write_prefix(self):
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
         gaps = [
             ClassifiedGap(
                 query="WRITE-XLSX-FILE",  # uppercase
@@ -800,14 +787,12 @@ class TestEnforceFileWriterMcpTool:
         assert out[0].classified_type == CapabilityType.MCP_TOOL
 
 
-class TestClassifierNodeWritererOverride:
-    """Integration-style — classifier_node wires the override correctly."""
+class TestClassifierNodeWriterOverride:
+    """classifier_node wires the file-writer override correctly."""
 
     @patch("src.orchestrator.classifier.classify_gap")
     def test_override_fires_when_contract_declares_files(self, mock_classify):
         """End-to-end: classifier LLM routes writer to AGENT, override fixes it."""
-        from src.schemas.task import OutputContract
-
         mock_classify.side_effect = [
             ClassifiedGap(
                 query="incident-triage-agent",
@@ -859,7 +844,7 @@ class TestClassifierNodeWritererOverride:
             required_capabilities=["write-csv-file"],
             gaps=[GapItem(query="write-csv-file", description="write-csv-file")],
             classified_gaps=[],
-            # No output_contract — override can't fire.
+            # No output_contract, so the override cannot fire.
         )
 
         cmd = classifier_node(state)

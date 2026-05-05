@@ -3,7 +3,7 @@
 Runs tasks through the evaluation harness and records results to a
 campaign-scoped DuckDB. Supports the 20-task testbed (T01-T20) across
 the four baseline conditions. Use ``--all-tasks --all-conditions
---n-runs 3`` for the frozen Stage 1 Chapter 6 matrix, and ``--tasks
+--n-runs 3`` for the frozen Stage 1 matrix, and ``--tasks
 T01,T07,...`` for targeted recovery/debug runs.
 
 Usage::
@@ -86,13 +86,12 @@ def _persisted_evaluation_run_count(db_path: str) -> int | None:
         return None
 
 
-# Security audit finding #103 (2026-04-19, ext10): SIGALRM-based
-# total-budget watchdog. Wraps a long-running ``harness.run_condition``
-# call so a hung Docker container or LangFuse-API stall can't silently
-# block an 18-hour campaign indefinitely. Unix-only (signal.SIGALRM is
-# unavailable on Windows). On budget exhaustion, raises BudgetExceeded
-# in the main thread — the caller is expected to log the partial
-# results recorded so far and skip the remaining work.
+# SIGALRM-based total-budget watchdog. Wraps a long-running
+# ``harness.run_condition`` call so a hung Docker container or LangFuse API
+# stall cannot block an unattended campaign indefinitely. Unix-only
+# (signal.SIGALRM is unavailable on Windows). On budget exhaustion, raises
+# BudgetExceeded in the main thread so the caller can log partial records and
+# skip the remaining work.
 class BudgetExceeded(BaseException):
     """Raised by the run-condition watchdog when the budget elapses."""
 
@@ -128,7 +127,7 @@ def _condition_budget_watchdog(
     def _on_alarm(_sig: int, _frame: object) -> None:
         raise BudgetExceeded(
             f"Condition '{condition}' exceeded {seconds}s budget — "
-            f"watchdog fired (security audit ext10 #103)"
+            f"watchdog fired"
         )
 
     prev_handler = signal.signal(signal.SIGALRM, _on_alarm)
@@ -157,15 +156,10 @@ def main() -> int:
       recorded (empty ``--tasks`` filter, harness setup failure, etc.).
     - ``5`` — per-task cycle_flush telemetry partially failed and
       ``--allow-partial-flush`` was not passed.
-    - ``7`` — watchdog fired on a condition (ext10 #103 + ext12 #115).
+    - ``7`` — watchdog fired on a condition.
       Partial records may have been persisted; downstream analyzers
       should gate on run-completeness before consuming. Distinct exit
       code so orchestrators can tell "aborted" from "clean success".
-
-    ext12 #115: previously ``main()`` returned ``None`` unconditionally
-    and the module entrypoint used bare ``main()`` — watchdog aborts
-    and empty-record campaigns exited 0, indistinguishable from a
-    successful campaign at the process-exit layer.
     """
     parser = argparse.ArgumentParser(description="JustInTimeMAS pilot evaluation runner")
     parser.add_argument(
@@ -202,15 +196,13 @@ def main() -> int:
         default=None,
         help="Path to save log output. If 'auto', generates timestamped file in data/logs/.",
     )
-    # ext7 #49 (2026-04-20): campaign isolation. Prior to this fix the DB path
-    # was a hardcoded constant — every invocation pooled into the same file.
     parser.add_argument(
         "--db",
         type=str,
         default=None,
         help="DuckDB path (default: data/eval/metrics_<timestamp>.duckdb — a fresh "
              "campaign-scoped path). Use an explicit path to re-use or wipe an "
-             "existing DB (see --fresh-db / --append). ext7 #49.",
+             "existing DB (see --fresh-db / --append).",
     )
     parser.add_argument(
         "--fresh-db",
@@ -232,46 +224,35 @@ def main() -> int:
              "next to --db (e.g. metrics_<ts>_metrics_store.duckdb). Pass "
              "'memory' for a debug-only in-memory MetricsStore.",
     )
-    # ext7 #48 (2026-04-20): condition-order randomization. Default is fixed
-    # order (deterministic, easier to debug + reproduce); opt-in when the
-    # campaign wants order-randomization as a methodology-purity measure.
     parser.add_argument(
         "--shuffle-conditions",
         action="store_true",
         help="Shuffle the condition execution order with --base-seed. "
              "Default: fixed order (full → no_verification → no_optimization "
-             "→ static). ext7 #48 methodology note: use this flag if Chapter "
-             "4.5 wants to eliminate time/order confounders (LangFuse latency "
-             "drift, Docker cache warmth) on M5 latency metrics.",
+             "→ static). Use this for order-randomization experiments where "
+             "time/order confounders matter.",
     )
     parser.add_argument(
         "--condition-budget-hours",
         type=float,
         default=6.0,
-        help="Wall-clock budget per condition (hours). Security audit ext10 "
-             "#103: SIGALRM-based watchdog around the harness call so a "
-             "hung Docker container or LangFuse-API stall can't silently "
-             "block the campaign indefinitely. Default 6h is comfortable "
-             "for direct runs; the frozen Stage 1 launcher passes 8h. "
-             "Set to 0 to disable the watchdog (NOT recommended for "
+        help="Wall-clock budget per condition (hours). Uses a SIGALRM watchdog "
+             "around the harness call so a hung Docker container or LangFuse "
+             "API stall cannot block the campaign indefinitely. Default 6h is "
+             "comfortable for direct runs; the frozen Stage 1 launcher passes "
+             "8h. Set to 0 to disable the watchdog (not recommended for "
              "unattended runs). Unix-only — no-op on Windows.",
     )
-    # ext14 #148 (2026-04-21): propagate FlushResult signal from the
-    # harness path. Pre-fix, the main eval runner exited 0 on partial
-    # per-task cycle_flush failures because the harness logged a WARNING
-    # but did not escalate.
-    # Reuses exit code 5 from ext13 #125 (the sibling fix that landed for
-    # longitudinal runners).
     parser.add_argument(
         "--allow-partial-flush",
         action="store_true",
-        help="ext14 #148: proceed with exit 0 even when per-task cycle_flush "
-             "partially failed. Default: refuse with exit 5. Thesis "
-             "disclosure REQUIRED.",
+        help="Proceed with exit 0 even when per-task cycle_flush partially "
+             "failed. Default: refuse with exit 5. Requires explicit result "
+             "disclosure.",
     )
     args = parser.parse_args()
 
-    # ext7 #49: resolve the DB path + refuse silent pooling.
+    # Resolve the DB path and refuse accidental pooling into stale campaign DBs.
     if args.fresh_db and args.append:
         print("ERROR: --fresh-db and --append are mutually exclusive.", file=sys.stderr)
         sys.exit(2)
@@ -280,14 +261,14 @@ def main() -> int:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         db_path = DATA_DIR / "eval" / f"metrics_{ts}.duckdb"
         # Fresh timestamped path — guaranteed empty.
-        print(f"ext7 #49: using fresh timestamped DB path: {db_path}")
+        print(f"using fresh timestamped DB path: {db_path}")
     else:
         db_path = Path(args.db)
 
     if db_path.exists() and db_path.stat().st_size > 0:
         if args.fresh_db:
             db_path.unlink()
-            print(f"ext7 #49: wiped existing DB at {db_path} per --fresh-db")
+            print(f"wiped existing DB at {db_path} per --fresh-db")
         elif not args.append:
             print(
                 f"ERROR: DB exists at {db_path} and is non-empty. Pass "
@@ -306,10 +287,10 @@ def main() -> int:
         base_metrics_store_path = Path(args.metrics_store)
     else:
         base_metrics_store_path = db_path.with_name(f"{db_path.stem}_metrics_store.duckdb")
-        print(f"ext8 #71: using campaign-scoped MetricsStore path: {base_metrics_store_path}")
+        print(f"using campaign-scoped MetricsStore path: {base_metrics_store_path}")
 
-    # ext7 #51: acquire the advisory lock on shared eval registry dirs. Retain
-    # the handle in a local so the OS releases on process exit.
+    # Acquire the advisory lock on shared eval registry dirs. Retain the handle
+    # in a local so the OS releases it on process exit.
     from scripts._eval_registry_lock import acquire_runner_lock
     _eval_lock = acquire_runner_lock(
         runner_name="run_pilot", data_dir=DATA_DIR / "eval",
@@ -356,13 +337,12 @@ def main() -> int:
         tasks = PILOT_TASKS
     conditions = ALL_CONDITIONS if args.all_conditions else [args.condition]
     if args.shuffle_conditions and len(conditions) > 1:
-        # ext7 #48: deterministic shuffle keyed on base_seed so a given seed
-        # always produces the same condition sequence — reproducible +
-        # order-free.
+        # Deterministic shuffle keyed on base_seed so a given seed always
+        # produces the same condition sequence.
         rng = random.Random(42)  # matches HarnessConfig.base_seed
         rng.shuffle(conditions)
         logger.info(
-            "ext7 #48: --shuffle-conditions active — condition order: %s",
+            "--shuffle-conditions active — condition order: %s",
             conditions,
         )
 
@@ -384,7 +364,7 @@ def main() -> int:
             if args.fresh_db:
                 condition_metrics_store_path.unlink()
                 print(
-                    f"ext8 #71: wiped existing MetricsStore at {condition_metrics_store_path} "
+                    f"wiped existing MetricsStore at {condition_metrics_store_path} "
                     f"for condition {condition} per --fresh-db",
                 )
             elif not args.append:
@@ -417,10 +397,8 @@ def main() -> int:
         logger.info("Snapshot: %s", snap_id)
 
         all_records = []
-        # ext12 #115: track watchdog-abort state so we can surface it as a
-        # non-zero process exit code. Pre-fix, a break-from-condition-loop
-        # fell through to the final summary + natural return, making a
-        # watchdog abort indistinguishable from a clean campaign at exit(0).
+        # Track watchdog-abort state so the process can return a dedicated
+        # non-zero exit code after the final summary.
         watchdog_aborted = False
         abort_condition: str | None = None
         for condition in conditions:
@@ -441,15 +419,10 @@ def main() -> int:
                 harness._config.metrics_store_path or ":memory:",
             )
 
-            # Security audit finding #103 (2026-04-19, ext10): wrap the
-            # synchronous harness call in a SIGALRM-based watchdog so a
-            # hung Docker container or stalled LangFuse API call can't
-            # block the campaign indefinitely. Watchdog raises
-            # ``BudgetExceeded`` in main thread on timeout; we log and
-            # skip the remaining conditions rather than abort the whole
-            # run (partial results from other conditions are preserved
-            # in the DB by the per-task ``record_run`` calls inside
-            # ``_execute_run``).
+            # Wrap the synchronous harness call in a SIGALRM-based watchdog.
+            # On timeout, log the abort and skip the remaining conditions.
+            # Partial task records are preserved in DuckDB by per-task
+            # ``record_run`` calls inside ``_execute_run``.
             budget_seconds = max(0, int(args.condition_budget_hours * 3600))
             watchdog_cm = (
                 _condition_budget_watchdog(
@@ -473,8 +446,8 @@ def main() -> int:
                     "Skipping the remaining conditions.",
                     condition, exc,
                 )
-                # ext12 #115: capture abort state so the process exits with
-                # a dedicated non-zero code (7) after the final summary.
+                # Capture abort state so the process exits with a dedicated
+                # non-zero code after the final summary.
                 watchdog_aborted = True
                 abort_condition = condition
                 break
@@ -540,9 +513,8 @@ def main() -> int:
         print(final_summary)
         logger.info("Final summary:\n%s", final_summary)
 
-        # ext14 #148 (2026-04-21): snapshot the harness's per-task
-        # FlushResult list BEFORE the ``with`` block closes the harness.
-        # The exit-code gate at the end of main() inspects this copy.
+        # Snapshot the harness's per-task FlushResult list before the ``with``
+        # block closes the harness. The exit-code gate below inspects this copy.
         harness_flush_results = list(harness.flush_results)
 
     # Flush LangFuse traces before exit
@@ -556,11 +528,11 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             pass
 
-    # ext12 #115: surface abort state as a non-zero exit code. Orchestrators
-    # (cron, CI, downstream analyzers) can then distinguish:
+    # Surface abort state as a non-zero exit code. Orchestrators and downstream
+    # analyzers can then distinguish:
     #   - 0: clean success with at least one record written
     #   - 4: zero records and no abort (filter/harness misconfig)
-    #   - 5: per-task cycle_flush partial failure (ext14 #148)
+    #   - 5: per-task cycle_flush partial failure
     #   - 7: watchdog fired mid-campaign (partial data persisted)
     if watchdog_aborted:
         logger.error(
@@ -578,17 +550,14 @@ def main() -> int:
         )
         return 4
 
-    # ext14 #148 (2026-04-21): per-task cycle_flush health gate. ext13 #125
-    # wired FlushResult into the longitudinal runners but not the main
-    # harness path. The harness accumulates every task's FlushResult; we
-    # snapshotted the list before the ``with`` block closed. Gate exit
-    # code on the aggregate here.
+    # Per-task cycle_flush health gate. The harness accumulates every task's
+    # FlushResult; we snapshotted the list before the ``with`` block closed.
+    # Gate the process exit code on the aggregate here.
     partial_flushes = [fr for fr in harness_flush_results if not fr.all_ok]
     if partial_flushes:
         logger.error(
-            "ext14 #148: %d/%d per-task cycle_flush operations partially "
-            "failed. Downstream M3 and longitudinal/plausibility checks "
-            "will see partial telemetry. Consider re-running or inspecting "
+            "%d/%d per-task cycle_flush operations partially failed. "
+            "Downstream analyses will see partial telemetry. Consider re-running or inspecting "
             "flush errors in the log. First error sample: %s",
             len(partial_flushes), len(harness_flush_results),
             partial_flushes[0].errors[:3] if partial_flushes[0].errors else "<no errors recorded>",
@@ -596,7 +565,7 @@ def main() -> int:
         if not args.allow_partial_flush:
             logger.error(
                 "Exiting with code 5. Pass --allow-partial-flush to "
-                "proceed with exit 0 (thesis disclosure REQUIRED)."
+                "proceed with exit 0 (explicit result disclosure required)."
             )
             return 5
 
@@ -604,10 +573,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # ext12 #115: ``sys.exit(main() or 0)`` makes the integer return value
-    # of ``main()`` the actual process exit code. ``main() or 0`` only
-    # matters for the happy path (``return 0``); any non-zero integer
-    # propagates verbatim. Pre-fix, ``if __name__ == "__main__": main()``
-    # dropped every return value on the floor and process exit was always
-    # 0 regardless of watchdog abort or empty-records outcome.
+    # Make the integer return value from ``main()`` the actual process exit
+    # code. ``main() or 0`` preserves the happy path and propagates non-zero
+    # outcomes verbatim.
     sys.exit(main() or 0)

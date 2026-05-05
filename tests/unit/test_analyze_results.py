@@ -1,14 +1,12 @@
 """Unit tests for scripts/analyze_results.py helpers.
 
-Covers three Chapter-6-load-bearing analyzer helpers:
+Covers analyzer helpers used by the evaluation reporting protocol:
 
-- ``print_latency_summary`` — Step 18.9 M5 time-to-first-correct filter
-  narrowing; exclude failed runs before aggregating.
-- ``_gini_coefficient`` + ``print_gini_summary`` — Step 18.5 M3 capability
-  reuse distribution (added 2026-04-19 after Step 13.5 audit surfaced
-  zero direct coverage for these helpers).
-- ``print_classification_accuracy`` — Step 18.5 Pillar 1 RQ #1 proxy
-  (task-level primary-type match); added 2026-04-19 for the same reason.
+- ``print_latency_summary``: exclude failed runs before aggregating
+  time-to-first-correct.
+- ``_gini_coefficient`` + ``print_gini_summary``: report capability reuse
+  concentration from invocation events.
+- ``print_classification_accuracy``: report task-level primary-type matches.
 
 All DB-reading tests use an in-memory ``EvaluationStore`` + direct
 ``_conn`` access. No Docker, no real LLM, hermetic.
@@ -37,9 +35,10 @@ from src.schemas.evaluation import EvaluationRecord  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _reset_analyze_results_module_state():
-    """ext7 #44/#52: reset module-level ``_SCOPE_SQL`` + ``_COMPLETENESS_BANNER``
-    around each test so ``main()``-invoking tests don't poison siblings
-    because a prior test left a run-id scope active).
+    """Reset mutable analyzer module state around each test.
+
+    Tests that invoke ``main()`` or set scope/banner globals must not leak
+    those values into sibling tests.
     """
     import scripts.analyze_results as _ar
 
@@ -89,7 +88,7 @@ def _record(
 def _open_in_memory_store() -> tuple[EvaluationStore, duckdb.DuckDBPyConnection]:
     """Return an EvaluationStore + its underlying connection (for direct queries)."""
     store = EvaluationStore()  # :memory: default
-    return store, store._conn  # noqa: SLF001 — test-only access
+    return store, store._conn  # noqa: SLF001 - test-only access
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +98,8 @@ def _open_in_memory_store() -> tuple[EvaluationStore, duckdb.DuckDBPyConnection]
 
 def test_filter_excludes_failed_runs(capsys):
     store, conn = _open_in_memory_store()
-    # Two successful runs at 1000ms and 3000ms → mean should be 2.0s.
-    # One failed run at 60000ms — MUST NOT pollute the mean.
+    # Two successful runs at 1000ms and 3000ms: mean should be 2.0s.
+    # One failed run at 60000ms must not pollute the mean.
     store.record_run(
         _record(
             condition="full",
@@ -120,7 +119,7 @@ def test_filter_excludes_failed_runs(capsys):
     store.record_run(
         _record(
             condition="full",
-            gate_passed=False,  # ← failed: must be excluded
+            gate_passed=False,  # failed: must be excluded
             output_in_range=False,
             latency_ms=60000,
         )
@@ -136,7 +135,7 @@ def test_filter_excludes_failed_runs(capsys):
 
 
 def test_filter_excludes_output_in_range_false(capsys):
-    """gate_passed=True alone is not enough — output_in_range must also be True."""
+    """gate_passed=True alone is not enough; output_in_range must also be True."""
     store, conn = _open_in_memory_store()
     store.record_run(
         _record(
@@ -146,7 +145,7 @@ def test_filter_excludes_output_in_range_false(capsys):
             latency_ms=2000,
         )
     )
-    # gate passed but output wrong-shape — still a failure, must be excluded.
+    # Gate passed but output is wrong-shape; still a failure, must be excluded.
     store.record_run(
         _record(
             condition="full",
@@ -201,12 +200,12 @@ def test_only_failed_runs_prints_no_successful_runs(capsys):
 
 
 # ---------------------------------------------------------------------------
-# Stdev edge cases — NaN-safe on n=1
+# Stdev edge cases - NaN-safe on n=1
 # ---------------------------------------------------------------------------
 
 
 def test_stdev_n_equals_one_renders_dash(capsys):
-    """Sample stdev over a single value is NULL — render as '-' not 'nan'."""
+    """Sample stdev over a single value is NULL; render as '-' not 'nan'."""
     store, conn = _open_in_memory_store()
     store.record_run(
         _record(
@@ -221,13 +220,16 @@ def test_stdev_n_equals_one_renders_dash(capsys):
 
     assert "nan" not in output.lower()
     # There should be a dash somewhere in the row for stdev.
-    lines = [l for l in output.splitlines() if "full" in l.lower() or "Full" in l]
-    assert any("-" in l for l in lines) or "      -" in output
+    lines = [
+        line for line in output.splitlines()
+        if "full" in line.lower() or "Full" in line
+    ]
+    assert any("-" in line for line in lines) or "      -" in output
 
 
 def test_stdev_n_equals_two_computes_real_number(capsys):
     store, conn = _open_in_memory_store()
-    # 1000ms + 3000ms → mean=2.0, stdev_sample = sqrt(2000000) ms = ~1414ms = 1.4s.
+    # 1000ms + 3000ms gives mean=2.0s and sample stdev about 1.4s.
     store.record_run(
         _record(
             condition="full",
@@ -256,7 +258,7 @@ def test_stdev_n_equals_two_computes_real_number(capsys):
 
 def test_pilot_rows_excluded_from_summary(capsys):
     store, conn = _open_in_memory_store()
-    # Pilot row — should be completely invisible (not summarized, not in excluded count).
+    # Pilot row should be invisible, not summarized or counted as excluded.
     store.record_run(
         _record(
             condition="full",
@@ -279,15 +281,13 @@ def test_pilot_rows_excluded_from_summary(capsys):
 
     assert "99.9" not in output  # pilot row's latency must not surface
     assert "2.0" in output  # real row's latency must surface
-    assert "Excluded: 0" in output  # pilot row isn't "excluded" — it's invisible
+    assert "Excluded: 0" in output  # pilot row is invisible, not excluded
 
 
 # ---------------------------------------------------------------------------
-# _gini_coefficient — pure function
+# _gini_coefficient - pure function
 #
-# Proposal §Metrics M3: "Capability reuse distribution — Gini coefficient
-# of invocation counts." These tests pin the formula against known-value
-# inputs + degenerate edges; zero coverage pre-2026-04-19.
+# These tests pin the formula against known-value inputs and degenerate edges.
 # ---------------------------------------------------------------------------
 
 
@@ -296,27 +296,27 @@ def test_gini_empty_returns_zero():
 
 
 def test_gini_all_zeros_returns_zero():
-    """Degenerate case: no invocations at all → perfectly equal at zero."""
+    """Degenerate case: no invocations at all is perfectly equal at zero."""
     assert _gini_coefficient([0, 0, 0]) == 0.0
 
 
 def test_gini_single_value_returns_zero():
-    """One capability, all invocations go to it → perfectly equal (n=1)."""
+    """One capability with all invocations is perfectly equal for n=1."""
     assert _gini_coefficient([42]) == 0.0
 
 
 def test_gini_perfect_equality_returns_zero():
-    """Every capability invoked exactly the same → Gini = 0."""
+    """Every capability invoked exactly the same has Gini = 0."""
     assert _gini_coefficient([5, 5, 5, 5]) == 0.0
 
 
 def test_gini_maximum_skew_approaches_one():
-    """One cap gets all traffic, others get nothing → Gini = (n-1)/n.
+    """One cap gets all traffic, others get nothing: Gini = (n-1)/n.
 
-    Formula: 2·Σ((i+1)·x_i) / (n·Σx) − (n+1)/n
+    Formula: 2 * sum((i + 1) * x_i) / (n * sum(x)) - (n + 1) / n
     For sorted [0, 0, 0, 10] with n=4, total=10:
-      cumulative = 1·0 + 2·0 + 3·0 + 4·10 = 40
-      Gini = 2·40 / (4·10) − 5/4 = 2.0 − 1.25 = 0.75
+      cumulative = 1*0 + 2*0 + 3*0 + 4*10 = 40
+      Gini = 2*40 / (4*10) - 5/4 = 2.0 - 1.25 = 0.75
     """
     assert _gini_coefficient([0, 0, 0, 10]) == 0.75
 
@@ -325,19 +325,19 @@ def test_gini_known_value_arithmetic_series():
     """Pin the formula against an arithmetic series [1, 2, 3, 4].
 
     Sorted=[1,2,3,4], n=4, total=10.
-      cumulative = 1·1 + 2·2 + 3·3 + 4·4 = 1 + 4 + 9 + 16 = 30
-      Gini = 2·30 / (4·10) − 5/4 = 1.5 − 1.25 = 0.25
+      cumulative = 1*1 + 2*2 + 3*3 + 4*4 = 1 + 4 + 9 + 16 = 30
+      Gini = 2*30 / (4*10) - 5/4 = 1.5 - 1.25 = 0.25
     """
     assert _gini_coefficient([1, 2, 3, 4]) == 0.25
 
 
 def test_gini_order_invariant():
-    """Gini is computed on sorted counts — input order must not change the result."""
+    """Gini is computed on sorted counts; input order must not change the result."""
     assert _gini_coefficient([4, 1, 3, 2]) == _gini_coefficient([1, 2, 3, 4])
 
 
 # ---------------------------------------------------------------------------
-# print_gini_summary — DB-reading
+# print_gini_summary - DB-reading
 # ---------------------------------------------------------------------------
 
 
@@ -360,18 +360,18 @@ def _record_invocations(
 
 
 def test_gini_summary_skipped_when_table_empty(capsys):
-    """Empty invocation_events → print 'skipped' message, no crash."""
+    """Empty invocation_events prints a skipped message and does not crash."""
     store, conn = _open_in_memory_store()
     print_gini_summary(conn)
     output = capsys.readouterr().out
-    # Table exists (fresh in-memory store) but is empty → "empty" path, not "not available".
+    # Table exists but is empty: use the "empty" path, not "not available".
     assert "Gini Coefficient" in output
     assert "skipped" in output.lower() or "empty" in output.lower()
 
 
 def test_gini_summary_reports_per_condition(capsys):
     store, conn = _open_in_memory_store()
-    # 'full' condition: skewed (one cap dominates) — but with counts_by_cap
+    # 'full' condition: skewed (one cap dominates), but with counts_by_cap
     # collapsing to list [10, 0, 0] per-run, skew is limited by how many
     # (cap, count>0) pairs exist; the GROUP BY in print_gini_summary filters
     # zero-count rows, so give each cap at least 1 invocation to exercise the
@@ -389,15 +389,15 @@ def test_gini_summary_reports_per_condition(capsys):
 
     assert "Gini Coefficient" in output
     # Condition labels are rendered via CONDITION_LABELS mapping:
-    # full → "JIT + Verif + Opt", static → "Static"
+    # full -> "JIT + Verif + Opt", static -> "Static".
     assert "JIT + Verif + Opt" in output
     assert "Static" in output
 
 
 def test_gini_summary_condition_with_no_data_shows_dash(capsys):
-    """Conditions absent from invocation_events should render '—'."""
+    """Conditions absent from invocation_events should render an em dash."""
     store, conn = _open_in_memory_store()
-    # Only populate 'full' — other conditions should show dashes
+    # Only populate 'full'; other conditions should show dashes.
     _record_invocations(
         store, run_id="r1", condition="full", task_id="T04",
         counts_by_cap={"cap-a": 3, "cap-b": 1},
@@ -405,12 +405,12 @@ def test_gini_summary_condition_with_no_data_shows_dash(capsys):
     print_gini_summary(conn)
     output = capsys.readouterr().out
 
-    # The em-dash is the renderer's sentinel for "no data".
-    assert "—" in output
+    # The em dash is the renderer's sentinel for "no data".
+    assert "\u2014" in output
 
 
 # ---------------------------------------------------------------------------
-# print_classification_accuracy — DB-reading
+# print_classification_accuracy - DB-reading
 # ---------------------------------------------------------------------------
 
 
@@ -443,7 +443,7 @@ def _eval_run(
 
 
 def test_classification_accuracy_skipped_when_no_rows(capsys):
-    """No non-pilot JIT-condition rows → print 'skipped', no crash."""
+    """No non-pilot JIT-condition rows prints skipped and does not crash."""
     store, conn = _open_in_memory_store()
     print_classification_accuracy(conn)
     output = capsys.readouterr().out
@@ -452,7 +452,7 @@ def test_classification_accuracy_skipped_when_no_rows(capsys):
 
 
 def test_classification_accuracy_excludes_static_baseline(capsys):
-    """Static condition bypasses the classifier — must not contribute to accuracy."""
+    """Static condition bypasses the classifier and must not affect accuracy."""
     store, conn = _open_in_memory_store()
     # T05 is authored as expected_type="mcp_tool" in tests/evaluation/tasks.py.
     # A 'static' row with WRONG type must be ignored.
@@ -461,12 +461,12 @@ def test_classification_accuracy_excludes_static_baseline(capsys):
     )
     print_classification_accuracy(conn)
     output = capsys.readouterr().out
-    # With only static rows, the classifier has no data → skipped.
+    # With only static rows, the classifier has no data.
     assert "skipped" in output.lower()
 
 
 def test_classification_accuracy_counts_correct_classification(capsys):
-    """Correct classification → high accuracy + confusion matrix diagonal."""
+    """Correct classification renders the accuracy section."""
     store, conn = _open_in_memory_store()
     # T05 expected_type is "mcp_tool". Record 3 matching runs under JIT conditions.
     for i, cond in enumerate(("full", "no_verification", "no_optimization")):
@@ -487,27 +487,25 @@ def test_classification_accuracy_counts_correct_classification(capsys):
 
 
 # ---------------------------------------------------------------------------
-# Security audit finding #17 — T19/T20 drop regression (2026-04-20)
+# Task catalog identity
 # ---------------------------------------------------------------------------
 
 
 def test_all_task_ids_match_testbed():
-    """Pre-fix, ``ALL_TASK_IDS = [f"T{i:02d}" for i in range(1, 19)]``
-    silently excluded T19 and T20 from every per-task table. Post-fix
-    it's imported from ``tests.evaluation.tasks.ALL_TASKS`` so any
-    testbed extension flows through automatically."""
+    """Analyzer task IDs should come from the evaluation task catalog."""
     from scripts.analyze_results import ALL_TASK_IDS
     from tests.evaluation.tasks import ALL_TASKS
 
     assert sorted(ALL_TASK_IDS) == sorted(t.task_id for t in ALL_TASKS)
-    # Testbed currently at 20 tasks (T01..T20); regression guard.
+    # Testbed currently has 20 tasks (T01..T20).
     assert "T19" in ALL_TASK_IDS
     assert "T20" in ALL_TASK_IDS
 
 
 def test_synthesis_task_ids_include_t19_and_t20():
     """Synthesis tasks are ALL_TASK_IDS minus retrieval (T01-T03).
-    With #17 fixed, synthesis now includes T19 + T20."""
+    The current catalog includes T19 and T20 as synthesis tasks.
+    """
     from scripts.analyze_results import RETRIEVAL_TASKS, SYNTHESIS_TASK_IDS
 
     assert "T19" in SYNTHESIS_TASK_IDS
@@ -518,20 +516,17 @@ def test_synthesis_task_ids_include_t19_and_t20():
 
 
 # ---------------------------------------------------------------------------
-# Security audit finding #32 — success predicate excludes shape mismatch
+# Success predicate excludes shape mismatch
 # ---------------------------------------------------------------------------
 
 
 def test_success_predicate_excludes_shape_mismatched_rows():
-    """Pre-fix, a row with gate_passed=True + output_in_range=True +
-    output_shape_mismatch=True counted as a success. Post-fix, the SUM
-    expression also requires NOT output_shape_mismatch. Regression
-    guard for finding #32."""
+    """Shape-mismatched rows are not counted as successes."""
     from scripts.analyze_results import query_condition_summary
 
     store, conn = _open_in_memory_store()
 
-    # Row A — genuine success (gate + range + no shape mismatch).
+    # Row A: genuine success (gate + range + no shape mismatch).
     rec_a = _record(
         condition="full",
         gate_passed=True,
@@ -539,7 +534,7 @@ def test_success_predicate_excludes_shape_mismatched_rows():
         latency_ms=1000,
         task_id="T04",
     )
-    # Row B — shape mismatch despite gate + range both True.
+    # Row B: shape mismatch despite gate + range both True.
     rec_b = _record(
         condition="full",
         gate_passed=True,
@@ -560,18 +555,18 @@ def test_success_predicate_excludes_shape_mismatched_rows():
     full_row = [r for r in summary if r["condition"] == "full"][0]
     assert full_row["n"] == 2
     assert full_row["successes"] == 1, (
-        f"Pre-fix, both rows counted as success (n=2, successes=2). "
-        f"Post-fix, row B (shape mismatch) excluded. Got successes={full_row['successes']}."
+        f"Shape-mismatched row should be excluded from success count. "
+        f"Got successes={full_row['successes']}."
     )
 
 
 # ---------------------------------------------------------------------------
-# Security audit finding #38 — run-id scoping (2026-04-20)
+# Run-id scoping
 # ---------------------------------------------------------------------------
 
 
 def test_resolve_scope_single_run_returns_empty_filter():
-    """DB with <=4 distinct run_ids → no scoping needed, empty filter."""
+    """DB with <= condition_count distinct run_ids needs no scope filter."""
     import scripts.analyze_results as ar
 
     store, conn = _open_in_memory_store()
@@ -601,15 +596,15 @@ def test_resolve_scope_explicit_run_ids_filters_sql(capsys):
 
 
 def test_resolve_scope_auto_selects_latest_when_many_runs_with_warning(capsys):
-    """Many distinct run_ids → stderr WARNING + auto-select N per condition.
+    """Many distinct run_ids emit a warning and auto-select per condition.
 
-    Rewritten post-ext7-#46: per-condition auto-select replaces "4 most recent".
-    With 6 single-condition runs and the default cap of 5, we expect 5 selected.
+    With 6 single-condition runs and the default cap of 3, we expect
+    3 selected run IDs.
     """
     import scripts.analyze_results as ar
 
     store, conn = _open_in_memory_store()
-    # 6 runs with the same condition — different run_ids via latency.
+    # 6 runs with the same condition, with different run_ids via latency.
     for i in range(6):
         rec = _record(
             condition="full", gate_passed=True, output_in_range=True,
@@ -622,12 +617,12 @@ def test_resolve_scope_auto_selects_latest_when_many_runs_with_warning(capsys):
     # WARNING emitted to stderr.
     assert "WARNING" in captured.err
     assert "per condition" in captured.err
-    # Default cap is 3; single condition present → 3 run_ids selected.
-    assert fragment.count("'") == 6  # 3 run_ids × 2 quotes each
+    # Default cap is 3; single condition present means 3 run_ids selected.
+    assert fragment.count("'") == 6  # 3 run_ids, 2 quotes each.
 
 
 # ---------------------------------------------------------------------------
-# ext7 #46 — auto-select must cover every condition, not fixed 4 total
+# Auto-select must cover every condition
 # ---------------------------------------------------------------------------
 
 
@@ -636,8 +631,7 @@ def test_auto_select_covers_all_conditions_in_canonical_eval_shape():
 
     The protocol default is now 3 run_ids per condition, so a canonical
     4-condition / 5-run-per-condition DB should auto-select 12 distinct
-    run_ids while still covering all 4 conditions. Pre-ext7-#46 a fixed
-    total cap could select only one condition's newest runs.
+    run_ids while still covering all 4 conditions.
     """
     import scripts.analyze_results as ar
 
@@ -661,7 +655,7 @@ def test_auto_select_covers_all_conditions_in_canonical_eval_shape():
     # Strip the leading " AND run_id IN (" and trailing ")".
     inner = fragment.split("IN (", 1)[1].rstrip(")")
     selected_ids = [s.strip().strip("'") for s in inner.split(",")]
-    assert len(selected_ids) == 12  # 3 per condition × 4 conditions
+    assert len(selected_ids) == 12  # 3 per condition, 4 conditions.
 
     conditions = conn.execute(
         "SELECT DISTINCT condition FROM evaluation_runs "
@@ -669,7 +663,7 @@ def test_auto_select_covers_all_conditions_in_canonical_eval_shape():
         selected_ids,
     ).fetchall()
     assert len(conditions) == 4, (
-        f"Auto-select must cover all 4 conditions (ext7 #46). "
+        f"Auto-select must cover all 4 conditions. "
         f"Got {len(conditions)}: {[c[0] for c in conditions]}"
     )
 
@@ -692,34 +686,28 @@ def test_auto_select_respects_per_condition_cap():
     fragment = ar._resolve_scope(
         conn, run_ids=None, since=None, per_condition_cap=2,
     )
-    # 2 conditions × 2 run_ids = 4 run_ids.
+    # 2 conditions, 2 run_ids each = 4 run_ids.
     assert fragment.count("'") == 8
 
 
 def test_auto_select_picks_n_distinct_run_ids_per_condition_at_production_density():
-    """ext12 #114 regression — canonical eval shape is 20 tasks per run
-    (one ``evaluation_runs`` row per task), NOT one row per run. Pre-fix
-    the CTE ranked ROWS via ``ROW_NUMBER()`` and then ``SELECT DISTINCT``
-    collapsed the result; at production density, ``rn <= 5`` picked 5
-    rows from the SINGLE most recent run_id per condition and DISTINCT
-    left exactly 1 run_id per condition = 4 total. The warning text
-    still promised "5 per condition".
+    """Auto-select ranks distinct run IDs, not task rows.
 
-    Post-fix: the inner ``distinct_runs`` CTE collapses to one row per
-    (run_id, condition) BEFORE ranking, so ``rn <= 5`` correctly selects
-    5 DISTINCT run_ids per condition = 20 total.
+    The canonical eval shape has one ``evaluation_runs`` row per task.
+    This test uses production density to ensure ``per_condition_cap=5``
+    selects 5 distinct run IDs for each of 4 conditions.
     """
     import scripts.analyze_results as ar
 
     store, conn = _open_in_memory_store()
     latency = 0
-    # 4 conditions × 5 runs × 20 tasks per run = 400 rows, 20 distinct run_ids.
+    # 4 conditions, 5 runs, 20 tasks per run = 400 rows, 20 distinct run_ids.
     for condition in ("full", "no_verification", "no_optimization", "static"):
         for run_idx in range(5):
             run_id = f"{condition}_run_{run_idx:02d}"
             for task_idx in range(20):
                 latency += 10
-                # Use a shared run_id across the 20 tasks — the production shape.
+                # Use a shared run_id across the 20 tasks: the production shape.
                 rec = _record(
                     condition=condition,
                     gate_passed=True,
@@ -733,11 +721,10 @@ def test_auto_select_picks_n_distinct_run_ids_per_condition_at_production_densit
     fragment = ar._resolve_scope(conn, run_ids=None, since=None, per_condition_cap=5)
     inner = fragment.split("IN (", 1)[1].rstrip(")")
     selected_ids = [s.strip().strip("'") for s in inner.split(",")]
-    # Post-fix: 5 run_ids per condition × 4 conditions = 20.
+    # 5 run_ids per condition, 4 conditions = 20.
     assert len(selected_ids) == 20, (
-        f"ext12 #114: expected 20 distinct run_ids (5 per × 4 conditions), "
-        f"got {len(selected_ids)}. Pre-fix would typically return 4 "
-        f"(rn <= 5 over 100 rows/condition picks rows from a single run)."
+        f"Expected 20 distinct run_ids (5 per condition, 4 conditions), "
+        f"got {len(selected_ids)}."
     )
     # Per-condition balance check.
     by_cond: dict[str, int] = {}
@@ -751,7 +738,7 @@ def test_auto_select_picks_n_distinct_run_ids_per_condition_at_production_densit
 
 
 def test_auto_select_no_scope_needed_when_few_runs():
-    """DB with ≤ condition_count distinct run_ids → legacy single-run mode
+    """DB with <= condition_count distinct run_ids uses empty scope
     (empty scope). The auto-select only kicks in when there are more run_ids
     than conditions.
     """
@@ -770,25 +757,21 @@ def test_auto_select_no_scope_needed_when_few_runs():
 
 
 # ---------------------------------------------------------------------------
-# ext7 #44 — M3 queries must honor _SCOPE_SQL
+# M3 queries must honor _SCOPE_SQL
 # ---------------------------------------------------------------------------
 
 
 def test_m3_gini_respects_scope_sql(capsys):
-    """Pre-fix, print_gini_summary read every row of invocation_events regardless
-    of --run-ids. Post-fix, rows outside the scope are excluded from the Gini
-    computation — the Chapter 6 M3 headline number no longer pools prior
-    campaigns silently.
-    """
+    """Rows outside the active run-id scope are excluded from Gini."""
     import scripts.analyze_results as ar
 
     store, conn = _open_in_memory_store()
-    # Old-campaign invocations — should be EXCLUDED when we scope to new_full.
+    # Old-campaign invocations should be excluded when scoped to new_full.
     _record_invocations(
         store, run_id="old_full", condition="full", task_id="T04",
         counts_by_cap={"cap-old-a": 10, "cap-old-b": 10},
     )
-    # New-campaign invocations — the only ones that should enter Gini.
+    # New-campaign invocations are the only rows that should enter Gini.
     _record_invocations(
         store, run_id="new_full", condition="full", task_id="T04",
         counts_by_cap={"cap-new-a": 5, "cap-new-b": 5, "cap-new-c": 5},
@@ -811,9 +794,7 @@ def test_m3_gini_respects_scope_sql(capsys):
 
 
 def test_m3_gini_ignores_scope_when_empty(capsys):
-    """Default (_SCOPE_SQL = "") keeps the un-scoped behavior — every row
-    enters Gini. Verifies the fix doesn't over-filter when no scope is set.
-    """
+    """Default (_SCOPE_SQL = "") keeps the un-scoped behavior."""
     import scripts.analyze_results as ar
 
     store, conn = _open_in_memory_store()
@@ -828,30 +809,29 @@ def test_m3_gini_ignores_scope_when_empty(capsys):
     ar._SCOPE_SQL = ""
     print_gini_summary(conn)
     output = capsys.readouterr().out
-    # Both conditions present — no scope filter dropped either run.
+    # Both conditions present; no scope filter dropped either run.
     assert "JIT + Verif + Opt" in output
     assert "Static" in output
 
 
 def test_every_analyzer_query_applies_scope_or_is_exempt():
-    """ext7 #44 regression guard: every `conn.execute(...)` in analyze_results.py
+    """Every scoped analyzer query must apply scope or be explicitly exempt.
+
+    Every `conn.execute(...)` in analyze_results.py
     that reads evaluation_runs or invocation_events must either reference
     _SCOPE_SQL OR be explicitly exempt (startup sanity checks, scope resolution
     itself). Catches future queries added without scope.
 
-    ext11 #110 (2026-04-20): extended to also recognize ``_scope_for_table(...)``
-    calls + local variables rebound from those calls (``scope_ie``, ``scope_ce``).
-    The helper is the table-aware wrapper introduced when ``--since`` scopes
-    crashed on ``invocation_events`` because ``_SCOPE_SQL`` hardcoded the
-    ``timestamp`` column.
+    The guard also recognizes ``_scope_for_table(...)`` calls and local
+    variables rebound from those calls (``scope_ie``, ``scope_ce``).
     """
     import ast
 
     src = (ROOT / "scripts" / "analyze_results.py").read_text()
     tree = ast.parse(src)
 
-    # Functions that are allowed to read evaluation_runs WITHOUT _SCOPE_SQL.
-    # Expand with care — every entry is a Chapter-6-integrity waiver.
+    # Functions that are allowed to read evaluation_runs without _SCOPE_SQL.
+    # Expand with care; every entry is an integrity waiver.
     SCOPE_EXEMPT = {
         "_resolve_scope",          # the scope-resolution call itself
         "_scope_for_table",        # the table-aware scope wrapper
@@ -861,7 +841,7 @@ def test_every_analyzer_query_applies_scope_or_is_exempt():
     SCOPED_TABLES = ("evaluation_runs", "invocation_events")
     # Any of these tokens in a f-string's placeholder expression counts as
     # explicit scope handling. Variable names are the ones used inside
-    # ``print_gini_summary`` after the ext11 #110 refactor.
+    # ``print_gini_summary``.
     SCOPE_TOKENS = ("_SCOPE_SQL", "_scope_for_table", "scope_ie", "scope_ce")
 
     # Collect (enclosing_fn_name, lineno, sql_snippet).
@@ -881,7 +861,7 @@ def test_every_analyzer_query_applies_scope_or_is_exempt():
                 and node.args
             ):
                 continue
-            # Extract the SQL literal — supports plain str + f-string.
+            # Extract the SQL literal; supports plain str and f-string.
             sql_arg = node.args[0]
             if isinstance(sql_arg, ast.Constant) and isinstance(sql_arg.value, str):
                 sql = sql_arg.value
@@ -904,12 +884,11 @@ def test_every_analyzer_query_applies_scope_or_is_exempt():
                 continue
 
             if not any(tbl in sql for tbl in SCOPED_TABLES):
-                # Query doesn't read a scoped table — pass.
+                # Query doesn't read a scoped table.
                 continue
             if any(tok in sql for tok in SCOPE_TOKENS):
                 continue
-            # Existence / availability probes (``SELECT 1 FROM t LIMIT 1``) don't
-            # aggregate scoped rows — they just check the table exists. Safe.
+            # Existence probes only check that the table exists.
             sql_upper = sql.upper().strip()
             if "SELECT 1 FROM" in sql_upper and "LIMIT 1" in sql_upper and "WHERE" not in sql_upper:
                 continue
@@ -918,24 +897,22 @@ def test_every_analyzer_query_applies_scope_or_is_exempt():
     assert not offenders, (
         "Every query reading evaluation_runs / invocation_events must reference "
         "_SCOPE_SQL or be explicitly exempt in SCOPE_EXEMPT. Offenders:\n"
-        + "\n".join(f"  {fn}:{lineno} — {sql}..." for fn, lineno, sql in offenders)
+        + "\n".join(f"  {fn}:{lineno} - {sql}..." for fn, lineno, sql in offenders)
     )
 
 
 # ---------------------------------------------------------------------------
-# ext7 #50 — invocation_events.is_pilot column + Gini filter
+# invocation_events.is_pilot column + Gini filter
 # ---------------------------------------------------------------------------
 
 
 def test_invocation_events_schema_has_is_pilot_column():
-    """ext7 #50: the schema regression guard. `is_pilot` column must exist so
-    the Gini query can filter pilot rows without a JOIN.
-    """
+    """The is_pilot column lets Gini filter pilot rows without a JOIN."""
     store, conn = _open_in_memory_store()
     cols = conn.execute("PRAGMA table_info(invocation_events)").fetchall()
     col_names = {row[1] for row in cols}
     assert "is_pilot" in col_names, (
-        "ext7 #50: invocation_events.is_pilot column missing. "
+        "invocation_events.is_pilot column missing. "
         f"Columns present: {sorted(col_names)}"
     )
 
@@ -964,18 +941,15 @@ def test_record_invocation_events_threads_is_pilot():
 
 
 def test_m3_gini_excludes_pilot_invocations(capsys):
-    """ext7 #50: pilot invocation rows are structurally excluded from the Gini
-    computation. Pre-fix, pilot rows from preflight/pilot runs silently deflated
-    Gini on the full campaign because the schema had no is_pilot marker.
-    """
+    """Pilot invocation rows are excluded from the Gini computation."""
     store, conn = _open_in_memory_store()
-    # Pilot invocations (narrow distribution — inflates measured concentration downward).
+    # Pilot invocations have a narrow distribution.
     _record_invocations_with_pilot(
         store, run_id="pilot_r", condition="full", task_id="T01",
         counts_by_cap={"cap-pilot-a": 5, "cap-pilot-b": 5, "cap-pilot-c": 5},
         is_pilot=True,
     )
-    # Non-pilot invocations (narrower: one cap dominates → high Gini).
+    # Non-pilot invocations have one dominant cap and high Gini.
     _record_invocations_with_pilot(
         store, run_id="full_r", condition="full", task_id="T01",
         counts_by_cap={"cap-full-a": 20, "cap-full-b": 1, "cap-full-c": 1},
@@ -983,7 +957,7 @@ def test_m3_gini_excludes_pilot_invocations(capsys):
     )
     print_gini_summary(conn)
     output = capsys.readouterr().out
-    # Pilot capability names must NOT appear in the Gini table — they were filtered.
+    # Pilot capability names must not appear in the Gini table.
     assert "cap-pilot" not in output
 
 
@@ -1002,7 +976,7 @@ def _record_invocations_with_pilot(
 
 
 # ---------------------------------------------------------------------------
-# ext7 #52 — completeness guard
+# Completeness guard
 # ---------------------------------------------------------------------------
 
 
@@ -1017,15 +991,13 @@ def test_completeness_banner_empty_when_not_incomplete(monkeypatch):
 
 
 def test_print_condition_table_includes_banner_when_set(capsys):
-    """ext7 #52: when main() sets _COMPLETENESS_BANNER, the per-table title
-    renders it inline.
-    """
+    """When main() sets _COMPLETENESS_BANNER, table titles render it inline."""
     import scripts.analyze_results as ar
     from scripts.analyze_results import print_condition_table
 
     ar._COMPLETENESS_BANNER = " [INCOMPLETE: total rows=200, expected 400]"
     try:
-        print_condition_table("Table 1: Success Rates — All Tasks", [])
+        print_condition_table("Table 1: Success Rates - All Tasks", [])
         captured = capsys.readouterr().out
         assert "[INCOMPLETE:" in captured
         assert "total rows=200" in captured
@@ -1034,7 +1006,7 @@ def test_print_condition_table_includes_banner_when_set(capsys):
 
 
 def _seed_partial_campaign(store, rows_per_condition: dict[str, int]) -> None:
-    """Seed a DB with a campaign of the given shape (condition → row count).
+    """Seed a DB with a campaign of the given shape (condition to row count).
 
     Every row is stamped with a single run_id per condition to keep the
     auto-select happy. Task IDs cycle through T01..T05 to spread the load.
@@ -1054,16 +1026,14 @@ def _seed_partial_campaign(store, rows_per_condition: dict[str, int]) -> None:
 
 
 def test_completeness_guard_refuses_partial_dataset(monkeypatch, capsys, tmp_path):
-    """ext7 #52: partial DB + no --allow-incomplete → exit 2 with a clear
-    'dataset appears incomplete' error.
+    """Partial DB + no --allow-incomplete returns exit 2.
 
-    ext13 #131 (2026-04-21): main() now returns the exit code rather
-    than calling ``sys.exit(2)`` directly; the __main__ wrapper does the
-    ``sys.exit(main() or 0)``. Assert on the return value.
+    The returned exit code is asserted directly instead of catching
+    ``SystemExit``.
     """
     import scripts.analyze_results as ar
 
-    # Build a partial DB (1 condition × 10 rows), save to temp path.
+    # Build a partial DB with 1 condition and 10 rows.
     db_path = tmp_path / "partial.duckdb"
     store = EvaluationStore(db_path=str(db_path))
     _seed_partial_campaign(store, {"full": 10})
@@ -1105,16 +1075,17 @@ def test_completeness_guard_allow_incomplete_proceeds_with_banner(monkeypatch, c
 
 
 def test_invocation_events_is_pilot_backfill_from_evaluation_runs(tmp_path):
-    """ext7 #50 migration: a legacy DB with pre-fix invocation_events rows
-    (is_pilot NULL) is backfilled on EvaluationStore open by JOINing
-    evaluation_runs.is_pilot.
+    """A DB missing invocation_events.is_pilot is backfilled on open.
+
+    This keeps older DuckDB files readable while preserving the current
+    Gini pilot-row filter.
     """
     import duckdb
 
-    db_path = tmp_path / "legacy.duckdb"
+    db_path = tmp_path / "older_shape.duckdb"
 
-    # Create a legacy-shape DB: evaluation_runs with is_pilot, invocation_events
-    # WITHOUT the is_pilot column (simulate pre-migration).
+    # Create an older-shape DB: evaluation_runs has is_pilot, while
+    # invocation_events does not.
     raw = duckdb.connect(str(db_path))
     raw.execute("""
         CREATE TABLE evaluation_runs (
@@ -1145,7 +1116,7 @@ def test_invocation_events_is_pilot_backfill_from_evaluation_runs(tmp_path):
     )
     raw.close()
 
-    # Re-open via EvaluationStore — migration + backfill fire.
+    # Re-open via EvaluationStore; migration + backfill fire.
     store = EvaluationStore(db_path=str(db_path))
     conn = store._conn  # noqa: SLF001
     rows = conn.execute(
@@ -1157,19 +1128,15 @@ def test_invocation_events_is_pilot_backfill_from_evaluation_runs(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# ext11 #109 — Gini prune-exclusion must not bleed across runs
+# Gini prune-exclusion must not bleed across runs
 # ---------------------------------------------------------------------------
 
 
 def test_gini_prune_exclusion_does_not_bleed_across_runs(capsys):
-    """Pre-fix (ext8 #78 one-shot), the prune subquery matched ``capability_id``
-    alone — pruning ``cap-x`` in run B erased run A's invocations of
-    ``cap-x`` from run A's Gini because the subquery pulled every pruned
-    cap across the whole DB. Post-ext11-#109, the subquery is correlated
-    on ``(capability_id, run_id)``; pruning in run B must not touch run A.
+    """Pruning in another run must not affect scoped Gini.
 
     Seed:
-    - run_A uses cap-x=100, cap-y=1 → expected Gini ≈ 0.4901.
+    - run_A uses cap-x=100, cap-y=1, so expected Gini is about 0.4901.
     - run_B prunes cap-x (no invocations needed).
 
     Scope analysis to run_A: Gini must match the un-pruned distribution.
@@ -1177,12 +1144,12 @@ def test_gini_prune_exclusion_does_not_bleed_across_runs(capsys):
     import scripts.analyze_results as ar
 
     store, conn = _open_in_memory_store()
-    # run_A — heavy use of cap-x plus one cap-y. Never pruned in this run.
+    # run_A: heavy use of cap-x plus one cap-y. Never pruned in this run.
     _record_invocations(
         store, run_id="run_A", condition="full", task_id="T04",
         counts_by_cap={"cap-x": 100, "cap-y": 1},
     )
-    # run_B — records a prune event for cap-x (no invocations of its own).
+    # run_B records a prune event for cap-x (no invocations of its own).
     store.record_cycle_events(
         run_id="run_B", condition="full", task_id="T04",
         events=[{"capability_id": "cap-x", "event_type": "pruned"}],
@@ -1195,30 +1162,24 @@ def test_gini_prune_exclusion_does_not_bleed_across_runs(capsys):
         ar._SCOPE_SQL = ""
     output = capsys.readouterr().out
 
-    # Pre-fix, cap-x was stripped → per-run Gini collapsed to [1] → 0.0.
-    # Post-fix, cap-x stays → Gini ≈ 0.49 (printed to 3 decimals).
+    # cap-x stays in run_A, so Gini is about 0.49 (printed to 3 decimals).
     assert "Gini Coefficient" in output
-    # The "0.490" token would appear in post-fix output; pre-fix showed "0.000".
     assert "0.490" in output, (
-        f"Expected run_A Gini ≈ 0.490 after ext11 #109 fix; got:\n{output}"
+        f"Expected run_A Gini about 0.490; got:\n{output}"
     )
 
 
 def test_gini_prune_exclusion_still_works_within_same_run(capsys):
-    """ext11 #109 must not regress ext8 #78: pruning a cap IN THE SAME RUN
-    still excludes that cap's ghost invocations from the Gini distribution.
-    The correlation on (capability_id, run_id) keeps within-run pruning
-    behaving as ext8 #78 intended.
-    """
+    """Pruning a cap in the same run excludes that cap from Gini."""
     import scripts.analyze_results as ar
 
     store, conn = _open_in_memory_store()
-    # run_A — heavy use of cap-x (100) + one cap-y.
+    # run_A: heavy use of cap-x (100) + one cap-y.
     _record_invocations(
         store, run_id="run_A", condition="full", task_id="T04",
         counts_by_cap={"cap-x": 100, "cap-y": 1},
     )
-    # Same run prunes cap-x — its ghost invocations must be excluded.
+    # Same run prunes cap-x, so its historical invocations are excluded.
     store.record_cycle_events(
         run_id="run_A", condition="full", task_id="T04",
         events=[{"capability_id": "cap-x", "event_type": "pruned"}],
@@ -1231,23 +1192,23 @@ def test_gini_prune_exclusion_still_works_within_same_run(capsys):
         ar._SCOPE_SQL = ""
     output = capsys.readouterr().out
 
-    # cap-x excluded → counts become [1] → Gini = 0.0 (single element / empty
+    # cap-x excluded: counts become [1] -> Gini = 0.0 (single element / empty
     # after zero-pad against the per-condition cap union which is {cap-y}).
     assert "Gini Coefficient" in output
     assert "0.000" in output
 
 
 # ---------------------------------------------------------------------------
-# ext11 #110 — --since scope must use `occurred_at` on invocation_events
+# --since scope must use occurred_at on invocation_events
 # ---------------------------------------------------------------------------
 
 
 def test_since_scope_uses_occurred_at_on_invocation_events(capsys):
-    """Pre-fix, ``_resolve_scope(since=...)`` returned a fragment
-    ``AND timestamp >= '...'`` which crashed the Gini query hard because
-    ``invocation_events`` uses ``occurred_at``. Post-ext11-#110 the
-    ``_scope_for_table`` helper rewrites the column for non-evaluation_runs
-    tables so the query runs cleanly.
+    """Since-scoped Gini rewrites timestamp filters to occurred_at.
+
+    ``invocation_events`` uses ``occurred_at`` rather than ``timestamp``,
+    so the table-aware scope helper must rewrite the fragment before the
+    query runs.
     """
     import scripts.analyze_results as ar
 
@@ -1258,10 +1219,10 @@ def test_since_scope_uses_occurred_at_on_invocation_events(capsys):
     )
 
     # Simulate a --since scope fragment; the exact timestamp is
-    # inconsequential — we just need the query to run instead of crashing.
+    # inconsequential; we just need the query to run instead of crashing.
     ar._SCOPE_SQL = " AND timestamp >= '1970-01-01T00:00:00'"
     try:
-        print_gini_summary(conn)  # Pre-fix: BinderException. Post-fix: clean.
+        print_gini_summary(conn)
     finally:
         ar._SCOPE_SQL = ""
     output = capsys.readouterr().out
@@ -1275,21 +1236,21 @@ def test_scope_for_table_rewrites_since_column_for_occurred_at_tables():
     """
     import scripts.analyze_results as ar
 
-    since_sql = " AND timestamp >= '2026-04-20T00:00:00'"
+    since_sql = " AND timestamp >= '2000-01-01T00:00:00'"
     run_ids_sql = " AND run_id IN ('r1', 'r2')"
 
     # --since rewrites for invocation_events / cycle_events, not evaluation_runs.
     assert ar._scope_for_table("invocation_events", since_sql) == (
-        " AND occurred_at >= '2026-04-20T00:00:00'"
+        " AND occurred_at >= '2000-01-01T00:00:00'"
     )
     assert ar._scope_for_table("cycle_events", since_sql) == (
-        " AND occurred_at >= '2026-04-20T00:00:00'"
+        " AND occurred_at >= '2000-01-01T00:00:00'"
     )
     assert ar._scope_for_table("evaluation_runs", since_sql) == since_sql
 
-    # --run-ids uses `run_id` — identical for all three tables.
+    # --run-ids uses run_id, identical for all three tables.
     for table in ("invocation_events", "cycle_events", "evaluation_runs"):
         assert ar._scope_for_table(table, run_ids_sql) == run_ids_sql
 
-    # Empty scope → empty scope, regardless of table.
+    # Empty scope remains empty, regardless of table.
     assert ar._scope_for_table("invocation_events", "") == ""

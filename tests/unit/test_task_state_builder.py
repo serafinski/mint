@@ -7,15 +7,13 @@ contracts and runner flags stay consistent across entry points.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(ROOT))
+from src.orchestrator.task_state_builder import build_initial_state
+from src.schemas.task import OutputContract
+from tests.evaluation.tasks import T01, T07
 
-from src.orchestrator.task_state_builder import build_initial_state  # noqa: E402
-from src.schemas.task import OutputContract  # noqa: E402
-from tests.evaluation.tasks import T01, T07  # noqa: E402
+ROOT = Path(__file__).parent.parent.parent
 
 
 def test_build_initial_state_threads_output_contract():
@@ -48,7 +46,7 @@ def test_build_initial_state_sets_allow_network():
 
 
 def test_longitudinal_runners_use_shared_builder():
-    """Regression guard for direct runner/harness TaskState construction.
+    """Runner and harness entry points use the shared TaskState builder.
 
     There must be no bare ``TaskState(task_description=...)`` in the eval
     harness or longitudinal runner; both entry points should use

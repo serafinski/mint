@@ -1,16 +1,12 @@
-"""Unit tests for src/orchestrator/composition.py — CompositionalExecutor."""
+"""Unit tests for src/orchestrator/composition.py and CompositionalExecutor."""
 
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 from src.orchestrator.composition import (
     CompositionalExecutor,
@@ -21,11 +17,9 @@ from src.schemas.task import (
     CapabilityReference,
     ChainResult,
     GeneratedArtifact,
-    GapItem,
     MatchItem,
     SubTask,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,7 +70,7 @@ def _make_match(name: str, cap_type: CapabilityType, score: float = 0.9) -> Matc
 
 
 def _make_task(
-    task_id: str = "T99",
+    task_id: str = "unit-task",
     fixture_paths: list[str] | None = None,
     task_prompt: str = "test task",
 ) -> SimpleNamespace:
@@ -168,10 +162,7 @@ class TestBuildExecutionOrder:
         assert order.index(2) < order.index(3)
 
     def test_cycle_fails_closed(self):
-        """Security audit finding #12 (2026-04-20): cycles return None
-        (fail-closed) instead of silently linearising. Pre-fix code
-        reported ``chain_success=True`` on what was actually a malformed
-        plan — now callers must handle None as a chain-fatal error."""
+        """Cycles return None so malformed DAGs fail closed."""
         subtasks = [
             _make_subtask("step 0", ["a"], depends_on=[1]),
             _make_subtask("step 1", ["b"], depends_on=[0]),
@@ -180,8 +171,7 @@ class TestBuildExecutionOrder:
         assert ex.build_execution_order() is None
 
     def test_out_of_range_depends_on_fails_closed(self):
-        """Reporter's repro: ``depends_on=[99]`` pre-fix hit IndexError
-        downstream. Post-fix build_execution_order returns None loudly."""
+        """Out-of-range dependencies return None instead of reaching execution."""
         subtasks = [
             _make_subtask("step 0", ["a"]),
             _make_subtask("step 1", ["b"], depends_on=[99]),
@@ -190,8 +180,7 @@ class TestBuildExecutionOrder:
         assert ex.build_execution_order() is None
 
     def test_negative_depends_on_fails_closed(self):
-        """Reporter's repro: ``depends_on=[-1]`` pre-fix phantom-executed
-        the last subtask. Post-fix negative indices fail closed."""
+        """Negative dependency indices fail closed."""
         subtasks = [
             _make_subtask("step 0", ["a"]),
             _make_subtask("step 1", ["b"], depends_on=[-1]),
@@ -209,8 +198,7 @@ class TestBuildExecutionOrder:
 
     def test_run_on_invalid_dag_returns_chain_failure(self):
         """End-to-end: run() with a cyclic DAG must return a
-        chain_success=False ChainResult with a descriptive reason —
-        not silently succeed via the old linear-fallback path."""
+        chain_success=False ChainResult with a descriptive reason."""
         subtasks = [
             _make_subtask("step 0", ["a"], depends_on=[1]),
             _make_subtask("step 1", ["b"], depends_on=[0]),
@@ -421,7 +409,7 @@ class TestChainExecution:
 
     @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
     def test_linear_mcp_tool_chain(self, mock_exec):
-        """Three MCP_TOOL steps in sequence — verify workspace state passing."""
+        """Three MCP_TOOL steps in sequence verify workspace state passing."""
         mock_exec.side_effect = [
             {"parsed": [1, 2, 3]},
             {"enriched": [10, 20, 30]},
@@ -473,11 +461,10 @@ class TestChainExecution:
     def test_mcp_tool_receives_transitive_upstream_closure(self, mock_exec):
         """Downstream MCP tools should see all ancestor outputs, not just direct deps.
 
-        T12 exposed a contract mismatch: decomposition/generation treat
-        ``requires_upstream_keys`` as satisfiable by transitive predecessors, but
-        the executor previously passed only direct ``depends_on`` indices into the
-        MCP sandbox. The final summary step therefore lost counts produced two
-        hops earlier even though the chain was deemed coherent.
+        Decomposition and generation treat ``requires_upstream_keys`` as
+        satisfiable by transitive predecessors. The executor must pass the full
+        ancestor closure into the MCP sandbox so downstream summary steps can
+        read values produced several hops earlier.
         """
         mock_exec.side_effect = [
             {"raw_rows": []},
@@ -539,7 +526,7 @@ class TestChainExecution:
 
     @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
     def test_mid_chain_failure(self, mock_exec):
-        """Step 1 returns empty dict → chain fails at step 1."""
+        """Step 1 returns empty dict, so the chain fails at step 1."""
         mock_exec.side_effect = [{"parsed": True}, {}]
 
         arts = [
@@ -575,7 +562,7 @@ class TestChainExecution:
         assert len(chain_result.step_results) == 2
 
     def test_unresolved_capability_fails_chain(self):
-        """Step with no resolution → chain fails immediately."""
+        """A step with no resolution fails immediately."""
         subtasks = [_make_subtask("step", ["missing-cap"])]
         ex = self._make_chain_executor(
             subtasks=subtasks, resolution={}, artifacts=[],
@@ -587,7 +574,7 @@ class TestChainExecution:
     @patch("tests.evaluation.execution.execute_skill_artifact")
     @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
     def test_mixed_type_chain(self, mock_mcp, mock_skill):
-        """MCP_TOOL → SKILL chain — HP4 scenario."""
+        """MCP_TOOL to SKILL chains pass upstream output via fixture contents."""
         mock_mcp.return_value = {"parsed_data": [1, 2, 3]}
         mock_skill.return_value = {"analysis": "done", "score": 0.95}
 
@@ -629,7 +616,7 @@ class TestChainExecution:
     @patch("tests.evaluation.execution.execute_agent_artifact")
     @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
     def test_mcp_tool_to_agent_chain(self, mock_mcp, mock_agent):
-        """MCP_TOOL → AGENT chain — verifies fixture injection for agents."""
+        """MCP_TOOL to AGENT chains pass upstream output via fixture contents."""
         mock_mcp.return_value = {"data": [1, 2]}
         mock_agent.return_value = {"investigation": "complete"}
 
@@ -673,8 +660,7 @@ class TestChainExecution:
         steps receive a ``{filename: content}`` dict. A regression that
         blurred this boundary (e.g. handed MCP_TOOL a fixture_contents dict
         or SKILL a raw Path) would silently break fixture access without
-        tripping any of the happy-path chain tests. Phase 3.5c established
-        this routing; keep it guarded.
+        tripping any of the happy-path chain tests.
         """
         mock_mcp.return_value = {"data": [1, 2, 3]}
         mock_skill.return_value = {"analysis": "done"}
@@ -713,7 +699,7 @@ class TestChainExecution:
         # Positional args carry no dict either.
         for arg in mock_mcp.call_args.args:
             assert not isinstance(arg, dict), (
-                "MCP_TOOL step received a dict — should only get workspace Path + source code"
+                "MCP_TOOL step received a dict; should only get workspace Path + source code"
             )
 
         # SKILL backend: third positional arg is the fixture_contents dict.
@@ -805,7 +791,7 @@ class TestChainExecution:
         assert not known_ws.exists()
 
 
-    # --- Step 13: agent execution timeout/error propagation -----------
+    # Agent execution timeout/error propagation.
 
     @patch("tests.evaluation.execution.execute_agent_artifact")
     def test_agent_timeout_populates_failed_step_reason(self, mock_agent):
@@ -916,7 +902,7 @@ class TestChainExecution:
     @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
     def test_non_agent_failure_leaves_reason_none(self, mock_exec):
         """An empty MCP_TOOL step output fails the chain but does NOT set
-        ``failed_step_reason`` — the reason slot is reserved for structured
+        ``failed_step_reason``; the reason slot is reserved for structured
         backend meta, not generic "empty output" outcomes."""
         mock_exec.return_value = {}
 
@@ -958,7 +944,7 @@ class TestMatchToArtifact:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3.5b: subagent_gap_queries in resolution map
+# subagent_gap_queries in resolution map
 # ---------------------------------------------------------------------------
 
 
@@ -1005,9 +991,9 @@ class TestResolutionMapSubagentGapQueries:
             matches=[match],
             artifacts=[lead],
         )
-        # profile-data → lead (no match)
+        # profile-data resolves to lead because there is no registry match.
         assert resolution["profile-data"].capability_name == "lead-investigator"
-        # detect-anomalies → registry match (higher priority)
+        # detect-anomalies resolves to the higher-priority registry match.
         assert resolution["detect-anomalies"].capability_name == "detect-anomalies"
         assert resolution["detect-anomalies"].source == "registry"
 
@@ -1049,8 +1035,6 @@ class TestLeadDedup:
         )
 
         call_count = 0
-        original_execute = executor._execute_step
-
         def counting_execute(*args, **kwargs):
             nonlocal call_count
             call_count += 1
@@ -1066,13 +1050,11 @@ class TestLeadDedup:
         assert result.step_results[0] == result.step_results[1]
 
     def test_lead_cache_hit_does_not_record_phantom_invocation(self):
-        """Security audit finding #29 (2026-04-20) regression guard.
+        """Cache-hit lead subtasks must not record phantom invocations.
 
-        When a lead AGENT covers 2 subtasks, the optimizer's _execute_step
-        runs once and the second subtask uses the cached output. Pre-fix,
-        ``_record_step_invocation`` ran for BOTH subtasks, inflating
-        per-cap invocation counts by the lead-reuse factor. Post-fix
-        the cache-hit subtask skips recording.
+        When a lead AGENT covers 2 subtasks, ``_execute_step`` runs once
+        and the second subtask uses the cached output. The cache-hit subtask
+        skips invocation recording so utility metrics count real executions.
         """
         from src.registry.metrics import MetricsStore
 
@@ -1113,32 +1095,28 @@ class TestLeadDedup:
             executor, "_execute_step",
             return_value={"result": "ok", "output_data": "something"},
         ):
-            executor.run(task_id="T29")
+            executor.run(task_id="lead-cache")
 
-        # Exactly ONE invocation row — the cache-hit subtask didn't
-        # phantom-record. Pre-fix would have been 2.
+        # Exactly ONE invocation row: the cache-hit subtask did not run.
         invocations = metrics._conn.execute(
             "SELECT COUNT(*) FROM invocations WHERE capability_id = 'lead-agent-29'"
         ).fetchone()[0]
         assert invocations == 1, (
             f"Expected 1 invocation (cache-hit subtask must skip recording). "
-            f"Got {invocations} — pre-fix phantom-row bug."
+            f"Got {invocations}."
         )
 
 
 # ---------------------------------------------------------------------------
-# File output support (B3)
+# File output support
 # ---------------------------------------------------------------------------
 
 
 class TestCollectOutputFiles:
-    """Tests for _collect_output_files — collecting non-intermediate files from workspace.
+    """Tests for collecting non-intermediate files from the workspace.
 
-    Post-2026-04-16 refinement: the collector is format-agnostic and picks up
-    any file at the workspace root that isn't a known intermediate
-    (``step_N_output.json``). Previously it only matched stem ``"output"``,
-    which silently dropped ``report.md`` / ``summary.txt`` / any non-``output.*``
-    filename that the decomposer's Rule 15 writer produced.
+    The collector is format-agnostic and picks up any root-level file that
+    is not a known intermediate ``step_N_output.json`` file.
     """
 
     def test_collects_output_csv(self, tmp_path):
@@ -1148,7 +1126,7 @@ class TestCollectOutputFiles:
         (ws / "output.csv").write_bytes(csv_content)
         # step_N_output.json intermediates are NOT collected.
         (ws / "step_0_output.json").write_text("{}")
-        # Other files ARE now collected (post-2026-04-16 fix).
+        # Other root-level files are collected too.
         (ws / "data.txt").write_text("hello")
 
         result = CompositionalExecutor._collect_output_files(ws)
@@ -1168,12 +1146,7 @@ class TestCollectOutputFiles:
         assert "output.xlsx" in result
 
     def test_collects_report_md(self, tmp_path):
-        """Regression guard for T16 rerun (2026-04-16 15:51).
-
-        The writer MCP_TOOL wrote ``/workspace/report.md`` correctly but the
-        previous stem-only filter silently dropped it. Rule 15 writers can
-        produce any filename; the collector must honor that.
-        """
+        """Writer steps can emit non-output-prefixed filenames."""
         ws = tmp_path / "workspace"
         ws.mkdir()
         md_content = b"# Incident Summary\n\n| metric | onset |\n|---|---|\n"
@@ -1190,7 +1163,7 @@ class TestCollectOutputFiles:
         assert result == {}
 
     def test_step_intermediates_skipped(self, tmp_path):
-        """step_N_output.json files are executor intermediates — don't collect."""
+        """step_N_output.json files are executor intermediates; do not collect."""
         ws = tmp_path / "workspace"
         ws.mkdir()
         (ws / "step_0_output.json").write_text("{}")
@@ -1323,27 +1296,26 @@ class TestEmbeddedFileExtraction:
 
 
 # ---------------------------------------------------------------------------
-# §12 finding #12 — AGENT/SKILL output_schema runtime compliance check
+# AGENT/SKILL output_schema runtime compliance check
 # ---------------------------------------------------------------------------
 
 # NOTE: TestBuildSchemaContext moved to tests/unit/test_generator_utils.py
-# (Batch 02b audit — file-placement fix; build_schema_context lives in
-# src/orchestrator/generators/utils.py, not composition.py).
+# because build_schema_context lives in src/orchestrator/generators/utils.py,
+# not composition.py.
 
 
 class TestAgentOutputSchemaRuntimeCheck:
-    """Runtime validator — Layer 2 of the finding #12 defense.
+    """Runtime checks for AGENT/SKILL output_schema compliance.
 
-    Layer 1 (dynamic response_format in execute_agent_artifact) is
-    tested in tests/unit/test_execution.py::TestBuildDynamicResultModel
-    and TestExecuteAgentArtifactDynamicResponseFormat.
+    Dynamic response_format behavior in execute_agent_artifact is tested in
+    tests/unit/test_execution.py.
     """
 
     @patch("tests.evaluation.execution.execute_agent_artifact")
     def test_agent_missing_schema_keys_fails_chain(self, mock_agent):
         """When AGENT output omits declared output_schema keys, chain fails."""
-        # AGENT returns task-level keys only — missing `metrics_table`
-        # that the decomposer declared. Reproduces the T16 2nd-run failure.
+        # AGENT returns task-level keys only, missing the decomposer-declared
+        # metrics_table handoff key.
         mock_agent.return_value = {
             "root_cause_metric": "db_connections",
             "cascade_chain": ["a", "b"],
@@ -1354,7 +1326,7 @@ class TestAgentOutputSchemaRuntimeCheck:
             required_capabilities=["incident-triage"],
             depends_on=[],
             output_schema={
-                "metrics_table": "list[dict] — each with metric, onset",
+                "metrics_table": "list[dict] with metric and onset",
                 "root_cause_metric": "str",
                 "cascade_chain": "list[str]",
             },
@@ -1423,7 +1395,7 @@ class TestAgentOutputSchemaRuntimeCheck:
 
     @patch("tests.evaluation.execution.execute_mcp_tool_in_chain")
     def test_mcp_tool_bypasses_runtime_check(self, mock_mcp):
-        """MCP_TOOL output is deterministic — runtime check only fires for AGENT/SKILL.
+        """MCP_TOOL output is deterministic; runtime check only fires for AGENT/SKILL.
 
         If an MCP_TOOL returns fewer keys than output_schema declared, that's
         a bug in the generated code and shows up as a KeyError downstream,
@@ -1457,19 +1429,16 @@ class TestAgentOutputSchemaRuntimeCheck:
 
         result = ex.run()
         # MCP_TOOL output missing declared keys still lets the chain succeed
-        # at this step — the runtime validator skips MCP_TOOL.
+        # at this step; the runtime validator skips MCP_TOOL.
         assert result.chain_success is True
 
     def test_union_output_schema_lead_with_subagents(self):
         """Union spans every subtask resolving to the same artifact.
 
-        T16 third-run failure: decomposer produced 5 subtasks, 4 AGENT
-        gaps collapsed into lead+subagents. Using the first subtask's
-        narrow schema as response_format forced the lead to produce only
-        parse-YAML keys, rejecting its natural aggregated output.
-
-        The union fix: combine all 4 collapsed subtasks' schemas so the
-        response_format captures every key the lead naturally produces.
+        When several decomposed gaps collapse into one lead+subagents
+        artifact but downstream handoffs still exist, the executor combines
+        the covered subtasks' schemas so the response model includes every
+        key the lead must hand off.
         """
         subtasks = [
             SubTask(
@@ -1574,11 +1543,10 @@ class TestAgentOutputSchemaRuntimeCheck:
     def test_fully_collapsed_lead_uses_task_level_model(self, mock_exec, tmp_path):
         """Lead-only tasks should not validate against conceptual handoff schemas.
 
-        T08/T10 style failure: all subtasks collapsed into one lead-with-
-        subagents artifact, but the runtime still built a response model from
-        the union of every conceptual subtask's output_schema. The lead then
-        failed structured-output validation for omitting intermediate fields
-        that never cross a real runtime boundary.
+        When all subtasks collapse into one lead-with-subagents artifact, no
+        real runtime handoff exists between conceptual subtasks. The lead
+        should use the task-level model instead of the union of every
+        conceptual subtask schema.
         """
         mock_exec.return_value = {
             "n_rows": 15,
@@ -1634,7 +1602,7 @@ class TestAgentOutputSchemaRuntimeCheck:
             artifacts=[art],
             matches=[],
             fixture_paths=[],
-            task=_make_task(task_id="T08"),
+            task=_make_task(task_id="fully-collapsed"),
         )
 
         workspace = tmp_path / "ws"
@@ -1706,7 +1674,7 @@ class TestAgentOutputSchemaRuntimeCheck:
             artifacts=[lead, writer],
             matches=[],
             fixture_paths=[],
-            task=_make_task(task_id="T16"),
+            task=_make_task(task_id="partially-collapsed"),
         )
 
         workspace = tmp_path / "ws"
@@ -1783,7 +1751,7 @@ class TestAgentOutputSchemaRuntimeCheck:
             artifacts=[art],
             matches=[],
             fixture_paths=[],
-            task=_make_task(task_id="T08"),
+            task=_make_task(task_id="fully-collapsed-run"),
         )
 
         result = executor.run()
@@ -1861,14 +1829,12 @@ class TestAgentOutputSchemaRuntimeCheck:
 
 
 class TestRecordStepInvocationPopulatesFields:
-    """Regression guards for docs/invocation_recording_gap_2026_04_19.md.
+    """Guards for compositional invocation records used by optimizer feedback.
 
-    The pre-fix writer left input_args and actual_output as None, which
-    silently excluded every production row from MetricsStore.get_recent_failures
-    (WHERE input_args IS NOT NULL), making the Pillar 3 Split coverage
-    verifier + failure-informed prompt structurally dead on real telemetry.
-    These tests assert the post-fix writer populates the fields that Split
-    depends on, and that error-shaped outputs are recorded as failures.
+    ``input_args`` and ``actual_output`` must be populated for failed
+    non-initial chain steps so ``MetricsStore.get_recent_failures`` can feed
+    failure-informed optimizer prompts. Error-shaped outputs must also be
+    recorded as failures, not successes.
     """
 
     def _make_executor_with_metrics(self, metrics_store):
@@ -1902,7 +1868,7 @@ class TestRecordStepInvocationPopulatesFields:
         output = {"error": "downstream function crashed on empty CSV"}
 
         ex._record_step_invocation(
-            ref, output, latency_ms=12.5, task_id="T99",
+            ref, output, latency_ms=12.5, task_id="unit-task",
             upstream_outputs=upstream,
         )
 
@@ -1919,8 +1885,7 @@ class TestRecordStepInvocationPopulatesFields:
         assert rec.success is False
 
     def test_error_shaped_output_recorded_as_failure(self):
-        """{'error': '...'} must be recorded as success=False, not True —
-        pre-fix bool(output) treated non-empty error dicts as successes."""
+        """{'error': '...'} must be recorded as success=False, not True."""
         from src.registry.metrics import MetricsStore
 
         metrics = MetricsStore(db_path=":memory:")
@@ -1928,7 +1893,7 @@ class TestRecordStepInvocationPopulatesFields:
 
         output = {"error": "tool raised something"}
         ex._record_step_invocation(
-            ref, output, latency_ms=1.0, task_id="T99",
+            ref, output, latency_ms=1.0, task_id="unit-task",
             upstream_outputs={0: {"x": 1}},
         )
 
@@ -1947,17 +1912,18 @@ class TestRecordStepInvocationPopulatesFields:
         # Real tool output: no 'error'/'exception'/'traceback'/'sandbox_error' key.
         output = {"error_count": 0, "total_rows": 100}
         ex._record_step_invocation(
-            ref, output, latency_ms=1.0, task_id="T99",
+            ref, output, latency_ms=1.0, task_id="unit-task",
             upstream_outputs={0: {"x": 1}},
         )
 
-        # Row recorded as success — get_recent_failures returns nothing.
+        # Row recorded as success, so get_recent_failures returns nothing.
         failures = metrics.get_recent_failures("thing-doer")
         assert len(failures) == 0
 
     def test_empty_upstream_serializes_to_none(self):
-        """Empty dict upstream (step 0 with no prior outputs) → input_args=None.
-        That's intentional — step-0 rows aren't usable as replay probes
+        """Empty dict upstream (step 0 with no prior outputs) gives input_args=None.
+
+        That's intentional: step-0 rows aren't usable as replay probes
         because the kwargs came from fixtures, not upstream."""
         from src.registry.metrics import MetricsStore
 
@@ -1965,24 +1931,22 @@ class TestRecordStepInvocationPopulatesFields:
         ex, ref = self._make_executor_with_metrics(metrics)
 
         ex._record_step_invocation(
-            ref, {"error": "step 0 blew up"}, latency_ms=1.0, task_id="T99",
+            ref, {"error": "step 0 blew up"}, latency_ms=1.0, task_id="unit-task",
             upstream_outputs={},
         )
 
-        # Row has NULL input_args → get_recent_failures filters it out.
+        # Row has NULL input_args, so get_recent_failures filters it out.
         failures = metrics.get_recent_failures("thing-doer")
         assert len(failures) == 0
 
 
 class TestMatchToArtifactAgentConfigNormalization:
-    """Security audit finding #9 (2026-04-19): registry metadata stores
-    ``agent_config`` as a JSON string (ChromaDB primitives-only
-    constraint), but ``GeneratedArtifact.agent_config`` is typed
-    ``dict | None``. Pre-fix ``_match_to_artifact`` passed the string
-    straight into the schema constructor, crashing with Pydantic
-    ``ValidationError`` on every registry-matched AGENT row — zero-
-    biasing AGENT reuse telemetry through the compositional path.
-    Post-fix uses the shared ``decode_agent_config_metadata`` helper.
+    """Registry agent_config metadata is normalized before execution.
+
+    Registry metadata can store ``agent_config`` as a JSON string while
+    ``GeneratedArtifact.agent_config`` is typed as ``dict | None``. The
+    compositional proxy artifact must decode that metadata or fall back to
+    ``None`` on malformed JSON.
     """
 
     def _make_match(self, meta: dict) -> MatchItem:
@@ -2009,7 +1973,7 @@ class TestMatchToArtifactAgentConfigNormalization:
         assert artifact.agent_config["system_prompt"] == "you are a helper"
 
     def test_malformed_json_falls_back_to_none(self):
-        """Malformed JSON → agent_config=None. Better than crashing the
+        """Malformed JSON gives agent_config=None instead of crashing the
         chain with ValidationError."""
         match = self._make_match({
             "agent_config": "{this is not valid json",

@@ -1,12 +1,12 @@
-"""Unit tests for tests/evaluation/execution.py — SKILL/AGENT execution via DeepAgent."""
+"""Tests for evaluation artifact execution helpers."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from tests.evaluation.execution import (
     AGENT_EXECUTION_TIMEOUT_S,
@@ -90,7 +90,11 @@ def _inline_agent_process_context():
 
 class TestResultModels:
     def test_t11_result_valid(self):
-        r = T11Result(summary_row_count=4, region_revenues={"North": 1000.0}, regions_meeting_target=2)
+        r = T11Result(
+            summary_row_count=4,
+            region_revenues={"North": 1000.0},
+            regions_meeting_target=2,
+        )
         assert r.summary_row_count == 4
 
     def test_t12_result_valid(self):
@@ -98,7 +102,11 @@ class TestResultModels:
         assert r.rules_applied == 3
 
     def test_t13_result_valid(self):
-        r = T13Result(anomaly_count=5, anomalies=[{"ts": "a", "m": "b", "v": 1}], metrics_analyzed=4)
+        r = T13Result(
+            anomaly_count=5,
+            anomalies=[{"ts": "a", "m": "b", "v": 1}],
+            metrics_analyzed=4,
+        )
         assert r.anomaly_count == 5
 
     def test_t19_result_valid(self):
@@ -217,11 +225,19 @@ class TestFormatFixtureMessage:
 class TestExecuteSkillArtifact:
     @patch("tests.evaluation.execution._execute_skill_inner")
     def test_returns_dict_on_success(self, mock_inner):
-        mock_inner.return_value = {"summary_row_count": 4, "region_revenues": {}, "regions_meeting_target": 2}
+        mock_inner.return_value = {
+            "summary_row_count": 4,
+            "region_revenues": {},
+            "regions_meeting_target": 2,
+        }
         task = SimpleNamespace(task_id="T11", task_prompt="test", fixture_paths=[])
         artifact = SimpleNamespace(skill_content="# Test Skill", capability_type="skill")
         result = execute_skill_artifact(artifact, task, {})
-        assert result == {"summary_row_count": 4, "region_revenues": {}, "regions_meeting_target": 2}
+        assert result == {
+            "summary_row_count": 4,
+            "region_revenues": {},
+            "regions_meeting_target": 2,
+        }
 
     @patch("tests.evaluation.execution._execute_skill_inner")
     def test_returns_empty_on_exception(self, mock_inner):
@@ -348,7 +364,7 @@ class TestExecuteAgentArtifact:
 
 
 # ---------------------------------------------------------------------------
-# Step 13 — sticky agent execution meta
+# Sticky agent execution metadata
 # ---------------------------------------------------------------------------
 
 
@@ -506,23 +522,28 @@ class TestExecuteAgentArtifactMeta:
         assert meta.failure_reason is None
 
     def test_timeout_ceiling_is_900s(self):
-        # Regression guard for the 480→900 bump. If this fires, update
-        # the value in tests/evaluation/execution.py and re-read the
-        # langfuse trace that justified it.
+        # Keep the AGENT artifact budget aligned with the eval runner.
         assert AGENT_EXECUTION_TIMEOUT_S == 900
 
     def test_lead_with_subagents_timeout_is_extended(self):
         artifact = SimpleNamespace(
             agent_config={
                 "system_prompt": "You are an agent.",
-                "subagents": [{"name": "worker", "description": "x", "system_prompt": "y", "tools": []}],
+                "subagents": [
+                    {
+                        "name": "worker",
+                        "description": "x",
+                        "system_prompt": "y",
+                        "tools": [],
+                    }
+                ],
             }
         )
         assert _agent_timeout_seconds(artifact) == LEAD_WITH_SUBAGENTS_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------
-# JSON extraction helpers — regression for T11-style empty-output bug
+# SKILL JSON extraction helpers
 # ---------------------------------------------------------------------------
 
 
@@ -536,13 +557,7 @@ def _ai_msg(content: str) -> SimpleNamespace:
 
 
 class TestExtractLastSandboxJson:
-    """Regression tests for the T11 empty-output bug.
-
-    The original implementation only parsed the LAST LINE of sandbox stdout,
-    which broke on `print(json.dumps(result, indent=2))` output (last line
-    would be just `}`). This caused generated SKILL runs to return empty dicts
-    when the skill used pretty-printed JSON output.
-    """
+    """Sandbox output parsing accepts realistic debug and JSON formats."""
 
     def test_single_line_json(self):
         import json
@@ -556,10 +571,14 @@ class TestExtractLastSandboxJson:
         assert result == {"summary_row_count": 60, "regions_meeting_target": 3}
 
     def test_multiline_pretty_printed_json(self):
-        """Regression for T11 bug — pretty-printed multi-line JSON."""
+        """Pretty-printed multi-line JSON is accepted."""
         import json
         pretty = json.dumps(
-            {"summary_row_count": 60, "region_revenues": {"East": 15019.57}, "regions_meeting_target": 3},
+            {
+                "summary_row_count": 60,
+                "region_revenues": {"East": 15019.57},
+                "regions_meeting_target": 3,
+            },
             indent=2,
         )
         tool_content = json.dumps({
@@ -690,26 +709,17 @@ class TestExtractLastJsonObject:
 
 
 # ---------------------------------------------------------------------------
-# Fixture → workspace file conversion — regression for T16 AGENT filesystem bug
+# Fixture → workspace file conversion for AGENT file access
 # ---------------------------------------------------------------------------
 
 
 class TestFixturesToWorkspaceFiles:
-    """Regression tests for solo-AGENT fixture file access (T16 bug).
+    """AGENT fixtures are keyed exactly as DeepAgents workspace reads expect.
 
     Keys MUST be absolute virtual paths (leading ``/``). DeepAgents'
     ``validate_path`` normalizes every ``read_file`` argument to start with
     ``/`` before ``StateBackend.read`` does a dict lookup, so bare-basename
-    keys will never match. The T16 agent trace on 2026-04-15
-    (``45a39ccd95d0edbedaa7bae3f71b4290``) showed the exact failure mode:
-    the agent called ``read_file("t16_incident.yaml")`` and got back
-    ``"Error: File '/t16_incident.yaml' not found"``, then fabricated an
-    answer via ``sandbox_execute`` on no data.
-
-    An earlier version of this helper stored fixtures under bare basenames
-    and these tests codified that wrong behavior. The test suite thus
-    passed while the runtime silently failed — a case of tests enshrining
-    the bug the code introduced.
+    keys will never match.
     """
 
     def test_empty_fixtures(self):
@@ -751,7 +761,7 @@ class TestFixturesToWorkspaceFiles:
     def test_keys_round_trip_through_validate_path(self):
         """Every key this helper produces must equal what DeepAgents'
         ``validate_path`` returns for the corresponding filename. This is
-        the direct invariant the T16 bug violated.
+        the direct workspace-read invariant.
         """
         from deepagents.backends.utils import validate_path
 
@@ -784,7 +794,7 @@ class TestFixturesToWorkspaceFiles:
         validated = validate_path("t16_incident.yaml")
         assert files.get(validated) is not None, (
             "StateBackend lookup would fail — bare-basename read_file call "
-            "does not resolve. This is the T16 bug."
+            "does not resolve."
         )
 
         # Agent calls read_file("/t16_incident.yaml") — the absolute form.
@@ -854,8 +864,7 @@ class TestAgentInvokeInput:
         )
 
     def test_fixtures_placed_in_workspace_files(self, tmp_path):
-        """Regression: fixtures must land in invoke_input['files'] so the
-        agent's read_file tool can access them."""
+        """Fixtures must land in invoke_input['files'] for read_file access."""
         from tests.evaluation import execution as exec_mod
 
         artifact = self._make_agent_artifact()
@@ -974,10 +983,7 @@ class TestAgentInvokeInput:
         Semantic invariant (NOT a dict.update ordering side-effect):
         ``_execute_agent_inner`` seeds ``workspace_files`` with the skill
         files first, then iterates fixture entries and only inserts each
-        one when its key is NOT already present. Pinned to the
-        ``if filename not in workspace_files`` guard at
-        ``tests/evaluation/execution.py`` around line 1193 (the for-loop
-        below ``workspace_files = dict(skill_files)``).
+        one when its key is NOT already present.
 
         The assertion below verifies the invariant by semantic intent:
         when a skill and a fixture share the same absolute-virtual path
@@ -1019,20 +1025,16 @@ class TestAgentInvokeInput:
 
 
 # ---------------------------------------------------------------------------
-# §12 finding #12 — dynamic response_format from decomposer output_schema
+# Dynamic response_format from decomposer output_schema
 # ---------------------------------------------------------------------------
 
 
 class TestBuildDynamicResultModel:
     def test_empty_schema_returns_none(self):
-        from tests.evaluation.execution import _build_dynamic_result_model
-
         assert _build_dynamic_result_model(None) is None
         assert _build_dynamic_result_model({}) is None
 
     def test_builds_model_with_declared_keys(self):
-        from tests.evaluation.execution import _build_dynamic_result_model
-
         schema = {
             "metrics_table": "list[dict]",
             "root_cause_metric": "str",
@@ -1050,26 +1052,13 @@ class TestBuildDynamicResultModel:
     def test_model_allows_extra_keys(self):
         """extra='allow' tolerates additional keys beyond the declared ones.
 
-        This is an INTENTIONAL design decision — see CLAUDE.md
-        §12 finding #12 ("AGENT output_schema compliance") and
-        ``MEMORY.md`` topic file
-        ``project_agent_output_schema_compliance.md``. Do NOT tighten to
-        ``extra='forbid'`` without revisiting that finding.
-
-        Important for lead+subagents AGENTs where the lead produces
-        aggregated output covering multiple collapsed gaps plus task-level
-        return keys. An earlier extra='forbid' design empirically failed
-        on the T16 third-run incident (2026-04-16): the lead produced
-        task-level keys as "extras", Pydantic rejected them, and the
-        whole compositional chain failed — that run is the reason this
-        test exists and the reason the decomposer's declared keys are
-        treated as a required floor with extras tolerated on top.
+        Lead-with-subagents AGENTs can return required handoff keys plus
+        task-level result keys. The decomposer-declared fields are therefore a
+        required floor, not an exhaustive schema.
 
         Required-key enforcement is NOT weakened — see
         ``test_model_still_requires_declared_keys`` below.
         """
-        from tests.evaluation.execution import _build_dynamic_result_model
-
         model = _build_dynamic_result_model({"a": "int"})
         # Declared key must be present.
         instance = model(a=1, b=2, c="extra")
@@ -1080,11 +1069,6 @@ class TestBuildDynamicResultModel:
 
     def test_model_still_requires_declared_keys(self):
         """extra='allow' doesn't weaken required-key enforcement."""
-        import pytest
-        from pydantic import ValidationError
-
-        from tests.evaluation.execution import _build_dynamic_result_model
-
         model = _build_dynamic_result_model({"a": "int"})
         # Missing declared key must be rejected even with extra='allow'.
         with pytest.raises(ValidationError):
@@ -1099,8 +1083,6 @@ class TestExecuteAgentArtifactDynamicResponseFormat:
     @patch("tests.evaluation.execution._execute_agent_inner")
     def test_output_schema_threaded_through(self, mock_inner):
         """execute_agent_artifact forwards output_schema to _execute_agent_inner."""
-        from tests.evaluation.execution import execute_agent_artifact
-
         mock_inner.return_value = {"metrics_table": [], "root_cause_metric": "x"}
 
         artifact = SimpleNamespace(agent_config={"system_prompt": "you are"})
@@ -1125,9 +1107,7 @@ class TestExecuteAgentArtifactDynamicResponseFormat:
 
     @patch("tests.evaluation.execution._execute_agent_inner")
     def test_default_no_output_schema(self, mock_inner):
-        """Existing callers without output_schema still work — param defaults to None."""
-        from tests.evaluation.execution import execute_agent_artifact
-
+        """Callers without output_schema still get the default response model."""
         mock_inner.return_value = {}
         artifact = SimpleNamespace(agent_config={"system_prompt": "you are"})
         task = SimpleNamespace(task_id="", task_prompt="test")

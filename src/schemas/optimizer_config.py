@@ -5,9 +5,9 @@ controls. Each optimizer operation (prune / split / merge) is independently
 configurable as ``auto`` (threshold-gated), ``on`` (always), or ``off``
 (never).
 
-The evaluation harness and older callers may still pass ``run_optimizer:
-bool``. ``OptimizerConfig.from_run_optimizer_bool`` translates that legacy
-surface to all-on or all-off so call sites can migrate gradually.
+Some runtime callers still pass ``run_optimizer: bool``.
+``OptimizerConfig.from_run_optimizer_bool`` translates that compatibility
+surface to all-on or all-off.
 """
 
 from __future__ import annotations
@@ -94,28 +94,14 @@ class OptimizerConfig(BaseModel):
         # "auto"
         return invocation_count >= threshold
 
-    def any_enabled(self, *, invocation_count: int, threshold: int) -> bool:
-        """Return True if at least one operation would fire this cycle.
-
-        This is a convenience helper for callers that already know the current
-        invocation count. ``create_pipeline`` cannot use it directly at graph
-        build time because the final invocation count is only known when the
-        optimizer loop runs.
-        """
-        return any(
-            self.is_enabled(op, invocation_count=invocation_count, threshold=threshold)
-            for op in ("prune", "split", "merge")
-        )
-
-    # -- Backward compat factories --------------------------------------
+    # -- run_optimizer bool factories -----------------------------------
 
     @classmethod
     def all_on(cls) -> OptimizerConfig:
         """Build a config with all three operations forced on.
 
-        Used by the backward-compatibility path when a caller passes
-        ``run_optimizer=True``. The
-        old ``bool`` semantics of "optimizer on" means all operations run.
+        Used by callers that pass ``run_optimizer=True``. The bool semantics
+        of "optimizer on" means all operations run.
         """
         return cls(prune="on", split="on", merge="on")
 
@@ -123,19 +109,16 @@ class OptimizerConfig(BaseModel):
     def all_off(cls) -> OptimizerConfig:
         """Build a config with all three operations forced off.
 
-        Used by the backward-compatibility path when a caller passes
-        ``run_optimizer=False``. The old ``bool`` semantics of "optimizer
-        off" means no operations run.
+        Used by callers that pass ``run_optimizer=False``. The bool semantics
+        of "optimizer off" means no operations run.
         """
         return cls(prune="off", split="off", merge="off")
 
     @classmethod
     def from_run_optimizer_bool(cls, run_optimizer: bool) -> OptimizerConfig:
-        """Translate the legacy ``run_optimizer: bool`` parameter.
+        """Translate the compatibility ``run_optimizer: bool`` parameter.
 
-        Eval harness and older integration tests pass ``run_optimizer=True``
-        or ``False`` via :func:`src.orchestrator.pipeline.create_pipeline`.
-        This keeps them working unchanged while newer callers can use the
-        per-operation surface.
+        Runtime scripts and some tests still pass ``run_optimizer=True`` or
+        ``False`` via :func:`src.orchestrator.pipeline.create_pipeline`.
         """
         return cls.all_on() if run_optimizer else cls.all_off()

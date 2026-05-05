@@ -1,19 +1,26 @@
-"""Layer 2: harness unit tests with mocked pipeline.
+"""Unit tests for evaluation harness result extraction and run loops.
 
-Tests the run loop, _extract_result, _run_static, and record writing
-without any LLM calls or Docker execution.
+These tests use mocked execution paths to cover harness behavior without LLM
+calls or Docker execution.
 """
 
 from __future__ import annotations
 
+import hashlib
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
-from src.schemas.task import GeneratedArtifact, MatchItem, TaskState
+from src.schemas.task import ChainResult, GeneratedArtifact, MatchItem, SubTask, TaskState
 from src.schemas.verification import VerificationReport
-from tests.evaluation.harness import EvaluationHarness, HarnessConfig, _extract_result
+from tests.evaluation.harness import (
+    EvaluationHarness,
+    HarnessConfig,
+    _derive_condition_seed,
+    _extract_result,
+    _extract_result_compositional,
+)
 from tests.evaluation.tasks import T01, T03, T04, T07, T13
 
 # ---------------------------------------------------------------------------
@@ -275,15 +282,11 @@ class TestExtractResult:
         assert len(result["generated_artifact_sources"]) == 1
 
     def test_registry_match_with_source_code_executes(self):
-        """Registry match with source_code in metadata → sandbox-executed.
+        """Registry match with source_code is sandbox-executed and shape-checked.
 
-        ext8 #64 (2026-04-20): T07 declares ``required_files=["output.csv"]``
-        but this test's mocked executor returns a dict-only output with no
-        output_files. The post-fix shape-check flips ``output_in_range=False``
-        and sets ``failure_reason="output_shape_mismatch"`` so LangFuse M1
-        agrees with DuckDB M1. Pre-fix the same row counted as a success
-        (validator happy, shape check skipped). The updated assertions
-        codify the post-fix semantics.
+        T07 requires ``output.csv``. A dict-only mocked executor may satisfy
+        the loose validator, but the output contract must still classify the
+        run as an output-shape mismatch.
         """
         state = _make_state(
             artifacts=[],
@@ -294,8 +297,8 @@ class TestExtractResult:
         with patch("tests.evaluation.harness._execute_artifact", return_value=fake_output):
             result = _extract_result(state, T07, loader)
         assert result["gate_passed"] is True
-        # ext8 #64: shape mismatch (no output.csv) flips output_in_range=False
-        # and promotes failure_reason accordingly.
+        # Missing output.csv flips output_in_range=False and promotes the
+        # failure reason to output_shape_mismatch.
         assert result["output_in_range"] is False
         assert result["failure_reason"] == "output_shape_mismatch"
         assert result["output_shape_mismatch"] is True
@@ -327,8 +330,6 @@ class TestExtractResult:
         assert result["failure_reason"] == "output_rejected"
 
     def test_decomposition_failure_short_circuits_compositional_path(self):
-        from src.schemas.task import SubTask
-
         state = _make_state(
             artifacts=[
                 _make_artifact(
@@ -362,17 +363,14 @@ class TestExtractResult:
 
 
 # ---------------------------------------------------------------------------
-# Step 13 — _extract_result_compositional classifies agent timeouts
+# _extract_result_compositional failure classification
 # ---------------------------------------------------------------------------
 
 
 class TestExtractResultCompositionalAgentFailure:
-    """The harness must translate a ChainResult.failed_step_reason into the
-    matching FailureReason enum value so Phase 5 analytics can distinguish
-    agent timeouts from generic chain-step failures."""
+    """The harness maps compositional step failures to record failure reasons."""
 
     def _subtasks(self):
-        from src.schemas.task import SubTask
         return [
             SubTask(
                 description="investigate",
@@ -382,7 +380,6 @@ class TestExtractResultCompositionalAgentFailure:
         ]
 
     def _make_fake_chain_result(self, *, failed_step_reason: str | None):
-        from src.schemas.task import ChainResult
         return ChainResult(
             chain_length=1,
             chain_success=False,
@@ -393,7 +390,6 @@ class TestExtractResultCompositionalAgentFailure:
         )
 
     def _extract(self, chain_result):
-        from tests.evaluation.harness import _extract_result_compositional
         art = GeneratedArtifact(
             capability_name="investigator",
             capability_type=CapabilityType.AGENT,
@@ -471,7 +467,7 @@ class TestRunPilot:
         mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         harness = EvaluationHarness(config)
-        # run_pilot default condition is "full"; pass static explicitly for a fast no-LLM test
+        # Use the static condition here to keep the default-condition assertion fast.
         records = harness.run_pilot([T04], condition="static")
 
         assert records[0].condition == "static"
@@ -567,32 +563,24 @@ class TestRunCondition:
 
 
 # ---------------------------------------------------------------------------
-# Security audit finding #34 — deterministic seed derivation (2026-04-20)
+# Deterministic condition seed derivation
 # ---------------------------------------------------------------------------
 
 
 class TestConditionSeedIsDeterministic:
-    """Pre-fix used Python's ``hash((condition, base_seed))`` which
-    randomizes across processes unless PYTHONHASHSEED is pinned. Post-
-    fix uses SHA-256 — same value on every process / Python version."""
+    """Condition seeds must be stable across processes and Python versions."""
 
     def test_derive_condition_seed_stable_across_calls(self):
-        from tests.evaluation.harness import _derive_condition_seed
-
         s1 = _derive_condition_seed("full", 42)
         s2 = _derive_condition_seed("full", 42)
         assert s1 == s2
 
     def test_derive_condition_seed_differs_by_condition(self):
-        from tests.evaluation.harness import _derive_condition_seed
-
         assert _derive_condition_seed("full", 42) != _derive_condition_seed(
             "static", 42,
         )
 
     def test_derive_condition_seed_differs_by_base(self):
-        from tests.evaluation.harness import _derive_condition_seed
-
         assert _derive_condition_seed("full", 42) != _derive_condition_seed(
             "full", 43,
         )
@@ -601,17 +589,11 @@ class TestConditionSeedIsDeterministic:
         """Pin the expected SHA-256-derived seed for the canonical
         (full, 42) pair so a future change to the hashing scheme is
         caught explicitly."""
-        import hashlib
-
-        from tests.evaluation.harness import _derive_condition_seed
-
         expected = int.from_bytes(
             hashlib.sha256(b"full|42").digest()[:4], "big",
         ) % (2**31)
         assert _derive_condition_seed("full", 42) == expected
 
     def test_derive_condition_seed_in_expected_range(self):
-        from tests.evaluation.harness import _derive_condition_seed
-
         s = _derive_condition_seed("full", 42)
         assert 0 <= s < 2**31

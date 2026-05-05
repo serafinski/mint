@@ -1,22 +1,16 @@
-"""Tests for ext7 #51 — eval-registry advisory lock.
+"""Tests for the eval-registry advisory lock.
 
-Prevents concurrent invocation of ``run_pilot.py`` + ``run_longitudinal.py``
-against shared ``data/eval/`` registry dirs, which pre-fix corrupted state
-(one runner's ``rmtree`` wipes the other's active registry; snapshot-hash
-mismatches raise RuntimeError mid-run).
+The lock prevents active eval runners from mutating shared ``data/eval/``
+registry directories at the same time. Concurrent cleanup/snapshot work can
+invalidate the other runner's active registry state, so contention must fail
+clearly before the run starts.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
-ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(ROOT))
-
-from scripts._eval_registry_lock import acquire_runner_lock  # noqa: E402
+from scripts._eval_registry_lock import acquire_runner_lock
 
 
 def test_first_runner_acquires_lock(tmp_path):
@@ -34,7 +28,7 @@ def test_first_runner_acquires_lock(tmp_path):
         handle.close()
 
 
-def test_second_runner_exits_2_when_lock_held(tmp_path, capsys):
+def test_second_runner_exits_2_when_lock_held(tmp_path):
     """A second concurrent acquirer fails loud rather than silently racing."""
     first = acquire_runner_lock(runner_name="first", data_dir=tmp_path)
     try:
@@ -65,7 +59,7 @@ def test_distinct_data_dirs_do_not_contend(tmp_path):
     dir_b = tmp_path / "b"
 
     handle_a = acquire_runner_lock(runner_name="runner_a", data_dir=dir_a)
-    # Should NOT raise — separate lock file.
+    # Should not raise; separate data dirs use separate lock files.
     handle_b = acquire_runner_lock(runner_name="runner_b", data_dir=dir_b)
     try:
         assert handle_a is not None

@@ -5,7 +5,7 @@ Covers static definition-token cost:
   - Stable ordering via sort_keys (JSON output is deterministic)
   - Empty/missing-field fallback returns 0
   - Tokenizer-exception fallback returns 0 and logs a warning
-  - Wiring tests for seed_registry + tool_loader + loading_node + operations
+  - Registry wiring through seed_registry() and ChromaDB persistence
 """
 
 from __future__ import annotations
@@ -189,7 +189,7 @@ def test_tokenizer_exception_returns_zero(caplog):
 
 
 def test_serialization_failure_returns_zero(caplog):
-    """Non-JSON-serializable agent_config must not raise — fall back to 0."""
+    """Serialization failures must not raise — fall back to 0."""
     artifact = GeneratedArtifact(
         capability_name="x",
         capability_type=CapabilityType.MCP_TOOL,

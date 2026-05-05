@@ -1,11 +1,8 @@
-"""Tests for ``src/verification/sandbox_parse.py``.
+"""Tests for shared sandbox stdout parsing.
 
-Security audit findings #21 + #22 (2026-04-20): two parsers in
-``src/verification/`` were fragile — both called ``json.loads(stdout)``
-on the full stdout string and failed on any non-JSON prefix. A third
-parser in the same file correctly used ``splitlines()[-1]``.
-Post-fix, all three delegate to ``parse_sandbox_last_json_line`` in
-this module.
+Sandboxed verification snippets emit their structured result as the final JSON
+line of stdout. The shared parser must tolerate debug output before that line
+and fail closed when the final non-empty line is not JSON.
 """
 
 from __future__ import annotations
@@ -31,7 +28,7 @@ class TestParseSandboxLastJsonLine:
         ],
     )
     def test_tolerates_debug_prefix(self, prefix):
-        """Reporter's core case: debug prints before the JSON line."""
+        """Debug or warning output before the final JSON line is ignored."""
         payload = '{"result": "42", "error": null}'
         result = {"success": True, "stdout": f"{prefix}{payload}\n"}
         parsed = parse_sandbox_last_json_line(result)

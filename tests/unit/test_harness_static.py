@@ -1,16 +1,30 @@
-"""Layer 1: smoke-test the hand-written static implementations in harness.py.
+"""Tests for the hand-written static evaluation baseline implementations.
 
-These run against real fixture files (no LLM, no Docker, no mocks).
-Each test calls _run_static_implementation directly and checks the output
+These run against real fixture files without LLM calls, Docker, or mocks. Each
+test calls ``_run_static_implementation`` directly and checks that the output
 passes the corresponding task validator.
-
-If any of these fail, the static baseline is broken before we ever run the pilot.
 """
 
 from __future__ import annotations
 
+import pytest
+
 from tests.evaluation.harness import _run_static_implementation
-from tests.evaluation.tasks import FIXTURES_DIR, T01, T02, T04, T05, T09, T11, T13, T14, T15, T19, T20
+from tests.evaluation.tasks import (
+    _EV,
+    FIXTURES_DIR,
+    T01,
+    T02,
+    T04,
+    T05,
+    T09,
+    T11,
+    T13,
+    T14,
+    T15,
+    T19,
+    T20,
+)
 
 
 def _unwrap(result):
@@ -21,17 +35,26 @@ def _unwrap(result):
 
 class TestStaticT01:
     def test_output_passes_validator(self):
-        output, _files = _unwrap(_run_static_implementation("T01", [FIXTURES_DIR / "t01_standard.csv"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T01",
+            [FIXTURES_DIR / "t01_standard.csv"],
+        ))
         assert "row_count" in output
         assert "column_names" in output
         assert T01.validator(output), f"T01 validator failed on: {output}"
 
     def test_row_count_correct(self):
-        output, _files = _unwrap(_run_static_implementation("T01", [FIXTURES_DIR / "t01_standard.csv"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T01",
+            [FIXTURES_DIR / "t01_standard.csv"],
+        ))
         assert output["row_count"] == 50
 
     def test_column_names_correct(self):
-        output, _files = _unwrap(_run_static_implementation("T01", [FIXTURES_DIR / "t01_standard.csv"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T01",
+            [FIXTURES_DIR / "t01_standard.csv"],
+        ))
         assert set(output["column_names"]) == {"id", "name", "age", "city"}
 
 
@@ -138,68 +161,92 @@ class TestStaticT15:
 
 
 class TestStaticT19:
-    """Security audit finding #97 (2026-04-19, ext9).
+    """Tests for the T19 static baseline branch.
 
-    T19 declares ``has_static_coverage=True`` so it MUST have a
-    dispatch branch in ``_run_static_implementation``. Pre-fix the
-    branch was missing, so every static-condition run of T19 raised
-    ``ValueError`` mis-attributed downstream as ``generation_failed``.
-    Replaces the prior ``TestStaticT03`` block, which exercised a
-    DEAD branch (T03 has ``has_static_coverage=False`` and never
-    reaches ``_run_static_implementation`` from production paths).
+    T19 declares ``has_static_coverage=True``, so the static dispatch table
+    must execute it and return the keys required by the task validator.
     """
 
     def test_output_passes_validator(self):
-        output, _files = _unwrap(_run_static_implementation("T19", [FIXTURES_DIR / "t19_product_sales.csv"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T19",
+            [FIXTURES_DIR / "t19_product_sales.csv"],
+        ))
         assert "n_rows" in output
         assert "n_categories" in output
         assert "categories" in output
         assert T19.validator(output), f"T19 validator failed on: {output}"
 
     def test_row_count_positive(self):
-        output, _files = _unwrap(_run_static_implementation("T19", [FIXTURES_DIR / "t19_product_sales.csv"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T19",
+            [FIXTURES_DIR / "t19_product_sales.csv"],
+        ))
         assert output["n_rows"] > 0
 
     def test_categories_match_n(self):
-        output, _files = _unwrap(_run_static_implementation("T19", [FIXTURES_DIR / "t19_product_sales.csv"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T19",
+            [FIXTURES_DIR / "t19_product_sales.csv"],
+        ))
         assert len(output["categories"]) == output["n_categories"]
 
 
 class TestStaticT05:
     def test_output_passes_validator(self):
-        output, _files = _unwrap(_run_static_implementation("T05", [FIXTURES_DIR / "t05_dirty.csv"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T05",
+            [FIXTURES_DIR / "t05_dirty.csv"],
+        ))
         assert "output_row_count" in output
         assert "null_count" in output
         assert T05.validator(output), f"T05 validator failed on: {output}"
 
     def test_null_count_zero(self):
-        output, _files = _unwrap(_run_static_implementation("T05", [FIXTURES_DIR / "t05_dirty.csv"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T05",
+            [FIXTURES_DIR / "t05_dirty.csv"],
+        ))
         assert output["null_count"] == 0
 
     def test_row_count_reduced(self):
-        from tests.evaluation.tasks import _EV
         input_count = _EV["T05"]["input_row_count"]
-        output, _files = _unwrap(_run_static_implementation("T05", [FIXTURES_DIR / "t05_dirty.csv"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T05",
+            [FIXTURES_DIR / "t05_dirty.csv"],
+        ))
         assert output["output_row_count"] < input_count
 
 
 class TestStaticT09:
     def test_output_passes_validator(self):
-        output, _files = _unwrap(_run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.xml"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T09",
+            [FIXTURES_DIR / "t09_report_data.xml"],
+        ))
         assert T09.validator(output), f"T09 validator failed on: {output}"
 
     def test_has_required_keys(self):
-        output, _files = _unwrap(_run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.xml"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T09",
+            [FIXTURES_DIR / "t09_report_data.xml"],
+        ))
         assert "summary" in output
         assert "stats_table" in output
         assert "anomalies" in output
 
     def test_exactly_five_anomalies(self):
-        output, _files = _unwrap(_run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.xml"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T09",
+            [FIXTURES_DIR / "t09_report_data.xml"],
+        ))
         assert len(output["anomalies"]) == 5
 
     def test_summary_is_string(self):
-        output, _files = _unwrap(_run_static_implementation("T09", [FIXTURES_DIR / "t09_report_data.xml"]))
+        output, _files = _unwrap(_run_static_implementation(
+            "T09",
+            [FIXTURES_DIR / "t09_report_data.xml"],
+        ))
         assert isinstance(output["summary"], str) and len(output["summary"]) > 0
 
 
@@ -214,6 +261,5 @@ class TestStaticT20:
 
 class TestStaticUnknownTask:
     def test_raises_for_unknown_task(self):
-        import pytest
         with pytest.raises(ValueError, match="No static implementation"):
             _run_static_implementation("T99", [])

@@ -1,19 +1,10 @@
-"""Unit tests for src/orchestrator/generators/utils.build_schema_context.
-
-Moved from tests/unit/test_composition.py (file-placement drift: the tests
-probe ``build_schema_context`` which lives in ``generators/utils.py``, not in
-``composition.py``). See Batch 02b audit for context.
-
-Sibling helper tests for ``build_task_context`` live in
-``tests/unit/test_build_task_context.py``.
-"""
+"""Unit tests for generator schema-context prompt helpers."""
 
 from __future__ import annotations
 
 from src.orchestrator.generators.utils import build_schema_context
 from src.schemas.capability import CapabilityType
 from src.schemas.task import ClassifiedGap, SubTask
-
 
 # ---------------------------------------------------------------------------
 # build_schema_context — inter-step schema contracts
@@ -114,10 +105,9 @@ class TestBuildSchemaContext:
     def test_transitive_upstream_keys_are_included_in_input_contract(self):
         """Downstream schema context should include transitive ancestor outputs.
 
-        T11 exposed a generator/runtime drift: execution passes the transitive
-        upstream closure, but ``build_schema_context`` previously documented
-        only direct parents. A downstream step that consumes a transitive key
-        such as ``targets`` must see that key in the generator prompt.
+        Execution passes the transitive upstream closure to downstream steps,
+        so a downstream step that consumes an ancestor key such as ``targets``
+        must see that key in the generator prompt.
         """
         gap = ClassifiedGap(
             description="compare revenues to targets",

@@ -62,8 +62,8 @@ class OptimizerState(BaseModel):
     allow_network: bool = Field(
         default=False,
         description=(
-            "Network policy inherited from the enclosing TaskState (Step "
-            "14.12). When True, merge/split variant verification runs with "
+            "Network policy inherited from the enclosing TaskState. When "
+            "True, merge/split variant verification runs with "
             "``--network bridge`` in Tier 2 / Tier 3, and MCP_TOOL coverage "
             "replay honors the same policy. Offline-by-default preserves "
             "the standard safety posture."
@@ -86,8 +86,8 @@ def _compute_kl_divergence(
     NOTE — this is the *online* convergence metric stored in
     ``OptimizerState.kl_divergence`` and propagated across pipeline
     invocations via ``_prev_optimizer_scores``. The longitudinal analyzer uses
-    the same utility-score distribution semantics for Chapter 6 convergence
-    reporting.
+    the same utility-score distribution semantics as the longitudinal
+    convergence analyzer.
     """
     if not prev_scores or not curr_scores:
         # Empty distribution signals catastrophic failure (e.g. all pruned),
@@ -160,21 +160,19 @@ def create_optimization_loop(
     """Build the LangGraph optimization loop.
 
     Args:
-        optimizer_config: Per-operation enable/disable config (§12 finding
-            #8). When ``None``, defaults to all-``"on"`` — preserves the
-            pre-finding-#8 semantic where the loop unconditionally ran
-            all three operations whenever invoked. Threshold gating
-            belongs to the caller (``create_pipeline`` decides whether to
-            invoke the loop at all based on invocation_count vs
+        optimizer_config: Per-operation enable/disable config. When ``None``,
+            defaults to all-``"on"`` so the loop unconditionally runs all
+            three operations whenever invoked. Threshold gating belongs to
+            the caller (``create_pipeline`` decides whether to invoke the
+            loop at all based on invocation_count vs
             ``AUTO_OPTIMIZER_THRESHOLD``); once invoked, each operation
             honors its per-config setting.
 
     Returns a compiled StateGraph.
     """
-    # Default to all-"on" when caller doesn't specify — preserves the
-    # pre-finding-#8 loop semantic (operations always fire when invoked).
-    # The threshold gate is enforced upstream by create_pipeline / callers,
-    # not by this loop.
+    # Default to all-"on" when caller doesn't specify: operations always fire
+    # when this loop is invoked. The threshold gate is enforced upstream by
+    # create_pipeline / callers, not by this loop.
     _config = optimizer_config or OptimizerConfig.all_on()
 
     def compute_metrics_node(state: OptimizerState) -> Command:
@@ -330,10 +328,10 @@ def create_optimization_loop(
     def apply_operations_node(state: OptimizerState) -> Command:
         """Apply prune, split, and merge operations.
 
-        Each operation is gated independently against ``optimizer_config``
-        per §12 finding #8. The gate resolves ``"auto"`` against the
-        current ``AUTO_OPTIMIZER_THRESHOLD`` using ``invocation_count`` from
-        the metrics store; ``"on"`` always runs; ``"off"`` always skips.
+        Each operation is gated independently against ``optimizer_config``.
+        The gate resolves ``"auto"`` against the current
+        ``AUTO_OPTIMIZER_THRESHOLD`` using ``invocation_count`` from the
+        metrics store; ``"on"`` always runs; ``"off"`` always skips.
         """
         errors = list(state.errors)
         pruned: list[str] = []

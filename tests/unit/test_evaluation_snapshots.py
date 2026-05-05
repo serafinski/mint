@@ -1,4 +1,4 @@
-"""Unit tests for tests/evaluation/snapshots.py."""
+"""Tests for evaluation snapshot isolation helpers."""
 
 from __future__ import annotations
 
@@ -20,10 +20,10 @@ def tmp_dirs(tmp_path):
     for d in (chroma, skills):
         d.mkdir()
     (chroma / "collection.db").write_bytes(b"chroma_data")
-    (skills / "skill_x" / "SKILL.md").mkdir(parents=True, exist_ok=True)
-    (skills / "skill_x" / "SKILL.md").rmdir()
-    (skills / "skill_x").mkdir(parents=True, exist_ok=True)
-    (skills / "skill_x" / "SKILL.md").write_text("---\nname: skill-x\n---\nbody")
+
+    skill_dir = skills / "skill_x"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: skill-x\n---\nbody")
     return chroma, skills
 
 

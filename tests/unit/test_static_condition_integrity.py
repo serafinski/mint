@@ -1,28 +1,13 @@
-"""Static-condition integrity (ext8 #65 + #68).
+"""Static-condition integrity tests.
 
-The ``static`` baseline in the Chapter-6 eval must produce data that's
-comparable with the JIT conditions. Two pre-ext8 asymmetries violated this:
-
-- **#65 (invocation telemetry):** ``_run_static`` never called
-  ``metrics_store.record_invocation``. ``invocation_events`` had zero rows
-  for the static condition → JIT-vs-static Gini had no baseline.
-- **#68 (contract validation):** ``_run_static`` skipped
-  ``task.output_contract.check``. A static capability that produced valid
-  metadata but missed its declared ``required_files`` passed M1 while the
-  same failure under JIT would correctly fail — a systematic thumb on the
-  scale in Chapter 6's Pillar 1 comparison.
-
-Both gaps are closed by the post-fix ``_run_static`` signature + body.
+The static baseline must stay comparable with JIT conditions: it records
+invocation telemetry, applies the same output-contract checks, and returns the
+shape-diagnostic fields expected by ``EvaluationRecord`` assembly.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(ROOT))
 
 
 def _make_harness():
@@ -42,20 +27,20 @@ def _make_harness():
 
 
 def test_run_static_accepts_metrics_store_kwarg():
-    """ext8 #65: _run_static signature gained `metrics_store` parameter."""
+    """_run_static accepts metrics_store so static runs record invocations."""
     import inspect
 
     from tests.evaluation.harness import EvaluationHarness
 
     sig = inspect.signature(EvaluationHarness._run_static)
     assert "metrics_store" in sig.parameters, (
-        "ext8 #65: _run_static must accept a `metrics_store` parameter to "
-        "record static-condition invocations."
+        "_run_static must accept a `metrics_store` parameter to record "
+        "static-condition invocations."
     )
 
 
 def test_run_static_records_invocation_when_metrics_store_provided():
-    """ext8 #65: a successful static run calls record_invocation on the store."""
+    """A successful static run calls record_invocation on the metrics store."""
     from src.schemas.metrics import InvocationRecord
     from tests.evaluation.tasks import T01
 
@@ -86,10 +71,11 @@ def test_run_static_records_invocation_when_metrics_store_provided():
 
 
 def _synth_task_with_static_coverage_and_required_files():
-    """Build a TaskDefinition that has BOTH has_static_coverage=True AND
-    output_contract.required_files non-empty. No current testbed task has
-    both — the combination is a Chapter-7 or future-task scenario, which is
-    exactly why ext8 #68 is a defensive fix.
+    """Build a dict-output static task with a required-file contract.
+
+    This exercises the branch where the static implementation produces valid
+    metadata but no output files, so the output contract must turn the run into
+    a shape mismatch.
     """
     from dataclasses import replace
 
@@ -106,8 +92,7 @@ def _synth_task_with_static_coverage_and_required_files():
 
 
 def test_run_static_applies_output_contract_check():
-    """ext8 #68: a static run that passes the validator but misses
-    required_files records output_shape_mismatch=True + output_in_range=False.
+    """Missing required files fail static runs even when the validator passes.
     """
     task = _synth_task_with_static_coverage_and_required_files()
 
@@ -132,22 +117,18 @@ def test_run_static_applies_output_contract_check():
     ):
         result = harness._run_static(task, registry, metrics_store)
 
-    # Pre-ext8 this row would have recorded {gate=True, range=True, reason='none'}.
-    # Post-ext8: shape mismatch promoted into failure_reason + output_in_range flipped.
     assert result["output_shape_mismatch"] is True, (
-        "ext8 #68: static run without output.csv must record shape mismatch"
+        "Static run without output.csv must record shape mismatch"
     )
     assert result["output_in_range"] is False, (
-        "ext8 #68: shape-mismatch must flip output_in_range=False (mirrors "
-        "compositional branch's ext8 #64 fix)."
+        "Shape mismatch must flip output_in_range=False."
     )
     assert result["failure_reason"] == "output_shape_mismatch"
     assert "output.csv" in result["output_shape_missing_files"]
 
 
 def test_run_static_invocation_reflects_failure_when_shape_mismatched():
-    """ext8 #65 + #68 interaction: the recorded invocation's success flag
-    must reflect the POST-shape-check status, not the pre-check validator.
+    """Recorded invocation success reflects the post-contract-check status.
     """
     task = _synth_task_with_static_coverage_and_required_files()
 
@@ -171,7 +152,7 @@ def test_run_static_invocation_reflects_failure_when_shape_mismatched():
 
 
 def test_run_static_no_metrics_store_still_works():
-    """Backward compatibility: calls without metrics_store (test-only) shouldn't crash."""
+    """Direct calls without metrics_store still run."""
     from tests.evaluation.tasks import T01
 
     harness = _make_harness()
@@ -192,16 +173,37 @@ def test_run_static_no_metrics_store_still_works():
 
 def test_run_static_returns_shape_fields_on_failure_paths():
     """The no-coverage + capability-missing + exception branches must all
-    return the new shape fields so the EvaluationRecord schema stays consistent.
+    return shape fields so the EvaluationRecord schema stays consistent.
     """
-    from tests.evaluation.tasks import T10  # no static coverage
+    from tests.evaluation.tasks import T01, T10
 
     harness = _make_harness()
     registry = MagicMock()
-    registry.get.return_value = None  # for the "cap missing" variant
 
     # No-static-coverage branch.
     result = harness._run_static(T10, registry, MagicMock())
+    assert "output_shape_mismatch" in result
+    assert result["output_shape_mismatch"] is False
+    assert result["output_shape_missing_keys"] == []
+    assert result["output_shape_missing_files"] == []
+
+    # Capability-missing branch.
+    registry.get.return_value = None
+    result = harness._run_static(T01, registry, MagicMock())
+    assert "output_shape_mismatch" in result
+    assert result["output_shape_mismatch"] is False
+    assert result["output_shape_missing_keys"] == []
+    assert result["output_shape_missing_files"] == []
+
+    # Static implementation exception branch.
+    cap = MagicMock()
+    cap.capability_type = "mcp_tool"
+    registry.get.return_value = cap
+    with patch(
+        "tests.evaluation.harness._run_static_implementation",
+        side_effect=RuntimeError("boom"),
+    ):
+        result = harness._run_static(T01, registry, MagicMock())
     assert "output_shape_mismatch" in result
     assert result["output_shape_mismatch"] is False
     assert result["output_shape_missing_keys"] == []

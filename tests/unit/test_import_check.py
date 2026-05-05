@@ -1,8 +1,7 @@
-"""Unit tests for src/verification/import_check.py (Tier 1.5).
+"""Unit tests for Tier 1.5 import-check verification.
 
-All Docker calls (sandbox_execute) are patched — these tests run without
-a real Docker daemon. Integration behavior (actually running Docker) is
-covered indirectly by Phase 4 smoke tests.
+All sandbox calls are patched, so these tests exercise import-check behavior
+and gate wiring without requiring a real Docker daemon.
 """
 
 from __future__ import annotations
@@ -11,12 +10,11 @@ from unittest.mock import patch
 
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
-from src.schemas.verification import Severity, VerificationReport
+from src.schemas.verification import Severity, VerificationFinding, VerificationReport
 from src.verification.import_check import (
     run_import_check,
     should_proceed_to_tier2,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -340,8 +338,6 @@ class TestAgentImportProbe:
 
 class TestShouldProceedToTier2:
     def _make_report(self, severities: list[Severity]) -> VerificationReport:
-        from src.schemas.verification import VerificationFinding
-
         return VerificationReport(
             capability_name="x",
             findings=[
@@ -428,13 +424,7 @@ class TestGateWiring:
 
 
 # ---------------------------------------------------------------------------
-# Step 14.12 / 2026-04-19 audit closure: allow_network forwarding
-#
-# Pre-2026-04-19, gate.py passed allow_network to behavioral + adversarial
-# but NOT to run_import_check — Tier 1.5's sandbox hardcoded offline mode.
-# Any MCP_TOOL whose import itself needs network (eager API init at import
-# time) would spuriously fail Tier 1.5 even under a task policy that does
-# permit network. The fix threads allow_network through.
+# allow_network forwarding
 # ---------------------------------------------------------------------------
 
 

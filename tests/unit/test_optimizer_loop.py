@@ -89,7 +89,7 @@ class TestKLDivergence:
 
 
 class TestSchemaJaccard:
-    """Tests for the _schema_jaccard helper (B1 Merge second conjunct)."""
+    """Tests for the _schema_jaccard merge-overlap helper."""
 
     def test_both_empty_returns_zero(self):
         """Unpopulated schemas must not form merge candidates — safe default."""
@@ -372,11 +372,11 @@ class TestCreateOptimizationLoop:
     def test_merge_candidates_rejected_when_schemas_disjoint(
         self, mock_merge, mock_split, mock_prune
     ):
-        """B1 second conjunct: high description cosine but disjoint schemas → no pair.
+        """High description similarity but disjoint schemas produce no pair.
 
-        Protects against regression of the proposal's *"overlapping input schemas"*
-        clause. Without this test, silently removing the Jaccard gate in
-        ``identify_candidates_node`` would still pass all other merge tests.
+        Without this test, silently removing the Jaccard gate in
+        ``identify_candidates_node`` would still pass the similarity-only
+        merge tests.
         """
         # Description cosine will be mocked high (0.8), but schemas have zero overlap.
         cap_a = _make_cap(
@@ -416,7 +416,7 @@ class TestCreateOptimizationLoop:
     def test_merge_candidates_rejected_when_schemas_identical(
         self, mock_merge, mock_split, mock_prune
     ):
-        """B1 safety rule: identical schemas (Jaccard = 1.0) → no merge.
+        """Identical schemas (Jaccard = 1.0) are not merged.
 
         Two capabilities with identical input/output contracts may hide
         different internal logic (e.g., strict vs. lenient CSV parsing).
@@ -458,7 +458,10 @@ class TestCreateOptimizationLoop:
     @patch("src.optimizer.loop.prune", return_value=["skill-a"])
     @patch("src.optimizer.loop.split")
     @patch("src.optimizer.loop.merge")
-    @patch("src.optimizer.loop.compute_all_utilities", return_value={"skill-a": 0.1, "skill-b": 0.1})
+    @patch(
+        "src.optimizer.loop.compute_all_utilities",
+        return_value={"skill-a": 0.1, "skill-b": 0.1},
+    )
     def test_pruned_capabilities_skipped_for_merge(
         self, mock_compute, mock_merge, mock_split, mock_prune
     ):
@@ -472,7 +475,7 @@ class TestCreateOptimizationLoop:
         prune() is mocked to return ["skill-a"].  apply_operations_node must then
         skip the ("skill-a", "skill-b") pair because skill-a is in pruned_set.
         """
-        # Overlapping schemas so the B1 Jaccard gate accepts the pair.
+        # Overlapping schemas so the Jaccard gate accepts the pair.
         # Jaccard = 3/5 = 0.6 — see test_merge_candidates_use_similarity.
         shared_inputs = {"file_path": "str", "row_count": "int"}
         cap_a = _make_cap(
@@ -566,14 +569,11 @@ class TestCreateOptimizationLoop:
         """identify_candidates_node must accept MCP_TOOL, SKILL, and AGENT as
         split candidates when the reuse/success thresholds fire.
 
-        Guards against regression of the Iteration-4 ``type != MCP_TOOL``
-        filter that blocked MCP_TOOL from autonomous split triggering. The
-        filter was removed to restore symmetry with merge (which was fixed
-        in B1 Step 3 commit ``6a8fc63``) and to match Step 8's per-type
-        split dispatch in ``operations.py``. Correctness on MCP_TOOL
-        variants is enforced downstream by ``verify_coverage`` + the
-        three-tier gate — the loop-level filter added no safety, only an
-        undisclosed scope hole in the auto-optimizer path.
+        Guards against reintroducing the old type filter that blocked
+        MCP_TOOL from autonomous split triggering. Current behavior lets
+        all capability types pass candidate selection; ``operations.split``
+        handles per-type dispatch, and downstream verification enforces
+        correctness.
         """
         caps = {
             "mcp-a": _make_cap("mcp-a", CapabilityType.MCP_TOOL),
@@ -610,15 +610,12 @@ class TestCreateOptimizationLoop:
         """If compute_granularity_metrics raises in identify_candidates_node,
         the node must log a warning and continue — not crash.
 
-        We mock compute_all_utilities so that compute_metrics_node SUCCEEDS
-        and populates capabilities_snapshot. Then store.compute_granularity_metrics
-        raises: caught by the SPLIT loop's try/except (src/optimizer/loop.py
-        L240-256). That try/except skips the cap without populating
-        ``metrics_cache``. The subsequent MERGE loop reads `metrics_cache.get(cap_id)`,
-        finds None, and `continue`s (L273-275) — no try/except needed because
-        the cache miss is handled structurally. The merge loop's own try/except
-        (L290, L320) guards `registry.search()` failures, not metrics failures.
-        Either way: no crash, empty candidate lists, graceful exit.
+        We mock compute_all_utilities so compute_metrics_node succeeds and
+        populates capabilities_snapshot. Then store.compute_granularity_metrics
+        raises during candidate identification. The split path catches the
+        error and skips the cap without populating ``metrics_cache``. The
+        merge path treats that cache miss as a structural skip, while its
+        own try/except guards registry-search failures.
         """
         caps = {"skill-a": _make_cap("skill-a", CapabilityType.SKILL)}
         registry = MagicMock()

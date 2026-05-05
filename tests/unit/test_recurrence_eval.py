@@ -1,3 +1,10 @@
+"""Unit coverage for the supplemental recurrence evaluation track.
+
+These tests guard the Stage 3 condition matrix, recurrence fixture generation,
+task-instance construction, validator picklability, and persistence of
+recurrence identity fields.
+"""
+
 from __future__ import annotations
 
 import json
@@ -14,7 +21,7 @@ from tests.evaluation.recurrence_tasks import build_recurrence_tasks
 from tests.evaluation.tasks import get_task
 
 
-def test_condition_profiles_are_proposal_aligned():
+def test_condition_profiles_match_eval_protocol():
     full = get_condition_profile("full")
     no_verification = get_condition_profile("no_verification")
     no_optimization = get_condition_profile("no_optimization")

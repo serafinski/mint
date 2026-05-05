@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.optimizer.operations import (
+    _MAX_AGENT_SUBAGENT_BUDGET,
     MergeAgentsResult,
     MergeAgentsSubagent,
     MergeSkillsResult,
@@ -19,22 +21,14 @@ from src.optimizer.operations import (
     SplitSkillVariant,
     SplitToolsResult,
     SplitToolVariant,
-    _MAX_AGENT_SUBAGENT_BUDGET,
-    _merge_agents,
-    _merge_skills,
-    _merge_tools,
-    _register_artifact_directly,
-    _split_agents,
-    _split_skills,
-    _split_tools,
     _summarize_failures_for_prompt,
     merge,
     prune,
     split,
     verify_and_register_or_rollback,
 )
-from src.schemas.metrics import InvocationRecord
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
+from src.schemas.metrics import InvocationRecord
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import (
     Severity,
@@ -215,7 +209,7 @@ class TestAgentSubagentNameValidation:
         assert event_call[0][1] == "pruned"
 
     def test_prune_mixed_registry_only_deactivates_unpinned(self):
-        """Mixed registry: pinned survives, active-with-invocations survives, idle-unpinned pruned."""
+        """Mixed registry: pinned and active survive; idle-unpinned is pruned."""
         pinned = _make_cap("pinned-cap")
         pinned = pinned.model_copy(
             update={
@@ -249,7 +243,7 @@ class TestAgentSubagentNameValidation:
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — verify_and_register_or_rollback helper
+# verify_and_register_or_rollback helper
 # ---------------------------------------------------------------------------
 
 
@@ -290,7 +284,7 @@ def _skill_artifact(name: str = "merged-skill") -> GeneratedArtifact:
 
 
 class TestVerifyAndRegisterOrRollback:
-    """Step 5 — the shared helper that merge and split funnel through."""
+    """The shared helper that merge and split funnel through."""
 
     @patch("src.verification.gate.verify")
     def test_gate_pass_registers_skill_and_records_event(self, mock_verify):
@@ -406,7 +400,7 @@ class TestVerifyAndRegisterOrRollback:
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — merge() dispatch + per-type merge functions
+# merge() dispatch + per-type merge functions
 # ---------------------------------------------------------------------------
 
 
@@ -426,14 +420,13 @@ def _cap_with_source(
     ``metadata['skill_content']`` / ``metadata['agent_config']``. Merge
     helpers pull parent executable content from these metadata keys.
     """
-    import json as _json
     metadata: dict[str, str] = {"generated": "true"}
     if source_code is not None:
         metadata["source_code"] = source_code
     if skill_content is not None:
         metadata["skill_content"] = skill_content
     if agent_config is not None:
-        metadata["agent_config"] = _json.dumps(agent_config)
+        metadata["agent_config"] = json.dumps(agent_config)
     return CapabilityDescriptor(
         name=name,
         description=f"Description for {name}",
@@ -521,6 +514,7 @@ class TestMergeTools:
     """_merge_tools: MCP_TOOL parents → combined FastMCP source."""
 
     def _mcp_cap(self, name: str, tags: list[str] | None = None) -> CapabilityDescriptor:
+        func_name = name.replace("-", "_")
         return _cap_with_source(
             name,
             cap_type=CapabilityType.MCP_TOOL,
@@ -531,7 +525,8 @@ class TestMergeTools:
                 "from pydantic import Field\n"
                 f"mcp = FastMCP(\"{name}\")\n"
                 "@mcp.tool()\n"
-                f"async def {name.replace('-', '_')}(x: Annotated[int, Field(description='x')]) -> dict:\n"
+                f"async def {func_name}("
+                "x: Annotated[int, Field(description='x')]) -> dict:\n"
                 "    return {'y': x}\n"
             ),
             tags=tags,
@@ -811,8 +806,7 @@ class TestMergeAgents:
         descriptor = registry.add.call_args[0][0]
         assert descriptor.capability_type == CapabilityType.AGENT
         # agent_config is stored as JSON string in metadata
-        import json as _json
-        agent_cfg = _json.loads(descriptor.metadata["agent_config"])
+        agent_cfg = json.loads(descriptor.metadata["agent_config"])
         assert agent_cfg["system_prompt"] == "You investigate both X and Y."
         # No subagents key when the list is empty
         assert "subagents" not in agent_cfg
@@ -867,9 +861,8 @@ class TestMergeAgents:
 
         result = merge(registry, store, ["agent-a", "agent-b"])
         assert result == "merged-agent"
-        import json as _json
         descriptor = registry.add.call_args[0][0]
-        agent_cfg = _json.loads(descriptor.metadata["agent_config"])
+        agent_cfg = json.loads(descriptor.metadata["agent_config"])
         assert len(agent_cfg["subagents"]) == 2
         assert agent_cfg["subagents"][0]["name"] == "sub-1"
         assert descriptor.input_schema == {"left": "str", "right": "str"}
@@ -914,8 +907,7 @@ class TestMergeAgents:
     def test_budget_ceiling_rejects_merge_without_calling_gate(
         self, mock_init, mock_verify
     ):
-        """Step 6d: more than 8 subagents → abort, parents stay active,
-        gate is NOT called (cheaper to reject than to run Tier 3)."""
+        """More than 8 subagents aborts before gate, keeping parents active."""
         cap_a = self._agent_cap("agent-a")
         cap_b = self._agent_cap("agent-b")
         registry = MagicMock()
@@ -982,7 +974,7 @@ class TestMergeAgents:
 
 
 # ---------------------------------------------------------------------------
-# Step 8 — per-type split dispatch + helpers
+# per-type split dispatch + helpers
 # ---------------------------------------------------------------------------
 
 
@@ -1564,23 +1556,14 @@ class TestSplitAgents:
 
 
 class TestSummarizeFailuresForPrompt:
-    """Guards the Pillar 3 Split LLM-prompt summarizer against the 2026-04-19
-    invocation-recording regression. Pre-fix, both production writers left
-    ``input_args`` and ``actual_output`` as None, so ``get_recent_failures``
-    returned an empty list and this summarizer hit its degraded-mode fallback
-    on every real-telemetry split. This test asserts the summarizer produces
-    real LLM-ready context when fed rows in the shape the post-fix writers
-    now produce. See ``docs/invocation_recording_gap_2026_04_19.md``.
-    """
+    """Guards the split LLM-prompt failure-case summarizer."""
 
     def test_empty_failures_returns_degraded_fallback(self):
         summary = _summarize_failures_for_prompt([])
         assert summary.startswith("No recorded failure cases.")
 
     def test_populated_failures_produce_real_context(self):
-        """The critical post-fix invariant: when production writers populate
-        input_args + error_message, the summarizer must NOT return the
-        degraded fallback."""
+        """Rows with replay input and an error produce real prompt context."""
         failures = [
             InvocationRecord(
                 capability_id="row-aggregator",
@@ -1614,7 +1597,7 @@ class TestSummarizeFailuresForPrompt:
                 token_cost=0,
                 latency_ms=1.0,
                 input_args='{"x": 1}',
-                actual_output='{"label": "B"}',  # user flagged this as wrong
+                actual_output='{"label": "B"}',
                 error_message=None,
             ),
         ]

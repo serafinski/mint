@@ -1,4 +1,4 @@
-"""Unit tests for src/registry/evaluation_store.py."""
+"""Tests for the DuckDB-backed evaluation store."""
 
 from __future__ import annotations
 
@@ -39,10 +39,10 @@ class TestInitParentDirAutocreation:
     def test_init_creates_parent_directory_if_missing(self, tmp_path):
         """``EvaluationStore(db_path=...)`` mkdirs missing parent dirs.
 
-        Regression guard: run_pilot.py / run_longitudinal*.py instantiate
-        ``EvaluationStore(db_path=args.db)`` on fresh data paths. If parent
-        dir doesn't exist, DuckDB raises FileNotFoundError. Defensive init
-        closes the class of bug.
+        Regression guard: eval runners instantiate
+        ``EvaluationStore(db_path=args.db)`` on fresh data paths. If the
+        parent dir doesn't exist, DuckDB raises FileNotFoundError. Defensive
+        init closes the class of bug.
         """
         nested = tmp_path / "nested" / "sub" / "dir" / "eval.duckdb"
         assert not nested.parent.exists()

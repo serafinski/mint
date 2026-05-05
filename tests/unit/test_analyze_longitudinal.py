@@ -1,4 +1,4 @@
-"""Unit tests for scripts/analyze_longitudinal.py helpers (Step 18.7)."""
+"""Unit tests for scripts/analyze_longitudinal.py helper behavior."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from scripts.analyze_longitudinal import (  # noqa: E402
 from src.registry.evaluation_store import EvaluationStore  # noqa: E402
 from src.schemas.evaluation import EvaluationRecord  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # _kl_divergence_between_snapshots
 # ---------------------------------------------------------------------------
@@ -28,22 +27,23 @@ from src.schemas.evaluation import EvaluationRecord  # noqa: E402
 
 class TestKLDivergenceBetweenSnapshots:
     def test_both_empty_returns_nan(self):
-        """ext12 #118 (2026-04-21): empty-vs-empty returns NaN so the
-        convergence detector can skip cycles with no data, rather than
-        the pre-fix 0.0 sentinel that let zero-evidence DBs report
-        false-positive convergence.
+        """Empty-vs-empty returns NaN so no-data cycles do not converge.
+
+        The convergence detector treats NaN as missing signal and resets
+        its sub-threshold streak.
         """
         import math
+
         result = _kl_divergence_between_snapshots({}, {})
         assert math.isnan(result)
 
     def test_prev_empty_curr_populated_returns_zero(self):
-        # First-cycle sentinel — we're seeing the first real snapshot, so
+        # First-cycle sentinel: we're seeing the first real snapshot, so
         # KL against nothing is 0.0 by convention.
         assert _kl_divergence_between_snapshots({}, {"a": 1.0}) == 0.0
 
     def test_prev_populated_curr_empty_returns_inf(self):
-        # Catastrophic — all caps disappeared between snapshots.
+        # Catastrophic: all caps disappeared between snapshots.
         assert _kl_divergence_between_snapshots({"a": 1.0}, {}) == float("inf")
 
     def test_identical_distributions_near_zero(self):
@@ -55,7 +55,7 @@ class TestKLDivergenceBetweenSnapshots:
         assert 0.0 <= kl < 0.001
 
     def test_different_distributions_non_trivial(self):
-        # Opposite distributions → higher KL than near-identical
+        # Opposite distributions produce higher KL than near-identical ones.
         kl_similar = _kl_divergence_between_snapshots(
             {"a": 0.5, "b": 0.5}, {"a": 0.55, "b": 0.45},
         )
@@ -66,7 +66,7 @@ class TestKLDivergenceBetweenSnapshots:
         assert kl_different > 0.5
 
     def test_negative_utility_scores_handled(self):
-        # Utility scores can be negative (U = α·reuse·success − β·cost − γ·maint).
+        # Utility scores can be negative.
         # The analyzer must shift to non-negative + normalize; it should not raise.
         kl = _kl_divergence_between_snapshots(
             {"a": -0.5, "b": 0.3, "c": 0.7},
@@ -76,7 +76,7 @@ class TestKLDivergenceBetweenSnapshots:
         assert kl >= 0.0
 
     def test_union_of_keys_handled(self):
-        # New cap appears in curr but not in prev — should still compute KL
+        # A new cap appears in curr but not prev; KL should still compute.
         kl = _kl_divergence_between_snapshots(
             {"a": 0.5, "b": 0.5},
             {"a": 0.4, "b": 0.4, "c": 0.2},  # c is new
@@ -108,10 +108,9 @@ class TestDetectConvergence:
 
     def test_converged_after_warmup(self):
         kls = [0.5, 0.3, 0.2, 0.005, 0.004, 0.003, 0.002]
-        # Sub-threshold run starts at index 3 (cycle 4); needs 3 consecutive
-        # → converges at cycle (3+1) - (3-1) = 2. Wait let me re-check my algorithm.
-        # _detect_convergence: i is 0-indexed; returns (i+1) - (min_consecutive-1)
-        # when run_len reaches min_consecutive. At i=3: run_len=1; i=4: 2; i=5: 3 → returns (6)-(2) = 4
+        # Sub-threshold run starts at index 3 (cycle 4). Once the third
+        # consecutive sub-threshold value is seen, the detector returns
+        # the first cycle in that qualifying window.
         result = _detect_convergence(kls, threshold=0.01, min_consecutive=3)
         assert result == 4
 
@@ -122,10 +121,10 @@ class TestDetectConvergence:
 
     def test_converged_then_diverged_then_reconverged(self):
         # Converges at cycle 3 (indices 0,1,2), then KL blows up at index 3,
-        # then sub-threshold again at 4,5,6 — first detection is the first
+        # then sub-threshold again at 4,5,6; first detection is the first
         # qualifying window.
         kls = [0.005, 0.004, 0.003, 0.5, 0.001, 0.001, 0.001]
-        # First: indices 0,1,2 — all sub-threshold → converged at cycle 1
+        # First window: indices 0,1,2 are all sub-threshold, so cycle 1.
         assert _detect_convergence(kls, threshold=0.01, min_consecutive=3) == 1
 
     def test_min_consecutive_one(self):
@@ -155,17 +154,16 @@ class TestTableExists:
         with EvaluationStore() as store:
             assert _table_exists(store._conn, "does_not_exist") is False
 
-    def test_step_18_5_and_follow_up_tables_exist(self):
+    def test_analyzer_support_tables_exist(self):
         with EvaluationStore() as store:
-            # All the tables the Step 18.7 analyzer queries should exist
-            # on a freshly-initialized store.
+            # All tables queried by the analyzer should exist on a fresh store.
             assert _table_exists(store._conn, "invocation_events") is True
             assert _table_exists(store._conn, "cycle_utility_scores") is True
             assert _table_exists(store._conn, "cycle_events") is True
 
 
 # ---------------------------------------------------------------------------
-# _load_cycle_data — integration with EvaluationStore
+# _load_cycle_data - integration with EvaluationStore
 # ---------------------------------------------------------------------------
 
 
@@ -288,11 +286,8 @@ class TestEndToEnd:
         """Verify _load_cycle_data + downstream processing produces a
         record with all expected fields when all four tables are populated.
 
-        Security audit finding #18 (2026-04-20): pass explicit
-        ``occurred_at`` timestamps so utility/event rows land in their
-        intended cycle windows. Post-fix the analyzer buckets rows by
-        timestamp, so the test must ensure temporal ordering matches
-        the task_rows.
+        Explicit ``occurred_at`` timestamps ensure utility/event rows land
+        in their intended cycle windows.
         """
         from datetime import UTC, datetime, timedelta
         base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
@@ -332,29 +327,23 @@ class TestEndToEnd:
 
 
 class TestPerCycleIsolationAcrossTaskRepetitions:
-    """Security audit finding #18 (2026-04-20) regression guard.
+    """Repeated task IDs must not collapse per-cycle telemetry.
 
-    Pre-fix, utility and event rows were keyed by ``task_id`` only. When
-    a task repeated in the sequence (default ``run_longitudinal.py
-    --n-tasks=40`` with 20 unique tasks repeats every task at least
-    once), cycle N and cycle M (both T01) both read the merged/last-
-    write-wins dict. Post-fix, rows are bucketed by timestamp window
-    against ``task_boundaries``, so each cycle sees only its own
-    utility/event rows.
+    Utility and event rows are bucketed by timestamp window, not only by
+    ``task_id``. That keeps repeated occurrences of the same task isolated
+    in the per-cycle time series.
     """
 
     def test_per_cycle_utility_snapshots_isolated_across_task_repetitions(self):
         """Two cycles with the same task_id carry distinct utility values."""
         from datetime import UTC, datetime, timedelta
 
-        # One longitudinal run = one run_id (security audit finding #24).
-        # Repeating task_ids within that run must still isolate per-cycle
-        # (ext5 #18 fix) — this test verifies per-cycle isolation WITHIN
-        # a single run_id.
+        # Repeating task_ids within one run must still isolate per-cycle
+        # telemetry.
         run_id = "longitudinal-run"
         base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
         with EvaluationStore() as store:
-            # Cycle 1 — T01 @ t=1 min; utility cap-x = 0.1
+            # Cycle 1: T01 at t=1 min; utility cap-x = 0.1.
             ts_1 = base + timedelta(minutes=1)
             store.record_run(_base_record(
                 task_id="T01", timestamp=ts_1, run_id=run_id,
@@ -365,7 +354,7 @@ class TestPerCycleIsolationAcrossTaskRepetitions:
                 occurred_at=ts_1 + timedelta(seconds=10),
             )
 
-            # Cycle 2 — T01 AGAIN @ t=2 min; utility cap-x = 0.9
+            # Cycle 2: T01 again at t=2 min; utility cap-x = 0.9.
             ts_2 = base + timedelta(minutes=2)
             store.record_run(_base_record(
                 task_id="T01", timestamp=ts_2, run_id=run_id,
@@ -379,11 +368,10 @@ class TestPerCycleIsolationAcrossTaskRepetitions:
             cycles = _load_cycle_data(store._conn)
             assert len(cycles) == 2
 
-            # Critical assertion: cycles must have DIFFERENT utility values.
-            # Pre-fix both cycles would read {"cap-x": 0.9} (last-write-wins).
+            # The two repeated task cycles must keep distinct utility values.
             assert cycles[0]["utility_scores"] == {"cap-x": 0.1}, (
                 f"Cycle 1 (T01 @ {ts_1}) should report its own utility 0.1. "
-                f"Got: {cycles[0]['utility_scores']} — pre-fix regression."
+                f"Got: {cycles[0]['utility_scores']}."
             )
             assert cycles[1]["utility_scores"] == {"cap-x": 0.9}
 
@@ -391,7 +379,7 @@ class TestPerCycleIsolationAcrossTaskRepetitions:
         """Events from different cycles of the same task_id must not merge."""
         from datetime import UTC, datetime, timedelta
 
-        # One longitudinal run = one run_id (security audit finding #24).
+        # One longitudinal run = one run_id.
         run_id = "longitudinal-run"
         base = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
         with EvaluationStore() as store:
@@ -418,8 +406,7 @@ class TestPerCycleIsolationAcrossTaskRepetitions:
             cycles = _load_cycle_data(store._conn)
             assert len(cycles) == 2
 
-            # Pre-fix: cycles[0]["events"] and cycles[1]["events"] both
-            # had 2 entries (the merged list). Post-fix: each has 1.
+            # Each repeated task cycle should carry only its own event.
             assert len(cycles[0]["events"]) == 1
             assert cycles[0]["events"][0]["event_type"] == "split"
             assert cycles[0]["events"][0]["details"] == "cycle 1"
@@ -430,22 +417,20 @@ class TestPerCycleIsolationAcrossTaskRepetitions:
 
 
 class TestRunIdIsolation:
-    """Security audit finding #24 (2026-04-20) regression guard.
+    """Multiple longitudinal runs in one DB must be analyzed separately.
 
-    Pre-fix, `_load_cycle_data` queried `WHERE condition = 'longitudinal'`
-    without a run_id filter — when the DB contained multiple runs, the
-    analyzer merged them into one interleaved timeline, corrupting
-    KL convergence and operation-count summaries.
+    ``_load_cycle_data`` scopes to a single ``run_id`` so appended or
+    repeated campaigns do not merge into one interleaved timeline.
     """
 
     def test_two_runs_each_analyzed_independently(self):
-        """Two runs in one DB → analyzer scoped to a single run_id
+        """Two runs in one DB: analyzer scoped to a single run_id
         returns only that run's cycles."""
         from datetime import UTC, datetime, timedelta
 
         base = datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC)
         with EvaluationStore() as store:
-            # Run r1 — 2 cycles at t=1min, t=2min
+            # Run r1: 2 cycles at t=1min, t=2min.
             for i in range(1, 3):
                 ts = base + timedelta(minutes=i)
                 store.record_run(_base_record(
@@ -453,7 +438,7 @@ class TestRunIdIsolation:
                     condition="longitudinal",
                 ))
 
-            # Run r2 — 2 cycles at t=10min, t=11min (later)
+            # Run r2: 2 cycles at t=10min, t=11min (later).
             for i in range(1, 3):
                 ts = base + timedelta(minutes=10 + i)
                 store.record_run(_base_record(
@@ -471,16 +456,15 @@ class TestRunIdIsolation:
             assert len(cycles_r2) == 2
             assert all(c["run_id"] == "r2" for c in cycles_r2)
 
-            # Default (None) auto-selects the latest — r2 has the newer
+            # Default (None) auto-selects the latest; r2 has the newer
             # timestamps so it wins.
             cycles_default = _load_cycle_data(store._conn)
             assert len(cycles_default) == 2
             assert all(c["run_id"] == "r2" for c in cycles_default)
 
     def test_nonexistent_run_id_raises(self):
-        """Explicit run_id that doesn't exist → ValueError (loud fail,
+        """Explicit run_id that doesn't exist raises ValueError (loud fail,
         not silent empty result)."""
-        import pytest as _pytest
         from datetime import UTC, datetime
 
         with EvaluationStore() as store:
@@ -489,11 +473,11 @@ class TestRunIdIsolation:
                 condition="longitudinal",
             ))
 
-            with _pytest.raises(ValueError, match="not found"):
+            with pytest.raises(ValueError, match="not found"):
                 _load_cycle_data(store._conn, run_id="nonexistent")
 
     def test_empty_db_returns_empty(self):
-        """No longitudinal runs → empty list, no error."""
+        """No longitudinal runs returns an empty list, no error."""
         with EvaluationStore() as store:
             assert _load_cycle_data(store._conn) == []
             assert _load_cycle_data(store._conn, run_id=None) == []

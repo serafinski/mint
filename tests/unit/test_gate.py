@@ -1,4 +1,4 @@
-"""Unit tests for src/verification/gate.py.
+"""Tests for the tiered verification gate.
 
 All external calls (behavioral.run, adversarial.probe, import_check.run_import_check)
 are mocked so these tests run without Docker or API keys.
@@ -757,7 +757,7 @@ def test_verify_never_raises_on_unexpected_exception(mock_static_scan):
     ``overall_passed=False`` so infrastructure errors do not manufacture
     PASS verdicts.
     """
-    mock_static_scan.side_effect = OSError("Simulated filesystem failure in _run_skill_precheck")
+    mock_static_scan.side_effect = OSError("Simulated filesystem failure in static scan")
     artifact = _make_artifact(
         cap_type=CapabilityType.SKILL,
         source_code=None,

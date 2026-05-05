@@ -1,9 +1,7 @@
 """Unit tests for the MCP tool generator.
 
-LLM-calling behaviour is covered by ``tests/integration/test_mcp_tool_generator.py``
-with real OpenAI calls.  These tests cover schema validation, the
-``_validate_code`` helper, and the node's routing logic (patching
-``generate_single_tool``, not the LLM).
+These tests cover schema validation, source validation, prompt plumbing,
+repair handling, retry skipping, and node routing with LLM calls patched.
 """
 
 from __future__ import annotations
@@ -22,8 +20,10 @@ from src.orchestrator.generators.mcp_tool import (
     generate_single_tool,
 )
 from src.orchestrator.generators.utils import (
+    build_schema_context,
     find_subtask_for_gap,
     is_first_step_for_gap,
+    slugify_gap,
 )
 from src.orchestrator.prompts.mcp_tool_generator import (
     DOWNSTREAM_STEP_DIRECTIVE,
@@ -161,7 +161,7 @@ class TestValidateCode:
         assert "Field" in error
 
     def test_multiple_async_def_rejected(self):
-        """Two top-level async defs are rejected (runner can't tell which is the tool)."""
+        """Two top-level async defs are rejected to avoid ambiguous execution."""
         code = (
             "from mcp.server.fastmcp import FastMCP\n"
             "from typing import Annotated\n"
@@ -180,10 +180,9 @@ class TestValidateCode:
     def test_nested_async_def_not_rejected(self):
         """A tool with a nested async def inside its body is accepted.
 
-        The runner discovers functions via ``dir(module)`` which only exposes
-        module-level names; a nested coroutine never appears there and does not
-        create ambiguity for the runner.  Using ``ast.iter_child_nodes`` (not
-        ``ast.walk``) ensures we only count top-level async defs.
+        Sandbox execution selects public module-level async functions. A nested
+        coroutine never appears as a candidate, so validation only counts
+        top-level async defs via ``ast.iter_child_nodes``.
         """
         code = (
             "from mcp.server.fastmcp import FastMCP\n"
@@ -228,7 +227,7 @@ class TestValidateCode:
     def test_async_def_in_string_literal_not_counted(self):
         """'async def' appearing only in a docstring is not counted as a function.
 
-        AST-based counting (BUG-10 fix) avoids false positives from substring search.
+        AST-based counting avoids false positives from substring search.
         A docstring like '\"\"\"Example: async def foo()\"\"\"' must not trigger the
         'exactly 1 async def required' check.
         """
@@ -291,8 +290,8 @@ class TestValidateCode:
     def test_private_top_level_async_helper_accepted(self):
         """A module-level private async helper (_prefixed) is not counted as a tool.
 
-        The tool runner skips _-prefixed names via dir() filter; _validate_code
-        must do the same so valid code with a private helper is not rejected.
+        Sandbox execution ignores private module-level helpers; _validate_code
+        mirrors that so valid code with a private helper is not rejected.
         """
         code = (
             "from mcp.server.fastmcp import FastMCP\n"
@@ -369,15 +368,14 @@ class TestValidateToolName:
         assert "snake_case" in error
 
     def test_starts_with_underscore(self):
-        # Leading underscore causes the runner to skip the function (dir() filter),
-        # resulting in silent execution failure — must be rejected at validation time.
+        # Leading underscores mark private helpers, so public tool names must reject them.
         error = _validate_tool_name("_add_numbers")
         assert error is not None
         assert "snake_case" in error
 
 
 # ---------------------------------------------------------------------------
-# _validate_step_signature + step-position plumbing (Step 14.7)
+# _validate_step_signature + step-position plumbing
 # ---------------------------------------------------------------------------
 
 
@@ -399,7 +397,7 @@ def _make_tool_source(params: str, body: str = "    return {}") -> str:
 
 
 class TestValidateStepSignature:
-    """Step 14.7: catch step-0 functions that falsely require upstream_data."""
+    """Catch step-0 functions that falsely require upstream_data."""
 
     _FIRST_STEP_CORRECT = _make_tool_source(
         'csv_path: Annotated[str, Field(description="Path to CSV")]'
@@ -670,16 +668,14 @@ class TestStepPositionInPrompt:
         assert "Step Position (HARD CONSTRAINT)" not in user_msg["content"]
 
     def test_schema_context_reaches_prompt(self):
-        """Phase 3.5c wires ``build_schema_context(gap, subtasks)`` into the
-        MCP tool generator prompt so each step knows its upstream input keys
-        and required output keys. A regression that disconnected this
-        plumbing (e.g. dropped the ``schema_context`` kwarg, stopped
-        formatting the section into the user prompt, or swallowed the
-        output of ``build_schema_context``) would silently produce schema-
-        blind tools. Guard the injection path with distinctive key tokens.
-        """
-        from src.orchestrator.generators.utils import build_schema_context
+        """Schema context is injected into the MCP tool prompt.
 
+        Each generated step needs its upstream input keys and required output
+        keys. A regression that dropped the ``schema_context`` kwarg, stopped
+        formatting the section into the user prompt, or swallowed the output
+        of ``build_schema_context`` would silently produce schema-blind tools.
+        Guard the injection path with distinctive key tokens.
+        """
         upstream = SubTask(
             description="Parse the input CSV",
             required_capabilities=["parse_csv"],
@@ -715,9 +711,10 @@ class TestStepPositionInPrompt:
         assert "aggregate_summary_fixture" in user_msg["content"]
 
     def test_empty_schema_context_omits_contract_section(self):
-        """When ``build_schema_context`` returns empty (legacy decomposition
-        without ``output_schema``), the generator must NOT emit a stray
-        ``## Input/Output Schema Contract`` heading with nothing under it.
+        """When no schema context is available, omit the contract section.
+
+        The generator must not emit a stray ``## Input/Output Schema Contract``
+        heading with nothing under it.
         """
         captured: list = []
         with patch(
@@ -993,14 +990,13 @@ class TestGenerateSingleTool:
 
         assert error is None
         assert artifact is not None
-        # Fix 5: name is now a deterministic slug, not the LLM-chosen name
-        from src.orchestrator.generators.utils import slugify_gap
+        # Name is a deterministic slug, not the LLM-chosen name.
         assert artifact.capability_name == slugify_gap("add_numbers")
         assert artifact.capability_type == CapabilityType.MCP_TOOL
         assert artifact.source_code == VALID_TOOL_SOURCE
 
     def test_description_preserved_in_artifact(self):
-        """The LLM-generated description is stored in the artifact (Bug 1 fix)."""
+        """The LLM-generated description is stored in the artifact."""
         valid_with_desc = GeneratedToolCode(
             tool_name="add_numbers",
             source_code=VALID_TOOL_SOURCE,
@@ -1054,8 +1050,7 @@ class TestGenerateSingleTool:
 
         assert error is None
         assert artifact is not None
-        # Fix 5: name is deterministic slug, not LLM-chosen
-        from src.orchestrator.generators.utils import slugify_gap
+        # Name is deterministic slug, not LLM-chosen.
         assert artifact.capability_name == slugify_gap("add_numbers")
         assert artifact.capability_type == CapabilityType.MCP_TOOL
 
@@ -1126,7 +1121,7 @@ class TestGenerateSingleTool:
         assert gap.description in user_msg["content"]
 
     def test_generate_single_tool_uses_forced_name(self):
-        """Fix 5: artifact uses slugify_gap(gap.query), not the LLM-chosen name."""
+        """Artifact uses slugify_gap(gap.query), not the LLM-chosen name."""
         llm_code = GeneratedToolCode(
             tool_name="something_else",  # LLM picks a different name
             source_code=VALID_TOOL_SOURCE,
@@ -1140,12 +1135,11 @@ class TestGenerateSingleTool:
 
         assert error is None
         assert artifact is not None
-        from src.orchestrator.generators.utils import slugify_gap
         assert artifact.capability_name == slugify_gap("add_numbers")
 
 
 # ---------------------------------------------------------------------------
-# Fix 4: Skip already-passing gaps on retry
+# Skip already-passing gaps on retry
 # ---------------------------------------------------------------------------
 
 
@@ -1253,7 +1247,7 @@ class TestSkipOnRetry:
 
 
 # ---------------------------------------------------------------------------
-# Fix 7: Parallel generation
+# Parallel generation
 # ---------------------------------------------------------------------------
 
 
@@ -1331,4 +1325,3 @@ class TestParallelGeneration:
 
         assert len(cmd.update["generated_artifacts"]) == 1
         assert any("tool-0" in e for e in cmd.update["errors"])
-

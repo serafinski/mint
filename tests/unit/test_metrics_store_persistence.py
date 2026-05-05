@@ -1,38 +1,23 @@
-"""ext8 #71 — MetricsStore persistence across runs.
-
-Pre-fix the harness + longitudinal runners instantiated ``MetricsStore()``
-with the default ``:memory:`` backend. Every run wiped ``maintenance_burden``
-+ any accumulated cross-run state, breaking the Pillar 3 "learning over
-time" claim — the optimizer had no memory of prior runs' verification
-failures.
-
-Post-fix: the harness accepts ``metrics_store_path`` via ``HarnessConfig``
-and the longitudinal runners use a per-campaign persistent DB co-located
-with their longitudinal.duckdb. Tests here:
-
-- ``HarnessConfig`` exposes the new field.
-- ``MetricsStore`` reads back data written by a prior session when given a
-  filesystem path.
-"""
+"""Tests for MetricsStore persistence across evaluation runs."""
 
 from __future__ import annotations
 
-import sys
+import ast
+import dataclasses
 from pathlib import Path
 
+from src.registry.metrics import MetricsStore
+from src.schemas.metrics import InvocationRecord
+from tests.evaluation.harness import HarnessConfig
+
 ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(ROOT))
 
 
 def test_harness_config_has_metrics_store_path_field():
-    """ext8 #71: HarnessConfig exposes a metrics_store_path field."""
-    import dataclasses
-
-    from tests.evaluation.harness import HarnessConfig
-
+    """HarnessConfig exposes a filesystem path for persistent MetricsStore state."""
     fields = {f.name for f in dataclasses.fields(HarnessConfig)}
     assert "metrics_store_path" in fields, (
-        "ext8 #71: HarnessConfig must expose `metrics_store_path` so "
+        "HarnessConfig must expose `metrics_store_path` so "
         "campaigns can opt into persistent MetricsStore."
     )
 
@@ -41,9 +26,6 @@ def test_metrics_store_persists_invocations_across_sessions(tmp_path):
     """A store opened at a filesystem path reads back rows from a prior
     session against the same path.
     """
-    from src.registry.metrics import MetricsStore
-    from src.schemas.metrics import InvocationRecord
-
     db_path = str(tmp_path / "metrics.duckdb")
 
     # Session 1: write an invocation.
@@ -61,21 +43,16 @@ def test_metrics_store_persists_invocations_across_sessions(tmp_path):
         "WHERE capability_id = 'cap-x'"
     ).fetchall()
     assert len(rows) == 1, (
-        "ext8 #71: MetricsStore must persist invocations when given a "
-        "filesystem path. Pre-fix the default :memory: backend dropped "
-        "this row between sessions."
+        "MetricsStore must persist invocations when given a filesystem path."
     )
     assert rows[0][0] == "cap-x"
     ms2.close()
 
 
 def test_default_in_memory_still_works():
-    """Legacy callers (tests without a path) still get the in-memory backend."""
-    from src.registry.metrics import MetricsStore
-
+    """Callers without a path still get the in-memory backend."""
     ms = MetricsStore()  # default :memory:
     # Writing + reading within one session still works — no regression.
-    from src.schemas.metrics import InvocationRecord
     ms.record_invocation(InvocationRecord(
         capability_id="cap-y", task_id="T01", success=True,
         token_cost=0, latency_ms=0,
@@ -88,9 +65,7 @@ def test_default_in_memory_still_works():
 
 
 def test_longitudinal_runners_use_persistent_store_path():
-    """ext8 #71 regression guard: the longitudinal runner MUST
-    construct MetricsStore with a non-default path.
-    """
+    """The longitudinal runner must construct MetricsStore with a non-default path."""
     runners = [
         ROOT / "scripts" / "run_longitudinal.py",
     ]
@@ -99,7 +74,7 @@ def test_longitudinal_runners_use_persistent_store_path():
         # Either explicit db_path= kwarg with a DATA_DIR reference,
         # or a literal path string.
         assert "MetricsStore(db_path=" in src, (
-            f"ext8 #71: {path.name} must pass db_path= to MetricsStore "
+            f"{path.name} must pass db_path= to MetricsStore "
             "(not the default :memory:) so maintenance_burden persists "
             "across runs."
         )
@@ -107,15 +82,8 @@ def test_longitudinal_runners_use_persistent_store_path():
         assert 'MetricsStore(db_path=":memory:")' not in src
 
 
-# ---------------------------------------------------------------------------
-# ext8 #62 — optimizer previous-utility scores persist via MetricsStore
-# ---------------------------------------------------------------------------
-
-
 def test_load_previous_utility_scores_returns_empty_on_fresh_store():
     """A freshly-constructed MetricsStore has no previous scores."""
-    from src.registry.metrics import MetricsStore
-
     ms = MetricsStore()
     assert ms.load_previous_utility_scores() == {}
     ms.close()
@@ -123,8 +91,6 @@ def test_load_previous_utility_scores_returns_empty_on_fresh_store():
 
 def test_persist_and_reload_utility_scores_roundtrip():
     """persist_utility_scores writes; load_previous_utility_scores reads back."""
-    from src.registry.metrics import MetricsStore
-
     ms = MetricsStore()
     ms.persist_utility_scores({"cap-a": 1.5, "cap-b": -0.3})
     loaded = ms.load_previous_utility_scores()
@@ -136,8 +102,6 @@ def test_persist_utility_scores_is_replace_not_append():
     """A second persist call REPLACES the prior map (it's the current
     snapshot, not an accumulator).
     """
-    from src.registry.metrics import MetricsStore
-
     ms = MetricsStore()
     ms.persist_utility_scores({"cap-a": 1.0, "cap-b": 2.0})
     ms.persist_utility_scores({"cap-c": 3.0})  # cap-a, cap-b should be gone
@@ -147,9 +111,7 @@ def test_persist_utility_scores_is_replace_not_append():
 
 
 def test_utility_scores_survive_across_sessions_with_persistent_path(tmp_path):
-    """The combination of #62 + #71: persisted scores survive a close()/re-open."""
-    from src.registry.metrics import MetricsStore
-
+    """Persisted utility scores survive a close/reopen cycle."""
     db_path = str(tmp_path / "metrics.duckdb")
     ms1 = MetricsStore(db_path=db_path)
     ms1.persist_utility_scores({"cap-x": 42.0})
@@ -160,19 +122,15 @@ def test_utility_scores_survive_across_sessions_with_persistent_path(tmp_path):
     ms2.close()
 
 
-def test_harness_default_preserves_legacy_behavior():
+def test_harness_default_uses_in_memory_metrics_store():
     """If HarnessConfig.metrics_store_path is None (default), the harness's
-    MetricsStore falls back to :memory: (backward compat with unit tests).
+    MetricsStore falls back to :memory:.
     """
-    import dataclasses
-
-    from tests.evaluation.harness import HarnessConfig
-
     default_cfg = HarnessConfig(
         chroma_dir=Path("/tmp"),
         skills_dir=Path("/tmp"),
     )
-    # Default must be None so legacy callers see no behavior change.
+    # Default must be None so tests and isolated debug runs remain in-memory.
     path_field = next(
         f for f in dataclasses.fields(HarnessConfig)
         if f.name == "metrics_store_path"
@@ -181,16 +139,9 @@ def test_harness_default_preserves_legacy_behavior():
     assert default_cfg.metrics_store_path is None
 
 
-# ---------------------------------------------------------------------------
-# ext11 #113 — longitudinal runners must reset the metrics_store DB on
-# invocation unless ``--reuse-metrics-store`` is passed.
-# ---------------------------------------------------------------------------
-
-
 def test_longitudinal_runners_declare_reuse_metrics_store_flag():
     """The longitudinal runner must expose ``--reuse-metrics-store`` so
-    cross-invocation accumulation is opt-in (ext11 #113). Default = fresh
-    baseline per invocation.
+    cross-invocation accumulation is opt-in.
     """
     runners = [
         ROOT / "scripts" / "run_longitudinal.py",
@@ -198,7 +149,7 @@ def test_longitudinal_runners_declare_reuse_metrics_store_flag():
     for path in runners:
         src = path.read_text()
         assert '"--reuse-metrics-store"' in src, (
-            f"ext11 #113: {path.name} must declare a --reuse-metrics-store "
+            f"{path.name} must declare a --reuse-metrics-store "
             "flag so callers can opt into cross-invocation state "
             "accumulation. Default behaviour must wipe the DB on start."
         )
@@ -207,12 +158,8 @@ def test_longitudinal_runners_declare_reuse_metrics_store_flag():
 def test_longitudinal_runners_reset_metrics_store_by_default():
     """The longitudinal runner must wipe its persistent MetricsStore DB
     at the top of ``main()`` unless the caller passed
-    ``--reuse-metrics-store``. Pre-ext11-#113 the DB was never reset;
-    cycle-1 KL + prune thresholds silently inherited prior invocation's
-    state and Chapter 6 reproducibility broke across back-to-back runs.
+    ``--reuse-metrics-store``.
     """
-    import ast
-
     runners = [
         ROOT / "scripts" / "run_longitudinal.py",
     ]
@@ -239,7 +186,7 @@ def test_longitudinal_runners_reset_metrics_store_by_default():
                     unlink_guarded = True
                     break
         assert unlink_guarded, (
-            f"ext11 #113: {path.name} must wipe its MetricsStore DB at "
+            f"{path.name} must wipe its MetricsStore DB at "
             "invocation start when --reuse-metrics-store is NOT passed. "
             "Expected pattern: "
             "``if not args.reuse_metrics_store and <path>.exists(): "
@@ -248,16 +195,11 @@ def test_longitudinal_runners_reset_metrics_store_by_default():
 
 
 def test_longitudinal_reset_is_isolated_from_sibling_runner_store(tmp_path):
-    """Behavioural cross-check on the ext11 #113 reset semantics: wiping
-    the DB at invocation start clears every persisted row without affecting
-    a sibling DB at a different path.
+    """Resetting one metrics DB does not affect a sibling metrics DB.
 
     Mirrors the runner's logic (``unlink()`` + open fresh ``MetricsStore``)
     without spawning the full pipeline.
     """
-    from src.registry.metrics import MetricsStore
-    from src.schemas.metrics import InvocationRecord
-
     db_a = tmp_path / "a.duckdb"
     db_b = tmp_path / "b.duckdb"
 
@@ -287,10 +229,9 @@ def test_longitudinal_reset_is_isolated_from_sibling_runner_store(tmp_path):
     ms_b.close()
 
     assert a_rows == 0, (
-        "ext11 #113: wiped DB must be empty after re-open "
-        f"(got {a_rows} rows)."
+        f"Wiped DB must be empty after re-open (got {a_rows} rows)."
     )
     assert b_rows == 1, (
-        "ext11 #113: wiping runner A's DB must not affect runner B's DB "
+        "Wiping runner A's DB must not affect runner B's DB "
         f"(got {b_rows} rows, expected 1)."
     )

@@ -1,9 +1,9 @@
-"""Unit tests for tools/quick_validate.py — Tier 0 SKILL.md validator.
+"""Unit tests for tools/quick_validate.py.
 
 Covers:
-- Frontmatter structural checks (existing behaviour)
-- Tier 0 prose checks (A1 hardening): lorem ipsum, TODO: implement,
-  '# placeholder return' literal markers
+- SKILL.md existence and frontmatter structure
+- prose hard-fails for known placeholder markers
+- body length warnings
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ def _write_skill(tmp_path: Path, content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Existing behaviour — clean and structurally invalid skills
+# Clean and structurally invalid skills
 # ---------------------------------------------------------------------------
 
 
@@ -58,7 +58,7 @@ class TestStructuralValidation:
 
 
 # ---------------------------------------------------------------------------
-# A1: Tier 0 prose checks
+# Prose hard-fail checks
 # ---------------------------------------------------------------------------
 
 
@@ -126,8 +126,9 @@ class TestProseHardFails:
             assert "# placeholder return" in msg
 
     def test_legitimate_placeholder_word_passes(self):
-        """T04 regression: 'placeholder' as a word in prose must NOT be
-        rejected. Only the literal '# placeholder return' marker is blocked.
+        """The word 'placeholder' can be legitimate prose.
+
+        Only the literal '# placeholder return' marker is blocked.
         """
         with tempfile.TemporaryDirectory() as tmp:
             content = (
@@ -203,10 +204,6 @@ class TestBodyLengthWarning:
     def test_exactly_500_lines_no_warning(self):
         """Exactly 500 body lines should not trigger the warning.
 
-        Arithmetic walk-through (the 2026-04-19 audit flagged this test as
-        SUSPICIOUS; re-derivation below confirmed the test is correct — name
-        and behaviour agree):
-
         ``validate_skill`` splits the file via regex ``^---\\n.*?\\n---\\n?(.*)$``
         with ``DOTALL``. After the closing ``---\\n``, the optional ``\\n?`` is
         consumed (not captured); the second ``\\n`` from the ``---\\n\\n`` prefix
@@ -217,7 +214,7 @@ class TestBodyLengthWarning:
         * body = "\\n" + "Line 0\\nLine 1\\n...\\nLine 498" + "\\n"
         * newline count = 1 (leading) + 498 (between) + 1 (trailing) = 500
         * body ends with ``\\n`` so the final ``+1`` branch does NOT apply
-        * body_lines = 500, threshold is ``> 500`` → no warning ✓
+        * body_lines = 500, threshold is ``> 500``, so there is no warning
         """
         with tempfile.TemporaryDirectory() as tmp:
             body_lines = "\n".join(f"Line {i}" for i in range(499))

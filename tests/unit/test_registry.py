@@ -1,3 +1,5 @@
+"""Unit tests for the ChromaDB-backed capability registry."""
+
 import uuid
 
 import pytest
@@ -38,7 +40,7 @@ def _make_cap(
     return CapabilityDescriptor(**safe_fields)
 
 
-# --- Existing tests (backward compatibility) ---
+# --- Core registry behavior ---
 
 
 def test_add_and_search(registry):
@@ -106,13 +108,14 @@ def test_detect_gaps_finds_gap(seeded_registry):
 
 
 def test_detect_gaps_mixed(seeded_registry):
+    queries = ["compute fibonacci number", "deploy kubernetes cluster"]
     matches, gaps = seeded_registry.detect_gaps(
-        ["compute fibonacci number", "deploy kubernetes cluster"],
+        queries,
         threshold=0.5,
     )
-    assert len(matches) >= 1
-    # kubernetes is far from any seeded capability
-    assert len(gaps) >= 0  # depends on embedding model's judgment
+    handled_queries = {match[2] for match in matches} | {gap[0] for gap in gaps}
+    assert handled_queries == set(queries)
+    assert any(match[0].name == "fibonacci" for match in matches)
 
 
 def test_persistent_registry(tmp_path):
@@ -452,7 +455,7 @@ def test_add_and_get_roundtrip(registry):
     assert result.version == cap.version
 
 
-# --- created_at round-trip (Bug 3 fix) ---
+# --- created_at round-trip ---
 
 
 def test_created_at_preserved_on_get(registry):
@@ -482,30 +485,30 @@ def test_created_at_preserved_on_search(registry):
     assert results and results[0][0].created_at == original_ts
 
 
-# --- detect_gaps respects is_active (Bug 1 fix) ---
+# --- detect_gaps respects is_active ---
 
 
 def test_detect_gaps_treats_deactivated_capability_as_gap(registry):
     """A deactivated capability must NOT count as a match — it must be a gap."""
     cap = CapabilityDescriptor(
-        name="legacy-tool",
+        name="inactive-tool",
         description="Compute the nth Fibonacci number",
         capability_type=CapabilityType.MCP_TOOL,
     )
     registry.add(cap)
-    registry.deactivate("legacy-tool")
+    registry.deactivate("inactive-tool")
 
     matches, gaps = registry.detect_gaps(["compute fibonacci number"])
 
     assert len(matches) == 0
     assert len(gaps) == 1
-    # Deactivated caps are now filtered from search results (M6 fix),
-    # so the gap reason is a generic low-score message, not "deactivated"
+    # Deactivated caps are filtered from active search results, so the exact
+    # reason text can vary by embedding score but must remain informative.
     assert gaps[0][1]  # reason is non-empty
 
 
 def test_detect_gaps_active_capability_still_matches(registry):
-    """An active capability above threshold must still be a match after the fix."""
+    """An active capability above threshold must still be a match."""
     cap = CapabilityDescriptor(
         name="active-tool",
         description="Compute the nth Fibonacci number",
@@ -560,21 +563,20 @@ class TestDescriptionSummarization:
         assert fetched.description == long_desc
 
 
-# --- Dual-query search (Step 14.5 Part A) ---
+# --- Dual-query search ---
 #
 # The decomposer produces short hyphen-case slugs in `required_capabilities`
 # which systematically fall below the 0.6 cosine threshold against the
 # registry's prose-style `_build_document()` output. Dual-query search
 # runs a second search on the natural-language `SubTask.description` and
-# takes the max-scoring hit. See `docs/registry_retrieval_fix_plan.md`
-# Part A for the empirical evidence (csv-parser 0.5425 slug → 0.7653 desc).
+# takes the max-scoring hit.
 
 
 class TestDetectGapsDualQuery:
     """Tests for the dual-query auxiliary_queries parameter on detect_gaps."""
 
     def test_backward_compat_no_auxiliary(self, seeded_registry):
-        """When auxiliary_queries is None, behaviour is identical to pre-fix."""
+        """When auxiliary_queries is None, only the primary query is used."""
         matches, gaps = seeded_registry.detect_gaps(
             ["compute fibonacci number"],
             auxiliary_queries=None,
