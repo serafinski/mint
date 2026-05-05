@@ -110,6 +110,17 @@ def test_persist_utility_scores_is_replace_not_append():
     ms.close()
 
 
+def test_persist_utility_scores_empty_map_is_noop():
+    """An empty optimizer snapshot must not erase the prior baseline."""
+    ms = MetricsStore()
+    ms.persist_utility_scores({"cap-a": 0.5, "cap-b": 0.7})
+
+    ms.persist_utility_scores({})
+
+    assert ms.load_previous_utility_scores() == {"cap-a": 0.5, "cap-b": 0.7}
+    ms.close()
+
+
 def test_utility_scores_survive_across_sessions_with_persistent_path(tmp_path):
     """Persisted utility scores survive a close/reopen cycle."""
     db_path = str(tmp_path / "metrics.duckdb")

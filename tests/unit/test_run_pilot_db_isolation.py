@@ -16,6 +16,8 @@ import sys
 
 import pytest
 
+from tests.unit._script_subprocess import run_project_script, run_wrapper, write_wrapper
+
 
 def _make_stub_harness(monkeypatch):
     """Stub the harness + tasks imports so main() short-circuits."""
@@ -235,3 +237,143 @@ def test_persisted_evaluation_run_count_returns_none_without_table(tmp_path):
         pass
 
     assert rp._persisted_evaluation_run_count(str(db)) is None
+
+
+def test_run_pilot_help_exits_zero_via_entrypoint():
+    """Subprocess smoke: argparse --help reaches the shell as exit 0."""
+    result = run_project_script("run_pilot.py", "--help", timeout=10)
+
+    assert result.returncode == 0
+    assert "--condition" in result.stdout
+
+
+def test_run_pilot_exits_7_on_watchdog_abort(tmp_path):
+    """A condition watchdog abort should surface as process exit code 7."""
+    db = tmp_path / "pilot.duckdb"
+    wrapper = tmp_path / "wrap_run_pilot_abort.py"
+    write_wrapper(wrapper, f"""
+from unittest.mock import MagicMock
+import sys
+
+import tests.evaluation.harness as _h
+import scripts._eval_registry_lock as _lock
+import scripts.run_pilot as _rp
+
+_h.EvaluationHarness = MagicMock()
+_h.HarnessConfig = MagicMock()
+_lock.acquire_runner_lock = lambda **kw: MagicMock()
+
+_inst = MagicMock()
+_inst.prepare.return_value = "snap-id"
+_inst.run_condition.side_effect = _rp.BudgetExceeded("stub abort")
+_inst.run_pilot.side_effect = _rp.BudgetExceeded("stub abort")
+_h.EvaluationHarness.return_value.__enter__.return_value = _inst
+_h.EvaluationHarness.return_value.__exit__.return_value = False
+
+sys.argv = [
+    "run_pilot.py",
+    "--db", r"{db}", "--fresh-db",
+    "--condition", "full",
+    "--n-runs", "1",
+    "--condition-budget-hours", "1",
+]
+sys.exit(_rp.main() or 0)
+""")
+
+    result = run_wrapper(wrapper)
+
+    assert result.returncode == 7, (
+        f"Expected exit 7 on watchdog abort, got {result.returncode}. "
+        f"stderr:\n{result.stderr[:2000]}\nstdout:\n{result.stdout[:2000]}"
+    )
+
+
+def test_run_pilot_exits_4_on_empty_records_no_abort(tmp_path):
+    """Zero produced records without a watchdog abort should exit 4."""
+    db = tmp_path / "pilot_empty.duckdb"
+    wrapper = tmp_path / "wrap_run_pilot_empty.py"
+    write_wrapper(wrapper, f"""
+from unittest.mock import MagicMock
+import sys
+
+import tests.evaluation.harness as _h
+import scripts._eval_registry_lock as _lock
+import scripts.run_pilot as _rp
+
+_h.EvaluationHarness = MagicMock()
+_h.HarnessConfig = MagicMock()
+_lock.acquire_runner_lock = lambda **kw: MagicMock()
+
+_inst = MagicMock()
+_inst.prepare.return_value = "snap-id"
+_inst.run_condition.return_value = []
+_inst.run_pilot.return_value = []
+_h.EvaluationHarness.return_value.__enter__.return_value = _inst
+_h.EvaluationHarness.return_value.__exit__.return_value = False
+
+sys.argv = [
+    "run_pilot.py",
+    "--db", r"{db}", "--fresh-db",
+    "--condition", "full",
+    "--n-runs", "1",
+    "--condition-budget-hours", "1",
+]
+sys.exit(_rp.main() or 0)
+""")
+
+    result = run_wrapper(wrapper)
+
+    assert result.returncode == 4, (
+        f"Expected exit 4 on empty records, got {result.returncode}. "
+        f"stderr:\n{result.stderr[:2000]}"
+    )
+
+
+def test_run_pilot_exits_0_on_clean_success(tmp_path):
+    """A one-record successful campaign should exit 0."""
+    db = tmp_path / "pilot_ok.duckdb"
+    wrapper = tmp_path / "wrap_run_pilot_ok.py"
+    write_wrapper(wrapper, f"""
+from unittest.mock import MagicMock
+import sys
+
+import tests.evaluation.harness as _h
+import scripts._eval_registry_lock as _lock
+import scripts.run_pilot as _rp
+
+_h.EvaluationHarness = MagicMock()
+_h.HarnessConfig = MagicMock()
+_lock.acquire_runner_lock = lambda **kw: MagicMock()
+
+_rec = MagicMock()
+_rec.success = True
+_rec.gate_passed = True
+_rec.output_in_range = True
+_rec.task_id = "T01"
+_rec.failure_reason = None
+_rec.capability_type = "mcp_tool"
+_rec.verification_tier_reached = 3
+
+_inst = MagicMock()
+_inst.prepare.return_value = "snap-id"
+_inst.run_pilot.return_value = [_rec]
+_inst.run_condition.return_value = [_rec]
+_h.EvaluationHarness.return_value.__enter__.return_value = _inst
+_h.EvaluationHarness.return_value.__exit__.return_value = False
+
+sys.argv = [
+    "run_pilot.py",
+    "--db", r"{db}", "--fresh-db",
+    "--condition", "full",
+    "--n-runs", "1",
+    "--condition-budget-hours", "1",
+]
+sys.exit(_rp.main() or 0)
+""")
+
+    result = run_wrapper(wrapper)
+
+    assert result.returncode == 0, (
+        f"Expected clean exit 0, got {result.returncode}. "
+        f"stderr:\n{result.stderr[:2000]}"
+    )

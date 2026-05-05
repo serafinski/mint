@@ -18,6 +18,7 @@ from src.verification.behavioral import (
     _generate_boundary_inputs,
     _generate_large_inputs,
     _generate_negative_inputs,
+    _normalize_for_variation,
     _test_knn_identifier_column_csv,
     _test_latency,
     _test_output_variation,
@@ -883,6 +884,34 @@ class TestOutputVariation:
             mock_sandbox,
         )
         assert findings[0].tier == 2
+
+
+class TestNormalizeForVariation:
+    """Normalization used before comparing output-variation probe results."""
+
+    def test_timestamp_normalized(self):
+        a = '{"data": "x", "ts": "2026-04-20T14:32:17.111+00:00"}'
+        b = '{"data": "x", "ts": "2026-04-20T14:32:18.222Z"}'
+
+        assert _normalize_for_variation(a) == _normalize_for_variation(b)
+
+    def test_uuid_normalized(self):
+        a = '{"id": "550e8400-e29b-41d4-a716-446655440000", "data": "x"}'
+        b = '{"id": "550e8400-E29B-41D4-A716-446655440001", "data": "x"}'
+
+        assert _normalize_for_variation(a) == _normalize_for_variation(b)
+
+    def test_counter_field_normalized(self):
+        a = '{"counter": 42, "data": "x"}'
+        b = '{"counter": 43, "data": "x"}'
+
+        assert _normalize_for_variation(a) == _normalize_for_variation(b)
+
+    def test_genuinely_different_outputs_not_normalized_equal(self):
+        a = '{"data": "apple"}'
+        b = '{"data": "banana"}'
+
+        assert _normalize_for_variation(a) != _normalize_for_variation(b)
 
 
 # ---------------------------------------------------------------------------

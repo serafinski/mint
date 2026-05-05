@@ -2,23 +2,27 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+from datetime import datetime, timedelta
 
+import duckdb
 import numpy as np
 import pytest
 
-ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(ROOT))
-
-from scripts.analyze_longitudinal import (  # noqa: E402
+from scripts.analyze_longitudinal import (
+    _average_distributions,
     _detect_convergence,
+    _detect_stable_convergence,
     _kl_divergence_between_snapshots,
     _load_cycle_data,
     _table_exists,
 )
-from src.registry.evaluation_store import EvaluationStore  # noqa: E402
-from src.schemas.evaluation import EvaluationRecord  # noqa: E402
+from src.registry.evaluation_store import EvaluationStore
+from src.schemas.evaluation import EvaluationRecord
+from tests.unit._script_subprocess import (
+    insert_invocation_events,
+    run_project_script,
+    seed_evaluation_runs,
+)
 
 # ---------------------------------------------------------------------------
 # _kl_divergence_between_snapshots
@@ -119,6 +123,17 @@ class TestDetectConvergence:
         kls = [0.5, 0.3, 0.005, 0.4, 0.2]
         assert _detect_convergence(kls, threshold=0.01, min_consecutive=3) is None
 
+    def test_nan_series_does_not_converge(self):
+        # NaN marks missing signal, so it must not satisfy a sub-threshold streak.
+        kls = [float("nan")] * 40
+
+        assert _detect_convergence(kls, threshold=0.05, min_consecutive=3) is None
+
+    def test_nan_breaks_convergence_streak(self):
+        kls = [0.01, 0.01, float("nan"), 0.01, 0.01]
+
+        assert _detect_convergence(kls, threshold=0.05, min_consecutive=3) is None
+
     def test_converged_then_diverged_then_reconverged(self):
         # Converges at cycle 3 (indices 0,1,2), then KL blows up at index 3,
         # then sub-threshold again at 4,5,6; first detection is the first
@@ -138,6 +153,73 @@ class TestDetectConvergence:
     def test_shorter_than_min_consecutive_returns_none(self):
         kls = [0.001, 0.001]  # only 2, need 3
         assert _detect_convergence(kls, threshold=0.01, min_consecutive=3) is None
+
+
+class TestDetectStableConvergence:
+    def test_drift_to_new_state_not_falsely_converged_at_early_cycle(self):
+        """Stable convergence uses the final-window reference, not step deltas."""
+        snapshots = [
+            {"A": 0.9 - 0.08 * i, "B": 0.1 + 0.08 * i}
+            for i in range(10)
+        ]
+        snapshots += [{"A": 0.1, "B": 0.9}] * 5
+
+        result = _detect_stable_convergence(
+            snapshots,
+            threshold=0.01,
+            min_consecutive=3,
+            window_size=3,
+        )
+
+        assert result is None or result >= 9
+
+    def test_stable_distribution_detected(self):
+        snapshots = [{"A": 0.5, "B": 0.5}] * 10
+
+        result = _detect_stable_convergence(
+            snapshots,
+            threshold=0.01,
+            min_consecutive=3,
+            window_size=3,
+        )
+
+        assert result == 1
+
+    def test_too_few_snapshots_returns_none(self):
+        result = _detect_stable_convergence(
+            [{"A": 1.0}],
+            threshold=0.01,
+            min_consecutive=3,
+            window_size=5,
+        )
+
+        assert result is None
+
+    def test_empty_final_window_is_not_convergence(self):
+        """Collapse to an empty final distribution is not convergence."""
+        snapshots = [{"capA": 1.0} for _ in range(5)] + [{} for _ in range(5)]
+
+        result = _detect_stable_convergence(
+            snapshots,
+            threshold=0.1,
+            min_consecutive=3,
+            window_size=5,
+        )
+
+        assert result is None
+
+
+class TestAverageDistributions:
+    def test_average_with_missing_keys(self):
+        snapshots = [{"A": 1.0}, {"B": 1.0}, {"A": 1.0, "B": 1.0}]
+
+        avg = _average_distributions(snapshots)
+
+        assert abs(avg["A"] - 2 / 3) < 1e-9
+        assert abs(avg["B"] - 2 / 3) < 1e-9
+
+    def test_empty_snapshots(self):
+        assert _average_distributions([]) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -481,3 +563,356 @@ class TestRunIdIsolation:
         with EvaluationStore() as store:
             assert _load_cycle_data(store._conn) == []
             assert _load_cycle_data(store._conn, run_id=None) == []
+
+
+class TestAnalyzeLongitudinalScriptExitCodes:
+    """Subprocess-level checks for analyzer exit-code contracts."""
+
+    def test_help_exposes_kl_and_sparse_signal_flags(self):
+        result = run_project_script("analyze_longitudinal.py", "--help", timeout=15)
+
+        assert result.returncode == 0
+        assert "--allow-proxy-kl" in result.stdout
+        assert "--allow-sparse-signal" in result.stdout
+        assert "--min-cycle-coverage" in result.stdout
+
+    def test_partial_db_exits_3(self, tmp_path):
+        db = tmp_path / "longitudinal_partial.duckdb"
+        base_ts = datetime(2026, 4, 21, 10, 0, 0)
+        rows = [
+            {
+                "run_id": "lg_partial",
+                "condition": "longitudinal",
+                "task_id": f"T{i + 1:02d}",
+                "timestamp": base_ts + timedelta(seconds=i),
+            }
+            for i in range(5)
+        ]
+        seed_evaluation_runs(db, rows=rows)
+
+        result = run_project_script(
+            "analyze_longitudinal.py",
+            "--db",
+            str(db),
+            "--expected-cycles",
+            "40",
+        )
+
+        assert result.returncode == 3, (
+            f"Expected exit 3 for incomplete campaign, got {result.returncode}. "
+            f"stderr:\n{result.stderr}\nstdout:\n{result.stdout}"
+        )
+        assert "5 cycles, expected 40" in result.stderr or "expected 40" in result.stderr
+
+    def test_allow_incomplete_still_returns_nonzero_with_banner(self, tmp_path):
+        db = tmp_path / "longitudinal_partial.duckdb"
+        base_ts = datetime(2026, 4, 21, 10, 0, 0)
+        rows = [
+            {
+                "run_id": "lg_partial",
+                "condition": "longitudinal",
+                "task_id": f"T{i + 1:02d}",
+                "timestamp": base_ts + timedelta(seconds=i),
+            }
+            for i in range(5)
+        ]
+        seed_evaluation_runs(db, rows=rows)
+
+        result = run_project_script(
+            "analyze_longitudinal.py",
+            "--db",
+            str(db),
+            "--expected-cycles",
+            "40",
+            "--allow-incomplete",
+        )
+
+        assert result.returncode != 0, (
+            f"--allow-incomplete must still signal shortfall. Got {result.returncode}."
+        )
+        combined = result.stdout + result.stderr
+        assert (
+            "INCOMPLETE" in combined
+            or "zero-evidence" in combined.lower()
+            or "no invocation" in combined.lower()
+        ), f"Expected incomplete or zero-evidence signal. stdout+stderr:\n{combined}"
+
+    def test_empty_db_exits_1(self, tmp_path):
+        db = tmp_path / "empty.duckdb"
+        seed_evaluation_runs(db, rows=[])
+
+        result = run_project_script("analyze_longitudinal.py", "--db", str(db))
+
+        assert result.returncode == 1
+        combined = result.stdout.lower() + result.stderr.lower()
+        assert "no longitudinal rows" in combined
+
+    def test_zero_evidence_db_exits_4(self, tmp_path):
+        db = tmp_path / "zero_evidence.duckdb"
+        base_ts = datetime(2026, 4, 21, 10, 0, 0)
+        rows = [
+            {
+                "run_id": "zero_ev",
+                "condition": "longitudinal",
+                "task_id": f"T{(i % 20) + 1:02d}",
+                "timestamp": base_ts + timedelta(seconds=i),
+            }
+            for i in range(40)
+        ]
+        seed_evaluation_runs(db, rows=rows)
+
+        result = run_project_script(
+            "analyze_longitudinal.py",
+            "--db",
+            str(db),
+            "--expected-cycles",
+            "40",
+        )
+
+        assert result.returncode == 4, (
+            f"Expected exit 4 for zero-evidence DB, got {result.returncode}. "
+            f"stderr:\n{result.stderr}\nstdout:\n{result.stdout}"
+        )
+        combined = result.stderr + result.stdout
+        assert (
+            "NO invocation" in combined
+            or "zero-evidence" in combined.lower()
+            or "no signal" in combined.lower()
+        )
+
+    def test_overfull_cycle_count_exits_3(self, tmp_path):
+        db = tmp_path / "longitudinal_overfull.duckdb"
+        base_ts = datetime(2026, 4, 21, 10, 0, 0)
+        rows = [
+            {
+                "run_id": "long_1",
+                "condition": "longitudinal",
+                "task_id": f"T{(i % 17) + 4:02d}",
+                "timestamp": base_ts + timedelta(seconds=i),
+            }
+            for i in range(50)
+        ]
+        seed_evaluation_runs(db, rows=rows)
+
+        conn = duckdb.connect(str(db))
+        try:
+            for i in range(50):
+                task_id = f"T{(i % 17) + 4:02d}"
+                occurred_at = base_ts + timedelta(seconds=i, milliseconds=500)
+                conn.execute(
+                    "INSERT INTO cycle_utility_scores "
+                    "(id, run_id, condition, task_id, capability_id, "
+                    "utility_score, occurred_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        f"cus_{i}",
+                        "long_1",
+                        "longitudinal",
+                        task_id,
+                        f"cap_{i}",
+                        1.0,
+                        occurred_at,
+                    ],
+                )
+                conn.execute(
+                    "INSERT INTO invocation_events "
+                    "(id, run_id, condition, task_id, capability_id, "
+                    "capability_type, success, is_pilot, occurred_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        f"inv_{i}",
+                        "long_1",
+                        "longitudinal",
+                        task_id,
+                        f"cap_{i}",
+                        "mcp_tool",
+                        True,
+                        False,
+                        occurred_at,
+                    ],
+                )
+        finally:
+            conn.close()
+
+        result = run_project_script(
+            "analyze_longitudinal.py",
+            "--db",
+            str(db),
+            "--expected-cycles",
+            "40",
+        )
+
+        assert result.returncode == 3, (
+            f"Expected exit 3 for overfull timeline, got {result.returncode}. "
+            f"stderr:\n{result.stderr[:400]}"
+        )
+        assert "overfull" in result.stderr.lower()
+
+    def test_missing_utility_scores_refuses_proxy_kl_without_override(self, tmp_path):
+        """Invocation-only DBs must not silently use proxy KL as primary evidence."""
+        db = tmp_path / "proxy_kl_test.duckdb"
+        base_ts = datetime(2026, 4, 21, 10, 0, 0)
+        rows = [
+            {
+                "run_id": "r1",
+                "condition": "longitudinal",
+                "task_id": f"T{i + 1:02d}",
+                "timestamp": base_ts + timedelta(seconds=i),
+            }
+            for i in range(5)
+        ]
+        seed_evaluation_runs(db, rows=rows)
+        insert_invocation_events(
+            db,
+            events=[
+                {
+                    "run_id": "r1",
+                    "condition": "longitudinal",
+                    "task_id": f"T{i + 1:02d}",
+                    "capability_id": "cap-a",
+                    "occurred_at": base_ts + timedelta(seconds=i, milliseconds=500),
+                }
+                for i in range(5)
+            ],
+        )
+
+        result = run_project_script(
+            "analyze_longitudinal.py",
+            "--db",
+            str(db),
+            "--expected-cycles",
+            "5",
+        )
+
+        assert result.returncode == 6, (
+            f"Expected exit 6 for refused proxy KL, got {result.returncode}. "
+            f"stderr:\n{result.stderr[-600:]}"
+        )
+        assert "cycle_utility_scores is empty" in result.stderr
+
+    def test_allow_proxy_kl_adds_banner(self, tmp_path):
+        db = tmp_path / "proxy_kl_allow.duckdb"
+        base_ts = datetime(2026, 4, 21, 10, 0, 0)
+        rows = [
+            {
+                "run_id": "r1",
+                "condition": "longitudinal",
+                "task_id": f"T{i + 1:02d}",
+                "timestamp": base_ts + timedelta(seconds=i),
+            }
+            for i in range(5)
+        ]
+        seed_evaluation_runs(db, rows=rows)
+        insert_invocation_events(
+            db,
+            events=[
+                {
+                    "run_id": "r1",
+                    "condition": "longitudinal",
+                    "task_id": f"T{i + 1:02d}",
+                    "capability_id": "cap-a",
+                    "occurred_at": base_ts + timedelta(seconds=i, milliseconds=500),
+                }
+                for i in range(5)
+            ],
+        )
+
+        result = run_project_script(
+            "analyze_longitudinal.py",
+            "--db",
+            str(db),
+            "--expected-cycles",
+            "5",
+            "--allow-proxy-kl",
+        )
+
+        assert result.returncode != 6, (
+            f"--allow-proxy-kl should bypass exit 6. Got {result.returncode}. "
+            f"stderr:\n{result.stderr[-400:]}"
+        )
+        assert "[PROXY KL]" in result.stdout
+
+    def test_sparse_cycle_signal_exits_8(self, tmp_path):
+        """A single telemetry cycle in a full campaign is not enough evidence."""
+        db = tmp_path / "sparse.duckdb"
+        base_ts = datetime(2026, 4, 21, 10, 0, 0)
+        rows = [
+            {
+                "run_id": "r1",
+                "condition": "longitudinal",
+                "task_id": f"T{(i % 20) + 1:02d}",
+                "timestamp": base_ts + timedelta(seconds=i),
+            }
+            for i in range(20)
+        ]
+        seed_evaluation_runs(db, rows=rows)
+        insert_invocation_events(
+            db,
+            events=[
+                {
+                    "run_id": "r1",
+                    "condition": "longitudinal",
+                    "task_id": "T20",
+                    "capability_id": "cap-a",
+                    "occurred_at": base_ts + timedelta(seconds=19, milliseconds=500),
+                }
+            ],
+        )
+
+        result = run_project_script(
+            "analyze_longitudinal.py",
+            "--db",
+            str(db),
+            "--expected-cycles",
+            "20",
+        )
+
+        assert result.returncode == 8, (
+            f"Expected exit 8 for sparse signal, got {result.returncode}. "
+            f"stderr:\n{result.stderr[-500:]}"
+        )
+        assert "sparse telemetry" in result.stderr.lower() or "signal in only" in (
+            result.stderr.lower()
+        )
+
+    def test_allow_sparse_signal_adds_banner(self, tmp_path):
+        db = tmp_path / "sparse_allow.duckdb"
+        base_ts = datetime(2026, 4, 21, 10, 0, 0)
+        rows = [
+            {
+                "run_id": "r1",
+                "condition": "longitudinal",
+                "task_id": f"T{(i % 20) + 1:02d}",
+                "timestamp": base_ts + timedelta(seconds=i),
+            }
+            for i in range(20)
+        ]
+        seed_evaluation_runs(db, rows=rows)
+        insert_invocation_events(
+            db,
+            events=[
+                {
+                    "run_id": "r1",
+                    "condition": "longitudinal",
+                    "task_id": "T20",
+                    "capability_id": "cap-a",
+                    "occurred_at": base_ts + timedelta(seconds=19, milliseconds=500),
+                }
+            ],
+        )
+
+        result = run_project_script(
+            "analyze_longitudinal.py",
+            "--db",
+            str(db),
+            "--expected-cycles",
+            "20",
+            "--allow-sparse-signal",
+            "--allow-proxy-kl",
+        )
+
+        assert result.returncode != 8, (
+            f"--allow-sparse-signal should bypass exit 8. Got {result.returncode}. "
+            f"stderr:\n{result.stderr[-400:]}"
+        )
+        assert "[SPARSE:" in result.stdout

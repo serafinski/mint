@@ -144,6 +144,21 @@ class TestRecordAndRetrieve:
         assert r.failed_step_name == "agent-final-step"
 
 
+class TestHumanLabelUpdate:
+    def test_optimistic_concurrency_and_override(self, store):
+        """Manual audit labels cannot be overwritten unless explicitly allowed."""
+        row_id = store.record_run(_record())
+
+        assert store.update_human_label(row_id, "correct") is True
+        assert store.update_human_label(row_id, "partial") is False
+        assert store.update_human_label(
+            row_id,
+            "partial",
+            allow_overwrite=True,
+        ) is True
+        assert store.update_human_label("missing-row", "correct") is False
+
+
 class TestSuccessRate:
     def test_all_succeed(self, store):
         for i in range(4):

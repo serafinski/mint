@@ -57,6 +57,44 @@ class TestStructuralValidation:
             assert ok is False
 
 
+class TestBodyDelimiterValidation:
+    def test_rejects_skill_with_bare_dashes_in_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            content = (
+                "---\n"
+                "name: test-skill\n"
+                "description: test\n"
+                "---\n"
+                "# Body\n"
+                "content\n"
+                "---\n"
+                "trailing content\n"
+            )
+            path = _write_skill(Path(tmp), content)
+            ok, msg = validate_skill(path)
+
+            assert ok is False
+            assert "---" in msg
+            assert "extra bare-line" in msg or "delimiter" in msg.lower()
+
+    def test_accepts_skill_without_body_delimiters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            content = (
+                "---\n"
+                "name: clean-skill\n"
+                "description: a valid skill\n"
+                "---\n"
+                "# Body\n"
+                "Normal content here, no bare-dash delimiters.\n"
+            )
+            path = _write_skill(Path(tmp), content)
+            ok, msg = validate_skill(path)
+
+            if not ok:
+                assert "bare-line" not in msg
+                assert "delimiter" not in msg.lower()
+
+
 # ---------------------------------------------------------------------------
 # Prose hard-fail checks
 # ---------------------------------------------------------------------------

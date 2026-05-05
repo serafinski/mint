@@ -17,6 +17,7 @@ from src.orchestrator.taxonomy import (
     CapabilityDomainClassification,
     DomainTaxonomy,
     QueryDomainChoice,
+    _contains_domain_specific_literals,
     _normalize_category_name,
     classify_and_tag_artifacts,
 )
@@ -572,3 +573,46 @@ class TestClassifyAndTagArtifacts:
         assert "eligibility-aggregation" in categories
         assert structured_llm.prompts[0].count("eligibility-aggregation") == 0
         assert "- eligibility-aggregation:" in structured_llm.prompts[1]
+
+
+class TestDomainSpecificLiteralDetection:
+    def test_source_with_order_id_literal_detected(self):
+        artifact = _make_artifact(
+            name="parse_sales",
+            source_code='cols = ["order_id", "product_id"]',
+            description="",
+        )
+
+        assert _contains_domain_specific_literals(artifact) is True
+
+    def test_source_without_domain_literals_not_detected(self):
+        artifact = _make_artifact(
+            name="parse_csv",
+            source_code='cols = ["col1", "col2", "col3"]',
+            description="",
+        )
+
+        assert _contains_domain_specific_literals(artifact) is False
+
+    def test_skill_content_checked(self):
+        artifact = _make_artifact(
+            name="inventory-skill",
+            capability_type=CapabilityType.SKILL,
+            source_code=None,
+            skill_content='Check "needs_reorder" field on each item.',
+            description="",
+        )
+
+        assert _contains_domain_specific_literals(artifact) is True
+
+    def test_prose_mention_without_quotes_not_detected(self):
+        """Only quoted string literals count; prose mentions do not trigger."""
+        artifact = _make_artifact(
+            name="general-analyzer",
+            capability_type=CapabilityType.SKILL,
+            source_code=None,
+            skill_content="This analyzer handles generic inventory use cases.",
+            description="",
+        )
+
+        assert _contains_domain_specific_literals(artifact) is False

@@ -561,6 +561,27 @@ class TestRunCondition:
         # With 2 runs the seeds should differ (extremely unlikely to collide)
         assert len(seeds) == 2
 
+    @patch("tests.evaluation.harness.restore_clean_snapshot")
+    @patch("tests.evaluation.harness.seed_registry")
+    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.ToolLoader")
+    def test_run_condition_uses_full_uuid_entropy_in_run_id(
+        self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
+    ):
+        """Chapter 6 condition run IDs use a full 32-hex UUID suffix."""
+        mock_restore.return_value = "snap_abc12345"
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
+
+        config.n_runs = 2
+        harness = EvaluationHarness(config)
+        records = harness.run_condition("static", [T04])
+
+        suffixes = [record.run_id.rsplit("_", 1)[1] for record in records]
+        assert len(suffixes) == 2
+        for suffix in suffixes:
+            assert len(suffix) == 32
+            int(suffix, 16)
+
 
 # ---------------------------------------------------------------------------
 # Deterministic condition seed derivation

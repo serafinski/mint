@@ -15,22 +15,23 @@ All DB-reading tests use an in-memory ``EvaluationStore`` + direct
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
 import pytest
 
-ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(ROOT))
-
-from scripts.analyze_results import (  # noqa: E402
+from scripts.analyze_results import (
     _gini_coefficient,
     print_classification_accuracy,
     print_gini_summary,
     print_latency_summary,
 )
-from src.registry.evaluation_store import EvaluationStore  # noqa: E402
-from src.schemas.evaluation import EvaluationRecord  # noqa: E402
+from src.registry.evaluation_store import EvaluationStore
+from src.schemas.evaluation import EvaluationRecord
+from tests.unit._script_subprocess import run_project_script, seed_evaluation_runs
+
+ROOT = Path(__file__).parent.parent.parent
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +90,106 @@ def _open_in_memory_store() -> tuple[EvaluationStore, duckdb.DuckDBPyConnection]
     """Return an EvaluationStore + its underlying connection (for direct queries)."""
     store = EvaluationStore()  # :memory: default
     return store, store._conn  # noqa: SLF001 - test-only access
+
+
+def test_analyze_results_help_smoke():
+    """The analyzer script should parse --help without import errors."""
+    result = run_project_script("analyze_results.py", "--help", timeout=15)
+
+    assert result.returncode == 0
+    assert "--allow-missing-metrics" in result.stdout
+
+
+def _canonical_eval_rows(*, repeated_task_id: str | None = None) -> list[dict]:
+    """Return a complete 4-condition × 5-run × 20-task eval shape."""
+    base_ts = datetime(2026, 4, 21, 10, 0, 0)
+    conditions = ("full", "no_verification", "no_optimization", "static")
+    rows: list[dict] = []
+    for condition_index, condition in enumerate(conditions):
+        for run_index in range(5):
+            for task_index in range(20):
+                rows.append(
+                    {
+                        "run_id": f"{condition}_run_{run_index}",
+                        "condition": condition,
+                        "task_id": repeated_task_id or f"T{task_index + 1:02d}",
+                        "timestamp": base_ts
+                        + timedelta(
+                            seconds=condition_index * 10_000
+                            + run_index * 100
+                            + task_index
+                        ),
+                    }
+                )
+    return rows
+
+
+def test_analyze_results_exits_7_when_invocation_metrics_missing(tmp_path):
+    """A complete eval DB with no invocation metrics must fail loudly."""
+    db = tmp_path / "canonical_no_inv.duckdb"
+    seed_evaluation_runs(db, rows=_canonical_eval_rows())
+
+    result = run_project_script(
+        "analyze_results.py",
+        "--db",
+        str(db),
+        "--per-condition-cap",
+        "5",
+        "--expected-runs-per-condition",
+        "5",
+    )
+
+    assert result.returncode == 7, (
+        f"Expected exit 7 for missing metrics, got {result.returncode}. "
+        f"stderr:\n{result.stderr[-600:]}\nstdout:\n{result.stdout[-600:]}"
+    )
+    assert "CHAPTER 6 INCOMPLETE" in result.stderr
+    assert "M3" in result.stderr
+
+
+def test_allow_missing_metrics_bypasses_exit_7(tmp_path):
+    """The explicit override lets diagnostic runs continue without M3 rows."""
+    db = tmp_path / "canonical_allow.duckdb"
+    seed_evaluation_runs(db, rows=_canonical_eval_rows())
+
+    result = run_project_script(
+        "analyze_results.py",
+        "--db",
+        str(db),
+        "--per-condition-cap",
+        "5",
+        "--allow-missing-metrics",
+        "--expected-runs-per-condition",
+        "5",
+    )
+
+    assert result.returncode == 0, (
+        f"--allow-missing-metrics should bypass exit 7. Got "
+        f"{result.returncode}. stderr:\n{result.stderr[-500:]}"
+    )
+
+
+def test_completeness_guard_refuses_repeated_single_task_shape(tmp_path):
+    """A row-complete DB still fails if it repeats one task instead of T01-T20."""
+    db = tmp_path / "t01_only.duckdb"
+    seed_evaluation_runs(db, rows=_canonical_eval_rows(repeated_task_id="T01"))
+
+    result = run_project_script(
+        "analyze_results.py",
+        "--db",
+        str(db),
+        "--per-condition-cap",
+        "5",
+        "--expected-runs-per-condition",
+        "5",
+    )
+
+    assert result.returncode == 2, (
+        f"Expected exit 2 for distinct-task coverage gap, got {result.returncode}. "
+        f"stderr:\n{result.stderr[-800:]}"
+    )
+    combined = result.stderr + result.stdout
+    assert "distinct tasks" in combined
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +270,7 @@ def test_filter_excludes_output_in_range_false(capsys):
 
 def test_empty_db_prints_no_successful_runs(capsys):
     store, conn = _open_in_memory_store()
-    print_latency_summary(conn)
+    assert print_latency_summary(conn) is False
     output = capsys.readouterr().out
     assert "no successful runs" in output
     assert "Excluded: 0" in output
@@ -394,6 +495,32 @@ def test_gini_summary_reports_per_condition(capsys):
     assert "Static" in output
 
 
+def test_gini_summary_pools_aggregate_by_capability(capsys):
+    """Aggregate Gini pools counts by capability across runs."""
+    store, conn = _open_in_memory_store()
+    _record_invocations(
+        store,
+        run_id="r1",
+        condition="full",
+        task_id="T04",
+        counts_by_cap={"cap-a": 100},
+    )
+    _record_invocations(
+        store,
+        run_id="r2",
+        condition="full",
+        task_id="T04",
+        counts_by_cap={"cap-b": 100},
+    )
+
+    print_gini_summary(conn)
+    output = capsys.readouterr().out
+
+    assert "JIT + Verif + Opt" in output
+    assert "0.500" in output  # mean per-run Gini after zero-padding
+    assert "0.000" in output  # pooled aggregate over {cap-a: 100, cap-b: 100}
+
+
 def test_gini_summary_condition_with_no_data_shows_dash(capsys):
     """Conditions absent from invocation_events should render an em dash."""
     store, conn = _open_in_memory_store()
@@ -445,7 +572,7 @@ def _eval_run(
 def test_classification_accuracy_skipped_when_no_rows(capsys):
     """No non-pilot JIT-condition rows prints skipped and does not crash."""
     store, conn = _open_in_memory_store()
-    print_classification_accuracy(conn)
+    assert print_classification_accuracy(conn) is False
     output = capsys.readouterr().out
     assert "Classification Accuracy" in output
     assert "skipped" in output.lower()
@@ -735,6 +862,49 @@ def test_auto_select_picks_n_distinct_run_ids_per_condition_at_production_densit
         assert count == 5, (
             f"Condition {cond}: expected 5 distinct run_ids, got {count}"
         )
+
+
+def test_analyze_results_auto_select_warning_at_production_density(tmp_path):
+    """Subprocess smoke: script reports selected run IDs, not task rows."""
+    db = tmp_path / "metrics.duckdb"
+    base_ts = datetime(2026, 4, 20, 10, 0, 0)
+    rows: list[dict] = []
+    for condition_index, condition in enumerate(
+        ("full", "no_verification", "no_optimization", "static")
+    ):
+        for run_index in range(8):
+            run_id = f"{condition}_run_{run_index:02d}"
+            for task_index in range(20):
+                rows.append(
+                    {
+                        "run_id": run_id,
+                        "condition": condition,
+                        "task_id": f"T{task_index + 1:02d}",
+                        "timestamp": base_ts
+                        + timedelta(
+                            seconds=condition_index * 10_000
+                            + run_index * 100
+                            + task_index
+                        ),
+                    }
+                )
+    seed_evaluation_runs(db, rows=rows)
+
+    result = run_project_script(
+        "analyze_results.py",
+        "--db",
+        str(db),
+        "--per-condition-cap",
+        "5",
+        timeout=60,
+    )
+
+    combined = result.stdout + result.stderr
+    assert "auto-selected 20 total" in combined, (
+        "Expected warning to report 20 selected run_ids. Got:\n"
+        f"{combined[:3000]}"
+    )
+    assert "across 4 conditions" in combined
 
 
 def test_auto_select_no_scope_needed_when_few_runs():
