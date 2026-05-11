@@ -529,7 +529,7 @@ def _emit_plot(
         import matplotlib  # noqa: F401
         import matplotlib.pyplot as plt
     except ImportError:
-        print("  (skipped --plot: matplotlib not installed. `uv add matplotlib` to enable.)")
+        print("  (skipped --plot: matplotlib not installed. `uv sync --group analysis` to enable.)")
         return False
 
     cycles = [r["cycle"] for r in rows]

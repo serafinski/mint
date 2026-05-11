@@ -739,8 +739,8 @@ def _file_validate_t11(output: dict, output_files: dict[str, bytes]) -> bool:
         import openpyxl
     except ImportError:
         # Graceful degradation only when openpyxl is unavailable in this
-        # dev env. openpyxl is a hard eval dependency in pyproject so
-        # this branch fires only in narrow developer setups.
+        # dev env. The supported eval environment includes the eval dependency
+        # group, so this branch fires only in narrow developer setups.
         import logging as _logging
         _logging.getLogger(__name__).warning(
             "openpyxl unavailable; T11 falling back to dict-only validation."
