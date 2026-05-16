@@ -14,16 +14,16 @@ import os
 
 #: Unified LLM model identifier used by all components (generators, classifier,
 #: decomposition, adversarial probing, optimizer, etc.).
-#: Override via the ``JIT_LLM_MODEL`` environment variable for experiments.
-DEFAULT_LLM_MODEL: str = os.getenv("JIT_LLM_MODEL", "openai:gpt-5-mini")
+#: Override via the ``LLM_MODEL`` environment variable for experiments.
+DEFAULT_LLM_MODEL: str = os.getenv("LLM_MODEL", "openai:gpt-5-mini")
 
 # ---------------------------------------------------------------------------
 # Sandbox / Docker
 # ---------------------------------------------------------------------------
 
 #: Docker image name for sandboxed code execution.
-#: Override via ``JIT_SANDBOX_IMAGE`` for custom sandbox images.
-SANDBOX_IMAGE: str = os.getenv("JIT_SANDBOX_IMAGE", "jit-sandbox")
+#: Override via ``SANDBOX_IMAGE`` for custom sandbox images.
+SANDBOX_IMAGE: str = os.getenv("SANDBOX_IMAGE", "jit-sandbox")
 
 #: Packages pre-installed in the sandbox Dockerfile (mcp + pydantic).
 #: Must be kept in sync with ``sandbox/Dockerfile``.

@@ -23,7 +23,7 @@ protocol as the primary runnable surface on this branch.
 - **LangGraph** — Multi-agent orchestration and pipeline graphs
 - **DeepAgents** (`deepagents` package) — Agent harness with built-in planning (`write_todos`), file system context management, subagent spawning. Used for task decomposition (Pillar 1) and adversarial probing (Pillar 2).
 - **LLM Provider** — Provider-agnostic via `init_chat_model("provider:model")`.
-  - `openai:gpt-5-mini` — unified default for all components, centralized in `src/config.py` as `DEFAULT_LLM_MODEL`. Override via `JIT_LLM_MODEL` env var.
+  - `openai:gpt-5-mini` — unified default for all components, centralized in `src/config.py` as `DEFAULT_LLM_MODEL`. Override via `LLM_MODEL` env var.
   - Requires `OPENAI_API_KEY` in `.env`
 - **MCP SDK** — Tool serving (Python, FastMCP pattern)
 - **ChromaDB** — Skill registry (semantic search with hierarchical embeddings)
@@ -127,7 +127,7 @@ LangFuse traces LLM calls via `langfuse.langchain.CallbackHandler` passed as `co
 
 **LangGraph Patterns.** Use `Command(update={...}, goto="next_node")` for routing. Use `Send` for parallel fan-out. Use `interrupt()` for HITL. See `langgraph-architect` skill.
 
-**LLM Initialization.** Import `DEFAULT_LLM_MODEL` from `src.config` and use `init_chat_model(DEFAULT_LLM_MODEL)`. Never hardcode `"openai:gpt-5-mini"` — use the config constant so the model can be changed in one place (or via `JIT_LLM_MODEL`).
+**LLM Initialization.** Import `DEFAULT_LLM_MODEL` from `src.config` and use `init_chat_model(DEFAULT_LLM_MODEL)`. Never hardcode `"openai:gpt-5-mini"` — use the config constant so the model can be changed in one place (or via `LLM_MODEL`).
 
 **DeepAgents Integration.** Use DeepAgents only where multi-step autonomous reasoning adds value (see table above). `create_deep_agent()` returns a `CompiledStateGraph` — invoke it, don't wire it as a node. Use `response_format=YourPydanticModel` for structured output. Instruct agents to use files for intermediate results (context management). See `deep-agents` skill.
 
@@ -265,7 +265,7 @@ Import from these; avoid modifying unless explicitly required. These are the mod
 - **`src/verification/gate.py`** — `verify(artifact) -> VerificationReport` — never raises; fail-closed on gate errors (flipped from fail-open per §12 finding #14 + security audit #25, 2026-04-20 — internal exceptions produce a CRITICAL finding with `overall_passed=False` rather than silently passing). Verifies generated capabilities *as artifacts*; complemented by `src/orchestrator/output_contract_resolver.py::resolve_output_contract` (Step 14.6) which verifies *task outcomes* at the system boundary — orthogonal axes, both needed.
 - **`src/registry/store.py`** — `SkillRegistry` (CRUD + hierarchical embedding search); `seed_registry()`.
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + granularity metric queries).
-- **`src/config.py`** — `DEFAULT_LLM_MODEL` (env: `JIT_LLM_MODEL`), `SANDBOX_IMAGE` (env: `JIT_SANDBOX_IMAGE`), `DOCKER_PREINSTALLED`, `AUTO_OPTIMIZER_THRESHOLD`, `ADVERSARIAL_REASONING_EFFORT` (env: `JIT_ADVERSARIAL_REASONING`).
+- **`src/config.py`** — `DEFAULT_LLM_MODEL` (env: `LLM_MODEL`), `SANDBOX_IMAGE` (env: `SANDBOX_IMAGE`), `DOCKER_PREINSTALLED`, `AUTO_OPTIMIZER_THRESHOLD`, `ADVERSARIAL_REASONING_EFFORT` (env: `JIT_ADVERSARIAL_REASONING`).
 - **`tests/evaluation/`** — `tasks.py` (`TaskDefinition`, `ALL_TASKS`, `PILOT_TASKS`), `harness.py` (`EvaluationHarness`), `execution.py` (`execute_skill_artifact`, `execute_agent_artifact`), `snapshots.py`.
 
 Other stable interfaces (optimizer loop, verification tiers, tool_loader, sandbox_tool, evaluation_store, schema_extraction) can be discovered by reading the corresponding source files.

@@ -223,7 +223,17 @@ def create_pipeline(
             lambda state: loading_node(state, loader, registry),
         )
 
-    # Entry point — all subsequent routing is via Command returns from each node:
+    # Entry point — all subsequent routing is via Command returns from each node.
+    #
+    # The three type-specific generators are intentionally wired as a sequential
+    # chain rather than parallel graph branches. Each generator filters
+    # state.classified_gaps by its own CapabilityType; when no gaps of that type
+    # are present, the node is a cheap no-op with no LLM call. This keeps retry
+    # routing simple (verification_node can always return to generate_mcp_tool)
+    # while preserving intra-generator parallelism for multiple gaps of the same
+    # type. The trade-off is latency, not behavior: tasks that truly require
+    # generation across several capability types cannot overlap those generator
+    # stages.
     #   decomposition_node → "gap_detection"
     #   gap_detection      → "classifier_node"
     #   classifier_node    → "generate_mcp_tool"
