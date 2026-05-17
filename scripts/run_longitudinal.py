@@ -180,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     from src.orchestrator.tool_loader import ToolLoader
     from src.registry.evaluation_store import EvaluationStore
     from src.registry.metrics import MetricsStore
-    from src.registry.store import SkillRegistry, seed_registry
+    from src.registry.store import CapabilityRegistry, seed_registry
     from src.schemas.evaluation import EvaluationRecord
     from src.schemas.task import TaskState
     from tests.evaluation.harness import _extract_result
@@ -270,7 +270,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Snapshot: %s (restored: %s)", snap_id, restore_snap)
 
     # --- ONE registry, ONE metrics store, ONE loader ---
-    registry = SkillRegistry(
+    registry = CapabilityRegistry(
         persist_directory=str(CHROMA_DIR),
         collection_name="capabilities",
     )

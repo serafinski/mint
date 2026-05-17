@@ -21,7 +21,7 @@ from typing import Literal
 from langgraph.types import Command
 
 from src.registry.metrics import MetricsStore
-from src.registry.store import SkillRegistry
+from src.registry.store import CapabilityRegistry
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import GapItem, MatchItem, SubTask, TaskState, TaskStatus
 
@@ -104,7 +104,7 @@ def _is_match_compatible_with_subtask(
 
 def gap_detection_node(
     state: TaskState,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore | None = None,
 ) -> Command[Literal["classifier_node"]]:
     """Search the registry for each required capability.

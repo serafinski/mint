@@ -17,7 +17,7 @@ import pytest
 
 from src.orchestrator.pipeline import create_pipeline
 from src.orchestrator.tool_loader import ToolLoader
-from src.registry.store import SkillRegistry, seed_registry
+from src.registry.store import CapabilityRegistry, seed_registry
 from src.schemas.task import TaskState, TaskStatus
 
 # ---------------------------------------------------------------------------
@@ -27,7 +27,7 @@ from src.schemas.task import TaskState, TaskStatus
 
 @pytest.fixture
 def registry():
-    return SkillRegistry(collection_name=f"test-{uuid.uuid4().hex[:8]}")
+    return CapabilityRegistry(collection_name=f"test-{uuid.uuid4().hex[:8]}")
 
 
 @pytest.fixture

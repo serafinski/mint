@@ -13,7 +13,7 @@ class CapabilityType(StrEnum):
 
 
 class CapabilityDescriptor(BaseModel):
-    """Metadata for a registered capability in the skill registry."""
+    """Metadata for a registered capability in the capability registry."""
 
     name: str = Field(..., description="Unique capability name")
     description: str = Field(..., description="What this capability does")

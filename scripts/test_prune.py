@@ -41,12 +41,12 @@ sys.path.insert(0, str(ROOT))
 
 from src.optimizer.operations import prune  # noqa: E402
 from src.registry.metrics import MetricsStore  # noqa: E402
-from src.registry.store import SkillRegistry  # noqa: E402
+from src.registry.store import CapabilityRegistry  # noqa: E402
 from src.schemas.capability import CapabilityDescriptor, CapabilityType  # noqa: E402
 from src.schemas.metrics import InvocationRecord  # noqa: E402
 
 
-def _seed_registry(registry: SkillRegistry) -> None:
+def _seed_registry(registry: CapabilityRegistry) -> None:
     """Register the three canonical test capabilities."""
     old_created_at = datetime(2020, 1, 1, tzinfo=UTC)
     registry.add(
@@ -105,7 +105,7 @@ def run_prune_smoke() -> bool:
     print("=" * 70)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        registry = SkillRegistry(
+        registry = CapabilityRegistry(
             persist_directory=tmp_dir,
             collection_name="test_prune_smoke",
         )

@@ -75,7 +75,7 @@ def run_pipeline_and_verify(
     from src.orchestrator.pipeline import create_pipeline
     from src.orchestrator.task_state_builder import build_initial_state_from_prompt
     from src.orchestrator.tool_loader import ToolLoader
-    from src.registry.store import SkillRegistry, seed_registry
+    from src.registry.store import CapabilityRegistry, seed_registry
     from src.schemas.capability import CapabilityType
 
     type_map = {
@@ -90,7 +90,7 @@ def run_pipeline_and_verify(
     print(f"{'=' * 70}")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        registry = SkillRegistry(persist_directory=tmp_dir, collection_name="test_pipeline")
+        registry = CapabilityRegistry(persist_directory=tmp_dir, collection_name="test_pipeline")
         seed_registry(registry)
         loader = ToolLoader()
 

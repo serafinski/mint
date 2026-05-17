@@ -74,7 +74,7 @@ The pipeline operates in five stages:
 
 1. **Task decomposition.** An orchestrator agent (using a deep-thinking model with a large token budget) breaks the input task into subtasks, each annotated with the capabilities required to complete it.
 
-2. **Skill gap detection.** Each required capability is matched against a skill registry — a semantically indexed library of existing tools, skills, and agents. Gaps are identified as subtasks with no match above a confidence threshold. The registry uses hierarchical embeddings (domain → capability → specific skill) to prevent both false positives (superficial keyword matches) and false negatives (semantically equivalent but differently named skills).
+2. **Capability gap detection.** Each required capability is matched against a capability registry — a semantically indexed library of existing tools, skills, and agents. Gaps are identified as subtasks with no match above a confidence threshold. The registry uses hierarchical embeddings (domain → capability → specific skill) to prevent both false positives (superficial keyword matches) and false negatives (semantically equivalent but differently named skills).
 
 3. **Capability classification.** Each gap is classified to determine what *kind* of artifact should be generated:
    - **Deterministic + stateless** → Generate an **MCP tool** (a Python/TypeScript function wrapped in an MCP server interface, exposing typed input/output schemas via JSON-RPC)
@@ -114,7 +114,7 @@ These patterns are especially dangerous in a JIT pipeline because the generated 
 
 ### Approach: Three-Tier Verification
 
-Every generated capability must pass all three tiers before entering the production skill registry.
+Every generated capability must pass all three tiers before entering the production capability registry.
 
 **Tier 1 — Static Analysis (Pattern Detection)**
 
@@ -157,7 +157,7 @@ No published work on self-evolving agents (EvoMAC, EvoAgentX, STELLA, AgentEvolv
 
 ### Problem
 
-After running for many task cycles, the skill registry accumulates capabilities at arbitrary granularity levels. Some are too general (high reuse but inconsistent success), others too specific (perfect success but invoked once and forgotten). Without optimization pressure, the registry grows unboundedly while effective coverage stagnates.
+After running for many task cycles, the capability registry accumulates capabilities at arbitrary granularity levels. Some are too general (high reuse but inconsistent success), others too specific (perfect success but invoked once and forgotten). Without optimization pressure, the registry grows unboundedly while effective coverage stagnates.
 
 ### Approach: Evolutionary Feedback Loop
 
@@ -293,7 +293,7 @@ Chapter 7  Conclusion and Future Work
 | Skill packaging | Agent Skills specification (SKILL.md + resources) |
 | Verification scanner | Zero-dependency Python (CI-integrable) |
 | Sandbox execution | Docker containers / subprocess isolation |
-| Skill registry | Semantic search over embeddings (e.g., ChromaDB) |
+| Capability registry | Semantic search over embeddings (e.g., ChromaDB) |
 
 ---
 

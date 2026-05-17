@@ -27,7 +27,7 @@ Methodology
 
 This is a lower-level registry audit, not a full eval-protocol
 ``gap_detection_node`` simulation. The eval pipeline uses the same
-``SkillRegistry`` / ChromaDB search layer, but wraps it through
+``CapabilityRegistry`` / ChromaDB search layer, but wraps it through
 ``registry.detect_gaps()`` with slug+description dual-query retrieval,
 optional taxonomy filtering, and post-match compatibility checks. This
 script isolates the semantic-search false-negative question.
@@ -82,7 +82,7 @@ os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 load_dotenv(ROOT / ".env")
 
 from src.config import DEFAULT_LLM_MODEL  # noqa: E402
-from src.registry.store import SkillRegistry, seed_registry  # noqa: E402
+from src.registry.store import CapabilityRegistry, seed_registry  # noqa: E402
 from src.schemas.capability import CapabilityDescriptor  # noqa: E402
 
 logging.basicConfig(
@@ -140,7 +140,7 @@ def generate_paraphrases(
 ) -> list[str]:
     """Ask the LLM for ``n`` semantically-equivalent paraphrases."""
     prompt = (
-        "You are helping audit a skill registry for false-negative "
+        "You are helping audit a capability registry for false-negative "
         "retrieval (queries that should match an existing capability but "
         "miss it due to vocabulary differences).\n\n"
         f"Original capability name: {cap.name}\n"
@@ -170,7 +170,7 @@ def generate_paraphrases(
 
 
 def probe_cap(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     cap: CapabilityDescriptor,
     paraphrases: list[str],
     *,
@@ -258,7 +258,7 @@ def main() -> int:
 
     # Seed an ephemeral registry so we don't touch any persistent state.
     print("\nSeeding ephemeral registry...")
-    registry = SkillRegistry()  # ephemeral = no persist_directory
+    registry = CapabilityRegistry()  # ephemeral = no persist_directory
     seed_registry(registry)
     caps = registry.list_all()
     print(f"Seeded {len(caps)} capabilities.")

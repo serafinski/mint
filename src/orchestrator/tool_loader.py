@@ -24,7 +24,7 @@ class ToolLoader:
     def register_tool(
         self,
         artifact: GeneratedArtifact,
-        registry,  # SkillRegistry — not imported at module level to avoid circular deps
+        registry,  # CapabilityRegistry — not imported at module level to avoid circular deps
         *,
         description: str | None = None,
         domain: str = "generated",
@@ -39,7 +39,7 @@ class ToolLoader:
 
         Args:
             artifact: The generated artifact, which must be ``MCP_TOOL``.
-            registry: A ``SkillRegistry`` instance.
+            registry: A ``CapabilityRegistry`` instance.
             description: Human-readable description. Defaults to the
                 artifact's description, then a humanized capability name.
             domain: Fallback taxonomy domain when the artifact has no domain.

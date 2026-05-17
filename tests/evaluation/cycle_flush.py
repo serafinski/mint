@@ -78,7 +78,7 @@ def flush_task_cycle_state(
     Args:
         eval_store: EvaluationStore instance (persistent DB connection).
         metrics_store: MetricsStore instance (in-memory per run).
-        registry: SkillRegistry instance (passed to compute_all_utilities).
+        registry: CapabilityRegistry instance (passed to compute_all_utilities).
         run_id: The run ID for this longitudinal/harness run.
         condition: Condition label (e.g. "full", "static", "longitudinal").
         task_id: Canonical task family ID for the just-completed task.

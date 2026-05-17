@@ -144,7 +144,7 @@ See `chapter6_numbers.md` §6 for the full HEAD-by-stage table. Net summary:
 ## G. Files inspected but treated as non-authoritative
 
 - `data/eval/.eval_runner.lock` — runtime lock (`scripts._eval_registry_lock`); not a metric source.
-- `data/eval/chroma/` — ChromaDB internal storage for SkillRegistry; not a metric source. Inspected only via `gap_detection` log-trace claims.
+- `data/eval/chroma/` — ChromaDB internal storage for CapabilityRegistry; not a metric source. Inspected only via `gap_detection` log-trace claims.
 - `.DS_Store` (system files), `__pycache__/` directories — irrelevant.
 - Every `git_diff.txt` file with size 0 — empty by design (no working-tree diff at capture).
 

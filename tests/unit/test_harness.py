@@ -438,7 +438,7 @@ class TestExtractResultCompositionalAgentFailure:
 class TestRunPilot:
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_pilot_records_written(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -458,7 +458,7 @@ class TestRunPilot:
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_pilot_uses_full_condition_by_default(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -474,7 +474,7 @@ class TestRunPilot:
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_pilot_records_stored_in_db(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -496,7 +496,7 @@ class TestRunPilot:
 class TestRunCondition:
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_run_condition_calls_restore_per_run(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -513,7 +513,7 @@ class TestRunCondition:
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_run_condition_returns_n_runs_times_n_tasks(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -529,7 +529,7 @@ class TestRunCondition:
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_run_condition_non_pilot(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -544,7 +544,7 @@ class TestRunCondition:
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_run_condition_different_seeds_per_run(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -563,7 +563,7 @@ class TestRunCondition:
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_run_condition_uses_full_uuid_entropy_in_run_id(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config

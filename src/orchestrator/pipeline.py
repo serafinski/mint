@@ -49,7 +49,7 @@ from src.orchestrator.loading_node import loading_node
 from src.orchestrator.tool_loader import ToolLoader
 from src.orchestrator.verification_node import verification_node
 from src.registry.metrics import MetricsStore
-from src.registry.store import SkillRegistry
+from src.registry.store import CapabilityRegistry
 from src.schemas.optimizer_config import OptimizerConfig
 from src.schemas.task import TaskState
 from src.verification.gate import verify as gate_verify
@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_pipeline(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     loader: ToolLoader,
     *,
     run_optimizer: bool = False,

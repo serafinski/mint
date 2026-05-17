@@ -26,7 +26,7 @@ protocol as the primary runnable surface on this branch.
   - `openai:gpt-5-mini` — unified default for all components, centralized in `src/config.py` as `DEFAULT_LLM_MODEL`. Override via `LLM_MODEL` env var.
   - Requires `OPENAI_API_KEY` in `.env`
 - **MCP SDK** — Tool serving (Python, FastMCP pattern)
-- **ChromaDB** — Skill registry (semantic search with hierarchical embeddings)
+- **ChromaDB** — Capability registry (semantic search with hierarchical embeddings)
 - **DuckDB** — Metrics storage (invocations, outcomes, token costs)
 - **LangFuse** — Observability and tracing
 - **Docker** — Sandboxed execution for generated capabilities
@@ -79,7 +79,7 @@ src/
 │   ├── schema_extraction.py  # AST-based schema extraction (B1)
 │   ├── prompts/            # All LLM prompt templates
 │   └── generators/         # mcp_tool.py, skill.py, agent.py
-├── registry/               # ChromaDB skill registry + DuckDB metrics
+├── registry/               # ChromaDB capability registry + DuckDB metrics
 ├── verification/           # Pillar 2: static_scanner, behavioral, adversarial, gate, sandbox_tool
 ├── optimizer/              # Pillar 3: utility, operations, loop, simulation
 └── schemas/                # Shared Pydantic state schemas (single source of truth)
@@ -155,7 +155,7 @@ The evaluation testbed is the **Business Analytics Pipeline** — data ingestion
 
 ### MCP Tool Loading Strategy
 
-Generated MCP tools are registered by reading `source_code` into the `SkillRegistry`; no host-side import or subprocess runs the generated code during loading. Execution happens exclusively through the Docker sandbox (`src/verification/sandbox_tool.py::sandbox_execute`) in the eval harness (`tests/evaluation/execution.py::execute_mcp_tool_in_chain`). The three-tier gate's Tier 1.5 / Tier 2 / Tier 3 also run generated code exclusively in Docker. `ToolLoader.load_tool` / `ToolLoader.execute_tool` in `src/orchestrator/tool_loader.py` remain for unit-test inspection only and are **not production paths** — security audit finding #1 (2026-04-19) removed them from `loading_node` because they ran `spec.loader.exec_module` on the host after the gate had signed off. **Not** persistent FastMCP server processes — no ports, health checks, or zombie process risk. Full MCP server deployment is Chapter 7 future work.
+Generated MCP tools are registered by reading `source_code` into the `CapabilityRegistry`; no host-side import or subprocess runs the generated code during loading. Execution happens exclusively through the Docker sandbox (`src/verification/sandbox_tool.py::sandbox_execute`) in the eval harness (`tests/evaluation/execution.py::execute_mcp_tool_in_chain`). The three-tier gate's Tier 1.5 / Tier 2 / Tier 3 also run generated code exclusively in Docker. `ToolLoader.load_tool` / `ToolLoader.execute_tool` in `src/orchestrator/tool_loader.py` remain for unit-test inspection only and are **not production paths** — security audit finding #1 (2026-04-19) removed them from `loading_node` because they ran `spec.loader.exec_module` on the host after the gate had signed off. **Not** persistent FastMCP server processes — no ports, health checks, or zombie process risk. Full MCP server deployment is Chapter 7 future work.
 
 ### Generated Skills Landing Path
 
@@ -263,7 +263,7 @@ Import from these; avoid modifying unless explicitly required. These are the mod
 - **`src/orchestrator/generators/`** — `generate_mcp_tool()`, `generate_skill()`, `generate_agent()` — LangGraph nodes chained to `verification_node`.
 - **`src/orchestrator/classifier.py`** — `classify_gap(gap, task_description, required_capabilities)` is primary (per-gap); `classifier_node()` iterates `state.gaps`. `classify_task()` is a legacy wrapper preserved for one integration test.
 - **`src/verification/gate.py`** — `verify(artifact) -> VerificationReport` — never raises; fail-closed on gate errors (flipped from fail-open per §12 finding #14 + security audit #25, 2026-04-20 — internal exceptions produce a CRITICAL finding with `overall_passed=False` rather than silently passing). Verifies generated capabilities *as artifacts*; complemented by `src/orchestrator/output_contract_resolver.py::resolve_output_contract` (Step 14.6) which verifies *task outcomes* at the system boundary — orthogonal axes, both needed.
-- **`src/registry/store.py`** — `SkillRegistry` (CRUD + hierarchical embedding search); `seed_registry()`.
+- **`src/registry/store.py`** — `CapabilityRegistry` (CRUD + hierarchical embedding search); `seed_registry()`.
 - **`src/registry/metrics.py`** — `MetricsStore` (invocation recording + granularity metric queries).
 - **`src/config.py`** — `DEFAULT_LLM_MODEL` (env: `LLM_MODEL`), `SANDBOX_IMAGE` (env: `SANDBOX_IMAGE`), `DOCKER_PREINSTALLED`, `AUTO_OPTIMIZER_THRESHOLD`, `ADVERSARIAL_REASONING_EFFORT` (env: `JIT_ADVERSARIAL_REASONING`).
 - **`tests/evaluation/`** — `tasks.py` (`TaskDefinition`, `ALL_TASKS`, `PILOT_TASKS`), `harness.py` (`EvaluationHarness`), `execution.py` (`execute_skill_artifact`, `execute_agent_artifact`), `snapshots.py`.

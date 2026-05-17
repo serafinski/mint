@@ -77,7 +77,7 @@ os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 load_dotenv(ROOT / ".env")
 
 from src.config import DEFAULT_LLM_MODEL  # noqa: E402
-from src.registry.store import SkillRegistry, seed_registry  # noqa: E402
+from src.registry.store import CapabilityRegistry, seed_registry  # noqa: E402
 from src.schemas.capability import CapabilityDescriptor, CapabilityType  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -273,7 +273,7 @@ class PhaseAResult:
 
 
 def run_phase_a(
-    probes: list[Probe], registry: SkillRegistry, threshold: float
+    probes: list[Probe], registry: CapabilityRegistry, threshold: float
 ) -> list[PhaseAResult]:
     results: list[PhaseAResult] = []
     for probe in probes:
@@ -413,7 +413,7 @@ class PhaseBResult:
 
 
 def run_phase_b(
-    phase_a: list[PhaseAResult], registry: SkillRegistry
+    phase_a: list[PhaseAResult], registry: CapabilityRegistry
 ) -> list[PhaseBResult]:
     """Run the LLM compatibility judge on every match that fired in phase A."""
     from langchain.chat_models import init_chat_model
@@ -567,7 +567,7 @@ class PhaseCResult:
     error: str | None = None
 
 
-def run_phase_c(registry: SkillRegistry) -> list[PhaseCResult]:
+def run_phase_c(registry: CapabilityRegistry) -> list[PhaseCResult]:
     """Audit every capability in the registry for description/code drift."""
     from langchain.chat_models import init_chat_model
 
@@ -774,7 +774,7 @@ class PhaseDResult:
 
 
 def run_phase_d(
-    registry: SkillRegistry, threshold: float
+    registry: CapabilityRegistry, threshold: float
 ) -> list[PhaseDResult]:
     """Generate reusability probes for every non-pinned capability and audit."""
     from langchain.chat_models import init_chat_model
@@ -1457,7 +1457,7 @@ def main() -> int:
 
     # Load or seed the registry.
     if use_persistent:
-        registry = SkillRegistry(
+        registry = CapabilityRegistry(
             persist_directory=args.registry_path,
             collection_name="capabilities",
         )
@@ -1466,7 +1466,7 @@ def main() -> int:
             f"({registry.count} capabilities)"
         )
     else:
-        registry = SkillRegistry()  # ephemeral
+        registry = CapabilityRegistry()  # ephemeral
         seed_registry(registry)
         print(
             f"\n  Seeded ephemeral registry with {registry.count} capabilities "

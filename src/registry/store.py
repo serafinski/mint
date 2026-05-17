@@ -9,7 +9,7 @@ from src.config import DEFAULT_LLM_MODEL
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 
 
-class SkillRegistry:
+class CapabilityRegistry:
     """ChromaDB-backed capability registry with hierarchical semantic search."""
 
     def __init__(
@@ -63,7 +63,7 @@ class SkillRegistry:
         code paths that need it.
         """
         domain = getattr(capability, "domain", "general")
-        summary = SkillRegistry._summarize_description(capability.description)
+        summary = CapabilityRegistry._summarize_description(capability.description)
         return (
             f"{domain} > {capability.capability_type.value} > "
             f"{capability.name}: {summary}"
@@ -456,7 +456,11 @@ class SkillRegistry:
         return self._collection.count()
 
 
-def seed_registry(registry: SkillRegistry) -> None:
+# Backwards-compatible alias for older scripts and tests.
+SkillRegistry = CapabilityRegistry
+
+
+def seed_registry(registry: CapabilityRegistry) -> None:
     """Seed with diverse capabilities spanning all three types."""
     # Local imports to avoid circular deps at module import time.
     from src.registry.token_count import count_definition_tokens

@@ -297,7 +297,7 @@ def test_does_not_execute_module_top_level_on_host(tmp_path):
     Uses a real ToolLoader so accidental host-side source execution would
     surface through the filesystem side effect below.
     """
-    from src.registry.store import SkillRegistry
+    from src.registry.store import CapabilityRegistry
 
     marker = tmp_path / "pwned"
     source = (
@@ -315,7 +315,7 @@ def test_does_not_execute_module_top_level_on_host(tmp_path):
     state = TaskState(task_description="t", generated_artifacts=[artifact])
 
     real_loader = ToolLoader()
-    registry = MagicMock(spec=SkillRegistry)
+    registry = MagicMock(spec=CapabilityRegistry)
 
     cmd = loading_node(state, real_loader, registry)
 

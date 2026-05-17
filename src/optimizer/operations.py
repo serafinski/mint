@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 from src.config import DEFAULT_LLM_MODEL
 from src.orchestrator.tracing import emit_langfuse_event
 from src.registry.metrics import MetricsStore
-from src.registry.store import SkillRegistry
+from src.registry.store import CapabilityRegistry
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.metrics import InvocationRecord
 from src.schemas.task import GeneratedArtifact
@@ -123,7 +123,7 @@ def _langfuse_config() -> dict:
 
 def verify_and_register_or_rollback(
     artifact: GeneratedArtifact,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     event_type: str,
@@ -227,7 +227,7 @@ def verify_and_register_or_rollback(
 
 def _register_artifact_directly(
     artifact: GeneratedArtifact,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     event_type: str,
@@ -657,7 +657,7 @@ class MergeAgentsResult(_MergeResultCommon):
 
 
 def prune(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     window_days: int = 30,
@@ -709,7 +709,7 @@ def prune(
 
 
 def split(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     capability_id: str,
     *,
@@ -753,7 +753,7 @@ def split(
     *"must pass all three tiers"* contract the same way merge does.
 
     Args:
-        registry: Skill registry.
+        registry: Capability registry.
         metrics_store: Metrics store for pulling metrics + recording events.
         capability_id: ID of the capability to split.
         llm_model: Model identifier for init_chat_model. Empty string
@@ -911,7 +911,7 @@ def _invoke_structured_with_repair(
 
 def _merge_tools(
     caps: list[CapabilityDescriptor],
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -1026,7 +1026,7 @@ def _merge_tools(
 
 def _merge_skills(
     caps: list[CapabilityDescriptor],
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -1152,7 +1152,7 @@ def _merge_skills(
 
 def _merge_agents(
     caps: list[CapabilityDescriptor],
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -1318,7 +1318,7 @@ def _merge_agents(
 
 
 def merge(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     capability_ids: list[str],
     *,
@@ -1346,7 +1346,7 @@ def merge(
     optimizer-generated capabilities.
 
     Args:
-        registry: Skill registry.
+        registry: Capability registry.
         metrics_store: Metrics store for event recording.
         capability_ids: IDs of capabilities to merge (typically 2,
             but per-type helpers accept any ≥ 2).
@@ -1570,7 +1570,7 @@ def _split_phase_b_verify_all(
 def _split_finalize(
     parent: CapabilityDescriptor,
     artifacts: list[GeneratedArtifact],
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
 ) -> list[str] | None:
     """Phases D + E: register each verified variant and deactivate parent.
@@ -1634,7 +1634,7 @@ def _split_finalize(
 
 def _split_tools(
     parent: CapabilityDescriptor,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -1795,7 +1795,7 @@ def _split_tools(
 
 def _split_skills(
     parent: CapabilityDescriptor,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -1948,7 +1948,7 @@ def _split_skills(
 
 def _split_agents(
     parent: CapabilityDescriptor,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,

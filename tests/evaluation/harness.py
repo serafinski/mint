@@ -54,7 +54,7 @@ from typing import Any
 from src.orchestrator.output_contract_resolver import _extract_output_contract_llm
 from src.orchestrator.tool_loader import ToolLoader
 from src.registry.evaluation_store import EvaluationStore
-from src.registry.store import SkillRegistry, seed_registry
+from src.registry.store import CapabilityRegistry, seed_registry
 from src.schemas.evaluation import EvaluationRecord, GeneratedArtifactSnapshot
 from src.schemas.task import GeneratedArtifact, TaskState
 from tests.evaluation.conditions import get_condition_profile
@@ -241,7 +241,7 @@ class EvaluationHarness:
             shutil.rmtree(cfg.chroma_dir)
         cfg.chroma_dir.mkdir(parents=True, exist_ok=True)
 
-        registry = SkillRegistry(
+        registry = CapabilityRegistry(
             persist_directory=str(cfg.chroma_dir),
             collection_name=cfg.chroma_collection,
         )
@@ -352,7 +352,7 @@ class EvaluationHarness:
         # Force-release any ChromaDB PersistentClient from the previous run.
         # Without this, SQLite WAL files may still be held open when
         # restore_clean_snapshot does shutil.rmtree → shutil.copytree,
-        # causing corruption on the next SkillRegistry init.
+        # causing corruption on the next CapabilityRegistry init.
         try:
             import chromadb
 
@@ -372,7 +372,7 @@ class EvaluationHarness:
             raise RuntimeError(msg)
 
         # Rebuild registry and loader from the restored snapshot.
-        registry = SkillRegistry(
+        registry = CapabilityRegistry(
             persist_directory=str(cfg.chroma_dir),
             collection_name=cfg.chroma_collection,
         )
@@ -497,7 +497,7 @@ class EvaluationHarness:
         task: TaskDefinition,
         condition: str,
         run_id: str,
-        registry: SkillRegistry,
+        registry: CapabilityRegistry,
         loader: ToolLoader,
         metrics_store: Any,
         seed: int,
@@ -566,7 +566,7 @@ class EvaluationHarness:
     def _run_static(
         self,
         task: TaskDefinition,
-        registry: SkillRegistry,
+        registry: CapabilityRegistry,
         metrics_store: Any = None,
     ) -> dict:
         """Static baseline: registry lookup + execute pre-written implementation.
@@ -676,7 +676,7 @@ class EvaluationHarness:
         self,
         task: TaskDefinition,
         condition: str,
-        registry: SkillRegistry,
+        registry: CapabilityRegistry,
         loader: ToolLoader,
         metrics_store: Any,
         *,

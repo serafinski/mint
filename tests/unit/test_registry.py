@@ -4,14 +4,14 @@ import uuid
 
 import pytest
 
-from src.registry.store import SkillRegistry, seed_registry
+from src.registry.store import CapabilityRegistry, SkillRegistry, seed_registry
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 
 
 @pytest.fixture
 def registry():
     """Isolated ephemeral registry per test."""
-    return SkillRegistry(collection_name=f"test-{uuid.uuid4().hex[:8]}")
+    return CapabilityRegistry(collection_name=f"test-{uuid.uuid4().hex[:8]}")
 
 
 @pytest.fixture
@@ -41,6 +41,10 @@ def _make_cap(
 
 
 # --- Core registry behavior ---
+
+
+def test_skill_registry_alias_remains_for_backwards_compatibility():
+    assert SkillRegistry is CapabilityRegistry
 
 
 def test_add_and_search(registry):
@@ -121,12 +125,12 @@ def test_detect_gaps_mixed(seeded_registry):
 def test_persistent_registry(tmp_path):
     persist_dir = str(tmp_path / "registry")
     col_name = f"test-{uuid.uuid4().hex[:8]}"
-    registry = SkillRegistry(persist_directory=persist_dir, collection_name=col_name)
+    registry = CapabilityRegistry(persist_directory=persist_dir, collection_name=col_name)
     seed_registry(registry)
     assert registry.count == 14
 
     # Reopen from disk
-    registry2 = SkillRegistry(persist_directory=persist_dir, collection_name=col_name)
+    registry2 = CapabilityRegistry(persist_directory=persist_dir, collection_name=col_name)
     assert registry2.count == 14
     results = registry2.search("fibonacci")
     assert results[0][0].name == "fibonacci"
@@ -390,7 +394,7 @@ def test_persistence_survives_crud(tmp_path):
     col_name = f"test-{uuid.uuid4().hex[:8]}"
 
     # Session 1: add, update, deactivate
-    reg1 = SkillRegistry(persist_directory=persist_dir, collection_name=col_name)
+    reg1 = CapabilityRegistry(persist_directory=persist_dir, collection_name=col_name)
     reg1.add(
         CapabilityDescriptor(
             name="tool-a",
@@ -409,7 +413,7 @@ def test_persistence_survives_crud(tmp_path):
     reg1.deactivate("tool-b")
 
     # Session 2: reopen and verify
-    reg2 = SkillRegistry(persist_directory=persist_dir, collection_name=col_name)
+    reg2 = CapabilityRegistry(persist_directory=persist_dir, collection_name=col_name)
     assert reg2.count == 2
 
     tool_a = reg2.get("tool-a")
@@ -529,12 +533,12 @@ def test_detect_gaps_active_capability_still_matches(registry):
 class TestDescriptionSummarization:
     def test_short_description_unchanged(self):
         desc = "Parse a CSV file and return rows"
-        assert SkillRegistry._summarize_description(desc) == desc
+        assert CapabilityRegistry._summarize_description(desc) == desc
 
     def test_long_description_truncated_to_50_words(self):
         words = [f"word{i}" for i in range(100)]
         desc = " ".join(words)
-        summary = SkillRegistry._summarize_description(desc)
+        summary = CapabilityRegistry._summarize_description(desc)
         assert summary.endswith("…")
         # 50 words + ellipsis
         assert len(summary.split()) == 50  # trailing … is part of last token
@@ -542,14 +546,14 @@ class TestDescriptionSummarization:
     def test_exactly_50_words_unchanged(self):
         words = [f"word{i}" for i in range(50)]
         desc = " ".join(words)
-        summary = SkillRegistry._summarize_description(desc)
+        summary = CapabilityRegistry._summarize_description(desc)
         assert summary == desc
         assert "…" not in summary
 
     def test_build_document_uses_summary(self, registry):
         long_desc = " ".join(f"word{i}" for i in range(100))
         cap = _make_cap(name="long-desc-cap", description=long_desc)
-        doc = SkillRegistry._build_document(cap)
+        doc = CapabilityRegistry._build_document(cap)
         # Document should contain the truncated summary, not the full description
         assert "…" in doc
         assert "word99" not in doc

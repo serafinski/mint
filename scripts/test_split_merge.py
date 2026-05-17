@@ -67,7 +67,7 @@ load_dotenv(ROOT / ".env")
 
 from src.optimizer.operations import merge, split  # noqa: E402
 from src.registry.metrics import MetricsStore  # noqa: E402
-from src.registry.store import SkillRegistry  # noqa: E402
+from src.registry.store import CapabilityRegistry  # noqa: E402
 from src.schemas.capability import CapabilityDescriptor, CapabilityType  # noqa: E402
 from src.schemas.metrics import InvocationRecord  # noqa: E402
 
@@ -76,9 +76,9 @@ from src.schemas.metrics import InvocationRecord  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def _create_fresh_registry(tmp_dir: str) -> SkillRegistry:
+def _create_fresh_registry(tmp_dir: str) -> CapabilityRegistry:
     """Create a fresh ChromaDB registry in a temp directory."""
-    return SkillRegistry(
+    return CapabilityRegistry(
         persist_directory=tmp_dir,
         collection_name="test_split_merge",
     )

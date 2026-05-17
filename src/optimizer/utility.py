@@ -14,13 +14,13 @@ are seeded, generated, loaded, or created by optimizer operations.
 from __future__ import annotations
 
 from src.registry.metrics import MetricsStore
-from src.registry.store import SkillRegistry
+from src.registry.store import CapabilityRegistry
 
 
 def compute_utility(
     capability_id: str,
     metrics_store: MetricsStore,
-    registry: SkillRegistry | None = None,
+    registry: CapabilityRegistry | None = None,
     *,
     alpha: float = 1.0,
     beta: float = 0.1,
@@ -32,7 +32,7 @@ def compute_utility(
     Args:
         capability_id: Registry ID of the capability.
         metrics_store: DuckDB metrics store to pull metrics from.
-        registry: Optional SkillRegistry; used to read
+        registry: Optional CapabilityRegistry; used to read
             ``definition_token_cost`` off the CapabilityDescriptor. When
             ``None``, the delta term contributes 0 so callers without registry
             visibility can still score metrics-only records.
@@ -65,7 +65,7 @@ def compute_utility(
 
 
 def compute_all_utilities(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     alpha: float = 1.0,

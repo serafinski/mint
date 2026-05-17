@@ -18,7 +18,7 @@ from src.config import AUTO_OPTIMIZER_THRESHOLD
 from src.optimizer.operations import merge, prune, split
 from src.optimizer.utility import compute_all_utilities
 from src.registry.metrics import MetricsStore
-from src.registry.store import SkillRegistry
+from src.registry.store import CapabilityRegistry
 from src.schemas.capability import CapabilityDescriptor
 from src.schemas.metrics import GranularityMetrics
 from src.schemas.optimizer_config import OptimizerConfig
@@ -147,7 +147,7 @@ def _schema_jaccard(cap_a: CapabilityDescriptor, cap_b: CapabilityDescriptor) ->
 
 
 def create_optimization_loop(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     prune_window_days: int = 30,

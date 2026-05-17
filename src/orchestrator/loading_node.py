@@ -33,7 +33,7 @@ from src.orchestrator.schema_extraction import (
 )
 from src.orchestrator.tool_loader import ToolLoader
 from src.orchestrator.tracing import emit_langfuse_event
-from src.registry.store import SkillRegistry
+from src.registry.store import CapabilityRegistry
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import TaskState, TaskStatus
 
@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 def loading_node(
     state: TaskState,
     loader: ToolLoader,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
 ) -> Command[Literal["__end__"]]:
     """Register generated artifacts in the capability registry.
 

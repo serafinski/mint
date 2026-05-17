@@ -211,9 +211,9 @@ def test_serialization_failure_returns_zero(caplog):
 
 
 def test_seed_registry_populates_definition_token_cost():
-    from src.registry.store import SkillRegistry, seed_registry
+    from src.registry.store import CapabilityRegistry, seed_registry
 
-    registry = SkillRegistry()
+    registry = CapabilityRegistry()
     seed_registry(registry)
 
     caps = registry.list_all()
@@ -229,9 +229,9 @@ def test_seed_registry_populates_definition_token_cost():
 
 def test_definition_token_cost_survives_chromadb_round_trip():
     """Persistence check: value written by add() must come back through get()."""
-    from src.registry.store import SkillRegistry, seed_registry
+    from src.registry.store import CapabilityRegistry, seed_registry
 
-    registry = SkillRegistry()
+    registry = CapabilityRegistry()
     seed_registry(registry)
 
     before = registry.list_all()[0]

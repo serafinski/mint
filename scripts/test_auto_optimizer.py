@@ -180,7 +180,7 @@ def test_happy_path(verbose: bool = False) -> bool:
     from src.orchestrator.pipeline import create_pipeline
     from src.orchestrator.tool_loader import ToolLoader
     from src.registry.metrics import MetricsStore
-    from src.registry.store import SkillRegistry, seed_registry
+    from src.registry.store import CapabilityRegistry, seed_registry
     from src.schemas.capability import CapabilityDescriptor, CapabilityType
     from src.schemas.task import TaskState
 
@@ -190,7 +190,7 @@ def test_happy_path(verbose: bool = False) -> bool:
     print("=" * 70)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        registry = SkillRegistry(
+        registry = CapabilityRegistry(
             persist_directory=tmp_dir, collection_name="test_auto_opt"
         )
         seed_registry(registry)
@@ -524,7 +524,7 @@ def test_rollback(verbose: bool = False) -> bool:
     from src.orchestrator.pipeline import create_pipeline
     from src.orchestrator.tool_loader import ToolLoader
     from src.registry.metrics import MetricsStore
-    from src.registry.store import SkillRegistry, seed_registry
+    from src.registry.store import CapabilityRegistry, seed_registry
     from src.schemas.capability import CapabilityDescriptor, CapabilityType
     from src.schemas.task import TaskState
     from src.schemas.verification import Severity, VerificationFinding, VerificationReport
@@ -535,7 +535,7 @@ def test_rollback(verbose: bool = False) -> bool:
     print("=" * 70)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        registry = SkillRegistry(
+        registry = CapabilityRegistry(
             persist_directory=tmp_dir, collection_name="test_auto_opt_rb"
         )
         seed_registry(registry)
