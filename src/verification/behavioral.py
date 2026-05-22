@@ -164,7 +164,7 @@ def _extract_function_name(source_code: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Test input generation
+# Input generation helpers
 # ---------------------------------------------------------------------------
 
 
@@ -240,8 +240,7 @@ def _generate_negative_input_variants(
         ("float_neg_underflow", -1e308),
     ]
 
-    # Build a base "fallback" dict for non-numeric types so callers always
-    # get a valid kwargs dict per variant.
+    # Non-numeric parameters keep fallback values in each variant.
     base: dict[str, Any] = {}
     numeric_params: list[tuple[str, str]] = []  # (param_name, "int" | "float")
     for name, info in schema.items():
@@ -750,8 +749,7 @@ def _test_boundary(
     if not schema:
         return findings
 
-    # Run each negative numeric variant as its own probe so findings can
-    # identify the specific edge case that failed.
+    # Separate probes make the failing numeric edge case explicit.
     test_cases = [
         ("zero/empty", _generate_boundary_inputs(schema)),
     ]
@@ -997,9 +995,8 @@ def run(
                 allow_network=allow_network,
             )
         else:
-            # No declared dependencies — bare base image, no cached
-            # build needed. Patches to behavioral.sandbox_execute
-            # (used by unit tests) intercept this path normally.
+            # Dependency-free artifacts use the bare base image; cached image
+            # setup is only needed when pip packages must be installed.
             _sandbox = partial(
                 sandbox_execute,
                 extra_packages=None,

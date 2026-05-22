@@ -87,8 +87,8 @@ def _get_agent():
 # union of transitive predecessors' ``output_schema`` keys. No regex, no
 # natural-language heuristics.
 #
-# This aligns with the "Structured State Communication" section of the
-# thesis proposal: typed contracts over lossy natural-language parsing.
+# Aligned with the thesis proposal's "Structured State Communication" section:
+# typed contracts over lossy natural-language parsing.
 #
 # Fail-open semantics: validation failures append to ``state.errors`` and
 # set ``decomposition_succeeded=False``, but the pipeline continues so
@@ -560,11 +560,8 @@ def decomposition_node(
             structured: DecompositionResult | None = result.get("structured_response")
 
             if structured is not None and structured.subtasks:
-                # Build candidate subtasks and required_caps from the
-                # current attempt. We stage them in locals first so a
-                # failed DAG validation can discard the attempt and
-                # trigger a retry without contaminating the accumulated
-                # state from prior attempts.
+                # Stage the current attempt in locals so failed DAG validation
+                # can trigger a retry without contaminating accumulated state.
                 attempt_subtasks: list[SubTask] = []
                 attempt_caps: list[str] = []
                 for item in structured.subtasks:
@@ -579,7 +576,7 @@ def decomposition_node(
                     )
                     attempt_caps.extend(item.required_capabilities)
 
-                # Validate DAG structure inside the retry loop so malformed
+                # DAG validation stays inside the retry loop so malformed
                 # outputs get the full retry budget.
                 attempt_dag_violations = _validate_depends_on_indices(
                     attempt_subtasks
@@ -803,7 +800,7 @@ def decomposition_node(
                 subtasks = augmented
                 required_caps = list(dict.fromkeys(required_caps))
 
-        # Validate structural DAG integrity before semantic coherence.
+        # Structural DAG integrity is checked before semantic coherence.
         # Violations flip the sticky flag and emit a LangFuse event.
         dag_violations = _validate_depends_on_indices(subtasks)
         if dag_violations:

@@ -1,4 +1,4 @@
-"""Advisory lock for shared eval registry state (ext7 #51).
+"""Advisory lock for shared eval registry state.
 
 ``run_pilot.py`` and ``run_longitudinal.py`` both mutate shared eval state:
 ``data/eval/chroma``, ``data/eval/skills``, and the clean snapshot under
@@ -47,7 +47,7 @@ def acquire_runner_lock(
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         logger.error(
-            "Another eval runner holds the lock at %s — per ext7 #51, the "
+            "Another eval runner holds the lock at %s; the "
             "eval registry state (%s plus shared snapshots) is NOT safe for "
             "concurrent access. Wait for the other run to finish, or run "
             "against a separate data directory for isolated experiments.",
@@ -62,5 +62,5 @@ def acquire_runner_lock(
     except OSError:
         pass
 
-    logger.info("ext7 #51: acquired eval-runner lock (runner=%s)", runner_name)
+    logger.info("acquired eval-runner lock (runner=%s)", runner_name)
     return lock_file

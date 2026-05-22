@@ -442,7 +442,7 @@ class TestDuckDBMigration:
         """Older invocation tables pick up replay columns on open."""
         db_file = str(tmp_path / "older.duckdb")
 
-        # Create an older table without input_args / actual_output.
+        # Older table shape before input_args / actual_output existed.
         _conn = duckdb.connect(db_file)
         _conn.execute(
             """

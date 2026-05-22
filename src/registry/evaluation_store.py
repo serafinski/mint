@@ -402,7 +402,6 @@ class EvaluationStore:
                 f"label must be one of {sorted(v for v in valid if v)} "
                 f"or None; got {label!r}"
             )
-        # Check existence first.
         existed = self._conn.execute(
             "SELECT human_label FROM evaluation_runs WHERE id = ? LIMIT 1",
             [row_id],

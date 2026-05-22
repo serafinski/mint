@@ -49,9 +49,7 @@ class TestSlugifyGap:
         # A 46-char input where position 39 is an underscore
         query = "parse-this-xml-report-data-and-find-the-95c8e9"
         slug = slugify_gap(query)
-        # Verify no double underscore anywhere in the slug
         assert "__" not in slug, f"Double underscore in slug: {slug}"
-        # Verify the base ends cleanly (no trailing underscore before suffix)
         base = slug.rsplit("_", 1)[0]
         assert not base.endswith("_"), f"Base has trailing underscore: {base}"
 

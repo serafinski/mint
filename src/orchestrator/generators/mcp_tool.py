@@ -95,15 +95,10 @@ def _get_llm():
 # Validation
 # ---------------------------------------------------------------------------
 
-# NOTE: Intentional asymmetry with ``agent._SNAKE_CASE_RE`` (which is
-# ``r"^[a-z_][a-z0-9_]*$"`` — leading underscore allowed). MCP tool names are
-# used as public Python function/module identifiers during sandbox execution,
-# so they must follow PyPI-/import-safe conventions and cannot start with an
-# underscore. Agent node names are LangGraph/DeepAgent
-# identifiers where ``_private_subagents``-style names are meaningful, hence
-# the looser rule there. Any future unifier should preserve this difference —
-# see ``tests/unit/test_mcp_tool_generator.py::TestValidateToolName::test_starts_with_underscore``
-# and ``tests/unit/test_agent_generator.py::test_node_name_with_leading_underscore_is_valid``.
+# MCP tool names become public Python function/module identifiers in the
+# sandbox, so they cannot start with an underscore. Agent node names use a
+# looser rule because LangGraph/DeepAgent identifiers can intentionally use
+# helper-style names such as ``_private_subagents``.
 _SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
@@ -135,13 +130,12 @@ def _validate_code(source_code: str) -> str | None:
 
     Returns a semicolon-joined error string, or None if valid.
     """
-    # Syntax check — stop here because structural checks may be unreliable
+    # Structural checks depend on a parseable module.
     try:
         compile(source_code, "<generated>", "exec")
     except SyntaxError as exc:
         return f"SyntaxError at line {exc.lineno}: {exc.msg}"
 
-    # Structural check: collect all missing elements
     errors: list[str] = []
     if "FastMCP" not in source_code:
         errors.append("Missing FastMCP instance (expected: mcp = FastMCP(...))")
@@ -303,7 +297,6 @@ def generate_single_tool(
     # inherited via LangChain's contextvar-based callback propagation.  Creating an
     # additional handler here would generate duplicate traces.
 
-    # Build schema contract section — empty string if no schema available
     _schema_section = ""
     if schema_context:
         _schema_section = (
@@ -323,7 +316,6 @@ def generate_single_tool(
         {"role": "user", "content": user_prompt},
     ]
 
-    # --- First attempt ---
     try:
         result: GeneratedToolCode = structured_llm.invoke(messages)
     except Exception as exc:  # noqa: BLE001
@@ -331,13 +323,13 @@ def generate_single_tool(
         logger.warning(error_msg)
         return None, error_msg
 
-    # --- Validate source code and tool name (collect all so the repair prompt is complete) ---
+    # Keep all validation errors so the repair prompt has complete context.
     _code_err = _validate_code(result.source_code)
     _name_err = _validate_tool_name(result.tool_name)
     _sig_err = _validate_step_signature(result.source_code, is_first_step)
     validation_error = "; ".join(e for e in [_code_err, _name_err, _sig_err] if e) or None
     if validation_error is None:
-        # Success on first attempt — override whatever name the LLM chose
+        # Persist under the deterministic registry slug.
         if result.tool_name != forced_name:
             logger.debug(
                 "Overriding LLM name '%s' with stable slug '%s'",
@@ -477,14 +469,12 @@ def generate_mcp_tool(
     )
     task_context = build_task_context(state)
 
-    # Build per-gap schema context from decomposer output_schema
     from src.orchestrator.generators.utils import (
         build_schema_context,
         is_first_step_for_gap,
     )
     subtasks = list(state.subtasks) if state.subtasks else []
 
-    # Parallel generation — collect results then merge sequentially
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
         futures = {
             pool.submit(
@@ -504,7 +494,7 @@ def generate_mcp_tool(
                 gap = futures[future]
                 raw_results.append((None, f"Generation failed for {gap.query!r}: {exc}"))
 
-    # Merge after pool closes — sequential, no concurrent mutation
+    # Registry-facing state is updated after the pool closes.
     failed_queries: list[str] = []
     for artifact, error in raw_results:
         if artifact is not None:

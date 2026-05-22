@@ -1,4 +1,4 @@
-"""Longitudinal KL convergence analyzer — Step 18.7.
+"""Longitudinal KL convergence analyzer.
 
 Reads ``data/eval/longitudinal.duckdb`` (written by ``scripts/run_longitudinal.py``)
 and produces the Chapter 6 convergence figure + cycles-to-convergence number.
@@ -14,15 +14,7 @@ Addresses:
 - Proposal §Pillar 3 RQ #2: *"How many task cycles are required for
   the registry to converge?"*
 
-**Proposal-aligned implementation (2026-04-17 follow-up to Step 18.7).**
-
-Originally this analyzer used two proxies because the required data
-wasn't persisted: invocation-count KL (instead of utility-score KL)
-and active-cap-delta (instead of per-type op counts). The Step 18.7
-follow-up wired the harness to flush per-cycle utility scores
-(via ``src.optimizer.utility.compute_all_utilities``) and per-cycle
-capability_events to new EvaluationStore tables. This analyzer now
-reads those tables directly:
+The primary data source is per-cycle telemetry from EvaluationStore:
 
 - **Utility-score KL** (proposal-literal) when ``cycle_utility_scores``
   is populated — mirrors the online metric in
@@ -107,12 +99,8 @@ def _kl_divergence_between_snapshots(
 
     Returns:
         - ``float('nan')`` if both distributions are empty
-          (ext12 #118: no-data-at-all; the convergence detector MUST NOT
-          treat this as a sub-threshold signal. Pre-fix returned 0.0,
-          which let a 40-cycle DB with ZERO invocation/utility/event
-          rows report "converged at cycle 2" because 40 consecutive
-          empty-vs-empty pairs produced 40 consecutive KL=0.0 values
-          and the detector's ``min_consecutive`` streak fired trivially.)
+          (no data; the convergence detector must not count this as a
+          sub-threshold signal)
         - ``float('inf')`` if prev is non-empty but curr is empty (catastrophic)
         - 0.0 if curr is non-empty but prev is empty (first-cycle sentinel;
           intentional — we don't want the first real cycle flagged as
@@ -160,12 +148,10 @@ def _resolve_longitudinal_run_id(
 ) -> str | None:
     """Pick the run_id to analyze.
 
-    Security audit finding #24 (2026-04-20): when the DB contains
-    multiple longitudinal runs (re-runs with different configs, appended
-    experiments, etc.), pre-fix merged all of them into one interleaved
-    timeline. Now the analyzer picks a single run_id — the caller's
-    ``--run-id`` value if provided, otherwise the most-recent
-    longitudinal run, with a warning on the stderr if multiple exist.
+    A DB can contain multiple longitudinal runs from re-runs, appended
+    experiments, or different configs. The analyzer must pick exactly one
+    run_id: the caller's ``--run-id`` value if provided, otherwise the
+    most-recent run with a warning on stderr.
 
     Returns ``None`` if the DB has no longitudinal runs at all.
     """
@@ -230,12 +216,9 @@ def _load_cycle_data(
     Returns an empty list if either ``evaluation_runs`` is empty or has
     no longitudinal rows.
 
-    Security audit finding #24 (2026-04-20): ``run_id`` is now required
-    to disambiguate across multiple longitudinal runs in the same DB.
+    ``run_id`` disambiguates multiple longitudinal runs in the same DB.
     ``None`` auto-selects the most recent run with a stderr warning if
-    multiple exist. Pre-fix the analyzer merged all run_ids into one
-    timeline, corrupting KL convergence and operation-count summaries
-    whenever the DB had more than one longitudinal run.
+    multiple exist.
     """
     # Resolve the run_id (may warn / raise on ambiguity).
     selected_run_id = _resolve_longitudinal_run_id(conn, run_id)
@@ -268,11 +251,11 @@ def _load_cycle_data(
             [selected_run_id],
         ).fetchall()
     except Exception:  # noqa: BLE001
-        # invocation_events table may not exist on old DBs (pre-Step-18.5).
+        # Older DBs may not have invocation telemetry.
         inv_rows = []
 
-    # Build per-cycle incremental invocation maps by timestamp window.
-    # A task_id can repeat within one longitudinal run, so task_id alone
+    # Per-cycle invocation maps use timestamp windows. A task_id can repeat
+    # within one longitudinal run, so task_id alone
     # is not a safe bucket key. We use each evaluation_runs timestamp as
     # the cycle boundary and attribute each invocation to the most recent
     # task row whose timestamp is <= invocation occurred_at. This gives
@@ -281,22 +264,10 @@ def _load_cycle_data(
         (task_ts, (run_id, task_id))
         for run_id, task_id, task_ts in task_rows
     ]
-    # Map each invocation to its containing cycle (index into task_rows).
-    #
-    # ext8 #56 investigation (2026-04-20): the audit claimed this loop
-    # off-by-ones cycle attribution because ``task_boundaries[N]`` is an END
-    # timestamp and invocations "during task N" have ``occurred_at <
-    # task_boundaries[N]``. Empirical trace through the code shows the
-    # premise is wrong: ``EvaluationStore.record_invocation_events`` sets
-    # ``occurred_at = datetime.now(UTC)`` at FLUSH time, inside
-    # ``flush_task_cycle_state`` which runs AFTER ``record_run`` persists
-    # the EvaluationRecord (harness.py:410 → :421). Production occurred_at
-    # is therefore > evaluation_runs.timestamp, and the pre-fix loop
-    # correctly attributes invocations via "advance to the next cycle when
-    # its END timestamp is <= inv_ts". Verified by the pre-existing
-    # ``tests/unit/test_analyze_longitudinal.py::TestLoadCycleData`` suite
-    # (invocations with occurred_at > task timestamp bucket into the
-    # correct cycles). Audit #56 logged as false positive.
+    # Map each invocation to its containing cycle. Invocation timestamps are
+    # written during the cycle flush, after the evaluation_runs row for that
+    # cycle exists, so advancing only when the next task timestamp is <= the
+    # invocation timestamp preserves repeated task IDs.
     cycle_increment: list[dict[str, int]] = [defaultdict(int) for _ in task_rows]
     cycle_idx = 0
     for inv_task_id, cap_id, inv_ts in inv_rows:
@@ -307,14 +278,9 @@ def _load_cycle_data(
             cycle_idx += 1
         cycle_increment[cycle_idx][cap_id] += 1
 
-    # Security audit finding #18 (2026-04-20): bucket utility scores and
-    # events into per-cycle lists using the task_boundaries timestamp
-    # window — same pattern as cycle_increment above. Pre-fix, keying by
-    # task_id only merged all repetitions of the same task into one
-    # lookup, so cycles 1 and 5 (both T01) both returned cycle 5's
-    # utility scores. That silently collapsed the per-cycle time series.
-    # Under the default ``--n-tasks=40`` run every task repeats at least
-    # once, so the bug fires on every real eval.
+    # Utility scores and optimizer events use the same timestamp window. Keying
+    # only by task_id would merge repeated tasks and collapse the per-cycle
+    # time series.
     cycle_utility: list[dict[str, float]] = [{} for _ in task_rows]
     if _table_exists(conn, "cycle_utility_scores"):
         util_rows = conn.execute(
@@ -326,8 +292,7 @@ def _load_cycle_data(
             """,
             [selected_run_id],
         ).fetchall()
-        # ext8 #56 investigation: see inv_rows loop above — audit claim
-        # logged as false positive after empirical trace.
+        # Same timestamp-window attribution as invocation events.
         c_idx = 0
         for _util_task_id, cap_id, score, util_ts in util_rows:
             while (
@@ -335,10 +300,9 @@ def _load_cycle_data(
                 and task_boundaries[c_idx + 1][0] <= util_ts
             ):
                 c_idx += 1
-            # A single cycle's final utility flush for a given cap is the
-            # "end-of-cycle" reading — if multiple flushes land within
-            # one cycle window, the last wins (same intra-cycle semantics
-            # the pre-fix code had for a single task_id).
+            # A single cycle's final utility flush for a capability is the
+            # end-of-cycle reading; if multiple flushes land in the same
+            # window, the last one wins.
             cycle_utility[c_idx][cap_id] = float(score)
 
     cycle_events: list[list[dict]] = [[] for _ in task_rows]
@@ -352,8 +316,7 @@ def _load_cycle_data(
             """,
             [selected_run_id],
         ).fetchall()
-        # ext8 #56 investigation: see inv_rows loop above — audit claim
-        # logged as false positive after empirical trace.
+        # Same timestamp-window attribution as invocation events.
         c_idx = 0
         for _evt_task_id, cap_id, event_type, details, evt_ts in event_rows:
             while (
@@ -367,11 +330,9 @@ def _load_cycle_data(
                 "details": details or "",
             })
 
-    # Build cumulative snapshots
     cumulative: dict[str, int] = defaultdict(int)
     cycles: list[dict] = []
     for i, (run_id, task_id, ts) in enumerate(task_rows):
-        # Add this cycle's increments
         for cap_id, n in cycle_increment[i].items():
             cumulative[cap_id] += n
         cycles.append({
@@ -396,23 +357,17 @@ def _detect_convergence(
     """Return the first cycle N (1-indexed) where the KL stays < threshold
     for ``min_consecutive`` consecutive cycles. None if never converged.
 
-    ext8 #77 (2026-04-20): this is the LOCAL-STABILITY convergence
-    detector — it measures "consecutive-snapshot KL stayed below threshold
-    for N cycles", which is close to but not the same as the proposal's
-    "registry reaches a stable state where further cycles no longer
-    meaningfully change its contents." For the proposal-aligned
-    "distance-to-final-distribution" detector see
-    ``_detect_stable_convergence`` below. Callers can use either; Chapter
-    6 should cite both for defensibility.
+    This is the local-stability detector: it measures whether consecutive
+    snapshot KL stays below the threshold for N cycles. The
+    distance-to-final-distribution detector below catches slow drifts and
+    oscillations.
     """
     if len(kls) < min_consecutive:
         return None
     run_len = 0
     for i, kl in enumerate(kls):
-        # ext12 #118: NaN means "no data at all for this cycle pair" —
-        # reset the streak rather than coercing it to sub-threshold. Pre-
-        # fix, the empty-vs-empty sentinel returned 0.0 and counted toward
-        # ``min_consecutive``, letting zero-evidence DBs report "converged".
+        # NaN means there is no data for this cycle pair, so it resets the
+        # streak instead of counting as sub-threshold convergence.
         if isinstance(kl, float) and math.isnan(kl):
             run_len = 0
             continue
@@ -429,9 +384,8 @@ def _detect_convergence(
 def _average_distributions(snapshots: list[dict[str, float]]) -> dict[str, float]:
     """Return the element-wise average of a list of distribution dicts.
 
-    Missing keys in a snapshot are treated as 0. ext8 #77 helper used by
-    ``_detect_stable_convergence`` to smooth the final-window average so
-    noise at any single cycle doesn't set the reference point.
+    Missing keys in a snapshot are treated as 0 so the final-window average
+    is not set by noise from a single cycle.
     """
     if not snapshots:
         return {}
@@ -457,12 +411,10 @@ def _detect_stable_convergence(
     windowed-average distribution stays below ``threshold`` for
     ``min_consecutive`` consecutive cycles.
 
-    ext8 #77 (2026-04-20): proposal-aligned convergence detector. Unlike
-    ``_detect_convergence`` (local-stability: per-step KL < threshold),
-    this compares each cycle to the FINAL-WINDOW-AVERAGED distribution,
-    catching oscillations (each step small but cycle-N distribution far
-    from the attractor) and slow drifts. Returns None when no stable
-    window exists.
+    Unlike ``_detect_convergence`` (local stability: per-step KL <
+    threshold), this compares each cycle to the final-window-averaged
+    distribution. That catches oscillations and slow drifts where adjacent
+    cycles look similar but the sequence has not settled.
 
     ``kl_fn(reference, snapshot) -> float`` is injectable so tests can
     verify the behavior without depending on the analyzer's specific
@@ -475,21 +427,15 @@ def _detect_stable_convergence(
 
     final_ref = _average_distributions(snapshots[-window_size:])
 
-    # tmp.md P0 (2026-04-22): if the final-window attractor is empty,
-    # the system collapsed to an empty registry. "Converging to nothing"
-    # is not convergence — return None. Pre-fix: kl_fn({}, non_empty)
-    # hit the first-cycle sentinel in _kl_divergence_between_snapshots
-    # and returned 0.0, causing the detector to falsely report
-    # instantaneous convergence at the first non-empty cycle.
+    # An empty final-window attractor means the registry has collapsed to
+    # nothing, which is not convergence.
     if not final_ref:
         return None
 
     run_len = 0
     for i, snap in enumerate(snapshots):
-        # Guard the per-cycle call too: if snap is empty but final_ref
-        # is non-empty, the distance is catastrophic (inf), not 0. The
-        # underlying kl function already returns inf for this case; we
-        # must NOT let NaN (both-empty; dead cycle) count as sub-threshold.
+        # If snap is empty but final_ref is not, the distance is infinite.
+        # NaN represents a dead cycle and must reset the convergence streak.
         kl = kl_fn(final_ref, snap)
         import math as _math
         if _math.isnan(kl):
@@ -605,11 +551,8 @@ def _emit_plot(
     return True
 
 
-# ext13 #124 + #127: banner state for section headers. Set in ``main()``
-# after the proxy-KL downgrade / sparse-telemetry gates decide whether to
-# proceed under an override flag. Every section header then interpolates
-# whichever banner is active, so report readers cannot skim past the
-# degraded-data annotation.
+# Banner state for section headers. Override paths set these in ``main()``
+# so degraded-data annotations are repeated throughout the report.
 _PROXY_BANNER: str = ""
 _SPARSE_BANNER: str = ""
 
@@ -624,7 +567,7 @@ def _print_header(title: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Longitudinal KL convergence analyzer (Step 18.7)",
+        description="Longitudinal KL convergence analyzer",
     )
     parser.add_argument(
         "--db",
@@ -669,58 +612,49 @@ def main() -> int:
         default=None,
         help="Specific longitudinal run_id to analyze. Default: latest "
              "longitudinal run, with a WARNING on stderr if multiple are "
-             "present. Security audit finding #24 (2026-04-20).",
+             "present.",
     )
-    # ext12 #116: completeness guard. Pre-fix, the analyzer accepted ANY
-    # non-empty longitudinal DB and exited 0 whenever the convergence
-    # detector fired. A 5-cycle stub from an aborted 40-cycle campaign
-    # passed as "converged" silently. These flags make the campaign's
-    # expected shape explicit and refuse to proceed on short-fall DBs
-    # unless the user confirms via --allow-incomplete.
+    # Make the campaign's expected shape explicit. A partial or overfull DB is
+    # not comparable to a complete longitudinal campaign unless the caller
+    # opts in and keeps the warning banner.
     parser.add_argument(
         "--expected-cycles", type=int, default=40,
         help="Expected cycle count for a COMPLETE campaign (default: 40, "
              "matching scripts/run_longitudinal.py --n-tasks 40). If the DB "
              "has fewer cycles the analyzer refuses to proceed with exit 3, "
-             "unless --allow-incomplete is passed. ext12 #116.",
+             "unless --allow-incomplete is passed.",
     )
     parser.add_argument(
         "--allow-incomplete", action="store_true",
         help="Proceed on a shortfall DB. Output is prefixed with an "
              "[INCOMPLETE: N/expected] banner so Chapter 6 consumers can "
              "see the shortfall at a glance. Exit code is still non-zero "
-             "so orchestrators don't treat incomplete as success. ext12 #116.",
+             "so orchestrators don't treat incomplete as success.",
     )
-    # ext13 #124: proposal-literal KL lives on cycle_utility_scores; when
-    # that table is empty we silently fell back to invocation-count KL
-    # (proxy) and reported convergence as if it were the primary metric.
-    # Now: refuse with exit 6 unless the user explicitly opts in to the
-    # proxy. Override surfaces a [PROXY KL] banner on every section header
-    # so the downgrade remains visible in thesis text or manual reports.
+    # Utility-score KL is the primary metric. Invocation-count KL is only a
+    # proxy and must be explicitly enabled with a visible report banner.
     parser.add_argument(
         "--allow-proxy-kl", action="store_true",
         help="Proceed when cycle_utility_scores is empty, using the "
              "invocation-count KL proxy. Every section header is prefixed "
              "[PROXY KL]. Thesis disclosure REQUIRED. Default: refuse "
-             "with exit 6. ext13 #124.",
+             "with exit 6.",
     )
-    # ext13 #127: ext12 #118's data-presence gate is a global ``any()`` —
-    # a 40-cycle DB with a single invocation event passes and the
-    # convergence detector fires on the empty-vs-empty NaN pattern. Now
-    # require a per-cycle coverage floor (default 50%) and refuse with
-    # exit 8 below it unless --allow-sparse-signal is passed.
+    # A single telemetry row is not enough evidence for a full campaign.
+    # Require a per-cycle coverage floor unless the caller opts into a
+    # sparse-signal report.
     parser.add_argument(
         "--allow-sparse-signal", action="store_true",
         help="Proceed with convergence analysis when per-cycle telemetry "
              "coverage is below --min-cycle-coverage. Every section header "
              "is prefixed [SPARSE: N/M]. Thesis disclosure REQUIRED. "
-             "Default: refuse with exit 8. ext13 #127.",
+             "Default: refuse with exit 8.",
     )
     parser.add_argument(
         "--min-cycle-coverage", type=float, default=0.5,
         help="Minimum fraction of cycles that must carry signal (default "
              "0.5). Below this, exit 8 unless --allow-sparse-signal is "
-             "passed. ext13 #127.",
+             "passed.",
     )
     args = parser.parse_args()
 
@@ -744,12 +678,8 @@ def main() -> int:
         conn.close()
         return 1
 
-    # ext12 #116 + ext15 #172 (2026-04-22): completeness guard. Fires
-    # on BOTH underfull and overfull cycle counts. Pre-ext15-#172 the
-    # check was ``len(cycles) < expected``, so merged/duplicated
-    # timelines (from #153 collision, --append run_id reuse, duplicate
-    # writes) silently passed while producing invalid convergence
-    # curves across interleaved runs.
+    # Reject both underfull and overfull cycle counts. Overfull runs usually
+    # mean run_id reuse, duplicate writes, or merged timelines.
     incomplete_banner: str | None = None
     if len(cycles) != args.expected_cycles:
         direction = (
@@ -779,13 +709,9 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    # ext12 #118: data-presence gate. A DB with evaluation_runs rows but
-    # NO invocation_events / cycle_utility_scores / cycle_events would
-    # otherwise produce empty-vs-empty KL values every cycle. Pre-NaN
-    # fix those were 0.0 (false-positive convergence); post-NaN fix they
-    # are NaN (streak-reset → no convergence). Still loud-fail here so
-    # the user is told WHY nothing converged rather than seeing a
-    # cryptic ⚠ "did not converge within N cycles" line.
+    # A DB with evaluation_runs rows but no telemetry cannot support a
+    # convergence claim. Fail early with a concrete reason instead of letting
+    # every cycle collapse to empty-vs-empty KL.
     has_any_signal = any(
         c.get("cumulative_invocations")
         or c.get("utility_scores")
@@ -797,7 +723,7 @@ def main() -> int:
             f"ERROR: longitudinal DB has {len(cycles)} evaluation_runs cycles "
             f"but NO invocation / utility-score / cycle-event rows. "
             f"Convergence cannot be computed on zero-evidence runs. "
-            f"Likely causes: (a) Step 18.7 cycle-flush wiring failed mid-run, "
+            f"Likely causes: (a) cycle-flush wiring failed mid-run, "
             f"(b) DB predates the flush hooks, (c) a schema-drift dropped "
             f"the event tables. Exit 4.",
             file=sys.stderr,
@@ -805,20 +731,9 @@ def main() -> int:
         conn.close()
         return 4
 
-    # ext13 #127: per-cycle coverage gate. ext12 #118's ``any()`` passes
-    # on a single row of signal across the whole campaign; compute a
-    # coverage ratio and refuse below the threshold unless the user
-    # opts in via --allow-sparse-signal.
-    #
-    # ext14 #150 (2026-04-21): swap ``cumulative_invocations`` →
-    # ``incremental_invocations``. ``cumulative_invocations`` is a running
-    # snapshot — once any cycle lands an invocation, every subsequent
-    # snapshot carries that event forward, so a 40-cycle DB with one
-    # cycle-1 invocation reported ``cycles_with_signal=40/40`` and passed
-    # the gate that was built to reject exactly that case. The
-    # ``incremental_invocations`` dict holds only *this cycle's* new
-    # invocations → empty on a cycle with no new events → falsy → not
-    # counted as "signal". Restores ext13 #127's intended semantics.
+    # Per-cycle coverage must use incremental signal. Cumulative snapshots
+    # carry old invocations forward, which would make one early event look like
+    # every later cycle has fresh telemetry.
     cycles_with_signal = sum(
         1 for c in cycles
         if c.get("incremental_invocations")
@@ -834,16 +749,16 @@ def main() -> int:
                 f"({coverage_ratio:.0%}); below threshold "
                 f"{args.min_cycle_coverage:.0%}. Convergence analysis "
                 f"on sparse telemetry is unreliable — a single invocation "
-                f"event can pass ext12 #118's global presence gate while "
-                f"the remaining cycles carry no signal, and the convergence "
+                f"event can pass a global presence check while the remaining "
+                f"cycles carry no signal, and the convergence "
                 f"detector fires on sub-threshold empty-vs-empty comparisons.\n"
                 f"  Likely causes:\n"
-                f"    (a) cycle_flush.py partial-flush failures (ext13 #125)\n"
+                f"    (a) cycle_flush.py partial-flush failures\n"
                 f"    (b) metrics_store lost state mid-campaign\n"
                 f"    (c) registry/store sync broken at flush boundary\n"
                 f"  Pass --allow-sparse-signal to proceed with a "
                 f"[SPARSE: N/M] banner (thesis disclosure REQUIRED). "
-                f"Exit 8. ext13 #127.",
+                f"Exit 8.",
                 file=sys.stderr,
             )
             conn.close()
@@ -857,20 +772,14 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    # Check whether the Step 18.7-follow-up tables are populated. If so,
-    # we can use utility-score KL (proposal-literal). If not, fall back
-    # to invocation-count KL (proxy).
+    # Use utility-score KL when available. Invocation-count KL is only a
+    # sensitivity proxy.
     has_utility_scores = any(c.get("utility_scores") for c in cycles)
     has_events = any(c.get("events") for c in cycles)
     primary_kl_source = "utility_scores" if has_utility_scores else "invocation_counts"
 
-    # ext13 #124: proposal-literal KL lives on utility scores. When
-    # cycle_utility_scores is empty (partial-flush per ext13 #125, legacy
-    # DB pre-Step-18.7-follow-up, or registry/store sync broken at flush),
-    # we used to silently downgrade to the invocation-count proxy and
-    # report "converged at cycle N" as if it were the proposal-literal
-    # metric. Now: refuse with exit 6 unless --allow-proxy-kl is set; if
-    # the override is set, every section header carries a [PROXY KL] banner.
+    # Refuse silent downgrades from utility-score KL to invocation-count KL.
+    # The proxy path is explicit and visibly marked in each section header.
     if primary_kl_source == "invocation_counts":
         if not args.allow_proxy_kl:
             print(
@@ -880,12 +789,12 @@ def main() -> int:
                 "proxy, not the primary metric, so reporting convergence on "
                 "it would be a methodology violation.\n"
                 "  Likely causes:\n"
-                "    (a) cycle_flush.py utility-flush failure (ext13 #125)\n"
-                "    (b) DB predates Step 18.7 follow-up wiring (pre-2026-04-17)\n"
+                "    (a) cycle_flush.py utility-flush failure\n"
+                "    (b) DB predates utility-score flush wiring\n"
                 "    (c) metrics_store / registry sync broken at flush time\n"
                 "  Pass --allow-proxy-kl to proceed with a [PROXY KL] banner "
                 "on every section header (thesis disclosure REQUIRED). "
-                "Exit 6. ext13 #124.",
+                "Exit 6.",
                 file=sys.stderr,
             )
             conn.close()
@@ -899,7 +808,6 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    # Compute per-cycle KL (both series when possible) + Gini
     rows: list[dict] = []
     prev_snapshot: dict[str, int] = {}  # for invocation-count KL
     prev_utility: dict[str, float] = {}  # for utility-score KL
@@ -912,16 +820,9 @@ def main() -> int:
             _kl_divergence_between_snapshots(prev_utility, utility)
             if has_utility_scores else None
         )
-        # Security audit finding #107 (2026-04-19, ext10): report
-        # BOTH cumulative-Gini (pre-fix; smooth, stiffens over time)
-        # AND incremental-Gini (per-cycle slice; the signal Pillar 3
-        # RQ #1 actually asks about). If incremental converges toward
-        # cumulative the optimizer is genuinely stabilizing the
-        # invocation distribution; if incremental stays high while
-        # cumulative looks smooth, the smoothing is an artifact of
-        # cumulative anchoring. Reports keep cumulative Gini as the
-        # headline value and print incremental Gini as a diagnostic when
-        # it carries signal.
+        # Keep cumulative Gini as the headline metric, and compute
+        # incremental Gini to show whether the current cycle is stabilizing or
+        # the cumulative curve is merely smoothing volatility.
         gini_cumulative = (
             _gini_coefficient(list(snapshot.values())) if snapshot else 0.0
         )
@@ -966,7 +867,7 @@ def main() -> int:
             # Offset back to 1-indexed cycle numbers in the original sequence
             convergence_cycle += 1
 
-    header_title = "Longitudinal Registry Convergence — Step 18.7"
+    header_title = "Longitudinal Registry Convergence"
     if incomplete_banner is not None:
         header_title = f"{incomplete_banner} {header_title}"
     _print_header(header_title)
@@ -981,7 +882,7 @@ def main() -> int:
     )
     print(f"  Primary KL:      {primary_kl_source} ({primary_label})")
     if not has_utility_scores:
-        print("  (cycle_utility_scores empty — DB predates Step 18.7 follow-up wiring)")
+        print("  (cycle_utility_scores empty — utility-score telemetry unavailable)")
     if not has_events:
         print("  (cycle_events empty — per-type op counts unavailable)")
     print()
@@ -998,12 +899,8 @@ def main() -> int:
 
     # --- Gini range + seeded-vs-evolved comparison (Pillar 3 RQ #1) ---
     if ginis:
-        # Security audit finding #107 (2026-04-19, ext10): also
-        # report incremental Gini so readers can distinguish
-        # "optimizer stabilizing the distribution" (incremental
-        # converges toward cumulative) from "cumulative anchoring
-        # smoothes a still-volatile signal" (incremental stays high
-        # while cumulative looks flat).
+        # Incremental Gini distinguishes true stabilization from cumulative
+        # smoothing of a still-volatile per-cycle distribution.
         ginis_incremental = [r["gini_incremental"] for r in rows]
         print()
         print(f"  Gini (cumulative, final):    {ginis[-1]:.3f}")
@@ -1106,7 +1003,7 @@ def main() -> int:
     else:
         _print_header("Operation-count proxy — per-cycle delta in active-capability count")
         print("  (cycle_events table unavailable — falling back to active-cap-delta proxy.")
-        print("   Re-run run_longitudinal.py with Step 18.7 follow-up wiring to get true")
+        print("   Re-run run_longitudinal.py with event telemetry enabled to get true")
         print("   per-type counts.)")
         print("  Positive delta = net generation; negative = net optimization; zero = stable.")
         print()
@@ -1153,14 +1050,14 @@ def main() -> int:
                 print(f"  PNG written: {png_path}")
 
     conn.close()
-    # Exit-code contract (extended across ext12 + ext13):
+    # Exit-code contract:
     #   0  complete data + converged
     #   1  empty DB (no longitudinal rows at all) — handled earlier
     #   2  complete data but convergence not detected
     #   3  incomplete campaign (shortfall) — returned even with --allow-incomplete
     #   4  zero-evidence DB (rows present but no signal tables) — handled earlier
-    #   6  proposal-literal KL unavailable, --allow-proxy-kl required (ext13 #124)
-    #   8  sparse per-cycle telemetry, --allow-sparse-signal required (ext13 #127)
+    #   6  proposal-literal KL unavailable, --allow-proxy-kl required
+    #   8  sparse per-cycle telemetry, --allow-sparse-signal required
     if incomplete_banner is not None:
         return 3
     return 0 if convergence_cycle is not None else 2

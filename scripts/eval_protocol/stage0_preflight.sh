@@ -67,7 +67,7 @@ if [[ -z "$FAIL_REASON" ]]; then
     # If EVERY run fails the same way, that's a pipeline bug — inspect the log
     # and the unit tests cover the underlying wiring.
     if [[ $PIPE_RC -ne 0 ]]; then
-        echo "NOTE: test_pipeline.py exited non-zero ($PIPE_RC)." | tee -a "$EVAL_OUT/01_test_pipeline.log"
+        echo "INFO: test_pipeline.py exited non-zero ($PIPE_RC)." | tee -a "$EVAL_OUT/01_test_pipeline.log"
         echo "      Informational only — stochastic LLM generation; Stage 1 measures the rate." | tee -a "$EVAL_OUT/01_test_pipeline.log"
     fi
 fi
@@ -82,7 +82,7 @@ if [[ -z "$FAIL_REASON" ]]; then
     # end-to-end, test_verification.py's outcome is informational — log it, do
     # not block on it.
     if [[ $VERIF_RC -ne 0 ]]; then
-        echo "NOTE: test_verification.py exited non-zero ($VERIF_RC)." | tee -a "$EVAL_OUT/02_test_verification.log"
+        echo "INFO: test_verification.py exited non-zero ($VERIF_RC)." | tee -a "$EVAL_OUT/02_test_verification.log"
         echo "      Not treated as a blocker — unit tests + test_pipeline are authoritative." | tee -a "$EVAL_OUT/02_test_verification.log"
     fi
 fi
@@ -152,7 +152,7 @@ if [[ $AUDIT_RC -ne 0 ]]; then
     exit 1
 fi
 
-write_marker "$MARKER" "SHAPE_OK" "shape checks green; awaiting Claude/Codex+MCP audit verdicts"
+write_marker "$MARKER" "SHAPE_OK" "shape checks green; awaiting trace-audit verdicts"
 echo "STAGE 0: shape OK."
 print_audit_handoff "stage0" "smoke"
 exit 0

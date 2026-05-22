@@ -512,7 +512,7 @@ class TestRunIdIsolation:
 
         base = datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC)
         with EvaluationStore() as store:
-            # Run r1: 2 cycles at t=1min, t=2min.
+            # r1 has two cycles at t=1min and t=2min.
             for i in range(1, 3):
                 ts = base + timedelta(minutes=i)
                 store.record_run(_base_record(
@@ -520,7 +520,7 @@ class TestRunIdIsolation:
                     condition="longitudinal",
                 ))
 
-            # Run r2: 2 cycles at t=10min, t=11min (later).
+            # r2 has two later cycles at t=10min and t=11min.
             for i in range(1, 3):
                 ts = base + timedelta(minutes=10 + i)
                 store.record_run(_base_record(

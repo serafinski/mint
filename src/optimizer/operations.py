@@ -291,14 +291,11 @@ def _register_artifact_directly(
             # artifact.output_schema (merge derives from parents, split
             # derives from the parent being specialized).
             #
-            # ext8 #63 (2026-04-20): validate that the LLM-claimed schemas
-            # look sane. The MCP_TOOL path delegates to
-            # ``ToolLoader.register_tool`` which runs AST-based schema
-            # extraction; SKILL/AGENT have no AST equivalent because the
-            # "tool" is prose + embedded Python fences. Fail closed if
-            # the artifact has executable content (skill_content /
-            # agent_config) but both schemas are empty — a schema-less
-            # registration would poison later compatibility-aware reuse.
+            # Model-claimed schemas must be present before SKILL/AGENT
+            # registration. MCP tools get AST-based schema extraction through
+            # ToolLoader; prose-based artifacts have no equivalent fallback.
+            # A schema-less registration would poison later
+            # compatibility-aware reuse.
             has_content = bool(
                 artifact.skill_content or artifact.agent_config
             )
@@ -311,7 +308,7 @@ def _register_artifact_directly(
                     f"schema-less {artifact.capability_type.value} artifact "
                     f"'{name}' is not registerable"
                 )
-                logger.warning("ext8 #63: %s", reason)
+                logger.warning("schema validation failed: %s", reason)
                 return False, reason
             metadata: dict[str, str] = {
                 "generated": "true",
@@ -337,10 +334,8 @@ def _register_artifact_directly(
                 output_schema=dict(artifact.output_schema or {}),
                 tags=list(tags or []),
                 definition_token_cost=count_definition_tokens(artifact),
-                # Security audit finding #83 (2026-04-19, ext9): preserve
-                # generator-declared pip_packages through Pillar 3 Merge /
-                # Split registration so optimised MCP tools retain their
-                # runtime dependencies.
+                # Preserve generator-declared pip packages through optimizer
+                # registration so merged/split tools keep runtime deps.
                 pip_packages=list(getattr(artifact, "pip_packages", []) or []),
                 metadata=metadata,
             )
@@ -799,32 +794,18 @@ _MAX_AGENT_SUBAGENT_BUDGET = 8
 # Shared robustness guidance for merge prompts.
 # ---------------------------------------------------------------------------
 #
-# The proposal's Pillar 3 Merge clause says *"The merged version inherits
-# the strongest behavioral patterns from each parent."* True "strongest
-# patterns" selection would require per-parent success metrics on each
-# behavior subspace, which is outside the current implementation. For now we
-# approximate it via explicit robustness hints in the merge prompts — tell the LLM to
-# prefer battle-tested library patterns, robust error handling, and
-# explicit validation at boundaries.
+# The proposal's Pillar 3 Merge clause says "The merged version inherits
+# the strongest behavioral patterns from each parent." True pattern selection
+# would require per-parent success metrics for each behavior subspace, which is
+# outside the current implementation. For now, the merge prompts use
+# domain-general robustness guidance: prefer reliable libraries, validate inputs
+# at boundaries, and preserve explicit error handling. Avoid naming specific
+# parser libraries or fixture edge cases here; that would bias merges toward one
+# evaluation domain instead of arbitrary user workloads.
 #
-# **Deliberately domain-general — no testbed-specific library names or
-# edge-case examples.** An earlier version of this hint named
-# `csv.Sniffer`, `pandas.read_csv`, `openpyxl`, specific CSV edge cases
-# (BOM markers, line endings, header detection), etc. — that was
-# effective at steering the LLM past the specific bugs seen on
-# `test_split_merge.py`, but it overfit the hint to the Business
-# Analytics testbed. MINT is supposed to work across arbitrary user
-# inputs (medical, legal, factory simulation, text analysis, …), and
-# a prompt that biases every merge toward file-format parsing would
-# add noise on non-file-format tasks and hurt generalization. The
-# current hint keeps only domain-general principles so it transfers across
-# verticals. Merge success rates may be lower than a testbed-tuned prompt would
-# show, because the LLM has no hand-holding on the specific edge cases of any
-# one format. This is proposal-aligned: the gate catches bad output.
-#
-# This block is injected into all three per-type merge prompts as a shared
-# section. True per-parent success-metric-driven selection remains outside the
-# current eval-minimum implementation.
+# Shared by all three per-type merge prompts. Metric-driven
+# per-parent pattern selection is a future implementation boundary, not current
+# behavior.
 
 _MERGE_ROBUSTNESS_HINT = """\
 ## Robustness requirements (Pillar 3 "strongest behavioral patterns")
@@ -1261,7 +1242,7 @@ def _merge_agents(
         )
         return None
 
-    # Build the merged agent_config dict that the execution backend expects.
+    # Execution backends expect AGENT capabilities to carry agent_config.
     agent_config: dict = {
         "system_prompt": result.combined_system_prompt,
         "is_deep_agent": True,

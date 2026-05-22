@@ -5,17 +5,15 @@ Classification is based on three architectural layers (industry consensus):
 - Skill = knowledge layer (procedural expertise, prescribed workflow)
 - Agent = reasoning layer (autonomous, adaptive, unpredictable path)
 
-As of Stage 2 of the compositional refactor, the classifier decides a type
-for a SINGLE gap (one step of the workflow), not for the whole task. The
-task description is supplied as context so the classifier can reason about
-what the gap's role is within the larger workflow.
+The classifier decides a type for a SINGLE gap (one step of the workflow), not
+for the whole task. The task description is supplied as context so the
+classifier can reason about what the gap's role is within the larger workflow.
 
 References: MCP spec (modelcontextprotocol.io), Agent Skills spec
 (agentskills.io), Anthropic "Building Effective Agents", LangGraph docs.
 """
 
-# Per-gap classification prompt (Stage 2+). One LLM call classifies ONE gap
-# at a time, in the context of the whole task.
+# One LLM call classifies one gap at a time, in the context of the whole task.
 GAP_CLASSIFICATION_PROMPT = """\
 You are a capability classifier for a JIT synthesis pipeline. Your job is to \
 classify ONE STEP (a "gap") of a larger task into one architectural layer \
@@ -205,8 +203,8 @@ test is too permissive — it fires for almost any narrow gap, including \
 gaps that exist precisely to apply a skill-task's specialized expertise. \
 Lead with the parent-task assessment instead.
 
-**File-writer exception (Phase 3 Step 12, 2026-04-16).** One carve-out \
-to the parent-task-first rule: **a subtask whose job is to serialize \
+**File-writer exception.** One carve-out to the parent-task-first rule: \
+**a subtask whose job is to serialize \
 upstream data to a file is ALWAYS `mcp_tool`, regardless of the parent \
 task's type.** Signals that identify a file-writer subtask:
 

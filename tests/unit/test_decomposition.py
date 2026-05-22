@@ -425,7 +425,6 @@ class TestCircuitBreaker:
 
         caps = cmd.update["required_capabilities"]
         assert len(caps) == 8
-        # Verify the truncation event was emitted
         truncation_calls = [
             c for c in mock_emit.call_args_list
             if c[0][1] == "decomposition.hard_truncation"

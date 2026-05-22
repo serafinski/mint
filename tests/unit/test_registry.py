@@ -174,7 +174,6 @@ def test_update_capability(registry):
     assert updated.version == 2
     assert registry.count == 1
 
-    # Verify the update persisted
     fetched = registry.get("fibonacci")
     assert fetched is not None
     assert fetched.description == "Compute fibonacci numbers fast"
@@ -198,7 +197,6 @@ def test_deactivate_capability(registry):
     registry.add(cap)
     registry.deactivate("fibonacci")
 
-    # Verify metadata shows inactive
     result = registry._collection.get(ids=["fibonacci"])
     assert result["metadatas"][0]["is_active"] is False
 

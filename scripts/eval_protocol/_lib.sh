@@ -83,8 +83,8 @@ banner() {
 #   (no marker) --run--> SHAPE_OK (audit request generated) --verdicts-arrive--> PASS
 #                                                            \--verdicts-fail--> FAIL
 #
-# "Verdicts arrive" = user pastes Claude's/Codex's response into <stage>_audit_verdicts.md
-# and re-runs the stage script. The script then calls check_audit_verdicts.
+# "Verdicts arrive" = the reviewer response is saved to
+# <stage>_audit_verdicts.md and the stage script is re-run.
 
 # Generate an audit request file for a given stage+profile.
 #   $1: stage short name (e.g. "stage0", "stage1")
@@ -98,7 +98,7 @@ generate_audit_request() {
     return $?
 }
 
-# Check whether Claude's/Codex's verdict file for a given stage is present and clean.
+# Check whether the reviewer verdict file for a given stage is present and clean.
 #   $1: stage short name — reads ${stage}_audit_verdicts.md
 # Returns:
 #   0 = file present AND verdict summary shows 0 FAILs
@@ -126,7 +126,7 @@ check_audit_verdicts() {
     return 0
 }
 
-# Print the "hand off to Claude/Codex" banner that tells the user exactly what to do.
+# Print the audit handoff banner that tells the user exactly what to do.
 print_audit_handoff() {
     local stage="$1"
     local profile="$2"
@@ -139,13 +139,13 @@ print_audit_handoff() {
   ────────────────────────────────────────────────────────────────
 
   The automated shape/agreement/plausibility checks passed for this stage.
-  BEFORE advancing, a Claude/Codex+LangFuse audit must confirm the underlying
+  BEFORE advancing, a reviewer with LangFuse MCP tools must confirm the underlying
   traces show real agent work.
 
-  1. Open a Claude/Codex session with LangFuse MCP tools (this session works).
+  1. Open a review session with LangFuse MCP tools.
   2. Paste the contents of:
          $req
-  3. Save Claude's/Codex's response to:
+  3. Save the reviewer's response to:
          $ver
   4. Re-run this stage script. It will read the verdicts and advance the marker.
 

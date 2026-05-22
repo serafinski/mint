@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shared audit-request generator. Invoked by stage scripts to prepare a
-# profile-specific Claude/Codex+LangFuse-MCP audit request.
+# profile-specific trace audit request.
 #
 # Usage:
 #   audit_traces.sh --stage <name> --profile <profile> --eval-dir <path>
@@ -353,7 +353,7 @@ plan = {
 lines = [
     f"# LangFuse trace audit — {stage} ({profile})",
     "",
-    "**Paste this entire file into a Claude/Codex session with LangFuse MCP tools.**",
+    "**Paste this entire file into a review session with LangFuse MCP tools.**",
     "",
     f"- Capture dir: `{eval_out}`",
     f"- DB: `{db_path}`",

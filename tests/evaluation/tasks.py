@@ -439,14 +439,10 @@ def _file_validate_t07(output: dict, output_files: dict[str, bytes]) -> bool:
     import csv
     import io
     try:
-        # Check metadata dict
         ok_count = int(output.get("row_count", -1)) == _t07_ev["expected_join_count"]
-        # Check CSV file content — required by T07's output_contract.
         csv_bytes = output_files.get("output.csv")
         if csv_bytes is None:
-            # Pre-fix fell back to dict-only; this is a contract
-            # violation and the pipeline never produced the required
-            # file. Fail closed.
+            # Dict-only output violates the task's required file contract.
             return False
         text = csv_bytes.decode("utf-8")
         reader = csv.reader(io.StringIO(text))
@@ -728,10 +724,9 @@ def _file_validate_t11(output: dict, output_files: dict[str, bytes]) -> bool:
     # Dict validation still required for metadata
     if not _validate_t11(output):
         return False
-    # Check Excel file — required by T11's output_contract.
     xlsx_bytes = output_files.get("output.xlsx")
     if xlsx_bytes is None:
-        # Pre-fix returned True; the file is contract-required.
+        # The file is contract-required.
         return False
     try:
         import io
@@ -748,10 +743,8 @@ def _file_validate_t11(output: dict, output_files: dict[str, bytes]) -> bool:
         return True
     try:
         wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), read_only=True)
-        # Should have at least one sheet
         if len(wb.sheetnames) == 0:
             return False
-        # Check first sheet has data rows (header + at least 4 region rows)
         ws = wb.active
         row_count = sum(1 for _ in ws.iter_rows(min_row=1))
         return row_count >= 5  # header + 4 regions

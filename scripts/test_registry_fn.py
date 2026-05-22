@@ -76,7 +76,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Step 13.6 / Fix #1: route dev-script LangFuse emissions to test env.
+# Route dev-script LangFuse emissions to the test environment.
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 
 load_dotenv(ROOT / ".env")
@@ -240,15 +240,14 @@ def main() -> int:
     parser.add_argument(
         "--verbose", action="store_true", help="Print per-paraphrase ranks"
     )
-    # ext13 #135: minimum capability-coverage threshold. Pre-fix a
-    # paraphrase-generation failure that skipped 7 of 8 caps silently
-    # reported "100% recall" on the remaining 1. Default 90%.
+    # Require enough capability coverage that recall is not computed on a
+    # biased subset.
     parser.add_argument(
         "--min-cap-coverage", type=float, default=0.9,
         help="Minimum fraction of capabilities that must be probed after "
              "the paraphrase-generation retry pass (default 0.9). Below "
              "this, exit 2 instead of reporting recall on a biased "
-             "subset. ext13 #135.",
+             "subset.",
     )
     args = parser.parse_args()
 
@@ -263,7 +262,6 @@ def main() -> int:
     caps = registry.list_all()
     print(f"Seeded {len(caps)} capabilities.")
 
-    # Build the paraphrase LLM.
     try:
         structured_llm = _build_paraphrase_llm()
     except Exception as exc:  # noqa: BLE001
@@ -310,12 +308,8 @@ def main() -> int:
                 f"@thr={result.above_threshold_hits}/{result.total}"
             )
 
-    # ext13 #135: retry pass for transient paraphrase-generation failures.
-    # Pre-fix, a capability whose first paraphrase call raised was silently
-    # dropped from the audit; recall was then computed on the non-skipped
-    # subset, masking the biased sample. Re-try each skipped cap once;
-    # anything still failing after the retry is reported via the coverage
-    # gate below.
+    # Retry transient paraphrase-generation failures once; anything still
+    # failing is handled by the coverage gate below.
     if skipped_caps:
         print(
             f"\n  Retrying {len(skipped_caps)} skipped capability/ies once "
@@ -349,10 +343,7 @@ def main() -> int:
     print("  AGGREGATE FALSE-NEGATIVE AUDIT REPORT")
     print("=" * 70)
 
-    # ext13 #135: minimum capability-coverage gate. Pre-fix a 7/8 skip
-    # rate (paraphrase generation failing on most caps) produced a
-    # "100% recall" report on the 1 cap that survived. Now: refuse with
-    # exit 2 when coverage falls below --min-cap-coverage (default 90%).
+    # Refuse to report recall when too many capabilities were skipped.
     _MIN_CAP_COVERAGE = args.min_cap_coverage
     cap_coverage = len(results) / len(caps) if caps else 1.0
     if cap_coverage < _MIN_CAP_COVERAGE:
@@ -363,7 +354,7 @@ def main() -> int:
             f"{_MIN_CAP_COVERAGE:.0%} — refusing to report recall on a "
             f"biased subset. Skipped: {skipped_caps[:10]}"
             f"{' (+more)' if len(skipped_caps) > 10 else ''}. "
-            f"ext13 #135. Exit 2.",
+            f"Exit 2.",
             file=sys.stderr,
         )
         return 2

@@ -744,11 +744,6 @@ def test_agent_no_fence_prose_passes(mock_behavioral, mock_adversarial):
     assert report.overall_passed is True
 
 
-# ---------------------------------------------------------------------------
-# verify() never raises — exception swallowing
-# ---------------------------------------------------------------------------
-
-
 @patch("src.verification.gate._static_scan")
 def test_verify_never_raises_on_unexpected_exception(mock_static_scan):
     """verify() must catch exceptions and fail closed.

@@ -68,10 +68,9 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute protocol eval's
-# ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
-# ambient .env values can't override. Same pattern as ``tests/conftest.py``.
+# Route dev-script LangFuse emissions to ``environment=test`` so they do not
+# pollute protocol eval data. Must be set before ``load_dotenv`` so ambient
+# .env values cannot override it.
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 
 load_dotenv(ROOT / ".env")
@@ -1170,14 +1169,8 @@ def _print_summary(
             and r.verdict is not None
         ]
 
-        # ext13 #134: judge-outage coverage gate. Pre-fix a full LLM-judge
-        # outage (every Phase B call raising) produced ``verdict=None`` for
-        # every row; the filter above then yielded ``pos_audited==[]`` and
-        # ``trap_audited==[]``, and the ``all_pass_b`` computation below
-        # silently returned True because neither ``pos_lost`` nor
-        # ``trap_let_through`` was positive. Gate it: require at least
-        # 80% of eligible rows to have a verdict, otherwise flip
-        # ``all_pass_b`` and print the outage category breakdown.
+        # Require enough Phase B verdict coverage that a judge outage cannot
+        # produce an OVERALL PASS on an empty audited subset.
         _MIN_AUDIT_COVERAGE = 0.8
         eligible_pos = [
             r for r in phase_b
@@ -1207,7 +1200,7 @@ def _print_summary(
                 f"({total_audited}/{total_eligible}) below threshold "
                 f"{_MIN_AUDIT_COVERAGE:.0%} — likely LLM-judge outage. "
                 f"Refusing to report OVERALL: PASS on a tiny audited "
-                f"subset. ext13 #134.",
+                f"subset.",
                 file=sys.stderr,
             )
             for cat, n in sorted(error_counts.items(), key=lambda x: -x[1]):
@@ -1241,11 +1234,8 @@ def _print_summary(
                 f"silent poisoning risk"
             )
 
-        # Pass criteria for phase B: every trap must be caught AND
-        # every true positive must be retained.
-        # ext13 #134: also require audit coverage >= threshold so a
-        # judge outage can't silently mint "OVERALL: PASS" with zero
-        # actual audits.
+        # Pass criteria for phase B: every trap must be caught, every true
+        # positive retained, and audit coverage must clear the threshold.
         all_pass_b = (
             trap_let_through == 0
             and pos_lost == 0
@@ -1455,7 +1445,6 @@ def main() -> int:
     run_b = not args.naive and not args.self_audit and not use_persistent
     run_c = not args.skip_self_audit and not args.naive
 
-    # Load or seed the registry.
     if use_persistent:
         registry = CapabilityRegistry(
             persist_directory=args.registry_path,

@@ -1294,8 +1294,8 @@ def _execute_agent_inner(
     agent_config = getattr(artifact, "agent_config", None) or {}
     system_prompt = agent_config.get("system_prompt", _AGENT_SYSTEM_FALLBACK)
 
-    # NOTE: skill_content is NO LONGER prepended to system_prompt.
-    # Skills are loaded via progressive disclosure through the skills= parameter.
+    # Skills are loaded via progressive disclosure through the skills=
+    # parameter, not prepended to the system prompt.
 
     # Determine skills directory — eval uses the generator default unless tests
     # or custom runners override it.
@@ -1334,9 +1334,8 @@ def _execute_agent_inner(
             sorted(output_schema.keys()),
         )
 
-    # Build subagents list if this is a lead-with-subagents artifact.
-    # Each subagent config is a dict with name, description, system_prompt, tools.
-    # The tool names are resolved to actual tool objects (only sandbox_execute).
+    # Lead-with-subagents artifacts pass concrete tool objects to DeepAgents.
+    # At execution time, generated subagents only receive sandbox_execute.
     subagents_config = agent_config.get("subagents")
     subagents_param = None
     if subagents_config:
@@ -1375,8 +1374,8 @@ def _execute_agent_inner(
 
     agent = create_deep_agent(**agent_kwargs)
 
-    # Build the workspace files dict: skills (for progressive disclosure) +
-    # fixtures (so `read_file("filename")` works from the agent's workspace).
+    # Workspace files include skills for progressive disclosure and fixtures
+    # so `read_file("filename")` works from the agent's workspace.
     # Inline fixture content is still provided in the user message, but the
     # workspace files make generated skill instructions that call read_file()
     # deterministic instead of relying on fallback behavior.

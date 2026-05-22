@@ -687,11 +687,6 @@ def test_success_predicate_excludes_shape_mismatched_rows():
     )
 
 
-# ---------------------------------------------------------------------------
-# Run-id scoping
-# ---------------------------------------------------------------------------
-
-
 def test_resolve_scope_single_run_returns_empty_filter():
     """DB with <= condition_count distinct run_ids needs no scope filter."""
     import scripts.analyze_results as ar
@@ -1203,7 +1198,6 @@ def test_completeness_guard_refuses_partial_dataset(monkeypatch, capsys, tmp_pat
     """
     import scripts.analyze_results as ar
 
-    # Build a partial DB with 1 condition and 10 rows.
     db_path = tmp_path / "partial.duckdb"
     store = EvaluationStore(db_path=str(db_path))
     _seed_partial_campaign(store, {"full": 10})
@@ -1254,8 +1248,7 @@ def test_invocation_events_is_pilot_backfill_from_evaluation_runs(tmp_path):
 
     db_path = tmp_path / "older_shape.duckdb"
 
-    # Create an older-shape DB: evaluation_runs has is_pilot, while
-    # invocation_events does not.
+    # Older-shape DB: evaluation_runs has is_pilot; invocation_events does not.
     raw = duckdb.connect(str(db_path))
     raw.execute("""
         CREATE TABLE evaluation_runs (

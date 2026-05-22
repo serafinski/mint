@@ -74,7 +74,6 @@ class HarnessConfig:
     # EvaluationStore path (None = in-memory, useful for tests)
     db_path: str | None = None
 
-    # Run parameters
     n_runs: int = 8
     base_seed: int = 42
 
@@ -379,9 +378,8 @@ class EvaluationHarness:
         seed_registry(registry)
         loader = ToolLoader()
 
-        # Create a single MetricsStore for this run. When metrics_store_path is
-        # set, optimizer telemetry persists across runs; otherwise tests get an
-        # isolated in-memory store.
+        # One MetricsStore backs the run. A configured metrics_store_path
+        # persists optimizer telemetry across runs; tests can stay in-memory.
         from src.registry.metrics import MetricsStore
 
         metrics_store = MetricsStore(db_path=self._config.metrics_store_path)
@@ -584,7 +582,6 @@ class EvaluationHarness:
                 "output_shape_missing_files": [],
             }
 
-        # Check registry has the expected capability by exact name lookup
         cap = registry.get(task.static_capability_name)
         if cap is None:
             logger.warning(
@@ -707,7 +704,7 @@ class EvaluationHarness:
                 fp.suffix.lower().lstrip(".") for fp in task.fixture_paths
             }) if task.fixture_paths else []
 
-            # Build the tag list to maximize analysis-time filterability. Axes:
+            # Tags maximize analysis-time filterability. Axes:
             # - condition: which ablation (full / no_verification / ...)
             # - task_id / tier: per-task + per-tier aggregation
             # - format:X: per-file-format behavior
@@ -863,10 +860,9 @@ def _extract_result_compositional(
     """
     from src.orchestrator.composition import CompositionalExecutor, build_resolution_map
 
-    # Check gate: all generated artifacts must have passed verification.
-    # If verification was enabled and any artifact failed, the pipeline
-    # would have retried up to MAX_ATTEMPTS.  We check the latest report
-    # for each artifact.
+    # Generated artifacts must have passed verification. If verification was
+    # enabled and any artifact failed, the pipeline would have retried up to
+    # MAX_ATTEMPTS, so the latest report is authoritative.
     gate_passed = True
     verification_tier_reached: int | None = None
     if verification_results:
@@ -885,12 +881,11 @@ def _extract_result_compositional(
         # No verification reports but artifacts exist = no_verification condition
         gate_passed = True
 
-    # Build resolution map
     resolution = build_resolution_map(
         required_capabilities, matches, artifacts,
     )
 
-    # Determine primary capability type (highest priority in chain)
+    # Record the most capable type present in the executed chain.
     cap_types = []
     for ref in resolution.values():
         ct = str(ref.capability_type).split(".")[-1].lower()
@@ -931,7 +926,6 @@ def _extract_result_compositional(
             "generated_artifact_sources": _snapshot_artifacts(artifacts),
         }
 
-    # Run the compositional chain
     executor = CompositionalExecutor(
         subtasks=subtasks,
         resolution=resolution,
@@ -947,7 +941,6 @@ def _extract_result_compositional(
 
     chain_result = executor.run(task_id=task.instance_id)
 
-    # Validate final output
     output_in_range = False
     failure_reason = "generation_failed"
     final_output: dict | None = None
@@ -1496,11 +1489,9 @@ def _execute_artifact(
                     if str(v) == str(fp):
                         fixture_inputs[k] = sandbox_path
 
-    # Build a sandbox invocation (same pattern as behavioral testing).
-    # Use inspect to filter kwargs to only what the function accepts,
-    # since extra_inputs may include params the tool doesn't expose.
-    # Fuzzy-match extra_inputs keys to actual param names (e.g.
-    # "features" matches "feature_columns") to handle LLM naming variance.
+    # Sandbox calls only pass kwargs accepted by the generated function.
+    # Fuzzy matching handles small naming differences such as "features"
+    # versus "feature_columns".
     sandbox_code = f"""
 import asyncio, json, inspect
 __name__ = "not_main"

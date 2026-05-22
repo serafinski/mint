@@ -38,10 +38,9 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute protocol eval
-# ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
-# ambient .env values can't override. Same pattern as ``tests/conftest.py``.
+# Route dev-script LangFuse emissions to ``environment=test`` so they do not
+# pollute protocol eval data. Must be set before ``load_dotenv`` so ambient
+# .env values cannot override it.
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 
 load_dotenv(ROOT / ".env")
@@ -98,7 +97,6 @@ def run_pipeline_and_verify(
         print(f"\n  Registry: {initial_count} seeded capabilities")
         print(f"  Task: {task_prompt[:100]}...")
 
-        # --- Run pipeline ---
         # Use the same entry-point shape as protocol eval: an output contract
         # object is always present, even for prompt-only smoke tests.
         pipeline = create_pipeline(registry, loader).compile()
@@ -188,9 +186,8 @@ def run_pipeline_and_verify(
                 sev = str(getattr(f, "severity", "")).upper()
                 msg = getattr(f, "message", "")[:80]
                 print(f"       [{sev}] {msg}")
-        # ext13 #136: stage 5 used to only fail when explicit findings
-        # were present; an empty ``verification_results`` with artifacts
-        # still generated passed silently (Pillar 2 gate bypassed).
+        # Artifacts must produce verification reports; otherwise the gate was
+        # skipped even though generation occurred.
         if verif_results:
             print("     OK")
         elif artifacts:
@@ -212,10 +209,7 @@ def run_pipeline_and_verify(
         new_caps = final_count - initial_count
         print(f"     Registry: {initial_count} -> {final_count} ({new_caps} new)")
 
-        # ext13 #136: stage 6 used to print WARN when gaps existed but no
-        # caps registered; the ``all_pass`` boolean never flipped. A
-        # pipeline that detected gaps, generated artifacts, then failed
-        # to register them silently passed smoke-test.
+        # Generated artifacts must be registered when gaps were detected.
         if artifacts and new_caps > 0:
             print("     OK")
         elif gaps and artifacts and new_caps == 0:
@@ -363,7 +357,7 @@ def test_mcp_tool() -> bool:
 
 
 def _validate_skill_output(artifacts) -> bool:
-    """Check that a SKILL artifact was produced with valid content."""
+    """Validate that a SKILL artifact was produced with valid content."""
     skill_artifacts = [
         a for a in artifacts
         if getattr(a, "capability_type", None).__class__.__name__ == "CapabilityType"
@@ -371,10 +365,9 @@ def _validate_skill_output(artifacts) -> bool:
     ]
     # Also accept MCP_TOOL (classifier may route differently)
     if not skill_artifacts:
-        # Check if any artifact was generated at all
         if artifacts:
             atype = str(getattr(artifacts[-1], "capability_type", "")).split(".")[-1]
-            print(f"     NOTE: Classifier routed to {atype} instead of SKILL")
+            print(f"     Info: Classifier routed to {atype} instead of SKILL")
             print("     OK (artifact generated, type selection is stochastic)")
             return True
         print("     FAIL: No artifacts generated")
@@ -423,7 +416,7 @@ def test_skill() -> bool:
 
 
 def _validate_agent_output(artifacts) -> bool:
-    """Check that an AGENT artifact was produced with valid config."""
+    """Validate that an AGENT artifact was produced with valid config."""
     agent_artifacts = [
         a for a in artifacts
         if str(getattr(a, "capability_type", "")).endswith("AGENT")
@@ -431,7 +424,7 @@ def _validate_agent_output(artifacts) -> bool:
     if not agent_artifacts:
         if artifacts:
             atype = str(getattr(artifacts[-1], "capability_type", "")).split(".")[-1]
-            print(f"     NOTE: Classifier routed to {atype} instead of AGENT")
+            print(f"     Info: Classifier routed to {atype} instead of AGENT")
             print("     OK (artifact generated, type selection is stochastic)")
             return True
         print("     FAIL: No artifacts generated")

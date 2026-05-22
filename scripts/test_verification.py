@@ -35,20 +35,15 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute protocol eval's
-# ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
-# ambient .env values can't override. Same pattern as ``tests/conftest.py``.
+# Route dev-script LangFuse emissions to ``environment=test`` so they do not
+# pollute protocol eval data. Must be set before ``load_dotenv`` so ambient
+# .env values cannot override it.
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 
 load_dotenv(ROOT / ".env")
 
 from src.schemas.capability import CapabilityType  # noqa: E402
 from src.schemas.task import GeneratedArtifact  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# Test artifacts
-# ---------------------------------------------------------------------------
 
 GOOD_MCP_TOOL = GeneratedArtifact(
     capability_name="fibonacci-test",
@@ -360,7 +355,6 @@ def main() -> int:
     results = {}
 
     if run_bad:
-        # Fast tests first — no Docker/LLM
         results["bad_mcp_tool"] = test_bad_mcp_tool()
 
     if run_skill:

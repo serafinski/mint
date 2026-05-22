@@ -1,10 +1,5 @@
 """SIGALRM-based budget watchdog for long-running eval tasks.
 
-Security audit ext12 #119 (2026-04-21): the longitudinal runner called
-``pipeline.invoke(...)`` in a per-task loop with no timeout. A single hung
-Docker container, stalled LangFuse API call, or DeepAgent plateau at
-``recursion_limit=50`` could freeze the campaign with no abort signal.
-
 This module provides the watchdog primitive used by
 ``scripts/run_longitudinal.py`` for per-task fail-fast behavior. The pilot
 and recurrence runners currently keep local condition-level watchdogs with
@@ -25,18 +20,13 @@ from collections.abc import Iterator
 class BudgetExceeded(BaseException):
     """Raised by ``budget_watchdog`` when the wrapped block exceeds the budget.
 
-    Named to match ``scripts.run_pilot.BudgetExceeded`` (ext10 #103), but
-    intentionally not re-exported from there. ``run_longitudinal.py`` catches
-    this module's exception class; ``run_pilot.py`` keeps its local
-    condition-level watchdog and exception.
+    ``run_longitudinal.py`` catches this module's exception class;
+    ``run_pilot.py`` keeps its local condition-level watchdog and exception.
 
     Inherits from ``BaseException`` rather than ``Exception`` so a watchdog
     abort cannot be silently swallowed by broad third-party ``except
-    Exception:`` handlers. This exact failure mode occurred in the
-    longitudinal smoke on 2026-04-22: the SIGALRM fired while OpenTelemetry
-    export code was running, OTLP export caught the timeout as a generic
-    Exception, logged it, and the task kept going past the supposed hard
-    budget.
+    Exception:`` handlers. OpenTelemetry exporters can catch generic
+    exceptions during shutdown, so the watchdog must bypass that path.
     """
 
 
@@ -80,8 +70,7 @@ def budget_watchdog(
 
     def _on_alarm(_sig: int, _frame: object) -> None:
         raise BudgetExceeded(
-            f"'{name}' exceeded {seconds}s budget — watchdog fired "
-            f"(security audit ext12 #119)"
+            f"'{name}' exceeded {seconds}s budget — watchdog fired"
         )
 
     prev_handler = signal.signal(signal.SIGALRM, _on_alarm)

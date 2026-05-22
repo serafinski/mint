@@ -203,8 +203,8 @@ def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> 
         return
 
     body = node.body
-    # Check if the body is effectively silent: only `pass`, `return None`,
-    # `return {}`, `return "..."`, or similar swallowed-exception patterns.
+    # Silent handlers are bodies with only pass, return None, return {},
+    # return "...", or similar swallowed-exception patterns.
     has_reraise = False
     has_logging = False
     is_only_pass = len(body) == 1 and isinstance(body[0], ast.Pass)
@@ -230,7 +230,6 @@ def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> 
             has_reraise = True
         if isinstance(child, ast.Call):
             func = child.func
-            # Check for logging calls like logger.error, print, log.warning, etc.
             if isinstance(func, ast.Attribute) and func.attr in (
                 "error", "warning", "info", "debug", "critical",
                 "exception", "log", "warn",
@@ -289,7 +288,6 @@ def _check_missing_external_calls(
     if not external_fn_found:
         return
 
-    # Check if source contains any external import.
     has_external_import = bool(_EXTERNAL_IMPORT_PATTERNS.search(source_code))
     if not has_external_import:
         severity = Severity.HIGH if allow_network else Severity.MEDIUM
@@ -461,7 +459,7 @@ def scan(
     """
     findings: list[VerificationFinding] = []
 
-    # --- Tier 0: Skill structural pre-check. ---
+    # Tier 0: Skill structural pre-check.
     if capability_type == CapabilityType.SKILL:
         tier0_finding = _run_skill_precheck(source_code, capability_name)
         if tier0_finding is not None:

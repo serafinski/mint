@@ -85,17 +85,13 @@ class TestTraceContext:
                 _trace_context_global.clear()
 
     def test_cross_thread_visibility_via_global(self):
-        # This is the core regression test: ContextVars don't propagate
-        # to ThreadPoolExecutor workers, so verification_node's gate pool
-        # must read tags from the module-global fallback. Verify that a
-        # worker thread inside a trace_context sees the module-global
-        # even though its ContextVar was never set.
+        # Regression coverage for ThreadPoolExecutor workers, where ContextVars
+        # do not propagate and verification_node must read the global fallback.
         captured: dict = {}
         barrier = threading.Barrier(2)
 
         def worker():
-            barrier.wait()  # ensure we run INSIDE the outer `with`
-            # ContextVar is not propagated to this thread by default
+            barrier.wait()
             captured["ctx_var"] = _trace_context_var.get()
             captured["read"] = _read_trace_context()
 

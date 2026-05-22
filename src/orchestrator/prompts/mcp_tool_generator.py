@@ -12,11 +12,6 @@
 # functions WITHOUT ``upstream_data`` (only fixture paths), so the tool
 # crashed with ``missing 1 required positional argument: 'upstream_data'``.
 #
-# Empirically observed on T11 where the decomposer named step 0
-# ``join-sales-with-products-...`` — the word "join" pattern-matched to
-# middle-step semantics in the LLM's understanding, overriding the
-# ``depends_on=[]`` signal.
-#
 # The current generator injects an explicit step-position block into the user
 # prompt so the LLM cannot confuse step role based on the gap name. A
 # post-generation AST check also flags signature/position mismatches for the
@@ -248,9 +243,8 @@ dict with metadata about the file \
 (e.g. ``{{"output_file": "report.md", "row_count": 42}}``). \
 The pipeline will collect the file from the workspace automatically.
 
-**CRITICAL — file path placement (security audit finding #98 / ext9, \
-2026-04-20).** The Docker sandbox ONLY mounts ``/workspace/``. Writing \
-to any other absolute path (``/report.md``, ``/output.csv``, \
+**CRITICAL — file path placement.** The Docker sandbox ONLY mounts \
+``/workspace/``. Writing to any other absolute path (``/report.md``, ``/output.csv``, \
 ``/tmp/report.md``, ``/metrics.csv``) will either raise \
 ``PermissionError: [Errno 13]`` (root paths) or land in a directory \
 ``_collect_output_files`` does not scan, in which case the file is \

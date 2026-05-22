@@ -8,7 +8,6 @@ This runs through the real pipeline path (create_pipeline with
 run_optimizer=True), not create_optimization_loop() directly — verifying
 the full wiring from pipeline to optimizer.
 
-**Scope (clarified 2026-04-17 per master plan Step 9.5b):**
 The primary role of this script is **pipeline-wiring verification** —
 does ``create_pipeline(run_optimizer=True)`` correctly trigger
 prune/split/merge via the ``optimizer_node`` branch? Deep content
@@ -53,10 +52,9 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute protocol eval
-# ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
-# ambient .env values can't override. Same pattern as ``tests/conftest.py``.
+# Route dev-script LangFuse emissions to ``environment=test`` so they do not
+# pollute protocol eval data. Must be set before ``load_dotenv`` so ambient
+# .env values cannot override it.
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 
 load_dotenv(ROOT / ".env")
@@ -284,7 +282,6 @@ def test_happy_path(verbose: bool = False) -> bool:
         total_invocations = metrics.invocation_count_total()
         print(f"  Invocations seeded: {total_invocations}")
 
-        # Verify metrics
         print("\n  Metrics:")
         print(f"    unused-temp-tool: invocations={metrics.invocation_count('unused-temp-tool')}")
         rr = metrics.reuse_rate("broad-data-processor")
@@ -299,7 +296,6 @@ def test_happy_path(verbose: bool = False) -> bool:
             f"reuse={metrics.reuse_rate('tsv-row-cleaner'):.3f} (merge: <0.05)"
         )
 
-        # Check similarity for merge candidates
         results = registry.search("csv-row-cleaner", n_results=5)
         sim = None
         for cap, score in results:
@@ -310,10 +306,6 @@ def test_happy_path(verbose: bool = False) -> bool:
             f"    csv↔tsv similarity: {sim:.3f}"
             if sim else "    csv↔tsv similarity: NOT FOUND"
         )
-
-        # ==================================================================
-        # Run pipeline with optimizer (through the real pipeline path)
-        # ==================================================================
 
         print(f"\n  Auto-enable check: {total_invocations} >= 20 = {total_invocations >= 20}")
 
@@ -335,10 +327,6 @@ def test_happy_path(verbose: bool = False) -> bool:
             return False
 
         print("  Pipeline completed.")
-
-        # ==================================================================
-        # Verify all three operations triggered
-        # ==================================================================
 
         events = metrics._conn.execute(
             "SELECT capability_id, event_type, details "
@@ -373,7 +361,6 @@ def test_happy_path(verbose: bool = False) -> bool:
                 print(f"    FAIL: Pinned '{name}' was pruned or missing")
                 all_pass = False
 
-        # --- SPLIT ---
         # Two valid outcomes for the wiring test:
         #   (a) "split" event fired → parent deactivated, variants registered
         #   (b) "split_rollback" event fired → gate rejected LLM output,
@@ -441,7 +428,6 @@ def test_happy_path(verbose: bool = False) -> bool:
             print("    FAIL: broad-data-processor should have triggered split path")
             all_pass = False
 
-        # --- MERGE ---
         # Two valid outcomes for the wiring test (parallel to SPLIT above):
         #   (a) "merged" event(s) → parents merged into new cap, content check
         #   (b) "verification_rollback" on the merged cap → gate rejected,

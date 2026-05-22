@@ -607,7 +607,6 @@ class TestChainExecution:
         assert chain_result.chain_success is True
         assert chain_result.chain_length == 2
 
-        # Verify the SKILL step received upstream output via fixture_contents
         mock_skill.assert_called_once()
         call_kwargs = mock_skill.call_args
         fixture_contents = call_kwargs[0][2]  # third positional arg
@@ -1299,9 +1298,8 @@ class TestEmbeddedFileExtraction:
 # AGENT/SKILL output_schema runtime compliance check
 # ---------------------------------------------------------------------------
 
-# NOTE: TestBuildSchemaContext moved to tests/unit/test_generator_utils.py
-# because build_schema_context lives in src/orchestrator/generators/utils.py,
-# not composition.py.
+# TestBuildSchemaContext lives in tests/unit/test_generator_utils.py because
+# build_schema_context is owned by src/orchestrator/generators/utils.py.
 
 
 class TestAgentOutputSchemaRuntimeCheck:

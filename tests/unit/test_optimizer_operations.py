@@ -151,11 +151,10 @@ class TestAgentSubagentNameValidation:
 
         prune(registry, store, window_days=7)
 
-        # Verify the cutoff was passed correctly
         args = store.invocations_since.call_args
         cutoff = args[0][1]
         now = datetime.now(UTC)
-        # Cutoff should be ~7 days ago
+        # Allow small wall-clock drift around the seven-day cutoff.
         assert (now - cutoff).days in (6, 7)
 
     def test_prune_skips_pinned_capability(self):

@@ -570,8 +570,8 @@ class DomainTaxonomy:
             )
             return None
 
-        # Validate: if the LLM returned a domain not in the taxonomy, treat
-        # as None (the LLM hallucinated a category that doesn't exist).
+        # Unknown domains are ignored rather than treated as new taxonomy
+        # entries during query classification.
         normalized_domain = _normalize_category_name(result.domain)
         if normalized_domain is None:
             logger.warning(

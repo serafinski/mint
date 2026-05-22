@@ -27,10 +27,9 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute protocol eval
-# ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
-# ambient .env values can't override. Same pattern as ``tests/conftest.py``.
+# Route dev-script LangFuse emissions to ``environment=test`` so they do not
+# pollute protocol eval data. Must be set before ``load_dotenv`` so ambient
+# .env values cannot override it.
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 
 load_dotenv(ROOT / ".env")
@@ -53,7 +52,6 @@ def _test_skill() -> bool:
     print("  SKILL BACKEND TEST — T04 (inventory reorder)")
     print(f"{'='*60}")
 
-    # Build a mock artifact with T04's expected skill content
     class MockArtifact:
         skill_content = (
             "---\n"

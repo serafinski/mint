@@ -572,11 +572,6 @@ class TestBuildSandboxCode:
         assert payload["result"] == "42"
 
 
-# ---------------------------------------------------------------------------
-# run() full behavioral test suite
-# ---------------------------------------------------------------------------
-
-
 class TestRunCleanTool:
     """A well-behaved tool should produce no HIGH/CRITICAL findings."""
 
@@ -1074,8 +1069,7 @@ class TestAllowNetworkPropagates:
         # extra_packages is empty. Instead assert the partial's keyword.
         # The findings run behavioral tests via partial(sandbox_execute, ...)
         # with allow_network=False keyword bound.
-        # This test passes iff run() returns without crashing and no call to
-        # sandbox_execute leaked an unexpected allow_network=True.
+        # Any unexpected allow_network=True call indicates policy leakage.
         calls_with_true = [
             c for c in mock_sandbox.call_args_list
             if c.kwargs.get("allow_network") is True

@@ -425,11 +425,9 @@ class CapabilityRegistry:
             if best_cap is not None and best_score >= threshold:
                 matches.append((best_cap, best_score, query))
             else:
-                # Check whether a deactivated capability would have matched on
-                # the primary (slug) query. The deactivated-check intentionally
-                # only considers the primary for consistency with existing
-                # behaviour — augmenting it with auxiliary searches for
-                # deactivated caps would add noise without changing outcomes.
+                # The deactivated check only uses the primary slug query.
+                # Adding auxiliary searches would add noise without changing
+                # matching outcomes.
                 if (
                     unfiltered
                     and unfiltered[0][1] >= threshold
@@ -466,7 +464,7 @@ def seed_registry(registry: CapabilityRegistry) -> None:
     from src.registry.token_count import count_definition_tokens
     from src.schemas.task import GeneratedArtifact
 
-    # Build kwargs for optional fields — only include if schema supports them
+    # Optional fields are only passed when the schema supports them.
     model_fields = CapabilityDescriptor.model_fields
     has_domain = "domain" in model_fields
     has_tags = "tags" in model_fields
@@ -499,8 +497,8 @@ def seed_registry(registry: CapabilityRegistry) -> None:
 
         agent_config_dict = decode_agent_config_metadata(agent_config)
         if agent_config_dict is None and isinstance(agent_config, str) and agent_config:
-            # This path only builds a tokenizer snapshot, so a non-JSON agent
-            # prompt can be represented as a bare system prompt.
+            # Tokenizer snapshots can represent non-JSON agent prompts as
+            # bare system prompts.
             agent_config_dict = {"system_prompt": agent_config}
         snapshot = GeneratedArtifact(
             capability_name=name,

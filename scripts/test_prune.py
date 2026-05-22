@@ -120,12 +120,10 @@ def run_prune_smoke() -> bool:
             f"Expected 3 active caps, got {active_before}"
         )
 
-        # --- Run prune ---
         print("\n  Running prune(window_days=30)...")
         pruned = prune(registry, metrics, window_days=30)
         print(f"  Pruned: {pruned}")
 
-        # --- Assertions ---
         failed = False
 
         # Exactly one capability should have been pruned

@@ -186,7 +186,6 @@ def create_optimization_loop(
                 goto="identify_candidates",
             )
 
-        # Compute KL divergence against previous cycle
         kl = _compute_kl_divergence(state.previous_utility_scores, scores)
 
         # Emit KL as a LangFuse score attached to the active trace so
@@ -252,8 +251,8 @@ def create_optimization_loop(
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to compute metrics for '%s': %s", cap_id, e)
 
-        # Build merge pairs: low-reuse capability pairs with high embedding
-        # similarity AND overlapping I/O schemas (the second proposal conjunct).
+        # Merge pairs need low reuse, high embedding similarity, and
+        # overlapping I/O schemas (the second proposal conjunct).
         # Use registry.search() to find semantically similar partners rather
         # than pairing consecutive capabilities (which would be arbitrary).
         #
@@ -430,7 +429,6 @@ def create_optimization_loop(
             goto=END,
         )
 
-    # Build graph
     graph = StateGraph(OptimizerState)
     graph.add_node("compute_metrics", compute_metrics_node)
     graph.add_node("identify_candidates", identify_candidates_node)

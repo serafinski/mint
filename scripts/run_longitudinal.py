@@ -52,11 +52,6 @@ DEFAULT_DB = str(DATA_DIR / "eval" / "longitudinal.duckdb")
 def main(argv: list[str] | None = None) -> int:
     """Run the longitudinal optimizer campaign.
 
-    ext12 #119 (2026-04-21): added per-task + campaign-level SIGALRM
-    watchdogs + exit-code propagation. Pre-fix, ``main()`` returned None
-    and the entrypoint was ``main()`` (not ``sys.exit(main())``), so a
-    watchdog abort or hanging task couldn't surface as a non-zero exit.
-
     Returns:
         0: campaign completed with all tasks attempted
         2: output DB already contained rows and --append was not passed
@@ -86,39 +81,31 @@ def main(argv: list[str] | None = None) -> int:
             "Inherit the prior invocation's MetricsStore DB (utility scores, "
             "invocation counts, prune events). Default: fresh DB per run — "
             "each invocation starts from a clean baseline so Day-N decisions "
-            "don't depend on Day-(N-1) state. ext11 #113 (2026-04-20): "
-            "ext8 #71 made the MetricsStore path persistent for within-run "
-            "accumulation but never reset between invocations, silently "
-            "contaminating cycle-1 KL + prune thresholds across back-to-back "
-            "runs. Pass this flag only for explicit cross-invocation "
-            "experiments."
+            "don't depend on Day-(N-1) state. Pass this flag only for "
+            "explicit cross-invocation experiments."
         ),
     )
-    # ext12 #119: campaign watchdogs. Pre-fix, a single hung task (Docker
-    # stall, LangFuse rate-limit, DeepAgent recursion plateau) froze the
-    # whole row-9 campaign indefinitely.
+    # Campaign watchdogs keep Docker stalls, LangFuse stalls, or agent loops
+    # from blocking the whole task sequence indefinitely.
     parser.add_argument(
         "--per-task-budget-seconds", type=int, default=1800,
         help="SIGALRM budget per task (default: 1800s = 30 min). 0 disables "
              "the per-task watchdog. A single hung task will otherwise "
-             "block the whole campaign indefinitely. ext12 #119.",
+             "block the whole campaign indefinitely.",
     )
     parser.add_argument(
         "--campaign-budget-hours", type=float, default=12.0,
         help="Total wall-clock budget for the full task sequence (default: "
-             "12h for --n-tasks 40). 0 disables the campaign-level deadline. "
-             "ext12 #119.",
+             "12h for --n-tasks 40). 0 disables the campaign-level deadline.",
     )
-    # ext15 #175 (2026-04-22): freshness guard. Pre-fix, successive
-    # invocations with the default ``--db`` silently accumulated in the
-    # same DB → #174 selector stale-fallback risk and cross-campaign
-    # pollution. Match run_pilot.py's ext7 #49 contract.
+    # Freshness guard: default runs should not append into an existing
+    # campaign DB unless the caller explicitly requests it.
     parser.add_argument(
         "--fresh-db", action="store_true",
         help=(
             "Refuse to run if the --db target already exists with rows. "
             "Use --append to explicitly allow appending to an existing DB. "
-            "ext15 #175: one DB = one campaign."
+            "One DB should represent one campaign unless --append is explicit."
         ),
     )
     parser.add_argument(
@@ -126,15 +113,14 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Explicitly allow writing into an existing non-empty DB. "
             "Default: refuse to append; require either --append or a fresh "
-            "--db path. ext15 #175."
+            "--db path."
         ),
     )
     args = parser.parse_args(argv)
 
-    # ext15 #175: freshness guard.
+    # Freshness guard.
     db_path = Path(args.db)
     if db_path.exists() and db_path.stat().st_size > 0 and not args.append:
-        # Check whether the DB has evaluation_runs rows.
         try:
             import duckdb as _duckdb
             with _duckdb.connect(str(db_path), read_only=True) as _conn:
@@ -145,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
             existing = 1  # file exists; err on the side of blocking
         if existing > 0:
             logger.error(
-                "ext15 #175: --db %s already contains %d evaluation_runs rows. "
+                "--db %s already contains %d evaluation_runs rows. "
                 "Refusing to append silently. Pass --append to acknowledge, "
                 "or use a fresh path. Each longitudinal run must be one campaign.",
                 db_path, existing,
@@ -175,7 +161,6 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         logger.info("LangFuse tracing disabled: %s", exc)
 
-    # --- Imports ---
     from src.orchestrator.pipeline import create_pipeline
     from src.orchestrator.tool_loader import ToolLoader
     from src.registry.evaluation_store import EvaluationStore
@@ -190,7 +175,6 @@ def main(argv: list[str] | None = None) -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "eval").mkdir(parents=True, exist_ok=True)
 
-    # --- Build task sequence ---
     rng = random.Random(args.seed)
     task_sequence = []
     while len(task_sequence) < args.n_tasks:
@@ -199,15 +183,11 @@ def main(argv: list[str] | None = None) -> int:
         task_sequence.extend(batch)
     task_sequence = task_sequence[: args.n_tasks]
 
-    # tmp.md P2 (2026-04-22): use full uuid4 entropy (128 bits) instead
-    # of truncated 8-hex (32 bits). No uniqueness constraint on run_id
-    # in the schema; collision would silently merge distinct campaigns.
+    # Use full uuid4 entropy; run_id has no uniqueness constraint in the
+    # schema, so collisions would merge distinct campaigns.
     run_id = f"longitudinal_{uuid.uuid4().hex}"
-    # Security audit finding #87 (2026-04-19, ext9): per-invocation
-    # timestamp threaded into the LangFuse session_id so two runs with
-    # the same ``--seed`` don't pool their traces into one session in
-    # the LangFuse UI. Campaign-scoped (one value per invocation) so
-    # every task in the sequence shares the same session.
+    # Thread a campaign timestamp into the LangFuse session_id so two runs
+    # with the same seed do not pool their traces into one UI session.
     _campaign_start = datetime.now().strftime("%Y%m%d-%H%M%S")
     logger.info("Run ID: %s (campaign %s)", run_id, _campaign_start)
     logger.info(
@@ -216,7 +196,6 @@ def main(argv: list[str] | None = None) -> int:
         [t.task_id for t in task_sequence],
     )
 
-    # --- ONE snapshot restore ---
     import gc
     try:
         import chromadb
@@ -225,27 +204,21 @@ def main(argv: list[str] | None = None) -> int:
         pass
     gc.collect()
 
-    # ext7 #51: acquire the advisory lock before mutating shared registry dirs.
-    # Refuses (exit 2) if another runner already holds it — concurrent runs
-    # corrupt the shared chroma/skills/snapshot state. Retain in a local so the
-    # OS releases the lock on process exit.
+    # Acquire the advisory lock before mutating shared registry dirs. Refuse
+    # if another runner already holds it; concurrent runs corrupt shared
+    # chroma/skills/snapshot state.
     from scripts._eval_registry_lock import acquire_runner_lock
     _eval_lock = acquire_runner_lock(
         runner_name="run_longitudinal", data_dir=DATA_DIR / "eval",
     )
 
-    # Security audit finding #31 (2026-04-20): clean the two registry
-    # directories BEFORE snapshotting so the "clean baseline" captures
-    # an actually-empty state, not whatever a prior run left behind.
-    # Seed AFTER the clean to produce a known (seeded-only) baseline;
-    # re-snapshot over the seeded state so downstream restores hit
-    # that same known baseline.
+    # Clean registry directories before snapshotting, seed a known baseline,
+    # then snapshot that seeded state for downstream restores.
     #
     # Generated MCP tools are persisted as ``source_code`` metadata in
     # ChromaDB, not as source-tree files. Clean ChromaDB + skills only.
     import shutil as _shutil
-    # Safety net for security audit finding #86: refuse to rmtree any
-    # directory that lives inside project source.
+    # Safety net: never rmtree project source directories.
     _project_source_roots = (
         (ROOT / "src").resolve(),
         (ROOT / "scripts").resolve(),
@@ -257,9 +230,8 @@ def main(argv: list[str] | None = None) -> int:
             if _resolved == _root or _root in _resolved.parents:
                 raise RuntimeError(
                     f"Refusing to rmtree {_resolved!s} — inside project "
-                    f"source {_root!s}. Security audit finding #86 "
-                    f"(ext9). Use a path under data/eval/ for runtime "
-                    f"state."
+                    f"source {_root!s}. Use a path under data/eval/ for "
+                    f"runtime state."
                 )
         if _d.exists():
             _shutil.rmtree(_d)
@@ -275,23 +247,14 @@ def main(argv: list[str] | None = None) -> int:
         collection_name="capabilities",
     )
     seed_registry(registry)
-    # ext8 #71 (2026-04-20): persist MetricsStore WITHIN a run so
-    # maintenance_burden (and any other state the Pillar 3 optimizer
-    # accumulates across pipeline recompiles) survives. The path is
-    # co-located with the longitudinal DB for per-campaign isolation.
-    #
-    # ext11 #113 (2026-04-20): the previous fix never reset the DB between
-    # script invocations, so a second ``uv run scripts/run_longitudinal.py``
-    # inherited the prior run's final utility scores, invocation counts,
-    # and prune-event history — cycle-1 KL was computed against Day-1's
-    # converged state, prune thresholds fired on stale combined counts,
-    # and Chapter 6 numbers were silently non-reproducible. Default now:
-    # wipe the DB at invocation start. Cross-invocation accumulation is
-    # still available via --reuse-metrics-store for explicit experiments.
+    # Persist MetricsStore within a campaign so optimizer state survives
+    # pipeline recompiles, but reset it between invocations by default for
+    # reproducible cycle-1 baselines. --reuse-metrics-store opts into
+    # cross-invocation accumulation.
     _metrics_store_path = Path(DATA_DIR / "eval" / "longitudinal_metrics_store.duckdb")
     if not args.reuse_metrics_store and _metrics_store_path.exists():
         _metrics_store_path.unlink()
-        logger.info("ext11 #113: wiped %s for a clean baseline", _metrics_store_path)
+        logger.info("wiped %s for a clean baseline", _metrics_store_path)
     metrics_store = MetricsStore(db_path=str(_metrics_store_path))
     loader = ToolLoader()
 
@@ -314,8 +277,8 @@ def main(argv: list[str] | None = None) -> int:
         now_utc,
     )
 
-    # ext12 #119: campaign-level wall-clock deadline. Per-task watchdog alone
-    # can't bound total campaign time if many tasks each take just-under-budget.
+    # Per-task watchdogs do not bound total campaign time if many tasks each
+    # take just under budget.
     campaign_deadline: float | None = (
         time.monotonic() + args.campaign_budget_hours * 3600
         if args.campaign_budget_hours > 0 else None
@@ -323,17 +286,14 @@ def main(argv: list[str] | None = None) -> int:
     per_task_aborted = False
     campaign_deadline_hit = False
 
-    # ext13 #125: accumulate per-task flush results so we can exit 5 when
-    # any batch failed silently. Pre-fix, cycle_flush swallowed every
-    # persistence error and returned None, hiding partial telemetry that
-    # then cascaded into silent-downgrade KL analysis (#124) + silent-M3
-    # skips (#126). The runner now owns the detection.
+    # Accumulate per-task flush results so partial telemetry can produce a
+    # non-zero campaign exit.
     flush_results: list[FlushResult] = []
 
     for i, task in enumerate(task_sequence):
         if campaign_deadline is not None and time.monotonic() > campaign_deadline:
             logger.error(
-                "ext12 #119: campaign deadline exhausted at task %d/%d; stopping early.",
+                "campaign deadline exhausted at task %d/%d; stopping early.",
                 i, len(task_sequence),
             )
             campaign_deadline_hit = True
@@ -342,13 +302,11 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Task %d/%d: %s", i + 1, len(task_sequence), task.task_id)
         logger.info("=" * 60)
 
-        # Step 18.7 / 18.8 (2026-04-17): capture the pre-task timestamp so
-        # the post-task cycle_events flush can filter MetricsStore's
-        # capability_events to just this task's events.
+        # Capture the pre-task timestamp so the post-task flush can filter
+        # MetricsStore capability_events to this task's events.
         task_events_cutoff = now_utc()
         t_start = time.monotonic()
 
-        # Create pipeline with optimizer enabled
         pipeline = create_pipeline(
             registry,
             loader,
@@ -373,12 +331,8 @@ def main(argv: list[str] | None = None) -> int:
             f"static_coverage:{str(task.has_static_coverage).lower()}",
             *(f"format:{fmt}" for fmt in sorted(_file_fmts)),
         ]
-        # Security audit finding #87 (2026-04-19, ext9): derive the
-        # LangFuse session_id from ``--seed`` AND the campaign start
-        # time so two back-to-back invocations with the same seed don't
-        # pool their traces into one LangFuse session. ``_campaign_start``
-        # is computed once below at the top of main() so every task in
-        # a single invocation shares the same session_id.
+        # Include the campaign timestamp in the LangFuse session so repeated
+        # seed values stay separated in the UI.
         _lf_session = f"longitudinal-{args.seed}-{_campaign_start}"
 
         invoke_config: dict = {}
@@ -386,9 +340,8 @@ def main(argv: list[str] | None = None) -> int:
             invoke_config["callbacks"] = [langfuse_handler]
             invoke_config["metadata"] = {
                 "langfuse_session_id": _lf_session,
-                # Step 13.7 tagging audit (2026-04-18) — user_id
-                # differentiates longitudinal runs from eval-harness and
-                # ad-hoc programmatic traces in per-user LangFuse dashboards.
+                # Separate longitudinal runs from eval-harness and ad-hoc
+                # programmatic traces in per-user LangFuse dashboards.
                 "langfuse_user_id": "longitudinal-runner",
                 "langfuse_tags": _lf_tags,
                 "task_id": task.task_id,
@@ -401,41 +354,31 @@ def main(argv: list[str] | None = None) -> int:
         # identically with the harness path.
         from src.orchestrator.task_state_builder import build_initial_state
         initial_state = build_initial_state(task)
-        # Step 13.7 tag-propagation fix (2026-04-19): wrap the pipeline
-        # invocation + post-task flush in trace_context so events from
-        # ThreadPool workers (verification, adversarial), LangChain @tool
-        # callbacks (sandbox_execute), and the flush itself inherit tags.
+        # Wrap the pipeline invocation and post-task flush so worker-thread,
+        # tool, and flush events inherit the campaign trace metadata.
         with trace_context(
             tags=_lf_tags,
             session_id=_lf_session,
             user_id="longitudinal-runner",
         ):
             try:
-                # ext12 #119: SIGALRM-bounded per-task invocation. A hung
-                # Docker container / stalled LangFuse API / DeepAgent
-                # recursion plateau now raises BudgetExceeded in main
-                # thread rather than blocking the campaign indefinitely.
+                # Bound each task so Docker stalls, LangFuse stalls, or agent
+                # loops raise BudgetExceeded in the main thread.
                 with budget_watchdog(
                     args.per_task_budget_seconds,
                     name=f"task-{i + 1}-{task.task_id}",
                     logger_=logger,
                 ):
                     final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
-                # Security audit finding #27 (2026-04-20): pass metrics_store
-                # so compositional execution records invocations to the
-                # shared DB. Pre-fix, default None disabled recording and
-                # every longitudinal run produced an empty invocations
-                # table — collapsing Gini / KL / utility analyzers to
-                # flat-line output.
+                # Pass the shared metrics_store so compositional execution
+                # records invocation telemetry for KL, Gini, and utility
+                # analysis.
                 result = _extract_result(
                     final_state, task, loader,
                     metrics_store=metrics_store,
                 )
-                # Step 13.7 Batch B6 parity with harness.py:815-834 —
-                # capture LangFuse root trace ID so
-                # ``evaluation_runs.langfuse_trace_id`` is populated and
-                # Stage 6 trace audits can fetch by ID instead of
-                # session-scan. Never raises.
+                # Capture the LangFuse root trace ID so evaluation_runs can be
+                # joined back to the trace directly.
                 if langfuse_handler is not None:
                     try:
                         _lf_trace_id = getattr(
@@ -447,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
                         pass
             except BudgetExceeded as exc:
                 logger.error(
-                    "ext12 #119: task %s aborted by per-task watchdog: %s. "
+                    "task %s aborted by per-task watchdog: %s. "
                     "Recording synthetic failure record; continuing with "
                     "remaining tasks.",
                     task.task_id, exc,
@@ -470,13 +413,9 @@ def main(argv: list[str] | None = None) -> int:
 
             elapsed_ms = int((time.monotonic() - t_start) * 1000)
 
-            # tmp.md P0 (2026-04-22): thread every key _extract_result
-            # returns through EvaluationRecord. Pre-fix, compositional /
-            # artifact / contract / snapshot fields were silently defaulted
-            # (chain_length=1, chain_success=False, generated_artifact_count=0,
-            # output_shape_mismatch=False, generated_artifact_sources=[]),
-            # hiding longitudinal contract and artifact evidence from
-            # downstream audits that inspect evaluation_runs directly.
+            # Thread every key _extract_result returns through EvaluationRecord
+            # so downstream analysis sees compositional, artifact, contract,
+            # and snapshot evidence.
             record = EvaluationRecord(
                 run_id=run_id,
                 condition="longitudinal",
@@ -514,13 +453,9 @@ def main(argv: list[str] | None = None) -> int:
             eval_store.record_run(record)
             records.append(record)
 
-            # Step 18.7 / 18.8 (2026-04-17): persist per-task cycle state
-            # (invocation_events + cycle_utility_scores + cycle_events) for
-            # Chapter 6 KL/Gini/convergence analysis via
-            # scripts/analyze_longitudinal.py. Never-raises — flush failure
-            # is accumulated below and surfaces as a non-zero campaign exit.
-            # ext13 #125: capture the FlushResult so partial flush surfaces
-            # as a non-zero exit code at campaign end.
+            # Persist per-task cycle telemetry for KL/Gini/convergence
+            # analysis. Flush failures are accumulated and surfaced as a
+            # non-zero campaign exit.
             fr = flush_task_cycle_state(
                 eval_store=eval_store,
                 metrics_store=metrics_store,
@@ -529,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
                 condition="longitudinal",
                 task_id=task.task_id,
                 task_events_cutoff=task_events_cutoff,
-                is_pilot=False,  # ext7 #50 — longitudinal is always non-pilot
+                is_pilot=False,  # longitudinal is always non-pilot
             )
             flush_results.append(fr)
 
@@ -606,11 +541,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001
             pass
 
-    # ext13 #125: surface partial flush at campaign end. The per-batch
-    # `FlushResult` accumulated across the loop lets us distinguish
-    # "telemetry fully landed" from "some batches silently dropped",
-    # which directly drives analyze_longitudinal.py's KL/Gini/convergence
-    # conclusions downstream.
+    # Surface partial telemetry flushes at campaign end. The accumulated
+    # FlushResult values distinguish complete telemetry from dropped batches.
     n_bad_invocations = sum(1 for r in flush_results if not r.invocations_ok)
     n_bad_utility = sum(1 for r in flush_results if not r.utility_scores_ok)
     n_bad_events = sum(1 for r in flush_results if not r.events_ok)
@@ -619,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if partial_flush:
         logger.error(
-            "ext13 #125: per-task flush partial failures detected. "
+            "per-task flush partial failures detected. "
             "invocations=%d/%d bad, utility=%d/%d bad, events=%d/%d bad. "
             "M6 analysis (analyze_longitudinal.py) will see partial "
             "telemetry and may fail strict utility-score checks. "
@@ -629,13 +561,9 @@ def main(argv: list[str] | None = None) -> int:
             n_bad_events, len(flush_results),
         )
 
-    # ext12 #119: surface watchdog aborts as non-zero exit codes so
-    # orchestrators (cron, CI) can distinguish clean completion from
-    # campaign-level degradation. Campaign-deadline exit (5) takes
-    # precedence over per-task abort (3) because hitting the deadline
-    # implies the campaign did not attempt every task in the sequence.
-    # ext13 #125: partial-flush exit code (5) shares the slot with
-    # campaign-deadline — both are "campaign did not complete cleanly".
+    # Surface watchdog aborts and partial telemetry as non-zero exit codes.
+    # Campaign deadline takes precedence because it means the run did not
+    # attempt every task.
     # Precedence: deadline > partial-flush > per-task-abort.
     if campaign_deadline_hit:
         return 5

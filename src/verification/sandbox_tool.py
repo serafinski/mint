@@ -46,7 +46,6 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
     Results are cached in ``_pip_resolution_cache`` for the session.
     Falls back to identity mapping (import name = pip name) on any error.
     """
-    # Check cache — only query uncached imports.
     uncached = [name for name in import_names if name not in _pip_resolution_cache]
     if not uncached:
         return {name: _pip_resolution_cache[name] for name in import_names}
@@ -84,7 +83,6 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
                     missing,
                 )
 
-        # Update cache with LLM results.
         for name in uncached:
             pip_name = result.mappings.get(name, name)
             _pip_resolution_cache[name] = pip_name
@@ -440,7 +438,6 @@ def _sandbox_execute_with_install(
         subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
         return {"stdout": "", "stderr": str(exc), "exit_code": -1, "success": False}
 
-    # Run the actual code against the ephemeral image.
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(code)
         script_path = f.name

@@ -145,16 +145,10 @@ def _get_llm():
 # ---------------------------------------------------------------------------
 
 _HYPHEN_CASE_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
-# NOTE: Intentional asymmetry with ``mcp_tool._SNAKE_CASE_RE`` (which is
-# ``r"^[a-z][a-z0-9_]*$"`` — no leading underscore). Agent *node names* appear
-# as LangGraph node identifiers and as DeepAgent subagent keys where a
-# ``_private_subagents`` / ``_helper`` convention is meaningful, so a leading
-# underscore is allowed. MCP tool names must stay import-safe because the
-# sandbox runner materializes generated source as Python modules, which
-# forbids leading underscores. Any future unifier
-# should preserve this difference — see
-# ``tests/unit/test_agent_generator.py::test_node_name_with_leading_underscore_is_valid``
-# and ``tests/unit/test_mcp_tool_generator.py::TestValidateToolName::test_starts_with_underscore``.
+# Agent node names appear as LangGraph node identifiers and DeepAgent subagent
+# keys, where helper-style names such as ``_private_subagents`` are valid. MCP
+# tool names use a stricter import-safe rule because generated source is
+# materialized as Python modules.
 _SNAKE_CASE_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
@@ -205,12 +199,11 @@ def _validate_result(result: AgentGenerationResult) -> list[str]:
                 "skill_content validation skipped: agent_name is invalid"
             )
         else:
-            # Run full quick_validate.py check (same as skill generator does)
             is_valid, msg = validate_skill_content(result.skill_content, result.agent_name)
             if not is_valid:
                 errors.append(f"skill_content failed validation: {msg}")
             else:
-                # Verify the frontmatter name matches agent_name so DeepAgents can load the skill
+                # DeepAgents loads the skill by its frontmatter name.
                 content_name = extract_skill_name(result.skill_content)
                 if content_name and content_name != result.agent_name:
                     errors.append(
@@ -266,14 +259,12 @@ def _generate_single_agent(
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
     # handler propagates automatically via LangChain's contextvar inheritance.
 
-    # First attempt
     try:
         result: AgentGenerationResult = structured_llm.invoke(prompt)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Agent generation LLM call failed for %r: %s", gap.query, exc)
         return None, f"Agent generation failed for '{gap.query}': {exc}"
 
-    # Validate
     validation_errors = _validate_result(result)
 
     # Repair pass (one attempt)
@@ -324,7 +315,6 @@ def _generate_single_agent(
             )
             return None, f"Agent generation invalid after repair for '{gap.query}': {error_str}"
 
-    # Build the agent_config dict
     node_config = {
         "name": result.node_name,
         "model": result.model,
@@ -402,7 +392,6 @@ def _validate_lead_result(result: LeadWithSubagentsResult) -> list[str]:
     if not result.is_deep_agent:
         errors.append("is_deep_agent must be true for lead-with-subagents")
 
-    # Validate subagents
     if not result.subagents:
         errors.append("subagents list must not be empty")
     else:
@@ -465,14 +454,12 @@ def _generate_lead_with_subagents(
         model_default=DEFAULT_LLM_MODEL,
     )
 
-    # First attempt
     try:
         result: LeadWithSubagentsResult = structured_llm.invoke(prompt)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Lead-with-subagents generation failed: %s", exc)
         return None, f"Lead-with-subagents generation failed: {exc}"
 
-    # Validate
     validation_errors = _validate_lead_result(result)
 
     # Repair pass (one attempt)
@@ -504,7 +491,6 @@ def _generate_lead_with_subagents(
             logger.warning("Lead-with-subagents still invalid after repair: %s", error_str)
             return None, f"Lead-with-subagents invalid after repair: {error_str}"
 
-    # Build agent_config with subagents
     node_config = {
         "name": result.node_name,
         "model": result.model,
@@ -583,7 +569,6 @@ def generate_agent(
 
     # On retry, skip gaps already covered by passing artifacts.
     existing_gap_queries = {a.gap_query for a in artifacts if a.gap_query is not None}
-    # Also check subagent_gap_queries on existing artifacts
     for a in artifacts:
         if a.agent_config and a.agent_config.get("subagent_gap_queries"):
             existing_gap_queries.update(a.agent_config["subagent_gap_queries"])

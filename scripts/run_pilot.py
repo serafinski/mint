@@ -434,7 +434,6 @@ def main() -> int:
             try:
                 with watchdog_cm:
                     if args.n_runs == 1 and not args.all_conditions:
-                        # Single pilot run
                         records = harness.run_pilot(tasks, condition=condition)
                     else:
                         records = harness.run_condition(condition, tasks)

@@ -2,8 +2,7 @@
 
 Produces:
 - Disaggregated success rates (all tasks vs synthesis-only T04-T20)
-  (ext15 #163: labels derived from ALL_TASKS; T01-T03 retrieval tasks,
-  T04-T20 synthesis tasks as of 2026-04-22)
+  (labels derived from ALL_TASKS; T01-T03 are retrieval tasks)
 - Exact binomial 95% confidence intervals
 - gate_passed and output_in_range as separate columns
 - Fisher's exact test (each JIT condition vs static, per task)
@@ -34,12 +33,8 @@ sys.path.insert(0, str(ROOT))
 CONDITIONS = ["full", "no_verification", "no_optimization", "static"]
 RETRIEVAL_TASKS = {"T01", "T02", "T03"}
 
-# Security audit finding #17 (2026-04-20): pre-fix hard-coded
-# ``range(1, 19)`` silently dropped T19 and T20 from every per-task
-# table — both the only exploratory-AGENT task (T19) and the only
-# policy-SKILL task (T20), exactly the two tasks Chapter 6's per-type
-# analysis most depends on. Import from the single source of truth so
-# any future testbed extension flows through automatically.
+# Import the task list from the testbed source of truth so summary tables
+# cannot drift when tasks are added or renamed.
 from tests.evaluation.tasks import ALL_TASKS  # noqa: E402
 
 ALL_TASK_IDS = [t.task_id for t in ALL_TASKS]
@@ -118,24 +113,16 @@ def load_data(db_path: str) -> duckdb.DuckDBPyConnection:
     return duckdb.connect(db_path, read_only=True)
 
 
-# Security audit finding #38 (2026-04-20): module-level scope filter
-# resolved at ``main()`` startup. Every SQL query appends this fragment
-# to its WHERE clause so analyzers operate on a single run-set. Empty
-# string when no scoping is requested (legacy behavior). Populated by
-# ``_resolve_scope`` below.
+# Module-level scope filter resolved once at ``main()`` startup. Every SQL
+# query appends this fragment so analyzers operate on one run-set.
 _SCOPE_SQL: str = ""
 
-# ext7 #52 (2026-04-20): banner to mark Chapter-6 output tables as
-# [INCOMPLETE: ...] when --allow-incomplete was used. Populated at startup
-# from the completeness check; empty when the dataset matches the expected
-# campaign shape.
+# Banner used when --allow-incomplete lets a partial campaign proceed.
 _COMPLETENESS_BANNER: str = ""
 
 
-# ext7 #46: canonical eval shape is --n-runs 3 per condition × 4 conditions
-# = 12 distinct run_ids, not 4. Pre-fix auto-select of "4 most recent" silently
-# dropped 3 of 4 conditions on a canonical eval DB. Configurable via
-# --per-condition-cap.
+# Canonical eval shape is --n-runs 3 per condition across 4 conditions, so
+# auto-select needs a per-condition cap rather than a global "latest N".
 _DEFAULT_PER_CONDITION_CAP = 3
 
 
@@ -149,12 +136,9 @@ def _scope_for_table(table: str, scope_sql: str | None = None) -> str:
     ``_SCOPE_SQL`` to queries against those tables crashes DuckDB with
     ``Binder Error: Referenced column "timestamp" not found in FROM clause``.
 
-    ext11 #110 (2026-04-20): pre-fix, ``print_gini_summary`` hand-rewrote
-    ``run_id`` → ``ie.run_id`` but did nothing for the ``--since`` case, so
-    ``--since`` scoped invocations of the Gini query crashed hard. This
-    helper rewrites the column name when the active scope is
-    ``--since``-based. ``--run-ids`` / auto-select scopes use ``run_id``
-    which all three tables share, so this is a no-op for those cases.
+    For ``--since`` scopes this rewrites the column name to ``occurred_at``.
+    ``--run-ids`` and auto-select scopes use ``run_id``, which all three
+    tables share, so they pass through unchanged.
     """
     if scope_sql is None:
         scope_sql = _SCOPE_SQL
@@ -171,20 +155,14 @@ def _resolve_scope(
 ) -> str:
     """Return a SQL WHERE fragment that scopes queries to a single run-set.
 
-    Security audit finding #38 (2026-04-20): pre-fix, ``analyze_results.py``
-    pooled every non-pilot row in the DB. When the DB contains multiple
-    runs (re-runs after code changes, different configs, etc.), every
-    table mixes populations.
+    Multi-run DBs can contain reruns after code changes or different configs,
+    so default reporting must scope to one comparable run-set:
 
-    Resolution:
     - Explicit ``run_ids`` → filter on exactly those.
     - ``since`` → filter on timestamp.
     - Neither: auto-select the ``per_condition_cap`` most recent run_ids
-      PER CONDITION (ext7 #46 — the canonical eval-protocol shape is
-      ``--n-runs 3 × 4 conditions = 12 distinct run_ids``, so a fixed
-      4-total cap silently drops 3 of 4 conditions). Default: 3 per
-      condition. Fails loud with exit code 2 if the selected set doesn't
-      cover every condition present in the DB.
+      per condition. This preserves the canonical eval-protocol shape of
+      ``--n-runs 3 × 4 conditions = 12 distinct run_ids``.
 
     Returns "" when no scoping is applied (legacy mode — unsafe on
     multi-run DBs).
@@ -216,13 +194,8 @@ def _resolve_scope(
     if total_available <= max(condition_count, 1):
         return ""
 
-    # ext12 #114: pre-fix this CTE ranked ROWS (one row per task) via
-    # ROW_NUMBER(), then DISTINCT-collapsed. On the canonical eval shape of
-    # 20 tasks per run, rn <= 5 picked 5 rows from the single most recent
-    # run, then DISTINCT collapsed to 1 run_id per condition. The inner
-    # ``distinct_runs`` CTE now collapses to one row per (run_id, condition)
-    # BEFORE ranking, so ROW_NUMBER() ranks distinct run_ids and rn <= N
-    # correctly selects N run_ids per condition.
+    # Rank distinct run_ids per condition, not task rows. A run has many task
+    # rows, so ranking before this collapse would over-sample the newest run.
     selected_rows = conn.execute(
         """
         WITH distinct_runs AS (
@@ -248,9 +221,8 @@ def _resolve_scope(
     latest = [r[0] for r in selected_rows]
     selected_conditions = {r[1] for r in selected_rows}
 
-    # Loud-fail if the auto-select dropped any condition. Under fixed
-    # condition-order (see #48), a 4-total auto-select could cover exactly
-    # one condition — worst-case bias is condition-dependent.
+    # Loud-fail if auto-select dropped any condition; downstream comparisons
+    # require every condition in scope.
     if len(selected_conditions) < condition_count:
         print(
             f"ERROR: auto-select covered {len(selected_conditions)}/{condition_count} "
@@ -280,14 +252,8 @@ def query_condition_summary(
 ) -> list[dict]:
     """Per-condition summary: success, gate_pass, output_in_range counts.
 
-    Security audit finding #79 (2026-04-19, ext9): every correctness
-    column now applies the SAME shape-mismatch tightening — pre-fix
-    ``successes`` tightened by ``NOT output_shape_mismatch`` but the
-    sibling ``output_in_range`` column did not, so Table 1 readers saw
-    contradictory headline numbers ("90% Output OK but only 50%
-    Success") with no column explaining the gap. A new
-    ``shape_mismatch`` count is also reported so the gap is visible
-    directly instead of inferred.
+    Every correctness column applies the same shape-mismatch tightening.
+    ``shape_mismatch`` is reported separately so the gap is visible directly.
     """
     rows = conn.execute(
         f"""
@@ -332,10 +298,8 @@ def query_condition_summary(
 def query_per_task(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """Per-task, per-condition success counts.
 
-    Security audit finding #79 (2026-04-19, ext9): ``output_in_range``
-    applies the shape-mismatch tightening consistently with
-    ``successes`` so per-task rows stay internally coherent. See
-    ``query_condition_summary`` for the root rationale.
+    ``output_in_range`` applies the same shape-mismatch tightening as
+    ``successes`` so per-task rows stay internally coherent.
     """
     rows = conn.execute(
         f"""
@@ -411,11 +375,10 @@ def fmt_p(p: float) -> str:
 def print_condition_table(title: str, data: list[dict]) -> list[str]:
     """Print condition summary table with CIs. Returns CSV lines.
 
-    Security audit finding #79 (2026-04-19, ext9): adds a Shape
-    Mismatch column so readers can see the gap between ``Output OK``
-    (shape-checked) and ``Gate Pass`` (raw validator) directly.
+    Includes a Shape Mismatch column so readers can distinguish
+    shape-checked output from raw gate status.
     """
-    # ext7 #52: append the [INCOMPLETE: ...] banner (if any) to the title.
+    # Append the [INCOMPLETE: ...] banner when --allow-incomplete was used.
     lines = [f"\n{'='*80}", f"  {title}{_COMPLETENESS_BANNER}", f"{'='*80}"]
     header = (
         f"{'Condition':<22} {'Success':>14} {'95% CI':>18} "
@@ -588,14 +551,10 @@ def print_failure_breakdown(
 ) -> None:
     """Print per-condition failure breakdown.
 
-    Security audit finding #85 (2026-04-19, ext9): include a
-    denominator (N) and a rate column so identical failure counts
-    across conditions with different N aren't read as equivalent
-    outcomes. Pre-fix a JIT condition with N=100 and 5 failures
-    looked "as bad as" a static condition with N=20 and 5 failures —
-    5% vs 25%, a 5x invisible gap. ``condition_totals`` is optional
-    for back-compat; absent totals fall back to count-only rendering
-    with an explicit banner.
+    Includes denominator (N) and rate columns so identical failure counts
+    across conditions with different N are not read as equivalent outcomes.
+    ``condition_totals`` is optional for back-compat; absent totals fall
+    back to count-only rendering with an explicit banner.
     """
     lines = [
         f"\n{'='*80}",
@@ -652,7 +611,7 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
     jit_max = max(jit_rates) * 100
     static_rate = static["successes"] / static["n"] * 100 if static["n"] > 0 else 0
 
-    # ext15 #163 (2026-04-22): derive range from ALL_TASKS, not hardcoded literal.
+    # Derive the displayed task range from ALL_TASKS.
     _synth_range = (
         f"{SYNTHESIS_TASK_IDS[0]}-{SYNTHESIS_TASK_IDS[-1]}"
         if SYNTHESIS_TASK_IDS else "none"
@@ -665,12 +624,8 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
         f"{jit_max - static_rate:.1f} pp"
     )
 
-    # Security audit finding #80 (2026-04-19, ext9): report the full-
-    # system gap separately so readers see the headline "full vs
-    # static" number alongside the cluster spread. Pre-fix the cluster
-    # range alone buried the full-system gap at the upper bound and
-    # anchored the lower bound to the weakest ablation — systematically
-    # under-selling the full-system benefit for a hurried reader.
+    # Report the full-system gap separately from the JIT cluster spread so
+    # the main intervention is visible alongside ablations.
     full_cond = next(
         (d for d in jit_conds if d["condition"] == "full"), None
     )
@@ -702,19 +657,10 @@ def print_cluster_analysis(all_data: list[dict], synth_data: list[dict]) -> None
 
     lines.append("")
 
-    # Security audit finding #81 (2026-04-19, ext9): the pooled-JIT
-    # Fisher test is a statistical fallacy — pooling non-exchangeable
-    # ablation conditions (`full`, `no_verification`, `no_optimization`)
-    # into a single bucket treats three different interventions as
-    # samples of one population and inflates N by 3x, shrinking the
-    # p-value artificially. Pre-fix the number was printed alongside
-    # the legitimate per-condition tests with a one-line disclaimer —
-    # a hurried reader could still misquote it as "p_pooled < 0.01
-    # supports JIT". Downgraded here to a DIAGNOSTIC ONLY block,
-    # clearly labeled DO NOT CITE so it can still be inspected during
-    # development without masquerading as a thesis-quotable result.
-    # The per-condition Fisher + Holm-Bonferroni tests above remain the
-    # proposal-correct methodology.
+    # The pooled-JIT Fisher test is diagnostic only. Pooling full,
+    # no_verification, and no_optimization treats distinct interventions as
+    # one population and inflates N, so the per-condition Fisher tests above
+    # remain the citable result.
     jit_total_k = sum(d["successes"] for d in jit_conds)
     jit_total_n = sum(d["n"] for d in jit_conds)
     _, p_pooled = fisher_exact_2x2(
@@ -773,18 +719,17 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> bool:
     Gini coefficient of invocation counts across the registry. Healthy
     registries have moderate inequality; unhealthy ones have extreme skew."*
 
-    Reads from the persistent ``invocation_events`` table (Step 18.5
-    harness wiring). Groups invocations by (condition, run_id) and
-    computes one Gini per run; reports mean + spread across the N runs
-    per condition. Also reports a condition-level aggregate Gini (all
-    invocations pooled).
+    Reads from the persistent ``invocation_events`` table. Groups invocations
+    by (condition, run_id) and computes one Gini per run; reports mean +
+    spread across the N runs per condition. Also reports a condition-level
+    aggregate Gini (all invocations pooled).
 
     Degenerate cases (empty counts, all zeros) → Gini 0.0. Conditions
     with no invocation data are skipped (happens if an old eval DB
-    predates Step 18.5 wiring). Returns False when Gini evidence is
+    predates invocation telemetry). Returns False when Gini evidence is
     absent or incomplete.
     """
-    # Check the table exists — old eval DBs won't have it.
+    # Old eval DBs may not have invocation telemetry.
     try:
         conn.execute("SELECT 1 FROM invocation_events LIMIT 1")
     except Exception as exc:  # noqa: BLE001
@@ -793,33 +738,15 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> bool:
         print(f"{'='*80}")
         print(
             f"  (skipped: invocation_events table not available — {exc.__class__.__name__}. "
-            "Re-run the eval with Step 18.5 wiring to populate this.)"
+            "Re-run the eval with invocation telemetry enabled to populate this.)"
         )
         return False
 
     # Per-condition, per-run Gini
-    # ext7 #44: filter by scope BEFORE grouping.
-    # ext7 #50: exclude pilot invocations via the new is_pilot column. Pre-fix
-    # the table had no pilot marker; legacy rows are backfilled via JOIN on
-    # EvaluationStore init. COALESCE defends against any remaining NULL cases.
-    #
-    # ext8 #78 (2026-04-20): exclude invocations of capabilities that were
-    # later pruned (optimizer operation). Pre-fix, pruned caps' historical
-    # high-count invocations remained as "ghost" rows in the Gini
-    # computation, inflating inequality even after the optimizer
-    # successfully reduced active-registry concentration.
-    #
-    # ext11 #109 (2026-04-20): the prune subquery is now correlated on
-    # (capability_id, run_id) AND scoped by ``_scope_for_table("cycle_events")``.
-    # Pre-fix, the subquery selected every prune event across the whole DB
-    # — pruning ``cap_x`` in run B erased run A's invocations of ``cap_x``
-    # from run A's Gini. Correlating on run_id confines the exclusion to the
-    # run that actually pruned the cap; scoping the subquery is
-    # belt-and-suspenders for future cross-run bugs.
-    #
-    # ext11 #110 (2026-04-20): both fragments go through ``_scope_for_table``
-    # so ``--since`` rewrites the column to ``occurred_at`` instead of the
-    # ``timestamp`` column that only exists on ``evaluation_runs``.
+    # Scope before grouping, exclude pilot rows, and remove capabilities
+    # pruned within the same run. The prune subquery is correlated by
+    # (capability_id, run_id) so a prune in one run cannot erase another
+    # run's invocation history.
     scope_ie = _scope_for_table("invocation_events").replace(
         " AND run_id ", " AND ie.run_id "
     )
@@ -860,21 +787,16 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> bool:
         print("  Gini Coefficient of Capability Invocation Counts")
         print(f"{'='*80}")
         print("  (skipped: invocation_events table is empty)")
-        # ext13 #126: globally-empty invocation_events used to silently
-        # exit 0 with M3 absent from Chapter 6. Return False so main()
-        # accumulates this in ``missing_metrics`` and exits 7.
+        # Return False so main() can report M3 as a missing active metric.
         return False
 
     # Group by (condition, run_id) → counts keyed by capability, so we
     # can zero-pad against the per-condition active-registry proxy
     # below. Also collect the per-condition union of capability ids.
     #
-    # ext15 #162 (2026-04-22): ``by_condition`` is now a dict keyed by
-    # capability_id that sums across runs, so the Aggregate column is
-    # computed on ``[capA_total, capB_total, ...]`` as the proposal-
-    # intended "pooled distribution over capabilities" — not on the raw
-    # per-(run, capability) list that would treat a permutation-
-    # symmetric workload (capA-only run + capB-only run) as inequality.
+    # The aggregate column pools by capability across runs. That measures the
+    # condition-level capability distribution rather than the raw
+    # per-(run, capability) list.
     from collections import defaultdict
     by_run: dict[tuple[str, str], dict[str, int]] = defaultdict(dict)
     by_condition_capsum: dict[str, dict[str, int]] = defaultdict(
@@ -886,17 +808,9 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> bool:
         by_condition_capsum[cond][cap_id] += int(inv_count)
         condition_caps[cond].add(cap_id)
 
-    # Security audit finding #96 (2026-04-19, ext9): zero-pad the
-    # per-run counts with all capabilities that were EVER invoked
-    # within this condition. Pre-fix the Gini was computed only over
-    # caps actually invoked in that specific run, so a run that used
-    # one cap 100 times reported Gini=0.0 (perfect equality of a
-    # single-element list) when the proposal-correct measure — "how
-    # concentrated are invocations across the registry?" — demanded
-    # ~0.95 (extreme concentration). Using the per-condition
-    # cap-union as the denominator is an approximation of the active
-    # registry size (legacy DBs don't carry cap-registry size per run)
-    # and correctly registers unused active caps as zeros.
+    # Zero-pad each run with the per-condition capability union so unused
+    # capabilities count as zeros. Otherwise a run that used one capability
+    # repeatedly would look perfectly equal because the vector has length one.
     condition_ginis: dict[str, list[float]] = defaultdict(list)
     for (cond, _run_id), run_counts in by_run.items():
         all_caps_for_condition = condition_caps[cond]
@@ -928,8 +842,7 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> bool:
             )
             continue
         mean = sum(run_ginis) / len(run_ginis)
-        # ext15 #162: aggregate over capability totals (pooled by capability
-        # across runs), not over raw per-(run,cap) counts.
+        # Aggregate over capability totals, not raw per-(run, cap) counts.
         aggregate = _gini_coefficient(list(by_condition_capsum[cond].values()))
         label = CONDITION_LABELS.get(cond, cond)
         print(
@@ -945,10 +858,8 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> bool:
         "\"healthy registry\" prediction is moderate values (~0.3-0.6)."
     )
 
-    # ext13 #128: per-condition coverage check. ext13 #126 already covers
-    # the globally-empty case above; this sibling handles the case where
-    # invocation_events has rows for SOME conditions but not all — the
-    # JIT-vs-static M3 comparison needs every condition present.
+    # Per-condition coverage check: M3 comparisons need invocation evidence
+    # for every condition, not just at least one condition.
     missing_conditions = [
         cond for cond in CONDITIONS
         if not condition_ginis.get(cond)
@@ -962,13 +873,8 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> bool:
         )
         return False
 
-    # ext14 #147 (2026-04-21): per-(condition, run_id) M3 completeness
-    # check. ext13 #128's gate above fires only when an ENTIRE CONDITION
-    # has no invocations. A complete evaluation_runs shape (3 runs/cond)
-    # paired with invocation_events for only 1 run/cond silently passes
-    # that gate — Chapter 6's "N runs" column lies. Cross-check
-    # per-condition invocation coverage against the expected
-    # per-condition run_id count in evaluation_runs.
+    # Cross-check per-run coverage too. A condition can have some invocation
+    # rows while still missing telemetry for one or more run_ids.
     expected_per_condition = dict(conn.execute(
         f"""
         SELECT condition, COUNT(DISTINCT run_id)
@@ -989,7 +895,7 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> bool:
             for c, p, e in per_run_gaps
         )
         print(
-            f"\n  ⚠ M3 partial per-run coverage: {gap_str} (ext14 #147)",
+            f"\n  ⚠ M3 partial per-run coverage: {gap_str}",
             file=sys.stderr,
         )
         return False
@@ -998,11 +904,6 @@ def print_gini_summary(conn: duckdb.DuckDBPyConnection) -> bool:
 
 def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
     """Core-Work Classification Accuracy — task-level primary-type match.
-
-    ext15 #164 (2026-04-22): returns ``bool`` — True on success, False
-    on skip — so main() can accumulate into ``missing_metrics`` and
-    exit 7 when this active Chapter 6 metric is absent.
-
 
     Operational proxy for proposal Pillar 1 RQ #1:
         *"How accurately can an LLM classify capability gaps into the
@@ -1063,6 +964,9 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
     implementation). The three JIT conditions (no_verification /
     no_optimization / full) all exercise the classifier; their
     aggregate is the Chapter 6 headline number.
+
+    Returns ``True`` when the metric is available and ``False`` when it
+    should be reported as missing by ``main()``.
     """
     expected_map: dict[str, str | None] = {t.task_id: t.expected_type for t in ALL_TASKS}
     scorable = {tid for tid, et in expected_map.items() if et is not None}
@@ -1072,16 +976,11 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
         print("  (operational proxy for Pillar 1 RQ #1; see docstring for framing)")
         print(f"{'='*80}")
         print("  (skipped: no tasks have expected_type assigned)")
-        return False  # ext15 #164
+        return False
 
-    # ext15 #166 (2026-04-22): explicit JIT whitelist, not blacklist.
-    # Pre-fix ``condition != 'static'`` silently admitted non-baseline
-    # labels (longitudinal, longitudinal_shift, future ablations, enum
-    # drift) into the pooled confusion matrix.
-    # ext15 #181 (2026-04-22): filter on ``generated_artifact_count > 0``.
-    # Pure registry-match rows (classifier never ran; capability_type
-    # carries the pre-registered descriptor) must NOT be scored as
-    # classifier judgment. Two-layer defense: SQL filter + footer.
+    # Use an explicit JIT-condition whitelist and require generated artifacts.
+    # Pure registry-match rows bypass the classifier and are excluded from the
+    # denominator.
     total_rows_before_filter = conn.execute(
         f"""
         SELECT COUNT(*)
@@ -1109,7 +1008,7 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
         print("  (operational proxy for Pillar 1 RQ #1; see docstring for framing)")
         print(f"{'='*80}")
         print("  (skipped: no non-pilot JIT-condition rows with generated_artifact_count > 0)")
-        return False  # ext15 #164
+        return False
 
     # Per-condition accuracy
     from collections import defaultdict
@@ -1178,7 +1077,7 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
             f"  {exp:<11} | {cells} | {row_total:>9}   {row_acc:>7.1f}%"
         )
 
-    # ext15 #181 (2026-04-22): disclosure footer for excluded registry-match rows.
+    # Disclosure footer for excluded registry-match rows.
     if excluded_registry_only > 0:
         print(
             f"\n  Note: {excluded_registry_only} row(s) excluded from the "
@@ -1187,16 +1086,11 @@ def print_classification_accuracy(conn: duckdb.DuckDBPyConnection) -> bool:
             f"Pillar 1 RQ #1 proxy is scored over classifier-invoked rows only."
         )
 
-    return True  # ext15 #164
+    return True
 
 
 def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> bool:
-    """M5 time-to-first-correct execution per condition (Step 18.9).
-
-    ext16 #177 (2026-04-22): returns ``bool`` — True if at least one JIT
-    condition had a successful run to report on, False when no successful
-    runs exist in scope OR JIT-condition coverage is incomplete.
-
+    """M5 time-to-first-correct execution per condition.
 
     Per proposal §Evaluation Strategy M5: *"Latency from task input to
     verified correct output, including any JIT generation time."* The
@@ -1208,6 +1102,7 @@ def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> bool:
     correct output) and must be excluded before aggregation.
 
     Reports mean / median / p95 / stdev over successful runs per condition,
+    and returns ``False`` if the scoped data cannot support the metric.
     plus the count of excluded rows with the exclusion rationale.
     """
     rows = conn.execute(
@@ -1285,10 +1180,8 @@ def print_latency_summary(conn: duckdb.DuckDBPyConnection) -> bool:
     for line in lines:
         print(line)
 
-    # ext16 #177: M5 completeness gate. No successful runs → M5 evidence
-    # is structurally absent → signal missing_metrics up the chain. Also
-    # flag partial per-JIT-condition coverage (one JIT condition with
-    # zero successful runs while others have coverage).
+    # M5 is absent if there are no successful runs, or if any JIT condition
+    # has no successful run coverage.
     if not rows:
         return False
     jit_conditions = {"full", "no_verification", "no_optimization"}
@@ -1309,8 +1202,7 @@ def main() -> int:
     parser.add_argument(
         "--run-ids", nargs="+", default=None,
         help="Specific run_ids to include. Default: auto-select the N most "
-             "recent run_ids PER CONDITION (ext7 #46) with stderr WARNING. "
-             "Security audit finding #38 (2026-04-20).",
+             "recent run_ids PER CONDITION with stderr WARNING.",
     )
     parser.add_argument(
         "--since", default=None,
@@ -1321,29 +1213,28 @@ def main() -> int:
         "--per-condition-cap", type=int, default=_DEFAULT_PER_CONDITION_CAP,
         help=f"When auto-selecting (no --run-ids / --since), how many recent "
              f"run_ids to pick per condition. Default matches Stage 1's "
-             f"--n-runs={_DEFAULT_PER_CONDITION_CAP}. ext7 #46.",
+             f"--n-runs={_DEFAULT_PER_CONDITION_CAP}.",
     )
-    # ext7 #52: campaign completeness guard.
+    # Campaign completeness guard.
     parser.add_argument(
         "--expected-tasks", type=int, default=20,
         help="Expected number of distinct task_ids per condition (default: 20, "
-             "matches the canonical T01-T20 evaluation set). ext7 #52.",
+             "matches the canonical T01-T20 evaluation set).",
     )
     parser.add_argument(
         "--expected-runs-per-condition", type=int, default=3,
         help="Expected number of runs per condition (default: 3, matches "
-             "EVAL_PROTOCOL.md Stage 1 and stage1_main_eval.sh --n-runs). ext7 #52.",
+             "EVAL_PROTOCOL.md Stage 1 and stage1_main_eval.sh --n-runs).",
     )
     parser.add_argument(
         "--expected-conditions", type=int, default=4,
         help="Expected number of distinct conditions (default: 4: full, "
-             "no_verification, no_optimization, static). ext7 #52.",
+             "no_verification, no_optimization, static).",
     )
     parser.add_argument(
         "--allow-incomplete", action="store_true",
         help="Proceed even if the scoped dataset doesn't match the expected "
-             "campaign shape. Every output table carries an [INCOMPLETE] banner. "
-             "ext7 #52.",
+             "campaign shape. Every output table carries an [INCOMPLETE] banner.",
     )
     # Track active Chapter 6 metric absences and exit 7 unless the user
     # explicitly opts in with --allow-missing-metrics.
@@ -1364,8 +1255,8 @@ def main() -> int:
 
     conn = load_data(args.db)
 
-    # Security audit finding #38 (2026-04-20): resolve the scope ONCE at
-    # startup; every subsequent query reads module-level _SCOPE_SQL.
+    # Resolve the scope once; every subsequent query reads module-level
+    # _SCOPE_SQL.
     global _SCOPE_SQL
     _SCOPE_SQL = _resolve_scope(
         conn, args.run_ids, args.since, args.per_condition_cap,
@@ -1377,10 +1268,7 @@ def main() -> int:
     ).fetchone()[0]
     print(f"\nTotal non-pilot records: {total}")
 
-    # ext7 #52: dataset-completeness guard. Refuse to produce Chapter-6 output
-    # on a partial campaign unless --allow-incomplete is passed. Partial
-    # datasets with the same visual shape as complete ones silently misrepresent
-    # incomplete data as headline numbers.
+    # Refuse partial campaign data unless --allow-incomplete is passed.
     expected_conditions = args.expected_conditions
     expected_tasks = args.expected_tasks
     expected_runs = args.expected_runs_per_condition
@@ -1409,10 +1297,9 @@ def main() -> int:
         for c in sorted(missing):
             issues.append(f"condition '{c}' missing entirely (0 rows)")
 
-    # ext13 #131: extend ext7 #52's row-count gate with distinct-task
-    # coverage + per-(condition, task_id) uniformity checks. A 400-row
-    # DB of T01 repeated 100x per condition passes the row-count gate
-    # and yields Chapter 6 headlines computed on 1/20 of the testbed.
+    # Row counts are not enough: verify distinct-task coverage and
+    # per-(condition, task_id) uniformity so repeated-task datasets cannot
+    # masquerade as full campaigns.
     per_cond_task_coverage = conn.execute(
         f"SELECT condition, COUNT(DISTINCT task_id) "
         f"FROM evaluation_runs WHERE is_pilot = FALSE{_SCOPE_SQL} "
@@ -1436,9 +1323,7 @@ def main() -> int:
             f"expected {expected_runs}"
         )
 
-    # ext15 #152 (2026-04-22): task-identity check. Row-count passes but
-    # task_id set can be drifted (e.g., T21..T25 after cross-iteration
-    # append, or a manually-modified harness). Assert canonical identity.
+    # Task identity must match the canonical evaluation set.
     canonical_task_ids = set(ALL_TASK_IDS)
     per_cond_observed_tasks = conn.execute(
         f"SELECT condition, task_id FROM evaluation_runs "
@@ -1454,29 +1339,25 @@ def main() -> int:
         if extra:
             issues.append(
                 f"condition '{cond}': non-canonical task_ids "
-                f"{sorted(extra)} (ext15 #152)"
+                f"{sorted(extra)}"
             )
         if missing:
             issues.append(
                 f"condition '{cond}': missing canonical task_ids "
-                f"{sorted(missing)} (ext15 #152)"
+                f"{sorted(missing)}"
             )
 
-    # ext15 #157 (2026-04-22): condition-identity check. Symmetric to
-    # #152 on the condition axis.
+    # Condition identity must match the canonical evaluation set.
     canonical_conditions = set(CONDITIONS)
     observed_conditions = set(condition_map)
     extra_conditions = observed_conditions - canonical_conditions
     if extra_conditions:
         issues.append(
-            f"extra non-canonical conditions: {sorted(extra_conditions)} "
-            f"(ext15 #157)"
+            f"extra non-canonical conditions: {sorted(extra_conditions)}"
         )
 
-    # ext15 #171 (2026-04-22): distinct-run-id cardinality per condition.
-    # Protects Fisher/Holm/CI independence assumptions against pseudo-
-    # replicated data (single run_id per condition with duplicated rows
-    # passing the per-(condition, task_id) uniformity gate).
+    # Distinct run_id cardinality protects Fisher/Holm/CI assumptions against
+    # pseudo-replicated data.
     per_cond_distinct_runs = conn.execute(
         f"SELECT condition, COUNT(DISTINCT run_id) "
         f"FROM evaluation_runs WHERE is_pilot = FALSE{_SCOPE_SQL} "
@@ -1486,8 +1367,7 @@ def main() -> int:
         if n_runs != expected_runs:
             issues.append(
                 f"condition '{cond}': {n_runs} distinct run_ids, "
-                f"expected {expected_runs} — pseudo-replication risk "
-                f"(ext15 #171)"
+                f"expected {expected_runs} — pseudo-replication risk"
             )
 
     if issues and not args.allow_incomplete:
@@ -1495,7 +1375,7 @@ def main() -> int:
             "\nERROR: dataset appears incomplete — refusing to produce Chapter-6 output.\n"
             "Issues:\n  - " + "\n  - ".join(issues) + "\n"
             "Pass --allow-incomplete to override (output will be marked "
-            "INCOMPLETE in every table header). ext7 #52 + ext13 #131.",
+            "INCOMPLETE in every table header).",
             file=sys.stderr,
         )
         return 2
@@ -1512,7 +1392,7 @@ def main() -> int:
         print(f"\nWARNING: proceeding with partial data:{_COMPLETENESS_BANNER}", file=sys.stderr)
 
     # ── Table 1: All tasks ───────────────────────────────────────────────
-    # ext15 #163 (2026-04-22): derive ranges from ALL_TASKS.
+    # Derive ranges from ALL_TASKS.
     _all_range = (
         f"{ALL_TASK_IDS[0]}-{ALL_TASK_IDS[-1]}" if ALL_TASK_IDS else "none"
     )
@@ -1550,21 +1430,17 @@ def main() -> int:
     print_cluster_analysis(all_data, synth_data)
 
     # ── Failure breakdown ────────────────────────────────────────────────
-    # Security audit finding #85 (2026-04-19, ext9): pass condition
-    # totals so the table prints rates alongside counts. ``all_data``
-    # carries the per-condition ``n`` from ``query_condition_summary``.
+    # Pass condition totals so the table prints rates alongside counts.
     failures = query_failure_breakdown(conn)
     condition_totals = {d["condition"]: d["n"] for d in all_data}
     print_failure_breakdown(failures, condition_totals)
 
     # ── Latency summary ──────────────────────────────────────────────────
-    # ext16 #177 (2026-04-22): capture return value for missing_metrics.
     m5_ok = print_latency_summary(conn)
 
-    # ── Core-work classification accuracy (Step 18.5) ────────────────────
+    # ── Core-work classification accuracy ────────────────────────────────
     # Task-level primary-type match as operational proxy for Pillar 1 RQ #1.
     # See print_classification_accuracy docstring for framing rationale.
-    # ext15 #164 (2026-04-22): capture return value for missing_metrics.
     classification_ok = print_classification_accuracy(conn)
 
     # Accumulate active metric absences so we can exit 7 at the bottom
@@ -1575,11 +1451,9 @@ def main() -> int:
     if not print_gini_summary(conn):
         missing_metrics.append("M3 (Gini / Pillar 3 RQ #1)")
 
-    # ext16 #177: M5 latency.
     if not m5_ok:
         missing_metrics.append("M5 (Latency / Chapter 6 time-to-correct)")
 
-    # ext15 #164: Classification Accuracy coverage check.
     if not classification_ok:
         missing_metrics.append("Classification Accuracy / Pillar 1 RQ #1")
 

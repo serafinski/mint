@@ -233,8 +233,7 @@ def validate_skill_content(content: str, skill_name: str) -> tuple[bool, str]:
             "(forward slash, backslash, or null byte are not allowed)"
         )
 
-    # Additional check: non-empty body after frontmatter closing ---
-    # quick_validate.py only validates frontmatter; it does not check body.
+    # quick_validate.py only checks frontmatter; a usable skill also needs a body.
     parts = re.split(r"^---\s*$", content, maxsplit=2, flags=re.MULTILINE)
     if len(parts) >= 3:
         body = parts[2].strip()
@@ -306,7 +305,6 @@ def _generate_single_skill(
 
     is_valid, message = validate_skill_content(content, skill_name)
 
-    # --- Repair pass ---
     if not is_valid:
         logger.warning(
             "Validation failed for skill '%s' — triggering repair pass. "
@@ -368,7 +366,7 @@ def _generate_single_skill(
         return None, error_msg
     logger.info("Wrote skill '%s' to %s", skill_name, target_dir)
 
-    # Override whatever name the LLM chose with the deterministic slug
+    # Persist under the deterministic registry slug.
     if skill_name != forced_name:
         logger.debug(
             "Overriding LLM skill name '%s' with stable slug '%s'",
