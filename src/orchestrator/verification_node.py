@@ -1,4 +1,4 @@
-"""Verification node — runs the three-tier gate on every generated artifact.
+"""Verification node: run the three-tier gate on generated artifacts.
 
 This node sits between the generator chain and ``loading_node``:
 
@@ -16,20 +16,12 @@ On each call the node:
    ``generate_mcp_tool``.  The generators re-run all classified gaps; the
    replace-by-name logic in each generator ensures that re-generated
    artifacts overwrite the old versions rather than accumulating.
-5. If attempts are exhausted AND some artifacts still fail (**§12 finding
-   #14, 2026-04-16**): the node FAILS CLOSED per the proposal's Pillar 2
-   contract (*"Only verified capabilities enter production"*).
-   Concretely: failed artifacts are DROPPED from ``generated_artifacts``
-   so they never register; the sticky flag
-   ``state.verification_succeeded`` is set to ``False``; routing still
-   proceeds to ``loading_node`` (which registers only the remaining
-   passed artifacts) and then through the rest of the pipeline, but the
-   CLI runner and evaluation harness both detect the sticky flag at
-   terminal state and classify the run as VERIFICATION_FAILED with a
-   clear error. This replaces the pre-2026-04-16 fail-open behavior
-   (unverified artifacts kept + executed with warnings), which was a
-   latent drift from the proposal — see master plan §12 finding #14 for
-   the full audit trail.
+5. If attempts are exhausted and some artifacts still fail, the node
+   fails closed: failed artifacts are dropped from
+   ``generated_artifacts`` so they never register, and the sticky
+   ``state.verification_succeeded`` flag is set to ``False``. Routing
+   still proceeds to ``loading_node`` so any passed sibling artifacts
+   can register normally and the pipeline reaches a terminal state.
 
 **No-verification baseline:** ``gate_fn=None`` uses ``_stub_gate``, which
 always returns a passing ``VerificationReport``.  The real ``gate.verify``
@@ -39,14 +31,15 @@ is wired as the default in ``pipeline.py``.
 from __future__ import annotations
 
 import concurrent.futures
+import inspect
 import logging
 from collections.abc import Callable
 from typing import Literal
 
+from langgraph.config import get_config as _get_langgraph_config
 from langgraph.types import Command
 
-from src.orchestrator.tracing import emit_langfuse_event
-from src.schemas.capability import CapabilityType  # noqa: F401 — available for gate impls
+from src.orchestrator.tracing import emit_langfuse_event, submit_with_context, trace_context
 from src.schemas.task import GeneratedArtifact, TaskState, TaskStatus
 from src.schemas.verification import Severity, VerificationFinding, VerificationReport
 
@@ -57,16 +50,16 @@ MAX_VERIFICATION_WORKERS = 4
 
 
 # ---------------------------------------------------------------------------
-# Stub gate (Iteration 2 placeholder — always passes)
+# Stub gate for the no-verification baseline
 # ---------------------------------------------------------------------------
 
 
 def _stub_gate(artifact: GeneratedArtifact) -> VerificationReport:
-    """Stub verification gate: every artifact passes.
+    """Return a passing report without running the real verification gate.
 
-    Replaced by the real tiered gate (``src/verification/gate.py``) in
-    Iteration 3.  Keeps the pipeline runnable end-to-end while the gate is
-    being developed.
+    ``pipeline.py`` uses this when ``verification_enabled=False`` so the
+    no-verification baseline can exercise the rest of the runtime without
+    Tier 1-3 checks.
     """
     return VerificationReport(
         capability_name=artifact.capability_name,
@@ -90,33 +83,30 @@ def verification_node(
     Args:
         state: Current pipeline state.
         gate_fn: Callable that takes a ``GeneratedArtifact`` and returns a
-            ``VerificationReport``.  Defaults to ``_stub_gate`` (always passes)
-            until the real gate is available in Iteration 3.
+            ``VerificationReport``. Defaults to ``_stub_gate`` for the
+            no-verification baseline.
 
     Returns:
         A ``Command`` that either:
-        - routes to ``"loading_node"`` when all artifacts pass or attempts are
-          exhausted (fail open), or
+        - routes to ``"loading_node"`` when all artifacts pass, or when
+          attempts are exhausted and failed artifacts have been dropped
+          fail-closed, or
         - routes back to ``"generate_mcp_tool"`` with only the passing artifacts
           in state so generators regenerate only the failed capabilities.
     """
     if gate_fn is None:
         gate_fn = _stub_gate
 
-    # Step 14.12: when the task carries ``allow_network=True``, thread it
-    # through to the real gate so Tier 2 / Tier 3 probe under the same
-    # network policy the artifact will execute under. The stub gate
-    # ignores this kwarg, so wrapping unconditionally is safe — but we
-    # guard with a capability check to preserve signatures that don't
-    # accept it (legacy tests patch gate_fn with a strict 1-arg lambda).
-    import inspect as _inspect
-
+    # When the task allows network access, thread the same policy into
+    # the real gate so Tier 2/Tier 3 probes match the execution context.
+    # Custom gates may still expose a strict one-argument signature, so
+    # only pass the kwarg when the callable accepts it.
     task_allow_network = bool(getattr(state, "allow_network", False))
     if task_allow_network:
         try:
-            sig = _inspect.signature(gate_fn)
+            sig = inspect.signature(gate_fn)
             accepts_network = "allow_network" in sig.parameters or any(
-                p.kind == _inspect.Parameter.VAR_KEYWORD
+                p.kind == inspect.Parameter.VAR_KEYWORD
                 for p in sig.parameters.values()
             )
         except (TypeError, ValueError):
@@ -142,34 +132,25 @@ def verification_node(
         new_attempt_count,
     )
 
-    # Pass LangFuse metadata to adversarial prober (runs in worker threads
-    # where get_config() is unavailable). Must be set before the pool starts.
-    #
-    # Fix #4 (2026-04-19): also populate ``state.trace_id`` from the
-    # pipeline's CallbackHandler.last_trace_id so the trace_context wrap
-    # below can thread the trace_id into ThreadPool workers. Without this,
-    # state.trace_id stays None (its default) and the workers fall back
-    # to the standalone-span path — which defeats Fix #4's whole point.
-    # handler.last_trace_id IS populated by the time verification_node runs
-    # because earlier pipeline nodes already fired LLM calls.
+    # Pass LangFuse metadata to the adversarial prober before worker
+    # threads start, because LangGraph config is unavailable inside those
+    # workers. Also capture the parent trace ID from the pipeline callback
+    # so worker events can attach to the pipeline trace.
     try:
-        from langgraph.config import get_config as _get_langgraph_config
         from src.verification.adversarial import set_langfuse_metadata
 
         parent_config = _get_langgraph_config()
         parent_meta = (parent_config or {}).get("metadata", {})
         lf_meta = {
-            k: v for k, v in parent_meta.items()
+            k: v
+            for k, v in parent_meta.items()
             if k.startswith("langfuse_") or k in ("task_id", "condition", "run_id", "tier")
         }
         set_langfuse_metadata(lf_meta)
 
-        # Fix #4: extract last_trace_id from the CallbackHandler in the
-        # pipeline's invoke config. LangChain wraps callbacks in a
-        # BaseCallbackManager during LangGraph traversal, so we need to
-        # handle both list form (user-provided) and manager form
-        # (post-traversal). CallbackManager exposes ``handlers`` attr
-        # containing the underlying BaseCallbackHandler list.
+        # LangChain wraps callbacks in a BaseCallbackManager during
+        # LangGraph traversal, so handle both the user-provided list form
+        # and manager objects exposing handler collections.
         if state.trace_id is None:
             _raw_callbacks = (parent_config or {}).get("callbacks")
             if _raw_callbacks is None:
@@ -189,7 +170,7 @@ def verification_node(
                     break
             if state.trace_id is None and _handler_iter:
                 logger.debug(
-                    "Fix #4: found %d callback(s) but none had last_trace_id; "
+                    "Found %d callback(s) but none had last_trace_id; "
                     "ThreadPool events will fall back to standalone-span path. "
                     "Handler types: %s",
                     len(_handler_iter),
@@ -199,19 +180,30 @@ def verification_node(
         pass
 
     # On retry, skip artifacts that already have a passing verification
-    # report — they haven't changed and re-verifying them wastes Tier 2/3 cost.
-    already_passed: set[str] = set()
+    # report and the same content hash. A regenerated artifact with the
+    # same name but modified source must be verified again.
+    from src.verification.gate import compute_artifact_hash
+
+    already_passed_hash: dict[str, str] = {}
     for report in state.verification_results:
         if report.overall_passed:
-            already_passed.add(report.capability_name)
+            # Empty hash on older persisted rows forces re-verification.
+            already_passed_hash[report.capability_name] = report.artifact_hash or ""
+
+    def _is_already_passed(art: GeneratedArtifact) -> bool:
+        prior_hash = already_passed_hash.get(art.capability_name)
+        if not prior_hash:
+            return False
+        return compute_artifact_hash(art) == prior_hash
 
     artifacts_to_verify = [
         a for a in state.generated_artifacts
-        if a.capability_name not in already_passed
+        if not _is_already_passed(a)
     ]
-    # Artifacts with existing passing reports go straight to passed list.
+    # Artifacts with existing passing reports AND matching hash go straight
+    # to passed list.
     for a in state.generated_artifacts:
-        if a.capability_name in already_passed:
+        if _is_already_passed(a):
             passed_artifacts.append(a)
 
     logger.info(
@@ -220,23 +212,14 @@ def verification_node(
         len(state.generated_artifacts) - len(artifacts_to_verify),
     )
 
-    # Fix #4 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
-    # wrap the ThreadPool in a trace_context(trace_id=state.trace_id) so
-    # events emitted from inside the gate / adversarial / coverage
-    # workers (which run in separate threads where neither LangGraph's
-    # contextvar nor LangFuse SDK's contextvar is available) attach to
-    # the parent pipeline trace via TraceContext instead of creating
-    # standalone wrapper traces. ~80% fewer sibling traces in the
-    # LangFuse UI; every verification.tier_*.{pass,reject},
-    # adversarial.*, verification.coverage.* event nests as a child of
-    # the originating pipeline trace.
-    from src.orchestrator.tracing import trace_context as _trace_context
-
     # Run gate_fn in parallel — each call is independent (isolated Docker sandbox).
-    with _trace_context(trace_id=state.trace_id), \
+    # ``trace_context`` and ``submit_with_context`` keep LangFuse events
+    # emitted by gate/adversarial/coverage workers attached to the parent
+    # pipeline trace instead of relying on a shared global fallback.
+    with trace_context(trace_id=state.trace_id), \
          concurrent.futures.ThreadPoolExecutor(max_workers=MAX_VERIFICATION_WORKERS) as pool:
         future_to_artifact = {
-            pool.submit(gate_fn, artifact): artifact
+            submit_with_context(pool, gate_fn, artifact): artifact
             for artifact in artifacts_to_verify
         }
         for future in concurrent.futures.as_completed(future_to_artifact):
@@ -285,19 +268,17 @@ def verification_node(
             new_attempt_count,
         )
     elif new_attempt_count >= MAX_ATTEMPTS:
-        # §12 finding #14 (2026-04-16): FAIL CLOSED per the proposal's
-        # Pillar 2 contract. Drop the failed artifacts (they never
-        # register) and set the sticky verification_succeeded=False flag
-        # so the CLI runner / evaluation harness classify the run as
-        # verification_failed. Still route to loading_node so any
-        # passed-sibling artifacts register normally, and so the pipeline
-        # reaches a terminal state (never-raises contract preserved).
+        # Fail closed: drop failed artifacts before registration and set
+        # the sticky verification_succeeded=False flag so terminal
+        # callers classify the run as verification_failed. Still route to
+        # loading_node so passed sibling artifacts register normally and
+        # the pipeline reaches a terminal state.
         goto = "loading_node"
         artifacts_to_keep = passed_artifacts
         verification_succeeded = False
         logger.warning(
             "Verification failed for %d artifact(s) after %d attempt(s) — "
-            "failing CLOSED per proposal Pillar 2 (§12 finding #14). "
+            "failing closed under the verified-capabilities contract. "
             "Dropping failed artifacts: %s",
             len(failed_artifacts),
             new_attempt_count,
@@ -314,7 +295,7 @@ def verification_node(
         )
         errors.append(
             f"Verification failed after {new_attempt_count} attempt(s); "
-            "task classified as VERIFICATION_FAILED per Pillar 2 contract. "
+            "task classified as VERIFICATION_FAILED. "
             "Failed artifacts dropped from registry: "
             + ", ".join(a.capability_name for a in failed_artifacts)
         )

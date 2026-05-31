@@ -1,9 +1,9 @@
-"""Evolutionary operations: prune, split, merge.
+"""Evolutionary optimizer operations: prune, split, merge.
 
-Type scoping (post-Steps-5/6/7/8, 2026-04-15):
-- Prune: all types (unchanged)
-- Split: all types — see _split_tools / _split_skills / _split_agents (Step 8)
-- Merge: all types — see _merge_tools / _merge_skills / _merge_agents (Step 6)
+Current type scoping:
+- Prune: all capability types.
+- Split: all capability types via _split_tools / _split_skills / _split_agents.
+- Merge: all capability types via _merge_tools / _merge_skills / _merge_agents.
 
 All merge and split operations produce a ``GeneratedArtifact`` with
 real executable content (not metadata-only stubs) and route it through
@@ -22,14 +22,14 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from langchain.chat_models import init_chat_model
-
-from src.config import DEFAULT_LLM_MODEL
 from pydantic import BaseModel, Field
 
+from src.config import DEFAULT_LLM_MODEL
 from src.orchestrator.tracing import emit_langfuse_event
 from src.registry.metrics import MetricsStore
-from src.registry.store import SkillRegistry
+from src.registry.store import CapabilityRegistry
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
+from src.schemas.metrics import InvocationRecord
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import Severity
 
@@ -42,12 +42,12 @@ def _record_and_emit_event(
     event_type: str,
     details: str = "",
 ) -> None:
-    """Record a Pillar 3 op event in BOTH DuckDB and LangFuse (Step 13.7 Batch A3).
+    """Record a Pillar 3 operation event in both DuckDB and LangFuse.
 
-    Previously only DuckDB-native via ``metrics_store.record_event``; now
-    mirrors to LangFuse as ``pillar3.<event_type>`` so Chapter 5.3's
-    per-operation narrative is traceable in the LangFuse UI without a
-    DuckDB join. Never raises — both sides are best-effort.
+    Mirrors ``metrics_store.record_event`` to LangFuse as
+    ``pillar3.<event_type>`` so optimizer operations are traceable from the
+    LangFuse UI without a DuckDB join. Never raises — both sides are
+    best-effort.
 
     Event level: ``WARNING`` for rollbacks (``verification_rollback``,
     ``split_rollback``), ``DEFAULT`` otherwise.
@@ -74,25 +74,10 @@ def _langfuse_config() -> dict:
     """Return a LangChain config dict inheriting parent session_id / tags /
     user_id from the active LangGraph config (best-effort).
 
-    Step 13.7 Batch A2 (2026-04-18): merge/split LLM traces link to the
-    triggering task's session. Without this, optimizer-path traces
-    appear orphaned in LangFuse (not joinable to the originating Phase 4
-    record) and Chapter 5.3 navigation requires a DB join.
-
-    Fix #3 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
-    Previously constructed a fresh ``LangfuseHandler()`` and added it to
-    ``base["callbacks"]``. But ``operations.py`` runs inside
-    ``optimizer_node`` which is itself a LangGraph node under the parent
-    ``pipeline.invoke`` config — where a CallbackHandler is ALREADY
-    attached. LangChain's ``.invoke(config=lf_config)`` merges callbacks
-    additively, so the same merge/split LLM call would fire BOTH handlers
-    and produce two GENERATION spans per call (pure duplicate).
-
-    Fix: omit the explicit handler. LangGraph propagates the parent
-    ``pipeline.invoke`` CallbackHandler via contextvar, so the LLM call
-    auto-traces under the parent trace — single GENERATION, correctly
-    nested under ``optimizer_node``'s graph position. Metadata inheritance
-    unchanged (tags / session / user still flow through).
+    Optimizer LLM calls run inside ``optimizer_node`` under the parent
+    ``pipeline.invoke`` config. We inherit metadata but do not attach a fresh
+    LangFuse handler, because LangGraph already propagates the parent callback
+    context. Adding another handler would duplicate generation spans.
     """
     base: dict = {}
 
@@ -115,16 +100,14 @@ def _langfuse_config() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Step 5 (B1 Pillar 3, 2026-04-15) — shared verify-and-register-or-rollback
+# Shared verify-and-register-or-rollback helper.
 # ---------------------------------------------------------------------------
 #
 # The merge and split operations produce a GeneratedArtifact with real
-# executable content (not metadata-only stubs like the pre-2026-04-15 code)
-# and must route it through the three-tier verification gate before it
-# enters the registry. The pre-2026-04-15 code path bypassed the gate
-# entirely with a self-justifying comment ("metadata-only, no verification
-# needed"), which violated the proposal's Pillar 2 contract and produced
-# unexecutable descriptors that poisoned the registry.
+# executable content, not metadata-only stubs, and must route it through the
+# three-tier verification gate before it enters the registry. The old
+# metadata-only path bypassed the gate, which violated the proposal's Pillar 2
+# contract and produced unexecutable descriptors that poisoned the registry.
 #
 # The helper below is the single entry point that both merge and split
 # funnel through. Atomicity guarantee: if the gate rejects the artifact,
@@ -140,7 +123,7 @@ def _langfuse_config() -> dict:
 
 def verify_and_register_or_rollback(
     artifact: GeneratedArtifact,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     event_type: str,
@@ -172,7 +155,7 @@ def verify_and_register_or_rollback(
     3. Otherwise build a ``CapabilityDescriptor`` and call
        ``registry.add``. For ``MCP_TOOL`` artifacts the registration
        path delegates to ``ToolLoader.register_tool`` which also runs
-       AST schema extraction (Step 2). For ``SKILL`` and ``AGENT`` the
+       AST schema extraction. For ``SKILL`` and ``AGENT`` the
        descriptor is built directly from ``artifact.input_schema`` and
        ``artifact.output_schema`` which the caller (merge/split) is
        responsible for populating.
@@ -220,10 +203,10 @@ def verify_and_register_or_rollback(
             for f in report.findings
             if f.severity in (Severity.CRITICAL, Severity.HIGH)
         ]
-        reason = (
-            f"gate rejected {name}: "
-            f"{', '.join(blocking) if blocking else 'report.overall_passed=False with no blocking findings'}"
+        blocking_summary = ", ".join(blocking) if blocking else (
+            "report.overall_passed=False with no blocking findings"
         )
+        reason = f"gate rejected {name}: {blocking_summary}"
         logger.warning(
             "verify_and_register_or_rollback(%s): %s", name, reason
         )
@@ -244,7 +227,7 @@ def verify_and_register_or_rollback(
 
 def _register_artifact_directly(
     artifact: GeneratedArtifact,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     event_type: str,
@@ -255,8 +238,8 @@ def _register_artifact_directly(
     """Register an artifact without re-running the verification gate.
 
     Factored out from :func:`verify_and_register_or_rollback` for reuse
-    by Step 8's per-type split helpers, which verify every variant in
-    a batch BEFORE registering any. The split flow is:
+    by the per-type split helpers, which verify every variant in a batch
+    BEFORE registering any. The split flow is:
 
     1. Build N variants from the LLM output.
     2. For each variant, call ``gate.verify()`` — if any fails, abort
@@ -265,18 +248,18 @@ def _register_artifact_directly(
     4. Register each variant via this helper (NO re-verification).
     5. Deactivate the parent.
 
-    Phase 4 must not re-run the gate because Tier 3's adversarial probe
-    is LLM-nondeterministic — a variant that passed phase 2 could fail
-    phase 4 on stochastic variance, which would break atomicity without
-    an obvious rollback path. Instead, the split trusts phase 2's
-    verdict and only registers the artifact here.
+    Registration finalization must not re-run the gate because Tier 3's
+    adversarial probe is LLM-nondeterministic — a variant that passed phase B
+    could fail on stochastic variance, which would break atomicity without an
+    obvious rollback path. Instead, the split trusts phase B's verdict and
+    only registers the artifact here.
 
     For merge, ``verify_and_register_or_rollback`` calls this helper
     directly after its own gate check, so there is no behavior change
     for merge callers — the logic is identical, just refactored.
 
-    MCP_TOOL: delegates to ``ToolLoader.register_tool`` to inherit
-    Step 2's AST schema extraction + source_code persistence.
+    MCP_TOOL: delegates to ``ToolLoader.register_tool`` to inherit AST schema
+    extraction + source_code persistence.
     SKILL / AGENT: builds the descriptor directly from artifact fields.
 
     Never raises. Returns ``(True, None)`` on successful registration,
@@ -291,9 +274,8 @@ def _register_artifact_directly(
         effective_domain = domain or artifact.domain or "generated"
         if artifact.capability_type == CapabilityType.MCP_TOOL:
             # Delegate to ToolLoader.register_tool so we inherit the
-            # AST-based input/output schema extraction from Step 2 AND
-            # the source_code-in-metadata persistence. register_tool
-            # calls registry.add internally.
+            # AST-based input/output schema extraction and source_code
+            # persistence. register_tool calls registry.add internally.
             from src.orchestrator.tool_loader import ToolLoader
             loader = ToolLoader()
             loader.register_tool(
@@ -308,6 +290,26 @@ def _register_artifact_directly(
             # is responsible for populating artifact.input_schema and
             # artifact.output_schema (merge derives from parents, split
             # derives from the parent being specialized).
+            #
+            # Model-claimed schemas must be present before SKILL/AGENT
+            # registration. MCP tools get AST-based schema extraction through
+            # ToolLoader; prose-based artifacts have no equivalent fallback.
+            # A schema-less registration would poison later
+            # compatibility-aware reuse.
+            has_content = bool(
+                artifact.skill_content or artifact.agent_config
+            )
+            has_schemas = bool(
+                (artifact.input_schema or {})
+                or (artifact.output_schema or {})
+            )
+            if has_content and not has_schemas:
+                reason = (
+                    f"schema-less {artifact.capability_type.value} artifact "
+                    f"'{name}' is not registerable"
+                )
+                logger.warning("schema validation failed: %s", reason)
+                return False, reason
             metadata: dict[str, str] = {
                 "generated": "true",
                 "source": "optimizer",
@@ -332,6 +334,9 @@ def _register_artifact_directly(
                 output_schema=dict(artifact.output_schema or {}),
                 tags=list(tags or []),
                 definition_token_cost=count_definition_tokens(artifact),
+                # Preserve generator-declared pip packages through optimizer
+                # registration so merged/split tools keep runtime deps.
+                pip_packages=list(getattr(artifact, "pip_packages", []) or []),
                 metadata=metadata,
             )
             registry.add(descriptor)
@@ -418,7 +423,7 @@ class SplitSkillVariant(_SplitVariantCommon):
 class SplitAgentVariantSubagent(BaseModel):
     """One subagent of one AGENT variant in a split."""
 
-    name: str = Field(..., description="Subagent name (hyphen-case)")
+    name: str = Field(..., max_length=64, description="Subagent name (hyphen-case, max 64 chars)")
     description: str = Field(..., description="One-sentence subagent role")
     system_prompt: str = Field(
         ..., description="Full system prompt for the subagent's isolated context"
@@ -465,9 +470,9 @@ class _SplitResultCommon(BaseModel):
             "and how the failure cases partition into input subspaces. "
             "The proposal's Pillar 3 Split clause calls this 'the input "
             "subspaces where the capability breaks'. This field is the "
-            "LLM's articulation of that partition and is used for "
-            "Chapter 6 analysis — humans can read it to understand what "
-            "the optimizer saw in the failure data."
+            "LLM's articulation of that partition and is used for analysis "
+            "and reporting — humans can read it to understand what the "
+            "optimizer saw in the failure data."
         ),
     )
 
@@ -592,7 +597,7 @@ class MergeSkillsResult(_MergeResultCommon):
 class MergeAgentsSubagent(BaseModel):
     """One subagent in a lead-with-subagents AGENT configuration."""
 
-    name: str = Field(..., description="Subagent name (hyphen-case)")
+    name: str = Field(..., max_length=64, description="Subagent name (hyphen-case, max 64 chars)")
     description: str = Field(..., description="One-sentence description of the subagent's role")
     system_prompt: str = Field(
         ..., description="Full system prompt for the subagent's isolated context"
@@ -637,7 +642,7 @@ class MergeAgentsResult(_MergeResultCommon):
         description=(
             "Subagents the lead can delegate to via the task() tool. "
             "Empty list means the merged agent runs as a solo DeepAgent. "
-            "Total count must not exceed 8 (Step 6d budget ceiling); "
+            "Total count must not exceed the agent budget ceiling; "
             "the caller rejects the merge if this is violated."
         ),
     )
@@ -647,7 +652,7 @@ class MergeAgentsResult(_MergeResultCommon):
 
 
 def prune(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     window_days: int = 30,
@@ -655,6 +660,11 @@ def prune(
     """Deactivate capabilities with zero invocations in the given window.
 
     Applies to ALL capability types.
+
+    Freshly created capabilities are exempt until they age past the prune
+    window. Otherwise the eval harness's `loading_node -> optimizer_node`
+    ordering would deactivate a capability immediately after registration,
+    before any later task in the same run had a chance to reuse it.
 
     Returns:
         List of pruned (deactivated) capability IDs.
@@ -669,10 +679,24 @@ def prune(
         if (cap.metadata or {}).get("pinned") == "true":
             logger.debug("Skipping pinned capability '%s'", cap.name)
             continue
+        if cap.created_at >= cutoff:
+            logger.debug(
+                "Skipping freshly created capability '%s' from prune window "
+                "(created_at=%s, cutoff=%s)",
+                cap.name,
+                cap.created_at.isoformat(),
+                cutoff.isoformat(),
+            )
+            continue
         count = metrics_store.invocations_since(cap.name, cutoff)
         if count == 0:
             registry.deactivate(cap.name)
-            _record_and_emit_event(metrics_store, cap.name, "pruned", f"zero invocations in {window_days}d")
+            _record_and_emit_event(
+                metrics_store,
+                cap.name,
+                "pruned",
+                f"zero invocations in {window_days}d",
+            )
             logger.info("Pruned capability '%s' (zero invocations in %dd)", cap.name, window_days)
             pruned.append(cap.name)
 
@@ -680,7 +704,7 @@ def prune(
 
 
 def split(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     capability_id: str,
     *,
@@ -721,11 +745,10 @@ def split(
     If any of phases 2-4 fail, the function returns ``None`` and
     neither the new variants nor the parent are touched. This is the
     atomic rollback guarantee that couples Pillar 3 Split to Pillar 2's
-    *"must pass all three tiers"* contract the same way merge already
-    does in Step 6.
+    *"must pass all three tiers"* contract the same way merge does.
 
     Args:
-        registry: Skill registry.
+        registry: Capability registry.
         metrics_store: Metrics store for pulling metrics + recording events.
         capability_id: ID of the capability to split.
         llm_model: Model identifier for init_chat_model. Empty string
@@ -768,41 +791,21 @@ _MAX_AGENT_SUBAGENT_BUDGET = 8
 
 
 # ---------------------------------------------------------------------------
-# Step 6 + pre-registered finding #4 from §12 (2026-04-15 end of session)
+# Shared robustness guidance for merge prompts.
 # ---------------------------------------------------------------------------
 #
-# The proposal's Pillar 3 Merge clause says *"The merged version inherits
-# the strongest behavioral patterns from each parent."* True "strongest
-# patterns" selection would require per-parent success metrics on each
-# behavior subspace, which is Chapter 7 work. For now we approximate it
-# via explicit robustness hints in the merge prompts — tell the LLM to
-# prefer battle-tested library patterns, robust error handling, and
-# explicit validation at boundaries.
+# The proposal's Pillar 3 Merge clause says "The merged version inherits
+# the strongest behavioral patterns from each parent." True pattern selection
+# would require per-parent success metrics for each behavior subspace, which is
+# outside the current implementation. For now, the merge prompts use
+# domain-general robustness guidance: prefer reliable libraries, validate inputs
+# at boundaries, and preserve explicit error handling. Avoid naming specific
+# parser libraries or fixture edge cases here; that would bias merges toward one
+# evaluation domain instead of arbitrary user workloads.
 #
-# **Deliberately domain-general — no testbed-specific library names or
-# edge-case examples.** An earlier version of this hint named
-# `csv.Sniffer`, `pandas.read_csv`, `openpyxl`, specific CSV edge cases
-# (BOM markers, line endings, header detection), etc. — that was
-# effective at steering the LLM past the specific bugs seen on
-# `test_split_merge.py`, but it overfit the hint to the Business
-# Analytics testbed. MINT is supposed to work across arbitrary CLI
-# inputs (medical, legal, factory simulation, text analysis, …), and
-# a prompt that biases every merge toward file-format parsing would
-# add noise on non-file-format tasks and hurt generalization. The
-# current hint keeps only domain-general principles so it transfers
-# across verticals. A Phase 5 / Chapter 6 consequence: merge success
-# rates may be lower than a testbed-tuned prompt would show, because
-# the LLM has no hand-holding on the specific edge cases of any one
-# format. This is proposal-aligned (the gate catches bad output) but
-# worth disclosing.
-#
-# This block is injected into all three per-type merge prompts as a
-# shared section. It is the domain-general partial implementation of
-# finding #4 from §12 of docs/MASTER_PLAN_2026_04_13.md — pulled
-# forward from the originally-planned §12 timing because the Step 6
-# merge smoke gave us strong empirical motivation to at least land
-# the general principles now. True per-parent success-metric-driven
-# selection remains Chapter 7 future work.
+# Shared by all three per-type merge prompts. Metric-driven
+# per-parent pattern selection is a future implementation boundary, not current
+# behavior.
 
 _MERGE_ROBUSTNESS_HINT = """\
 ## Robustness requirements (Pillar 3 "strongest behavioral patterns")
@@ -889,7 +892,7 @@ def _invoke_structured_with_repair(
 
 def _merge_tools(
     caps: list[CapabilityDescriptor],
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -1004,7 +1007,7 @@ def _merge_tools(
 
 def _merge_skills(
     caps: list[CapabilityDescriptor],
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -1130,7 +1133,7 @@ def _merge_skills(
 
 def _merge_agents(
     caps: list[CapabilityDescriptor],
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -1239,7 +1242,7 @@ def _merge_agents(
         )
         return None
 
-    # Build the merged agent_config dict that the execution backend expects.
+    # Execution backends expect AGENT capabilities to carry agent_config.
     agent_config: dict = {
         "system_prompt": result.combined_system_prompt,
         "is_deep_agent": True,
@@ -1249,6 +1252,14 @@ def _merge_agents(
             sa.model_dump() for sa in result.combined_subagents
         ]
 
+    merged_input_schema: dict[str, str] = {}
+    merged_output_schema: dict[str, str] = {}
+    for c in caps:
+        for k, v in (c.input_schema or {}).items():
+            merged_input_schema.setdefault(k, v)
+        for k, v in (c.output_schema or {}).items():
+            merged_output_schema.setdefault(k, v)
+
     all_tags = list({tag for c in caps for tag in c.tags})
 
     artifact = GeneratedArtifact(
@@ -1256,6 +1267,8 @@ def _merge_agents(
         capability_type=CapabilityType.AGENT,
         description=result.description,
         agent_config=agent_config,
+        input_schema=merged_input_schema,
+        output_schema=merged_output_schema,
         gap_query=None,
         domain=caps[0].domain,
     )
@@ -1286,7 +1299,7 @@ def _merge_agents(
 
 
 def merge(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     capability_ids: list[str],
     *,
@@ -1300,9 +1313,9 @@ def merge(
     - All parents ``MCP_TOOL`` → :func:`_merge_tools`
     - All parents ``SKILL`` → :func:`_merge_skills`
     - All parents ``AGENT`` → :func:`_merge_agents`
-    - Mixed types → ``ValueError`` (cross-type merge is Chapter 7
-      future work — the merged executable content only makes sense
-      within a single type).
+    - Mixed types → ``ValueError``. Cross-type merge is explicitly unsupported
+      because the merged executable content only makes sense within a single
+      type.
 
     Each per-type helper produces a ``GeneratedArtifact`` with real
     executable content, routes it through
@@ -1314,7 +1327,7 @@ def merge(
     optimizer-generated capabilities.
 
     Args:
-        registry: Skill registry.
+        registry: Capability registry.
         metrics_store: Metrics store for event recording.
         capability_ids: IDs of capabilities to merge (typically 2,
             but per-type helpers accept any ≥ 2).
@@ -1371,37 +1384,33 @@ def merge(
 
 
 # ---------------------------------------------------------------------------
-# Step 8 + finding #4/#5 — per-type split helpers
+# Per-type split helpers.
 # ---------------------------------------------------------------------------
 #
 # The split operation produces a ``GeneratedArtifact`` per variant with
-# real executable content (not metadata-only stubs like the pre-2026-04-16
-# code) and routes each through a five-phase atomic flow:
+# real executable content and routes each through a five-phase atomic flow:
 #
 #   Phase A. Build N variants from the LLM output.
 #   Phase B. ``gate.verify()`` each variant (no registration). If any
 #            variant fails, abort without touching the registry.
 #   Phase C. ``verify_coverage`` on all variants collectively. MCP_TOOL
 #            runs the replay loop; SKILL/AGENT return vacuously passing
-#            per the MCP_TOOL-only coverage scope (see §12 finding #5
-#            in docs/MASTER_PLAN_2026_04_13.md — Pillar 1 × Pillar 3
-#            tension analysis).
+#            per the MCP_TOOL-only coverage scope.
 #   Phase D. Register each variant via ``_register_artifact_directly``
 #            (no re-verification — Tier 3 is LLM-nondeterministic and
 #            re-running risks breaking atomicity on stochastic variance).
 #   Phase E. Deactivate the parent only after all variants registered.
 #
 # If any phase fails, the function returns ``None`` — parent stays
-# active, no variants registered. This mirrors Step 6's merge atomicity
-# guarantee at the multi-variant level.
+# active, no variants registered. This mirrors merge atomicity at the
+# multi-variant level.
 #
-# The robustness hint below is the split-side counterpart to Step 6's
+# The robustness hint below is the split-side counterpart to
 # ``_MERGE_ROBUSTNESS_HINT`` — same four general principles (prefer
 # library defaults, handle edge cases, explicit error handling, don't
 # swallow exceptions), framed for split's specialize-to-subspace
 # direction rather than merge's union-across-parents direction. It is
-# deliberately domain-general for the same generalization-concern
-# reasons documented in finding #4.
+# deliberately domain-general for the same generalization concern.
 
 
 _SPLIT_ROBUSTNESS_HINT = """\
@@ -1456,7 +1465,8 @@ really well.
 
 
 def _summarize_failures_for_prompt(
-    failures: list[InvocationRecord], max_cases: int = 5,
+    failures: list[InvocationRecord],
+    max_cases: int = 5,
 ) -> str:
     """Build a human-readable failure-case summary for the split prompt.
 
@@ -1473,7 +1483,10 @@ def _summarize_failures_for_prompt(
     to replay).
     """
     if not failures:
-        return "No recorded failure cases. Identify subspaces from the parent's description alone."
+        return (
+            "No recorded failure cases. Identify subspaces from the parent's "
+            "description alone."
+        )
 
     lines: list[str] = []
     for i, f in enumerate(failures[:max_cases], start=1):
@@ -1490,7 +1503,9 @@ def _summarize_failures_for_prompt(
             f"   failure: {mode}"
         )
     if len(failures) > max_cases:
-        lines.append(f"... plus {len(failures) - max_cases} more failure case(s) not shown.")
+        lines.append(
+            f"... plus {len(failures) - max_cases} more failure case(s) not shown."
+        )
     return "\n".join(lines)
 
 
@@ -1524,10 +1539,10 @@ def _split_phase_b_verify_all(
                 for f in report.findings
                 if f.severity in (Severity.CRITICAL, Severity.HIGH)
             ]
-            reason = (
-                f"variant '{artifact.capability_name}' failed gate: "
-                f"{', '.join(blocking) if blocking else 'overall_passed=False with no blocking findings'}"
+            blocking_summary = ", ".join(blocking) if blocking else (
+                "overall_passed=False with no blocking findings"
             )
+            reason = f"variant '{artifact.capability_name}' failed gate: {blocking_summary}"
             logger.warning("split phase B (%s): %s", context, reason)
             return False, reason
     return True, None
@@ -1536,7 +1551,7 @@ def _split_phase_b_verify_all(
 def _split_finalize(
     parent: CapabilityDescriptor,
     artifacts: list[GeneratedArtifact],
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
 ) -> list[str] | None:
     """Phases D + E: register each verified variant and deactivate parent.
@@ -1575,9 +1590,15 @@ def _split_finalize(
             for prev_name in registered:
                 try:
                     registry.deactivate(prev_name)
-                    _record_and_emit_event(metrics_store, prev_name,
+                    _record_and_emit_event(
+                        metrics_store,
+                        prev_name,
                         "split_rollback",
-                        f"phase D registration failed on sibling '{artifact.capability_name}'",)
+                        (
+                            "phase D registration failed on sibling "
+                            f"'{artifact.capability_name}'"
+                        ),
+                    )
                 except Exception as rollback_exc:  # noqa: BLE001
                     logger.error(
                         "split phase D (%s): rollback of '%s' also failed: %s",
@@ -1587,14 +1608,14 @@ def _split_finalize(
         registered.append(artifact.capability_name)
 
     registry.deactivate(parent.name)
-    _record_and_emit_event(metrics_store, parent.name, "split", f"into {registered}",)
+    _record_and_emit_event(metrics_store, parent.name, "split", f"into {registered}")
     logger.info("Split %s %s → %s", parent.capability_type.value, parent.name, registered)
     return registered
 
 
 def _split_tools(
     parent: CapabilityDescriptor,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -1705,7 +1726,12 @@ def _split_tools(
             "_split_tools: phase B rejected split of %s — %s. Parent stays active.",
             parent.name, reason,
         )
-        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase B: {reason}",)
+        _record_and_emit_event(
+            metrics_store,
+            parent.name,
+            "split_rollback",
+            f"phase B: {reason}",
+        )
         return None
 
     # Phase C — collective coverage verification (MCP_TOOL replay).
@@ -1718,7 +1744,12 @@ def _split_tools(
             "_split_tools: verify_coverage raised on %s: %s. Parent stays active.",
             parent.name, exc,
         )
-        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase C exception: {exc}",)
+        _record_and_emit_event(
+            metrics_store,
+            parent.name,
+            "split_rollback",
+            f"phase C exception: {exc}",
+        )
         return None
 
     if not coverage.all_covered:
@@ -1728,7 +1759,9 @@ def _split_tools(
             parent.name, coverage.status,
             coverage.uncovered_cases, len(coverage.execution_errors),
         )
-        _record_and_emit_event(metrics_store, parent.name,
+        _record_and_emit_event(
+            metrics_store,
+            parent.name,
             "split_rollback",
             (
                 f"phase C coverage: status={coverage.status}, "
@@ -1743,7 +1776,7 @@ def _split_tools(
 
 def _split_skills(
     parent: CapabilityDescriptor,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -1754,12 +1787,11 @@ def _split_skills(
     Same five-phase flow as :func:`_split_tools` but for SKILL parents.
     Coverage verification in phase C dispatches to
     ``CoverageReport(all_covered=True, status="unverifiable_type")``
-    per the MCP_TOOL-only scope documented in §12 finding #5 — SKILL
+    per the MCP_TOOL-only coverage scope — SKILL
     splits rely on the three-tier gate's per-variant safety check
-    alone, the same way SKILL merge already does in Step 6. The
-    coverage call is still made for consistency (and so any future
-    Chapter 7 work that adds SKILL coverage drops in cleanly) but
-    currently it's vacuous.
+    alone, the same way SKILL merge does. The coverage call is still made
+    for consistency so future SKILL coverage can drop in cleanly, but
+    currently it is vacuous.
     """
     from src.verification.coverage import verify_coverage
 
@@ -1861,12 +1893,17 @@ def _split_skills(
             "_split_skills: phase B rejected split of %s — %s. Parent stays active.",
             parent.name, reason,
         )
-        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase B: {reason}",)
+        _record_and_emit_event(
+            metrics_store,
+            parent.name,
+            "split_rollback",
+            f"phase B: {reason}",
+        )
         return None
 
     # Phase C — coverage dispatches to unverifiable_type (vacuous pass)
     # per MCP_TOOL-only scope. Still called for consistency with the
-    # MCP_TOOL path and to make future Chapter 7 extensions drop in.
+    # MCP_TOOL path and to keep the extension point explicit.
     coverage = verify_coverage(
         artifacts, failure_cases, allow_network=allow_network,
     )
@@ -1879,7 +1916,11 @@ def _split_skills(
             "status=%s. Parent stays active.",
             parent.name, coverage.status,
         )
-        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase C (SKILL): {coverage.status}",
+        _record_and_emit_event(
+            metrics_store,
+            parent.name,
+            "split_rollback",
+            f"phase C (SKILL): {coverage.status}",
         )
         return None
 
@@ -1888,7 +1929,7 @@ def _split_skills(
 
 def _split_agents(
     parent: CapabilityDescriptor,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     llm_model: str,
@@ -2011,9 +2052,12 @@ def _split_agents(
             _MAX_AGENT_SUBAGENT_BUDGET,
             parent.name,
         )
-        _record_and_emit_event(metrics_store, parent.name,
+        _record_and_emit_event(
+            metrics_store,
+            parent.name,
             "split_rollback",
-            f"subagent budget exceeded: {total_subagents} > {_MAX_AGENT_SUBAGENT_BUDGET}",)
+            f"subagent budget exceeded: {total_subagents} > {_MAX_AGENT_SUBAGENT_BUDGET}",
+        )
         return None
 
     for v in result.variants:
@@ -2024,7 +2068,9 @@ def _split_agents(
             )
             return None
 
-    # Phase A — build GeneratedArtifacts with agent_config dict.
+    # Phase A — build GeneratedArtifacts. Like SKILL splitting, AGENT
+    # variants inherit the parent's input/output contract; the LLM is
+    # specializing behavior, not redefining the callable schema.
     artifacts: list[GeneratedArtifact] = []
     for v in result.variants:
         agent_config: dict = {
@@ -2040,6 +2086,8 @@ def _split_agents(
                 description=v.description,
                 agent_config=agent_config,
                 gap_query=None,
+                input_schema=dict(parent.input_schema or {}),
+                output_schema=dict(parent.output_schema or {}),
                 domain=parent.domain,
             )
         )
@@ -2053,7 +2101,12 @@ def _split_agents(
             "_split_agents: phase B rejected split of %s — %s. Parent stays active.",
             parent.name, reason,
         )
-        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase B: {reason}",)
+        _record_and_emit_event(
+            metrics_store,
+            parent.name,
+            "split_rollback",
+            f"phase B: {reason}",
+        )
         return None
 
     # Phase C — vacuous for AGENT per MCP_TOOL-only scope.
@@ -2066,7 +2119,11 @@ def _split_agents(
             "status=%s. Parent stays active.",
             parent.name, coverage.status,
         )
-        _record_and_emit_event(metrics_store, parent.name, "split_rollback", f"phase C (AGENT): {coverage.status}",
+        _record_and_emit_event(
+            metrics_store,
+            parent.name,
+            "split_rollback",
+            f"phase C (AGENT): {coverage.status}",
         )
         return None
 

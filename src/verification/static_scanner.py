@@ -1,12 +1,13 @@
-"""Tier 1 static scanner — pure Python, no LLM, no subprocess.
+"""Tier 1 static scanner: pure Python, no LLM, no subprocess.
 
-Uses ``ast`` and ``re`` to detect five contamination categories in generated
-capability source code.  For skill-type capabilities, also runs
+Uses ``ast`` and ``re`` to detect contamination and structural issues in
+generated capability source code. For skill-type capabilities, also runs
 ``tools/quick_validate.py`` as a Tier 0 structural pre-check.
 
 Public API
 ----------
-scan(source_code, capability_name, capability_type="mcp_tool") -> VerificationReport
+scan(source_code, capability_name, capability_type="mcp_tool", allow_network=False)
+    -> VerificationReport
 should_proceed_to_tier2(report) -> bool
 """
 
@@ -24,7 +25,7 @@ from src.schemas.verification import Severity, VerificationFinding, Verification
 # Regex patterns
 # ---------------------------------------------------------------------------
 
-# "sample" intentionally excluded — false-positives on legitimate random.sample() calls.
+# "sample" intentionally excluded: false-positives on legitimate random.sample() calls.
 _MOCK_NAMES = re.compile(
     r"\b(mock|fake|dummy|placeholder|DEMO|TEST_DATA)\b",
     re.IGNORECASE,
@@ -46,7 +47,7 @@ _EXTERNAL_FN_NAMES = re.compile(
     re.IGNORECASE,
 )
 
-# Lorem ipsum placeholder text — never legitimate in real code/data
+# Lorem ipsum placeholder text is never legitimate in real code/data.
 _LOREM_IPSUM = re.compile(r"\blorem ipsum\b", re.IGNORECASE)
 
 
@@ -62,7 +63,7 @@ def _run_skill_precheck(
 
     Returns a tier-0 CRITICAL finding if validation fails, else ``None``.
     """
-    # Import the validate function directly to avoid subprocess
+    # Import the validate function directly to avoid subprocess.
     from tools.quick_validate import validate_skill
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -88,11 +89,53 @@ def _run_skill_precheck(
 # AST-based checks
 # ---------------------------------------------------------------------------
 
+def _resolve_return_expr(val: ast.expr, assignments: dict[str, ast.expr]) -> ast.expr:
+    """Resolve one level of variable indirection for return values."""
+    if isinstance(val, ast.Name):
+        return assignments.get(val.id, val)
+    return val
+
+
+def _dict_key_signature(val: ast.expr) -> tuple[object, ...] | None:
+    """Return a comparable key signature for dict literals with constant keys."""
+    if not isinstance(val, ast.Dict):
+        return None
+    if not all(isinstance(k, ast.Constant) for k in val.keys if k is not None):
+        return None
+    return tuple(k.value for k in val.keys if k is not None)
+
+
+def _has_dynamic_dict_return_with_same_keys(
+    current_return: ast.Return,
+    current_val: ast.Dict,
+    resolved_returns: list[tuple[ast.Return, ast.expr]],
+) -> bool:
+    """Detect fallback summary dicts paired with a real dynamic return.
+
+    This avoids false positives for tools that return a constant empty/default
+    summary in one branch but compute the same output shape dynamically in the
+    main path. Pure hardcoded stubs still fail because they have no matching
+    dynamic return.
+    """
+    current_sig = _dict_key_signature(current_val)
+    if current_sig is None:
+        return False
+
+    for other_return, other_val in resolved_returns:
+        if other_return is current_return or not isinstance(other_val, ast.Dict):
+            continue
+        if _dict_key_signature(other_val) != current_sig:
+            continue
+        if any(not isinstance(v, ast.Constant) for v in other_val.values):
+            return True
+    return False
+
+
 def _check_hardcoded_return(node: ast.AST, findings: list[VerificationFinding]) -> None:
     """Detect literal lists/dicts of >=3 items returned from a function body.
 
-    Also follows one level of variable indirection (B1.2): if the return value
-    is a Name, resolves it to the first assignment in the function scope.
+    Also follows one level of variable indirection: if the return value is a
+    Name, resolves it to the first assignment in the function scope.
     """
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return
@@ -105,13 +148,12 @@ def _check_hardcoded_return(node: ast.AST, findings: list[VerificationFinding]) 
                 if isinstance(target, ast.Name) and target.id not in assignments:
                     assignments[target.id] = stmt.value
 
+    resolved_returns: list[tuple[ast.Return, ast.expr]] = []
     for child in ast.walk(node):
-        if not isinstance(child, ast.Return) or child.value is None:
-            continue
-        val = child.value
-        # Follow one level of variable indirection.
-        if isinstance(val, ast.Name):
-            val = assignments.get(val.id, val)
+        if isinstance(child, ast.Return) and child.value is not None:
+            resolved_returns.append((child, _resolve_return_expr(child.value, assignments)))
+
+    for child, val in resolved_returns:
         if isinstance(val, ast.List) and len(val.elts) >= 3:
             if all(isinstance(e, ast.Constant) for e in val.elts):
                 findings.append(
@@ -119,7 +161,10 @@ def _check_hardcoded_return(node: ast.AST, findings: list[VerificationFinding]) 
                         tier=1,
                         category="hardcoded_data",
                         severity=Severity.CRITICAL,
-                        message=f"Hardcoded list of {len(val.elts)} literal items returned at line {child.lineno}",
+                        message=(
+                            f"Hardcoded list of {len(val.elts)} literal items "
+                            f"returned at line {child.lineno}"
+                        ),
                         location=f"line {child.lineno}",
                     )
                 )
@@ -127,23 +172,28 @@ def _check_hardcoded_return(node: ast.AST, findings: list[VerificationFinding]) 
             if all(isinstance(k, ast.Constant) for k in val.keys if k is not None) and all(
                 isinstance(v, ast.Constant) for v in val.values
             ):
+                if _has_dynamic_dict_return_with_same_keys(child, val, resolved_returns):
+                    continue
                 findings.append(
                     VerificationFinding(
                         tier=1,
                         category="hardcoded_data",
                         severity=Severity.CRITICAL,
-                        message=f"Hardcoded dict of {len(val.keys)} literal items returned at line {child.lineno}",
+                        message=(
+                            f"Hardcoded dict of {len(val.keys)} literal items "
+                            f"returned at line {child.lineno}"
+                        ),
                         location=f"line {child.lineno}",
                     )
                 )
 
 
 def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> None:
-    """Detect bare ``except:`` or ``except Exception: pass`` with no re-raise/logging."""
+    """Detect broad exception handlers with no re-raise or logging."""
     if not isinstance(node, ast.ExceptHandler):
         return
 
-    # Bare except (type is None) or except Exception
+    # Bare except (type is None) or except Exception.
     is_bare = node.type is None
     is_exception = (
         isinstance(node.type, ast.Name) and node.type.id == "Exception"
@@ -153,8 +203,8 @@ def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> 
         return
 
     body = node.body
-    # Check if the body is effectively silent: only `pass`, `return None`,
-    # `return {}`, `return "..."`, or similar swallowed-exception patterns.
+    # Silent handlers are bodies with only pass, return None, return {},
+    # return "...", or similar swallowed-exception patterns.
     has_reraise = False
     has_logging = False
     is_only_pass = len(body) == 1 and isinstance(body[0], ast.Pass)
@@ -162,7 +212,7 @@ def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> 
 
     if len(body) == 1 and isinstance(body[0], ast.Return):
         ret_val = body[0].value
-        # return None (explicit or implicit)
+        # return None (explicit or implicit).
         if ret_val is None:
             is_silent_return = True
         elif isinstance(ret_val, ast.Constant) and ret_val.value is None:
@@ -180,7 +230,6 @@ def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> 
             has_reraise = True
         if isinstance(child, ast.Call):
             func = child.func
-            # Check for logging calls like logger.error, print, log.warning, etc.
             if isinstance(func, ast.Attribute) and func.attr in (
                 "error", "warning", "info", "debug", "critical",
                 "exception", "log", "warn",
@@ -189,7 +238,11 @@ def _check_silent_except(node: ast.AST, findings: list[VerificationFinding]) -> 
             if isinstance(func, ast.Name) and func.id in ("print", "logging"):
                 has_logging = True
 
-    if (is_bare or is_only_pass or is_silent_return) and not has_reraise and not has_logging:
+    if (
+        (is_bare or is_only_pass or is_silent_return)
+        and not has_reraise
+        and not has_logging
+    ):
         if is_bare:
             label = "bare except"
         elif is_only_pass:
@@ -225,7 +278,7 @@ def _check_missing_external_calls(
       network, so claiming to fetch without network imports is a red flag
       (possibly faking data).
     """
-    # Collect all function names
+    # Collect all function names.
     fn_names: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -235,7 +288,6 @@ def _check_missing_external_calls(
     if not external_fn_found:
         return
 
-    # Check if source contains any external import
     has_external_import = bool(_EXTERNAL_IMPORT_PATTERNS.search(source_code))
     if not has_external_import:
         severity = Severity.HIGH if allow_network else Severity.MEDIUM
@@ -344,7 +396,7 @@ def _check_mock_imports(tree: ast.Module, findings: list[VerificationFinding]) -
 
 
 def _check_random_seed(tree: ast.Module, findings: list[VerificationFinding]) -> None:
-    """Detect ``random.seed(<literal>)`` — fake-determinism for stable mock outputs.
+    """Detect ``random.seed(<literal>)`` used to stabilize synthetic outputs.
 
     Also catches ``np.random.seed(<literal>)`` and ``numpy.random.seed(<literal>)``.
     """
@@ -354,10 +406,10 @@ def _check_random_seed(tree: ast.Module, findings: list[VerificationFinding]) ->
         func = node.func
         is_seed = False
         if isinstance(func, ast.Attribute) and func.attr == "seed":
-            # random.seed(...) or np.random.seed(...)
+            # random.seed(...) or np.random.seed(...).
             if isinstance(func.value, ast.Name) and func.value.id in ("random", "np"):
                 is_seed = True
-            # numpy.random.seed(...) — func.value is Attribute(attr='random', value=Name('numpy'))
+            # numpy.random.seed(...).
             elif isinstance(func.value, ast.Attribute) and func.value.attr == "random":
                 is_seed = True
         if is_seed and node.args and isinstance(node.args[0], ast.Constant):
@@ -366,7 +418,10 @@ def _check_random_seed(tree: ast.Module, findings: list[VerificationFinding]) ->
                     tier=1,
                     category="determinism_artifact",
                     severity=Severity.HIGH,
-                    message=f"random.seed() called with literal {node.args[0].value!r} at line {node.lineno}",
+                    message=(
+                        "random.seed() called with literal "
+                        f"{node.args[0].value!r} at line {node.lineno}"
+                    ),
                     location=f"line {node.lineno}",
                 )
             )
@@ -383,7 +438,7 @@ def scan(
     *,
     allow_network: bool = False,
 ) -> VerificationReport:
-    """Run Tier 0 (skills only) + Tier 1 static analysis on source code.
+    """Run Tier 0 (skills only) and Tier 1 static analysis on source code.
 
     Parameters
     ----------
@@ -392,7 +447,8 @@ def scan(
     capability_name:
         Name of the capability being scanned.
     capability_type:
-        One of ``CapabilityType`` values (``"mcp_tool"``, ``"skill"``, ``"agent"``).
+        One of ``CapabilityType`` values: ``"mcp_tool"``, ``"skill"``, or
+        ``"agent"``.
     allow_network:
         Whether the sandbox allows network access.  Affects severity of
         ``missing_external_calls`` findings (MEDIUM offline, HIGH online).
@@ -403,7 +459,7 @@ def scan(
     """
     findings: list[VerificationFinding] = []
 
-    # --- Tier 0: Skill structural pre-check ---
+    # Tier 0: Skill structural pre-check.
     if capability_type == CapabilityType.SKILL:
         tier0_finding = _run_skill_precheck(source_code, capability_name)
         if tier0_finding is not None:
@@ -415,9 +471,9 @@ def scan(
                 tier_reached=0,
             )
 
-    # --- Tier 1: AST + regex ---
-    # AST checks only apply to MCP_TOOL (Python source).  SKILL (YAML/markdown)
-    # and AGENT (JSON config) are not valid Python — skip AST entirely for them
+    # --- Tier 1: AST + regex. ---
+    # AST checks only apply to MCP_TOOL (Python source). SKILL (YAML/markdown)
+    # and AGENT (JSON config) are not valid Python; skip AST entirely for them
     # to avoid spurious SyntaxError findings.
     if capability_type == CapabilityType.MCP_TOOL:
         try:
@@ -439,7 +495,7 @@ def scan(
                 tier_reached=1,
             )
 
-        # AST checks
+        # AST checks.
         for node in ast.walk(tree):
             _check_hardcoded_return(node, findings)
             _check_silent_except(node, findings)
@@ -450,7 +506,7 @@ def scan(
         _check_mock_imports(tree, findings)
         _check_random_seed(tree, findings)
 
-        # Regex checks (MCP_TOOL only — skills/agents are natural-language
+        # Regex checks (MCP_TOOL only): skills/agents are natural-language
         # prose where words like "placeholder" or "mock" appear legitimately
         # in instructions and would produce false positives).
         _check_mock_artifacts(source_code, findings)
@@ -465,8 +521,6 @@ def scan(
         tier_reached=1,
     )
 
-
-
 def should_proceed_to_tier2(report: VerificationReport) -> bool:
-    """Return True if no Critical findings — Tier 2 should run."""
+    """Return True if no Critical findings block Tier 2."""
     return not any(f.severity == Severity.CRITICAL for f in report.findings)

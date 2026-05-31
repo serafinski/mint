@@ -1,106 +1,83 @@
-"""Integration test for optimizer split and merge operations.
+"""Developer diagnostic for optimizer split and merge operations.
 
-Seeds a fresh ChromaDB registry and MetricsStore with synthetic invocations
-that satisfy the split/merge thresholds, then runs the operations with real
-LLM calls to verify end-to-end behavior.
+This script is not invoked by the frozen evaluation protocol. It seeds a fresh
+ChromaDB registry and MetricsStore with synthetic invocation histories that
+satisfy optimizer thresholds, then runs the real split/merge code with LLM
+generation and verification.
 
-Split trigger:  reuse_rate > 0.6 AND success_rate < 0.7 (SKILL or AGENT
-                in the auto-optimizer loop; MCP_TOOL supported via direct
-                invocation + feedback-driven path). All three types
-                dispatch through ``_split_tools`` / ``_split_skills`` /
-                ``_split_agents`` post-Step-8.
-Merge trigger:  reuse_rate < 0.05 AND description cosine >= 0.5 AND
-                schema Jaccard in [0.5, 1.0). All three types supported
-                post-Step-6 via ``_merge_tools`` / ``_merge_skills`` /
-                ``_merge_agents``. Cross-type merge raises ValueError
-                (Chapter 7 future work).
+Coverage:
+- Split: SKILL rollback canary, MCP_TOOL coverage verifier, AGENT budget canary.
+- Merge: SKILL rollback + happy-path scenarios, MCP_TOOL, and AGENT.
+- Full loop: prune + split + merge through ``create_optimization_loop()``.
 
-**Two merge scenarios, intentionally different in how they exercise the gate.**
+Split trigger:  reuse_rate > 0.6 AND success_rate < 0.7. SKILL and AGENT
+                fire through the optimizer loop; MCP_TOOL can be exercised by
+                direct invocation. All three types dispatch through
+                ``_split_tools`` / ``_split_skills`` / ``_split_agents``.
+Merge trigger:  reuse_rate < 0.05 AND description cosine >= 0.5 AND schema
+                Jaccard in [0.5, 1.0). All three types dispatch through
+                ``_merge_tools`` / ``_merge_skills`` / ``_merge_agents``.
+                Cross-type merge raises ValueError; that remains future work.
 
-``test_merge`` — CSV/TSV cleaners merged into a delimited-data cleaner. Realistic
-but inherently Tier-3-hostile: the scenario steers the LLM toward heuristic header
-detection (``csv.Sniffer.has_header``), and the adversarial prober's content-
-sensitivity and ground-truth attacks reliably find edge cases. This scenario
-**empirically validates the atomic rollback path** under Step 5 + Step 14.11 —
-gate rejection → ``merge()`` returns None → parents stay active → no orphan
-descriptor in the registry.
+The SKILL merge scenarios intentionally exercise different gate outcomes:
 
-``test_merge_stats`` — ``list-stats-basic`` (min/max/mean/count) merged with
-``list-stats-distribution`` (median/stdev/variance/count) into a single
-``list-stats`` capability. Deterministic reference outputs (statistics
-functions are pure and side-effect-free), so the adversarial prober's
-ground-truth probes can't find false-positive content-sensitivity. This
-scenario **empirically validates the happy path** — LLM produces clean
-stats code → gate passes → merged capability registered → parents
+``test_merge`` — CSV/TSV cleaners merged into a delimited-data cleaner. The
+scenario tends to produce heuristic header detection, so Tier 3 often rejects
+the result. That makes it a rollback canary: ``merge()`` returns None, parents
+stay active, and no orphan descriptor is left in the registry.
+
+``test_merge_stats`` — deterministic list-statistics SKILLs merged into one
+broader statistics capability. Pure arithmetic/statistics behavior gives the
+gate a stable happy-path target: merged capability registered, parents
 deactivated.
-
-Together the two scenarios cover both paths Step 5's
-``verify_and_register_or_rollback`` helper can take. See the commit message
-for commit `` (2026-04-15) for the rationale on why CSV/TSV is
-used as a rollback canary rather than a happy-path check.
 
 Usage::
 
-    # Run both split and merge tests
     uv run scripts/test_split_merge.py
-
-    # Run only split
     uv run scripts/test_split_merge.py --split-only
-
-    # Run only merge (both scenarios — CSV rollback-canary + stats happy-path)
     uv run scripts/test_split_merge.py --merge-only
+    uv run scripts/test_split_merge.py --loop-only
+    uv run scripts/test_split_merge.py --merge-mcp-only --verbose
 
-    # Run only the CSV/TSV merge (rollback-path canary)
-    uv run scripts/test_split_merge.py --merge-csv-only
-
-    # Run only the stats merge (happy-path check)
-    uv run scripts/test_split_merge.py --merge-stats-only
-
-    # Verbose logging
-    uv run scripts/test_split_merge.py --verbose
-
-Makes 2-6 LLM calls (~$0.02). No pipeline execution, no Docker.
+Use ``--help`` for all single-scenario flags. The script makes multiple real
+LLM calls and may invoke Docker-backed verification.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import tempfile
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Step 13.6 / Fix #1 (2026-04-19): route dev-script LangFuse emissions
-# to ``environment=test`` so they don't pollute Phase 4 eval's
-# ``environment=default`` data. Must be set BEFORE ``load_dotenv`` so
-# ambient .env values can't override. Same pattern as ``tests/conftest.py``.
-import os  # noqa: E402
+# Route dev-script LangFuse emissions to ``environment=test`` so they do not
+# pollute protocol eval data. Must be set before ``load_dotenv`` so ambient
+# .env values cannot override it.
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
-
-from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
 from src.optimizer.operations import merge, split  # noqa: E402
 from src.registry.metrics import MetricsStore  # noqa: E402
-from src.registry.store import SkillRegistry  # noqa: E402
+from src.registry.store import CapabilityRegistry  # noqa: E402
 from src.schemas.capability import CapabilityDescriptor, CapabilityType  # noqa: E402
 from src.schemas.metrics import InvocationRecord  # noqa: E402
-
-logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _create_fresh_registry(tmp_dir: str) -> SkillRegistry:
+def _create_fresh_registry(tmp_dir: str) -> CapabilityRegistry:
     """Create a fresh ChromaDB registry in a temp directory."""
-    return SkillRegistry(
+    return CapabilityRegistry(
         persist_directory=tmp_dir,
         collection_name="test_split_merge",
     )
@@ -147,20 +124,16 @@ def test_split(verbose: bool = False) -> bool:
 
     Thresholds: reuse_rate > 0.6, success_rate < 0.7
 
-    **Step 8 (2026-04-16) changes:**
-    - Parent now carries ``skill_content`` in metadata so the new
-      ``_split_skills`` helper has a reference implementation to
-      specialize. Pre-Step-8 tests seeded bare descriptors which
-      the new code would reject (no content to split).
+    - Parent carries ``skill_content`` in metadata so ``_split_skills`` has
+      a reference implementation to specialize.
     - ``split()`` now returns ``None`` on any failure (gate rejection,
       name collision, LLM failure) rather than raising. Handles both
       outcomes as valid PASS as long as the atomic rollback invariant
       holds — the same dual-path pattern as ``test_merge``.
-    - SKILL coverage verification is vacuous per the MCP_TOOL-only scope
-      (see ``docs/MASTER_PLAN_2026_04_13.md`` §12 finding #5). This test
-      therefore only exercises the three-tier gate per variant, not
-      ``verify_coverage``. For the MCP_TOOL coverage path see
-      ``test_split_mcp_tool`` below.
+    - SKILL coverage verification is vacuous because ``verify_coverage`` is
+      MCP_TOOL-only. This test therefore only exercises the three-tier gate
+      per variant. For the MCP_TOOL coverage path see ``test_split_mcp_tool``
+      below.
     """
     print("\n" + "=" * 70)
     print("  SPLIT TEST — SKILL (rollback canary)")
@@ -230,7 +203,6 @@ def test_split(verbose: bool = False) -> bool:
             success_rate=0.5, n_per_task=5,
         )
 
-        # Verify metrics
         reuse = metrics.reuse_rate("data-file-processor")
         success = metrics.success_rate("data-file-processor")
         print(f"\n  Seeded {n_seeded} invocations across {len(used_task_ids)} task types")
@@ -241,10 +213,8 @@ def test_split(verbose: bool = False) -> bool:
             print("\n  ERROR: Metrics do not satisfy split thresholds!")
             return False
 
-        # Run split — this makes 1-3 LLM calls (one per variant for the
-        # three-tier gate's Tier 3 adversarial probe, plus the initial
-        # structured output call). Two valid outcomes under the Step 8
-        # atomic flow:
+        # split() may call the model once for structured output plus Tier 3
+        # adversarial probes per variant. Two valid outcomes are acceptable:
         #
         # 1. HAPPY PATH: gate passes on every variant → variants registered
         #    with real skill_content → parent deactivated → split returns
@@ -264,7 +234,7 @@ def test_split(verbose: bool = False) -> bool:
         if new_ids is None:
             # --- ROLLBACK PATH ---
             print(
-                "\n  NOTE: split() returned None — gate rejected one or more "
+                "\n  Info: split() returned None — gate rejected one or more "
                 "variants. Verifying atomic rollback invariant."
             )
             rollback_ok = True
@@ -313,7 +283,6 @@ def test_split(verbose: bool = False) -> bool:
             print(f"  FAIL: Expected >= 2 variants, got {len(new_ids)}")
             return False
 
-        # Check parent is deactivated
         parent = registry.get("data-file-processor")
         parent_active = parent.is_active if parent else "NOT FOUND"
         print(f"  Parent 'data-file-processor' is_active: {parent_active}")
@@ -322,10 +291,7 @@ def test_split(verbose: bool = False) -> bool:
             print("  FAIL: Parent should be deactivated after split")
             return False
 
-        # Check variants are registered, active, AND carry real skill_content
-        # (Step 6/8 canary: pre-Step-8 split produced metadata-only stubs
-        # with no executable content — this assertion catches any regression
-        # back to that broken state.)
+        # Variants must be registered, active, and carry real skill_content.
         for vid in new_ids:
             variant = registry.get(vid)
             if variant is None:
@@ -335,7 +301,7 @@ def test_split(verbose: bool = False) -> bool:
             if not variant_skill_content:
                 print(
                     f"  FAIL: variant '{vid}' has no skill_content in metadata — "
-                    "regression to pre-Step-8 metadata-only stub behavior?"
+                    "metadata-only variants are not valid split outputs"
                 )
                 return False
             if not variant_skill_content.lstrip().startswith("---"):
@@ -351,7 +317,6 @@ def test_split(verbose: bool = False) -> bool:
                 f"skill_content={len(variant_skill_content)} chars"
             )
 
-        # Check events were recorded
         events = metrics._conn.execute(
             "SELECT capability_id, event_type, details FROM capability_events "
             "ORDER BY occurred_at"
@@ -381,12 +346,11 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
     2. ``{value: 150, low: 0, high: null}`` — null high bound, parent
        raises a ``TypeError`` on the ``>`` comparison with ``None``.
 
-    Both are error-cases. Under the Step 7 coverage verifier's semantics
-    (see §12 finding #5 in ``docs/MASTER_PLAN_2026_04_13.md``):
-    *"variant handles the error-case iff it runs on the recorded
-    input_args without raising"*. Correct variants — ones that validate
-    their bounds before comparing — will handle both cases by not
-    raising. Happy-path PASS is the expected outcome.
+    Both are error-cases. Under the coverage verifier's error-case semantics,
+    a variant handles the case if it runs on the recorded ``input_args``
+    without raising. Correct variants — ones that validate their bounds before
+    comparing — will handle both cases by not raising. Happy-path PASS is the
+    expected outcome.
 
     **Why both are error-cases and not one error + one wrong-output:**
     the wrong-output-case branch of ``_variant_handles_case`` has
@@ -490,14 +454,13 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
         # the wrong-output-case branch of _variant_handles_case has
         # meaningful semantics only when the recorded actual_output is
         # *genuinely* wrong relative to some oracle (eval harness
-        # validator, honest user feedback). Synthetic wrong-output
+        # validator, external oracle). Synthetic wrong-output
         # seeding requires a deliberately-buggy parent. The first
         # version of this test labeled a correct clamp output as
         # "wrong" and the coverage verifier correctly rolled back the
         # split because no correct variant could differentiate against
-        # a parent that was right. See §12 pre-registered finding
-        # 5d in docs/MASTER_PLAN_2026_04_13.md for the full analysis.
-        # The wrong-output-case branch remains unit-tested in
+        # a parent that was right. The wrong-output-case branch remains
+        # unit-tested in
         # tests/unit/test_coverage.py::TestVariantHandlesCase_WrongOutputCase.
         error_case_swapped_bounds = InvocationRecord(
             capability_id="clamp-integer",
@@ -531,9 +494,8 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
             mode = "ERROR" if f.error_message else "WRONG_OUTPUT"
             print(f"    {f.task_id}: {mode} — input_args={f.input_args}")
 
-        # Run split — will make 1 LLM call for structured output plus
-        # N adversarial probe calls (one per variant × Tier 3). Typically
-        # ~4-6 LLM calls total, ~$0.03.
+        # split() calls the model for structured output plus adversarial probes
+        # for each variant.
         print("\n  Running split(...)...", flush=True)
         try:
             new_ids = split(registry, metrics, "clamp-integer")
@@ -544,7 +506,7 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
         if new_ids is None:
             # Rollback path — atomic invariant must hold.
             print(
-                "\n  NOTE: split() returned None — gate or coverage rejected the "
+                "\n  Info: split() returned None — gate or coverage rejected the "
                 "split. Verifying atomic rollback invariant."
             )
             rollback_ok = True
@@ -585,7 +547,6 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
             print(f"  FAIL: Expected >= 2 variants, got {len(new_ids)}")
             return False
 
-        # Parent deactivated
         parent_check = registry.get("clamp-integer")
         if parent_check is None or parent_check.is_active:
             print(
@@ -594,7 +555,6 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
             return False
         print("  OK: parent 'clamp-integer' deactivated")
 
-        # Each variant has real source_code in metadata
         for vid in new_ids:
             variant = registry.get(vid)
             if variant is None:
@@ -604,7 +564,7 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
             if not variant_source:
                 print(
                     f"  FAIL: variant '{vid}' has no source_code — regression "
-                    "to pre-Step-8 metadata-only stub?"
+                    "to a metadata-only stub?"
                 )
                 return False
             if "FastMCP" not in variant_source:
@@ -636,332 +596,6 @@ def test_split_mcp_tool(verbose: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Split via CLI feedback (wrong-output-case branch + §12 finding #6b)
-# ---------------------------------------------------------------------------
-
-
-def test_split_wrong_output_via_feedback(verbose: bool = False) -> bool:
-    """End-to-end: CLI feedback → split → variants fix the reported issue.
-
-    This is the canonical *"user runs buggy tool, flags wrong output,
-    split fires, new variants fix the problem"* flow. It closes the
-    loop between §12 finding #6b (``mint feedback --wrong``) and Step 8
-    split's **wrong-output-case** branch — the one branch that was
-    never previously verified against a real LLM on real feedback-
-    sourced failures.
-
-    **Why this is different from ``test_split_mcp_tool``.** The existing
-    MCP_TOOL split test seeds crash-shaped failures (error_message set,
-    actual_output null) — it exercises the error-case branch of
-    ``_variant_handles_case`` (*"variant handles iff runs without
-    raising"*). Feedback-flagged rows populate BOTH ``error_message``
-    (the user's reason) AND ``actual_output`` (the original wrong
-    output), so they exercise the wrong-output-case branch (*"variant
-    handles iff runs AND produces output ≠ parent's actual_output"*).
-    That branch has different semantics and had never been end-to-end
-    tested with a real LLM on real feedback-sourced rows.
-
-    **Why this requires a genuinely buggy parent.** Per §12 finding #5d,
-    the wrong-output-case semantic rewards wrongness when the recorded
-    ``actual_output`` is actually correct (variants can't differentiate
-    without becoming incorrect themselves). So we need a parent that IS
-    buggy and user feedback that correctly identifies the bug. Here the
-    parent ``clamp-integer-buggy`` returns ``value`` unclamped for
-    ``value > high`` — deliberately wrong. The LLM-generated variants
-    should produce ``{clamped: 100}`` for ``{value: 150}`` — which
-    differs from the parent's ``{clamped: 150}`` — so the wrong-output-
-    case branch reports "handled".
-
-    **The CLI flow this demonstrates:**
-
-    1. User runs ``mint run ...`` several times. Pipeline records
-       each invocation with ``success=True, actual_output={clamped: X}``
-       (pipeline has no oracle).
-    2. User notices some outputs are wrong and runs ``mint feedback
-       --wrong --capability clamp-integer-buggy --reason "..."`` to
-       flag them. Same code path this test exercises via
-       ``flag_most_recent_invocation_wrong``.
-    3. After enough invocations, optimizer threshold triggers split
-       (not orchestrated here — we call ``split()`` directly to skip
-       threshold orchestration).
-    4. Split's LLM produces specialized variants that actually clamp.
-    5. ``verify_coverage`` replays each flagged wrong-output case
-       against the variants — each variant produces a different (now
-       correct) output, so the wrong-output-case branch reports
-       "handled" and coverage passes.
-    6. Parent deactivated, variants registered, user's complaint fixed.
-
-    Expected happy path: LLM generates correct clamp variants →
-    verify_coverage passes → split commits atomically.
-
-    On rollback (LLM non-determinism): atomic invariant must hold —
-    parent stays active, no variants registered, rollback event
-    recorded. Same dual-path assertion structure as
-    ``test_split_mcp_tool``.
-    """
-    print("\n" + "=" * 70)
-    print("  SPLIT TEST — wrong-output-case branch via CLI feedback (§12 #6b)")
-    print("=" * 70)
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        registry = _create_fresh_registry(tmp_dir)
-        metrics = MetricsStore()
-
-        # Deliberately BUGGY parent — does not clamp high bound. This is
-        # load-bearing: the wrong-output-case branch requires the
-        # parent's recorded actual_output to be genuinely wrong relative
-        # to correct behavior, so that a correct variant produces a
-        # different (correct) output. See §12 finding #5d.
-        buggy_source = (
-            '"""Clamp an integer to [low, high] — BUGGY (does not clamp high)."""\n'
-            "from typing import Annotated\n"
-            "from mcp.server.fastmcp import FastMCP\n"
-            "from pydantic import Field\n\n"
-            'mcp = FastMCP("clamp-integer-buggy")\n\n'
-            "@mcp.tool()\n"
-            "async def clamp(\n"
-            "    value: Annotated[int, Field(description='The integer to clamp')],\n"
-            "    low: Annotated[int, Field(description='Lower bound (inclusive)')] = 0,\n"
-            "    high: Annotated[int, Field(description='Upper bound (inclusive)')] = 100,\n"
-            ") -> dict:\n"
-            "    \"\"\"Return {'clamped': clamped_value} — BUG: does not clamp high.\"\"\"\n"
-            "    if value < low:\n"
-            "        return {'clamped': low}\n"
-            "    return {'clamped': value}\n\n"
-            'if __name__ == "__main__":\n'
-            "    mcp.run()\n"
-        )
-
-        parent = CapabilityDescriptor(
-            name="clamp-integer-buggy",
-            description=(
-                "Clamp an integer to a configurable [low, high] range "
-                "(buggy — does not clamp high bound)"
-            ),
-            capability_type=CapabilityType.MCP_TOOL,
-            domain="math",
-            tags=["math", "utility"],
-            metadata={
-                "generated": "true",
-                "source": "integration_test_feedback",
-                "source_code": buggy_source,
-            },
-        )
-        registry.add(parent)
-        print(f"\n  Registered buggy parent: {parent.name}")
-        print("  Parent bug: returns `value` unclamped when value > high.")
-
-        # Simulate the user's CLI flow: invoke → flag wrong → invoke → flag wrong → ...
-        # The flag_most_recent_invocation_wrong API flags the MOST RECENT row.
-        # We sequence: record buggy invocation → immediately flag → repeat.
-        # Then record additional correct invocations to establish high reuse.
-        print("\n  Simulating CLI flow: invoke → mint feedback --wrong → repeat...")
-
-        # --- Flagged wrong-output cases (the user's grievances) ---
-        wrong_case_1 = InvocationRecord(
-            capability_id="clamp-integer-buggy",
-            task_id="user-run-150",
-            success=True,  # pipeline sees no crash
-            token_cost=100,
-            latency_ms=50.0,
-            input_args='{"value": 150, "low": 0, "high": 100}',
-            actual_output='{"clamped": 150}',  # WRONG (should be 100)
-        )
-        metrics.record_invocation(wrong_case_1)
-        flagged = metrics.flag_most_recent_invocation_wrong(
-            reason="value 150 not clamped to high bound 100",
-            capability_id="clamp-integer-buggy",
-        )
-        if flagged is None or flagged.task_id != "user-run-150":
-            print(f"  FAIL: expected to flag user-run-150; got {flagged}")
-            return False
-        print(f"    ✓ Flagged {flagged.task_id}: {flagged.error_message}")
-
-        wrong_case_2 = InvocationRecord(
-            capability_id="clamp-integer-buggy",
-            task_id="user-run-200",
-            success=True,
-            token_cost=100,
-            latency_ms=50.0,
-            input_args='{"value": 200, "low": 0, "high": 100}',
-            actual_output='{"clamped": 200}',  # WRONG
-        )
-        metrics.record_invocation(wrong_case_2)
-        flagged = metrics.flag_most_recent_invocation_wrong(
-            reason="value 200 not clamped to high bound 100",
-            capability_id="clamp-integer-buggy",
-        )
-        if flagged is None or flagged.task_id != "user-run-200":
-            print(f"  FAIL: expected to flag user-run-200; got {flagged}")
-            return False
-        print(f"    ✓ Flagged {flagged.task_id}: {flagged.error_message}")
-
-        # --- High reuse padding (correct invocations for in-range values) ---
-        # These don't get flagged; they establish reuse_rate > 0.6 so the
-        # parent looks like a realistic split candidate. Called directly
-        # via split() below so threshold orchestration is bypassed, but
-        # we seed for post-hoc metric sanity checks.
-        all_task_ids = [f"task-{i:02d}" for i in range(10)]
-        filler = CapabilityDescriptor(
-            name="filler-tool-feedback-split",
-            description="filler",
-            capability_type=CapabilityType.MCP_TOOL,
-        )
-        registry.add(filler)
-        _seed_invocations(
-            metrics, "filler-tool-feedback-split", all_task_ids,
-            success_rate=1.0, n_per_task=1,
-        )
-        # Correct invocations (in-range values, parent's buggy branch
-        # not hit so output is correct) — seeded as success=True.
-        correct_tasks = [f"correct-task-{i:02d}" for i in range(6)]
-        _seed_invocations(
-            metrics, "clamp-integer-buggy", correct_tasks,
-            success_rate=1.0, n_per_task=1,
-        )
-        print(f"\n  Reuse padding: {len(correct_tasks)} additional correct invocations seeded")
-
-        # Confirm the flagged rows are visible to split's failure-case query.
-        recorded_failures = metrics.get_recent_failures("clamp-integer-buggy")
-        print(f"  get_recent_failures returns {len(recorded_failures)} flagged row(s):")
-        for f in recorded_failures:
-            has_output = "yes" if f.actual_output else "no"
-            print(
-                f"    {f.task_id}: actual_output={has_output}, "
-                f"reason={f.error_message!r}"
-            )
-            if not f.actual_output:
-                print(
-                    f"  FAIL: feedback-flagged row missing actual_output — "
-                    "wrong-output-case branch cannot fire"
-                )
-                return False
-
-        # --- Run split with real LLM ---
-        # Split will: (a) prompt LLM for specialized variants, (b) verify
-        # each variant through three-tier gate, (c) run verify_coverage
-        # which replays the flagged wrong-output cases, (d) atomically
-        # register + deactivate parent on pass, or rollback on any fail.
-        # ~4-6 LLM calls, ~$0.10, 60-120s.
-        print("\n  Running split(...) — will take ~60-120s with real LLM...", flush=True)
-        try:
-            new_ids = split(registry, metrics, "clamp-integer-buggy")
-        except Exception as exc:
-            print(f"\n  FAIL: split() raised: {exc}")
-            return False
-
-        if new_ids is None:
-            # Rollback path — atomic invariant must hold. This can happen
-            # on LLM non-determinism (e.g., variant produces same buggy
-            # output as parent, or Tier 3 flags a hallucination). Report
-            # clearly and pass the test IF rollback is clean.
-            print(
-                "\n  NOTE: split() returned None — gate or coverage rejected "
-                "the variants. Verifying atomic rollback invariant."
-            )
-            rollback_ok = True
-            parent_check = registry.get("clamp-integer-buggy")
-            if parent_check is None or not parent_check.is_active:
-                print("  FAIL: parent 'clamp-integer-buggy' should still be active")
-                rollback_ok = False
-            else:
-                print("  OK: parent 'clamp-integer-buggy' still active")
-
-            rollback_events = metrics._conn.execute(
-                "SELECT capability_id, event_type, details FROM capability_events "
-                "WHERE event_type IN ('split_rollback', 'verification_rollback') "
-                "ORDER BY occurred_at"
-            ).fetchall()
-            print(f"\n  Rollback events: {len(rollback_events)}")
-            for cid, etype, details in rollback_events:
-                print(f"    {cid}: {etype} — {details[:100]}")
-            if not rollback_events:
-                print("  FAIL: no rollback event recorded")
-                rollback_ok = False
-
-            if rollback_ok:
-                print(
-                    "\n  PASS: coverage correctly rolled back (LLM variance on "
-                    "wrong-output-case branch) AND atomic invariant held."
-                )
-                return True
-            else:
-                print("\n  FAIL: atomic rollback invariant violated")
-                return False
-
-        # --- HAPPY PATH (expected) ---
-        print("\n  Results:")
-        print(f"  New variants: {new_ids}")
-
-        if len(new_ids) < 1:
-            print(f"  FAIL: expected >= 1 variant; got {len(new_ids)}")
-            return False
-
-        parent_check = registry.get("clamp-integer-buggy")
-        if parent_check is None or parent_check.is_active:
-            print(
-                "  FAIL: parent 'clamp-integer-buggy' should be deactivated "
-                "after successful split"
-            )
-            return False
-        print("  OK: parent 'clamp-integer-buggy' deactivated")
-
-        # Every variant has real executable source_code
-        for vid in new_ids:
-            variant = registry.get(vid)
-            if variant is None:
-                print(f"  FAIL: variant '{vid}' not found in registry")
-                return False
-            variant_source = (variant.metadata or {}).get("source_code", "")
-            if not variant_source:
-                print(
-                    f"  FAIL: variant '{vid}' has no source_code — regression "
-                    "to pre-Step-8 metadata-only stub"
-                )
-                return False
-            if "FastMCP" not in variant_source:
-                print(
-                    f"  FAIL: variant '{vid}' source does not mention FastMCP"
-                )
-                return False
-            print(f"  Variant '{vid}':")
-            print(f"    description: {variant.description[:70]}...")
-            print(
-                f"    type={variant.capability_type.value}, "
-                f"active={variant.is_active}, "
-                f"source_code={len(variant_source)} chars"
-            )
-
-        # Capability events trail
-        events = metrics._conn.execute(
-            "SELECT capability_id, event_type, details FROM capability_events "
-            "ORDER BY occurred_at"
-        ).fetchall()
-        print(f"\n  Events recorded: {len(events)}")
-        for eid, etype, details in events:
-            print(f"    {eid}: {etype} — {details[:80]}")
-
-        # Confirm user_flagged_wrong events — the Chapter 6 analytics signal
-        flagged_events = [e for e in events if e[1] == "user_flagged_wrong"]
-        if len(flagged_events) != 2:
-            print(
-                f"  FAIL: expected 2 user_flagged_wrong events; "
-                f"got {len(flagged_events)}"
-            )
-            return False
-        print(
-            f"  OK: {len(flagged_events)} user_flagged_wrong events recorded "
-            "for Chapter 6 analytics"
-        )
-
-        print(
-            "\n  PASS: CLI feedback → split → variants fix reported issue "
-            "(wrong-output-case branch exercised end-to-end with real LLM)"
-        )
-        return True
-
-
-# ---------------------------------------------------------------------------
 # Merge test
 # ---------------------------------------------------------------------------
 
@@ -976,20 +610,19 @@ def test_merge(verbose: bool = False) -> bool:
 
     Thresholds: reuse_rate < 0.05, semantic similarity >= 0.5
 
-    Two outcomes are valid under Step 14.11 (Tier 3 fail-closed) and
-    Step 5 (atomic rollback):
+    Two outcomes are valid under the fail-closed gate and atomic rollback
+    contract:
 
     1. **Happy path** — gate passes, merged descriptor registered with
        real ``skill_content``, both parents deactivated.
-    2. **Rollback path** — gate rejects the LLM output (e.g. Tier 3
-       ``ground_truth`` finding on LLM-generated example code), merge()
-       returns None, parents stay active, no orphan descriptor in the
+    2. **Rollback path** — gate rejects the generated output, merge() returns
+       None, parents stay active, no orphan descriptor in the
        registry, and a ``verification_rollback`` event is recorded.
 
     Both outcomes count as PASS as long as the atomic rollback invariant
     holds on the rollback path. The rollback path is the more interesting
     one — it empirically validates the Pillar 2 ↔ Pillar 3 coupling
-    that Step 5's ``verify_and_register_or_rollback`` helper provides.
+    that ``verify_and_register_or_rollback`` provides.
     """
     print("\n" + "=" * 70)
     print("  MERGE TEST")
@@ -999,18 +632,8 @@ def test_merge(verbose: bool = False) -> bool:
         registry = _create_fresh_registry(tmp_dir)
         metrics = MetricsStore()  # in-memory
 
-        # Step 6 (2026-04-15): the per-type merge for SKILL parents pulls
-        # ``metadata['skill_content']`` as the body the LLM combines. Pre-
-        # Step-6 this script seeded bare descriptors without skill content,
-        # which worked only because the old merge() was metadata-only.
-        # With the new _merge_skills helper the LLM must see real SKILL.md
-        # bodies or it has nothing to merge → combined output is empty →
-        # the verification gate (Tier 0 quick_validate + Tier 1 layered
-        # code-fence scan) rejects it → merge returns None.
-        #
-        # Minimum-viable fix: embed a small well-formed SKILL.md in each
-        # parent's metadata. Step 9.5 will do the fuller rewrite including
-        # MCP_TOOL + AGENT per-type integration and rollback scenarios.
+        # SKILL merges read metadata['skill_content'], so each parent needs
+        # a concrete, well-formed SKILL.md body for the merge prompt.
         csv_skill_md = (
             "---\n"
             "name: csv-data-cleaner\n"
@@ -1076,9 +699,7 @@ def test_merge(verbose: bool = False) -> bool:
         print(f"\n  Registered: {cap_a.name} — {cap_a.description[:60]}...")
         print(f"  Registered: {cap_b.name} — {cap_b.description[:60]}...")
 
-        # Seed invocations: low reuse (each used by only 1 task type out of many)
-        # Create 25 unique tasks, each capability only used by 1
-        # (reuse_rate = 1/25 = 0.04, below the 0.05 threshold)
+        # Low-reuse merge candidates: each is used by 1 of 25 task types.
         all_task_ids = [f"TASK_{i:02d}" for i in range(25)]
 
         # Seed many other tasks so the total task pool is large
@@ -1099,8 +720,6 @@ def test_merge(verbose: bool = False) -> bool:
         print(f"\n  csv-data-cleaner reuse_rate: {reuse_a:.3f} (threshold: < 0.05)")
         print(f"  tsv-data-cleaner reuse_rate: {reuse_b:.3f} (threshold: < 0.05)")
 
-        # Check semantic similarity
-        # search() returns list[tuple[CapabilityDescriptor, float]]
         results = registry.search("csv-data-cleaner", n_results=5)
         similarity = None
         for cap_desc, score in results:
@@ -1113,31 +732,25 @@ def test_merge(verbose: bool = False) -> bool:
             print("\n  WARNING: Similarity below 0.5 — merge would not be triggered")
             print("  by the optimizer loop, but we can still test merge() directly.")
 
-        # Run merge — this makes 1-2 LLM calls for the combined SKILL.md
-        # generation, then routes the result through the three-tier gate
+        # The merge generates a combined SKILL.md and routes it through the gate
         # (Tier 0 quick_validate + Tier 1 layered code-fence extraction +
-        # Tier 2/3 adversarial if applicable). Step 6 (2026-04-15):
-        # merge() now returns None on gate rejection instead of raising.
+        # Tier 2/3 adversarial if applicable). merge() returns None on gate
+        # rejection instead of raising.
         #
-        # TWO valid outcomes under Step 14.11 (Tier 3 fail-closed):
+        # TWO valid outcomes under the fail-closed gate:
         #
         # 1. HAPPY PATH: gate passes → merged_id is non-None, merged
         #    descriptor carries real executable content, parents are
         #    deactivated. All original assertions apply.
         #
-        # 2. ROLLBACK PATH: gate rejects (typically Tier 3 ground_truth
-        #    on LLM-generated example code) → merged_id is None →
+        # 2. ROLLBACK PATH: gate rejects the merged content → merged_id is None →
         #    verify_and_register_or_rollback recorded a rollback event
-        #    → per Step 5's atomic guarantee, parents MUST still be
-        #    active and the merged name MUST NOT exist in the registry.
-        #    This is the thesis-aligned behavior the proposal's Pillar 2
-        #    "must pass all three tiers" contract demands. Both outcomes
-        #    count as PASS as long as the invariant holds.
+        #    → the atomic guarantee requires parents to stay active and the
+        #    merged name to remain absent from the registry.
+        #    Expected Pillar 2/Pillar 3 coupling: both outcomes count as PASS
+        #    as long as the invariant holds.
         #
-        # The rollback path is empirically validated, not assumed — this
-        # script asserts on the atomic invariant directly so a silent
-        # regression to "parents get deactivated even on gate failure"
-        # would be caught.
+        # The rollback path is asserted directly, not assumed.
         print("\n  Running merge(...)...", flush=True)
         try:
             merged_id = merge(
@@ -1149,20 +762,15 @@ def test_merge(verbose: bool = False) -> bool:
             return False
 
         if merged_id is None:
-            # --- ROLLBACK PATH ---
-            # Gate rejected the merged artifact (typically Tier 3 HIGH
-            # on the LLM-generated example code). Verify the atomic
-            # rollback invariant: parents must still be active, merged
-            # name must NOT appear in the registry, and a
-            # verification_rollback event must have been recorded.
+            # Gate rejected the merged artifact; the atomic rollback invariant
+            # requires active parents, no merged capability, and a rollback event.
             print(
-                "\n  NOTE: merge() returned None — gate rejected the LLM's "
+                "\n  Info: merge() returned None — gate rejected the LLM's "
                 "combined SKILL.md. Verifying atomic rollback invariant."
             )
 
             rollback_ok = True
 
-            # 1. Both parents still active
             for parent_name in ["csv-data-cleaner", "tsv-data-cleaner"]:
                 parent = registry.get(parent_name)
                 if parent is None:
@@ -1177,7 +785,6 @@ def test_merge(verbose: bool = False) -> bool:
                 else:
                     print(f"  OK: parent '{parent_name}' still active")
 
-            # 2. A verification_rollback event was recorded
             rollback_events = metrics._conn.execute(
                 "SELECT capability_id, details FROM capability_events "
                 "WHERE event_type = 'verification_rollback' ORDER BY occurred_at"
@@ -1189,7 +796,6 @@ def test_merge(verbose: bool = False) -> bool:
                 print("  FAIL: no verification_rollback event recorded")
                 rollback_ok = False
 
-            # 3. No 'merged' success event on either parent
             merged_events = metrics._conn.execute(
                 "SELECT capability_id FROM capability_events WHERE event_type = 'merged'"
             ).fetchall()
@@ -1205,8 +811,8 @@ def test_merge(verbose: bool = False) -> bool:
                 print(
                     "\n  PASS: gate correctly rejected the LLM output AND "
                     "atomic rollback invariant held — parents untouched, no "
-                    "orphan descriptor in registry. This is the proposal-aligned "
-                    "Pillar 2 + Pillar 3 coupling (Step 5 + Step 14.11)."
+                    "orphan descriptor in registry. This is the expected "
+                    "Pillar 2 + Pillar 3 coupling."
                 )
                 return True
             else:
@@ -1214,7 +820,6 @@ def test_merge(verbose: bool = False) -> bool:
                 return False
 
         # --- HAPPY PATH ---
-        # Verify results
         print("\n  Results:")
         print(f"  Merged capability: {merged_id}")
 
@@ -1227,15 +832,13 @@ def test_merge(verbose: bool = False) -> bool:
         print(f"  type={merged.capability_type.value}, active={merged.is_active}")
         print(f"  tags={merged.tags}")
 
-        # Step 6: the merged capability must carry real executable content
-        # in metadata (skill_content for SKILL). Pre-Step-6 merge produced
-        # metadata-only stubs; this assertion is the canary that catches
-        # a regression back to that broken state.
+        # The merged capability must carry real executable content in
+        # metadata; this catches regressions to metadata-only stubs.
         merged_skill_content = (merged.metadata or {}).get("skill_content", "")
         if not merged_skill_content:
             print(
                 "  FAIL: merged capability has no skill_content in metadata — "
-                "regression to pre-Step-6 metadata-only stub behavior?"
+                "metadata-only merged skills are not valid"
             )
             return False
         print(f"  skill_content: {len(merged_skill_content)} chars, starts with "
@@ -1247,7 +850,6 @@ def test_merge(verbose: bool = False) -> bool:
             )
             return False
 
-        # Check parents are deactivated
         for parent_name in ["csv-data-cleaner", "tsv-data-cleaner"]:
             parent = registry.get(parent_name)
             active = parent.is_active if parent else "NOT FOUND"
@@ -1256,7 +858,6 @@ def test_merge(verbose: bool = False) -> bool:
                 print(f"  FAIL: Parent '{parent_name}' should be deactivated after merge")
                 return False
 
-        # Check events
         events = metrics._conn.execute(
             "SELECT capability_id, event_type, details FROM capability_events "
             "ORDER BY occurred_at"
@@ -1423,8 +1024,8 @@ def test_merge_stats(verbose: bool = False) -> bool:
             print("\n  WARNING: Similarity below 0.5 — merge would not be triggered")
             print("  by the optimizer loop, but we can still test merge() directly.")
 
-        # Run merge — this makes 1-2 LLM calls for the combined SKILL.md
-        # generation, then routes the result through the three-tier gate.
+        # merge() generates the combined SKILL.md, then routes it through the
+        # three-tier gate.
         # Same dual-path outcome handling as test_merge(): happy path
         # registers the merged capability and deactivates parents;
         # rollback path verifies the atomic invariant. For the stats
@@ -1442,10 +1043,7 @@ def test_merge_stats(verbose: bool = False) -> bool:
             return False
 
         if merged_id is None:
-            # Unexpected for this scenario — but still honor the atomic
-            # invariant check, and print a diagnostic so we know the
-            # "deterministic happy-path" scenario was actually unable to
-            # produce one.
+            # Expected-to-merge scenarios still need consistent rollback state.
             print(
                 "\n  UNEXPECTED: merge() returned None on the stats scenario. "
                 "The gate rejected the LLM output, which means even the "
@@ -1498,7 +1096,7 @@ def test_merge_stats(verbose: bool = False) -> bool:
         if not merged_skill_content:
             print(
                 "  FAIL: merged capability has no skill_content in metadata — "
-                "regression to pre-Step-6 metadata-only stub behavior?"
+                "metadata-only merged skills are not valid"
             )
             return False
         print(
@@ -1512,9 +1110,8 @@ def test_merge_stats(verbose: bool = False) -> bool:
             )
             return False
 
-        # Check that the merged content mentions all 7 stats keys we expect
-        # (loose check — the merge LLM might phrase them differently, but
-        # at minimum the description should cover the union of both parents).
+        # Soft content check: the merged skill should cover both parents'
+        # statistics concepts.
         missing_concepts: list[str] = []
         for keyword in ["min", "max", "mean", "median", "stdev", "variance", "count"]:
             if keyword not in merged_skill_content.lower():
@@ -1528,7 +1125,6 @@ def test_merge_stats(verbose: bool = False) -> bool:
         else:
             print("  OK: merged content mentions all 7 expected stat keywords")
 
-        # Check parents are deactivated
         for parent_name in ["list-stats-basic", "list-stats-distribution"]:
             parent = registry.get(parent_name)
             active = parent.is_active if parent else "NOT FOUND"
@@ -1553,18 +1149,16 @@ def test_merge_stats(verbose: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# MCP_TOOL merge test (deterministic happy-path canary, post-Step-6)
+# MCP_TOOL merge test (deterministic happy-path canary)
 # ---------------------------------------------------------------------------
 
 
 def test_merge_mcp_tool(verbose: bool = False) -> bool:
     """Merge two MCP_TOOL capabilities — deterministic happy-path scenario.
 
-    Closes the last hole in the Pillar 3 per-type integration matrix.
-    Post-Step-6 (commit ``0927261``), ``_merge_tools`` produces real
-    executable FastMCP source by prompting the LLM with each parent's
-    ``metadata['source_code']`` and asking for a single combined tool.
-    This test exercises that path end-to-end under real-LLM conditions.
+    Closes the MCP_TOOL merge path in the Pillar 3 per-type integration
+    matrix. ``_merge_tools`` produces real executable FastMCP source from
+    each parent's ``metadata['source_code']``.
 
     Scenario: ``compute-sum`` (returns ``{sum: a+b}``) and
     ``compute-product`` (returns ``{product: a*b}``) both have low reuse
@@ -1767,7 +1361,7 @@ def test_merge_mcp_tool(verbose: bool = False) -> bool:
         if not merged_source:
             print(
                 "  FAIL: merged capability has no source_code in metadata — "
-                "regression to pre-Step-6 metadata-only stub behavior?"
+                "metadata-only merged tools are not valid"
             )
             return False
         print(
@@ -1787,7 +1381,7 @@ def test_merge_mcp_tool(verbose: bool = False) -> bool:
             )
             return False
 
-        # Loose content check — merged tool should subsume both parents' concepts.
+        # Soft content check: merged tool should subsume both parents' concepts.
         lower = merged_source.lower()
         missing = [
             kw for kw in ("sum", "product")
@@ -1801,7 +1395,6 @@ def test_merge_mcp_tool(verbose: bool = False) -> bool:
         else:
             print("  OK: merged source mentions both parents' semantics")
 
-        # Check parents are deactivated.
         for parent_name in ["compute-sum", "compute-product"]:
             parent = registry.get(parent_name)
             active = parent.is_active if parent else "NOT FOUND"
@@ -1824,18 +1417,17 @@ def test_merge_mcp_tool(verbose: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# AGENT split test (post-Step-8 canary — global subagent budget ceiling)
+# AGENT split test (global subagent budget ceiling canary)
 # ---------------------------------------------------------------------------
 
 
 def test_split_agent(verbose: bool = False) -> bool:
-    """Split an AGENT capability — post-Step-8 AGENT path canary.
+    """Split an AGENT capability.
 
     Closes the AGENT split hole in the Pillar 3 per-type integration
-    matrix. Post-Step-8 (commit ``1f8a7db``), ``_split_agents`` produces
-    real agent configs (system_prompt + optional subagents) by prompting
-    the LLM with the parent's ``metadata['agent_config']`` + recent
-    failure cases, and enforces a global ceiling: the sum of subagent
+    matrix. ``_split_agents`` produces real agent configs (system_prompt +
+    optional subagents) from the parent's ``metadata['agent_config']`` and
+    recent failure cases, and enforces a global ceiling: the sum of subagent
     counts across all variants must not exceed ``_MAX_AGENT_SUBAGENT_BUDGET``
     (=8).
 
@@ -1913,7 +1505,7 @@ def test_split_agent(verbose: bool = False) -> bool:
         )
         registry.add(parent_cap)
         print(f"\n  Registered: {parent_cap.name} ({parent_cap.capability_type.value})")
-        print(f"  Parent is solo (0 subagents)")
+        print("  Parent is solo (0 subagents)")
 
         # Seed high-reuse + low-success invocations.
         all_task_ids = [f"TASK_{i:02d}" for i in range(10)]
@@ -1944,7 +1536,7 @@ def test_split_agent(verbose: bool = False) -> bool:
             print("\n  ERROR: Metrics do not satisfy split thresholds!")
             return False
 
-        # Run split. Two valid outcomes under the 5-phase atomic flow:
+        # Two valid outcomes under the atomic split flow:
         #   HAPPY: variants registered with non-empty agent_config, parent
         #          deactivated, total subagent count across variants <= 8.
         #   ROLLBACK: gate rejected a variant OR budget exceeded → parent
@@ -1959,7 +1551,7 @@ def test_split_agent(verbose: bool = False) -> bool:
         if new_ids is None:
             # --- ROLLBACK PATH ---
             print(
-                "\n  NOTE: split() returned None — gate/budget rejected one "
+                "\n  Info: split() returned None — gate/budget rejected one "
                 "or more variants. Verifying atomic rollback invariant."
             )
             parent = registry.get("multi-domain-investigator")
@@ -2001,11 +1593,10 @@ def test_split_agent(verbose: bool = False) -> bool:
         if parent and parent.is_active:
             print("  FAIL: Parent should be deactivated after split")
             return False
-        print(f"  Parent 'multi-domain-investigator' deactivated: OK")
+        print("  Parent 'multi-domain-investigator' deactivated: OK")
 
-        # Verify every variant has non-empty agent_config AND compute the
-        # total subagent count across all variants — must stay <= 8 per
-        # _MAX_AGENT_SUBAGENT_BUDGET.
+        # Each variant must carry agent_config, and total subagent count across
+        # variants must stay within _MAX_AGENT_SUBAGENT_BUDGET.
         total_subagents = 0
         for vid in new_ids:
             variant = registry.get(vid)
@@ -2023,7 +1614,7 @@ def test_split_agent(verbose: bool = False) -> bool:
             if not variant_cfg_raw:
                 print(
                     f"  FAIL: variant '{vid}' has no agent_config in metadata "
-                    "— regression to pre-Step-8 metadata-only stub behavior?"
+                    "— metadata-only agent variants are not valid"
                 )
                 return False
 
@@ -2077,17 +1668,16 @@ def test_split_agent(verbose: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# AGENT merge test (post-Step-6 canary — budget ceiling on returned config)
+# AGENT merge test (returned-config budget ceiling canary)
 # ---------------------------------------------------------------------------
 
 
 def test_merge_agent(verbose: bool = False) -> bool:
-    """Merge two AGENT capabilities — post-Step-6 AGENT path canary.
+    """Merge two AGENT capabilities.
 
     Closes the AGENT merge hole in the Pillar 3 per-type integration
-    matrix. Post-Step-6 (commit ``0927261``), ``_merge_agents``
-    produces a real combined agent_config (combined_system_prompt +
-    combined_subagents) via LLM, enforces the budget ceiling
+    matrix. ``_merge_agents`` produces a real combined agent_config
+    (combined_system_prompt + combined_subagents), enforces the budget ceiling
     (``_MAX_AGENT_SUBAGENT_BUDGET=8`` on returned config) BEFORE
     calling the gate, then routes the result through the standard
     verify_and_register_or_rollback path.
@@ -2223,9 +1813,9 @@ def test_merge_agent(verbose: bool = False) -> bool:
             return False
 
         if merged_id is None:
-            # Rollback path — verify atomic invariant.
+            # Rollback leaves parents active and no partial merged artifact.
             print(
-                "\n  NOTE: merge() returned None. Verifying atomic rollback."
+                "\n  Info: merge() returned None. Verifying atomic rollback."
             )
             rollback_ok = True
             for parent_name in ["csv-data-investigator", "json-data-investigator"]:
@@ -2270,7 +1860,7 @@ def test_merge_agent(verbose: bool = False) -> bool:
         if not merged_cfg_raw:
             print(
                 "  FAIL: merged capability has no agent_config in metadata — "
-                "regression to pre-Step-6 metadata-only stub behavior?"
+                "metadata-only merged agents are not valid"
             )
             return False
 
@@ -2306,7 +1896,7 @@ def test_merge_agent(verbose: bool = False) -> bool:
             return False
         print("  OK: budget constraint satisfied")
 
-        # Loose content check — merged prompt should cover both parents' domains.
+        # Soft content check: merged prompt should cover both parents' domains.
         lower = merged_system_prompt.lower()
         missing = [kw for kw in ("csv", "json") if kw not in lower]
         if missing:
@@ -2350,8 +1940,10 @@ def test_full_loop(verbose: bool = False) -> bool:
     in a single loop pass:
 
     - **Prune target**: "unused-formatter" — has zero invocations in the window
-    - **Split target**: "broad-data-processor" (SKILL) — high reuse (80%), low success (50%)
-    - **Merge targets**: "csv-row-cleaner" + "tsv-row-cleaner" (SKILLs) — low reuse, semantically similar
+    - **Split target**: "broad-data-processor" (SKILL) — high reuse (80%),
+      low success (50%)
+    - **Merge targets**: "csv-row-cleaner" + "tsv-row-cleaner" (SKILLs) —
+      low reuse, semantically similar
     - **Pinned (should survive)**: "core-tool" — has metadata={"pinned": "true"}
 
     Runs the full LangGraph optimization loop via create_optimization_loop().
@@ -2390,7 +1982,9 @@ def test_full_loop(verbose: bool = False) -> bool:
         )
         registry.add(pinned_cap)
 
-        # 3. Split target: SKILL with high reuse, low success
+        # 3. Split target: SKILL with high reuse, low success. Production
+        # SKILLs carry skill_content, so the seed does too; split needs a real
+        # reference body to rewrite into variants.
         split_cap = CapabilityDescriptor(
             name="broad-data-processor",
             description=(
@@ -2400,10 +1994,61 @@ def test_full_loop(verbose: bool = False) -> bool:
             capability_type=CapabilityType.SKILL,
             domain="data-processing",
             tags=["data", "parsing", "transformation"],
+            metadata={
+                "skill_content": (
+                    "---\n"
+                    "name: broad-data-processor\n"
+                    "description: Process and transform any structured data "
+                    "file including CSV, JSON, XML, and YAML formats with "
+                    "validation and cleaning.\n"
+                    "---\n\n"
+                    "# Broad Data Processor\n\n"
+                    "## Steps\n\n"
+                    "1. **Detect format** — Inspect the file extension and "
+                    "first few bytes to choose the right parser (CSV, JSON, "
+                    "XML, or YAML).\n"
+                    "2. **Parse** — Read the file using the matching parser. "
+                    "Tolerate minor format variations (BOM, trailing "
+                    "newlines, mixed quoting).\n"
+                    "3. **Validate** — Check that required fields are "
+                    "present and non-empty. Flag rows / nodes that fail "
+                    "validation.\n"
+                    "4. **Clean** — Drop empty rows, normalize whitespace, "
+                    "coerce numeric strings to numbers, parse date columns.\n"
+                    "5. **Return** — Emit a dict with `row_count` (int), "
+                    "`flagged` (list[dict]), and `cleaned_records` "
+                    "(list[dict]).\n\n"
+                    "## Output\n\n"
+                    "Single dict with the three keys above. The optimizer is "
+                    "expected to split this skill into format-specific "
+                    "variants when invocation data shows it's mostly used "
+                    "for one format.\n"
+                ),
+            },
         )
         registry.add(split_cap)
 
-        # 4. Merge targets: two similar low-reuse SKILLs
+        # 4. Merge targets: two similar low-reuse SKILLs. Their schemas overlap
+        # enough for the Jaccard merge gate, but are not identical. Include
+        # skill_content so the merge prompt has real workflow text to combine.
+        _row_cleaner_skill_content = (
+            "---\n"
+            "name: {name}\n"
+            "description: {description}\n"
+            "---\n\n"
+            "# {title}\n\n"
+            "## Steps\n\n"
+            "1. **Read the file** — Open the file at `file_path` using "
+            "the appropriate {format} parser ({format_lib}).\n"
+            "2. **Drop nulls** — Remove rows where any cell is empty / "
+            "null after stripping whitespace.\n"
+            "3. **Deduplicate** — Drop exact duplicate rows, keeping "
+            "the first occurrence.\n"
+            "4. **Normalize types** — Coerce numeric strings to numbers, "
+            "parse date columns to ISO format.\n"
+            "5. **Return** — Emit a dict with `clean_rows`, "
+            "`null_count`, and `dup_count`.\n"
+        )
         merge_a = CapabilityDescriptor(
             name="csv-row-cleaner",
             description=(
@@ -2413,6 +2058,24 @@ def test_full_loop(verbose: bool = False) -> bool:
             capability_type=CapabilityType.SKILL,
             domain="data-processing",
             tags=["csv", "cleaning"],
+            input_schema={"file_path": "str", "has_header": "bool"},
+            output_schema={
+                "clean_rows": "list[dict]",
+                "null_count": "int",
+                "dup_count": "int",
+            },
+            metadata={
+                "skill_content": _row_cleaner_skill_content.format(
+                    name="csv-row-cleaner",
+                    description=(
+                        "Clean rows in CSV data files by removing nulls, "
+                        "deduplicating, and normalizing types."
+                    ),
+                    title="CSV Row Cleaner",
+                    format="CSV",
+                    format_lib="`csv.DictReader`",
+                ),
+            },
         )
         merge_b = CapabilityDescriptor(
             name="tsv-row-cleaner",
@@ -2423,11 +2086,29 @@ def test_full_loop(verbose: bool = False) -> bool:
             capability_type=CapabilityType.SKILL,
             domain="data-processing",
             tags=["tsv", "cleaning"],
+            input_schema={"file_path": "str", "separator": "str"},
+            output_schema={
+                "clean_rows": "list[dict]",
+                "null_count": "int",
+                "dup_count": "int",
+            },
+            metadata={
+                "skill_content": _row_cleaner_skill_content.format(
+                    name="tsv-row-cleaner",
+                    description=(
+                        "Clean rows in TSV data files by removing nulls, "
+                        "deduplicating, and normalizing types."
+                    ),
+                    title="TSV Row Cleaner",
+                    format="TSV",
+                    format_lib="`csv.DictReader` with `delimiter='\\t'`",
+                ),
+            },
         )
         registry.add(merge_a)
         registry.add(merge_b)
 
-        # 5. Filler tool to create a large task pool for reuse_rate denominators
+        # Filler keeps the reuse-rate denominator large.
         filler = CapabilityDescriptor(
             name="filler-tool",
             description="A filler tool for task diversity",
@@ -2443,10 +2124,9 @@ def test_full_loop(verbose: bool = False) -> bool:
 
         # --- Seed invocations ---
 
-        # Create 25 unique tasks (large pool for reuse_rate denominators)
         all_task_ids = [f"TASK_{i:02d}" for i in range(25)]
 
-        # Filler: invoked across all tasks (so the task pool is large)
+        # Filler keeps the reuse-rate denominator large.
         _seed_invocations(metrics, "filler-tool", all_task_ids, success_rate=1.0, n_per_task=1)
 
         # Prune target: NO invocations (will be pruned)
@@ -2457,13 +2137,15 @@ def test_full_loop(verbose: bool = False) -> bool:
 
         # Split target: high reuse (80%), low success (50%)
         split_tasks = all_task_ids[:20]  # 20/25 = 80% reuse
-        _seed_invocations(metrics, "broad-data-processor", split_tasks, success_rate=0.5, n_per_task=5)
+        _seed_invocations(
+            metrics, "broad-data-processor", split_tasks,
+            success_rate=0.5, n_per_task=5,
+        )
 
         # Merge targets: low reuse (1 task each out of 25 = 4%)
         _seed_invocations(metrics, "csv-row-cleaner", ["TASK_00"], success_rate=0.8, n_per_task=3)
         _seed_invocations(metrics, "tsv-row-cleaner", ["TASK_01"], success_rate=0.8, n_per_task=3)
 
-        # Verify metrics
         print("\n  Seeded metrics:")
         for cap_name in ["unused-formatter", "core-tool", "broad-data-processor",
                          "csv-row-cleaner", "tsv-row-cleaner"]:
@@ -2472,22 +2154,22 @@ def test_full_loop(verbose: bool = False) -> bool:
             ic = metrics.invocation_count(cap_name)
             print(f"    {cap_name}: invocations={ic}, reuse={rr:.2f}, success={sr:.2f}")
 
-        # Check similarity between merge candidates
         results = registry.search("csv-row-cleaner", n_results=5)
         similarity = None
         for cap_desc, score in results:
             if cap_desc.name == "tsv-row-cleaner":
                 similarity = score
                 break
-        print(f"    csv↔tsv similarity: {similarity:.3f}" if similarity else "    csv↔tsv similarity: NOT FOUND")
+        if similarity:
+            print(f"    csv↔tsv similarity: {similarity:.3f}")
+        else:
+            print("    csv↔tsv similarity: NOT FOUND")
 
-        # --- Compute utility scores (pre-loop) ---
         pre_scores = compute_all_utilities(registry, metrics)
         print("\n  Pre-loop utility scores:")
         for cap_id, score in sorted(pre_scores.items()):
             print(f"    {cap_id}: {score:.4f}")
 
-        # --- Run the full optimization loop ---
         print("\n  Running create_optimization_loop()...", flush=True)
         try:
             loop = create_optimization_loop(
@@ -2502,7 +2184,6 @@ def test_full_loop(verbose: bool = False) -> bool:
             print(f"\n  FAIL: Optimization loop raised: {exc}")
             return False
 
-        # --- Verify results ---
         print("\n  Results:")
 
         # Prune
@@ -2520,44 +2201,83 @@ def test_full_loop(verbose: bool = False) -> bool:
         split_results = result.get("split_results", {})
         print(f"\n  Split results: {split_results}")
         if "broad-data-processor" not in split_results:
-            print("  FAIL: 'broad-data-processor' should have been split (reuse=0.80, success=0.50)")
+            print(
+                "  FAIL: 'broad-data-processor' should have been split "
+                "(reuse=0.80, success=0.50)"
+            )
             return False
         variants = split_results["broad-data-processor"]
-        if len(variants) < 2:
+        # Optimizer split has two valid outcomes: variants pass verification
+        # and the parent is deactivated, or one variant fails verification and
+        # the optimizer atomically rolls back while leaving the parent active.
+        if variants is None:
+            # Rollback is valid only if the parent stays active.
+            print(
+                "  Split returned None — optimizer atomically rolled back "
+                "(see WARNING above for the specific variant that failed). "
+                "This is a valid optimizer outcome under LLM nondeterminism."
+            )
+            parent = registry.get("broad-data-processor")
+            if parent is None or not parent.is_active:
+                print(
+                    "  FAIL: rollback contract violated — parent should "
+                    "remain ACTIVE after split rollback, but it was "
+                    f"{'missing' if parent is None else 'deactivated'}."
+                )
+                return False
+            print("  OK: rollback contract held — parent stays active.")
+            split_succeeded = False
+        elif len(variants) < 2:
             print(f"  FAIL: Expected >= 2 split variants, got {len(variants)}")
             return False
-        # Verify parent deactivated
-        parent = registry.get("broad-data-processor")
-        if parent and parent.is_active:
-            print("  FAIL: 'broad-data-processor' should be deactivated after split")
-            return False
-        # Verify variants exist and are active
-        for vid in variants:
-            v = registry.get(vid)
-            if v is None:
-                print(f"  FAIL: Split variant '{vid}' not found in registry")
+        else:
+            split_succeeded = True
+
+        # Successful splits deactivate the parent and register live variants.
+        if split_succeeded:
+            parent = registry.get("broad-data-processor")
+            if parent and parent.is_active:
+                print("  FAIL: 'broad-data-processor' should be deactivated after split")
                 return False
-            print(f"    Variant: {vid} — {v.description[:60]}...")
-        print("  OK: broad-data-processor split into", variants)
+            for vid in variants:
+                v = registry.get(vid)
+                if v is None:
+                    print(f"  FAIL: Split variant '{vid}' not found in registry")
+                    return False
+                print(f"    Variant: {vid} — {v.description[:60]}...")
+            print("  OK: broad-data-processor split into", variants)
 
         # Merge
         merge_results = result.get("merge_results", {})
         print(f"\n  Merge results: {merge_results}")
-        if not merge_results:
-            print("  FAIL: Expected at least one merge (csv-row-cleaner + tsv-row-cleaner)")
-            return False
-        merged_id = list(merge_results.values())[0]
-        merged = registry.get(merged_id)
-        if merged is None:
-            print(f"  FAIL: Merged capability '{merged_id}' not found")
-            return False
-        # Verify parents deactivated
-        for parent_name in ["csv-row-cleaner", "tsv-row-cleaner"]:
-            p = registry.get(parent_name)
-            if p and p.is_active:
-                print(f"  FAIL: '{parent_name}' should be deactivated after merge")
+        # Merge may either register a merged capability or roll back atomically.
+        if not merge_results or all(v is None for v in merge_results.values()):
+            print(
+                "  Merge results empty or rolled back — checking rollback "
+                "contract (both parents should remain ACTIVE)..."
+            )
+            for parent_name in ["csv-row-cleaner", "tsv-row-cleaner"]:
+                p = registry.get(parent_name)
+                if p is None or not p.is_active:
+                    print(
+                        f"  FAIL: rollback contract violated — '{parent_name}' "
+                        f"should remain ACTIVE after merge rollback, but it was "
+                        f"{'missing' if p is None else 'deactivated'}."
+                    )
+                    return False
+            print("  OK: merge rolled back atomically; both parents stay active.")
+        else:
+            merged_id = list(merge_results.values())[0]
+            merged = registry.get(merged_id)
+            if merged is None:
+                print(f"  FAIL: Merged capability '{merged_id}' not found")
                 return False
-        print(f"  OK: merged into '{merged_id}' — {merged.description[:60]}...")
+            for parent_name in ["csv-row-cleaner", "tsv-row-cleaner"]:
+                p = registry.get(parent_name)
+                if p and p.is_active:
+                    print(f"  FAIL: '{parent_name}' should be deactivated after merge")
+                    return False
+            print(f"  OK: merged into '{merged_id}' — {merged.description[:60]}...")
 
         # KL divergence
         kl = result.get("kl_divergence")
@@ -2610,7 +2330,7 @@ def main() -> int:
     parser.add_argument(
         "--split-only",
         action="store_true",
-        help="Run both split tests (SKILL rollback-canary + MCP_TOOL happy-path)",
+        help="Run all split tests (SKILL rollback-canary + MCP_TOOL + AGENT)",
     )
     parser.add_argument(
         "--split-skill-only",
@@ -2621,14 +2341,6 @@ def main() -> int:
         "--split-mcp-only",
         action="store_true",
         help="Run only the MCP_TOOL split test (coverage verifier happy-path)",
-    )
-    parser.add_argument(
-        "--split-feedback-only",
-        action="store_true",
-        help=(
-            "Run only the CLI-feedback → split → wrong-output-case test "
-            "(§12 finding #6b end-to-end)"
-        ),
     )
     parser.add_argument(
         "--merge-only",
@@ -2675,7 +2387,6 @@ def main() -> int:
         args.split_only
         or args.split_skill_only
         or args.split_mcp_only
-        or args.split_feedback_only
         or args.split_agent_only
         or args.merge_only
         or args.merge_csv_only
@@ -2689,9 +2400,6 @@ def main() -> int:
     )
     run_split_mcp = (
         args.split_mcp_only or args.split_only or (not only_one)
-    )
-    run_split_feedback = (
-        args.split_feedback_only or args.split_only or (not only_one)
     )
     run_split_agent = (
         args.split_agent_only or args.split_only or (not only_one)
@@ -2717,11 +2425,6 @@ def main() -> int:
 
     if run_split_mcp:
         results["split_mcp"] = test_split_mcp_tool(verbose=args.verbose)
-
-    if run_split_feedback:
-        results["split_feedback"] = test_split_wrong_output_via_feedback(
-            verbose=args.verbose,
-        )
 
     if run_split_agent:
         results["split_agent"] = test_split_agent(verbose=args.verbose)

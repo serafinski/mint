@@ -1,20 +1,27 @@
-"""Layer 2: harness unit tests with mocked pipeline.
+"""Unit tests for evaluation harness result extraction and run loops.
 
-Tests the run loop, _extract_result, _run_static, and record writing
-without any LLM calls or Docker execution.
+These tests use mocked execution paths to cover harness behavior without LLM
+calls or Docker execution.
 """
 
 from __future__ import annotations
 
+import hashlib
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
-from src.schemas.task import GeneratedArtifact, MatchItem, TaskState
+from src.schemas.task import ChainResult, GeneratedArtifact, MatchItem, SubTask, TaskState
 from src.schemas.verification import VerificationReport
-from tests.evaluation.harness import EvaluationHarness, HarnessConfig, _extract_result
-from tests.evaluation.tasks import T01, T04, T07
+from tests.evaluation.harness import (
+    EvaluationHarness,
+    HarnessConfig,
+    _derive_condition_seed,
+    _extract_result,
+    _extract_result_compositional,
+)
+from tests.evaluation.tasks import T01, T03, T04, T07, T13
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -24,7 +31,6 @@ from tests.evaluation.tasks import T01, T04, T07
 def config(tmp_path):
     return HarnessConfig(
         chroma_dir=tmp_path / "chroma",
-        mcp_tools_dir=tmp_path / "mcp_tools",
         skills_dir=tmp_path / "skills",
         db_path=None,  # in-memory
         n_runs=2,
@@ -49,13 +55,20 @@ def _make_report(passed=True, tier_reached=2):
     )
 
 
-def _make_state(artifacts=None, reports=None, attempt_count=1, matches=None):
+def _make_state(
+    artifacts=None,
+    reports=None,
+    attempt_count=1,
+    matches=None,
+    **extra,
+):
     return TaskState(
         task_description="test",
         generated_artifacts=artifacts or [],
         verification_results=reports or [],
         attempt_count=attempt_count,
         matches=matches or [],
+        **extra,
     )
 
 
@@ -80,7 +93,7 @@ class TestRunStatic:
     def test_no_static_coverage_returns_failure(self, config):
         harness = EvaluationHarness(config)
         mock_registry = MagicMock()
-        result = harness._run_static(T04, mock_registry)  # T04 has no static coverage
+        result = harness._run_static(T03, mock_registry)  # T03 has no static coverage
         assert result["gate_passed"] is False
         assert result["failure_reason"] == "generation_failed"
 
@@ -100,7 +113,10 @@ class TestRunStatic:
         mock_registry.get.return_value = mock_cap
 
         with patch("tests.evaluation.harness._run_static_implementation") as mock_impl:
-            mock_impl.return_value = {"row_count": 50, "column_names": ["id", "name", "age", "city"]}
+            mock_impl.return_value = {
+                "row_count": 50,
+                "column_names": ["id", "name", "age", "city"],
+            }
             result = harness._run_static(T01, mock_registry)
 
         assert result["gate_passed"] is True
@@ -248,8 +264,30 @@ class TestExtractResult:
         assert result["gate_passed"] is True
         assert result["output_in_range"] is False
 
+    def test_decomposition_failure_short_circuits_single_artifact_path(self):
+        state = _make_state(
+            artifacts=[_make_artifact()],
+            reports=[_make_report(passed=True)],
+            decomposition_succeeded=False,
+        )
+        loader = MagicMock()
+        with patch("tests.evaluation.harness._execute_artifact") as mock_exec:
+            result = _extract_result(state, T01, loader)
+        mock_exec.assert_not_called()
+        assert result["gate_passed"] is False
+        assert result["output_in_range"] is False
+        assert result["failure_reason"] == "generation_failed"
+        assert result["failed_step_reason"] == "decomposition_failed"
+        assert result["chain_success"] is False
+        assert len(result["generated_artifact_sources"]) == 1
+
     def test_registry_match_with_source_code_executes(self):
-        """Registry match with source_code in metadata → sandbox-executed."""
+        """Registry match with source_code is sandbox-executed and shape-checked.
+
+        T07 requires ``output.csv``. A dict-only mocked executor may satisfy
+        the loose validator, but the output contract must still classify the
+        run as an output-shape mismatch.
+        """
         state = _make_state(
             artifacts=[],
             matches=[_make_match(source_code="# tool source")],
@@ -259,8 +297,12 @@ class TestExtractResult:
         with patch("tests.evaluation.harness._execute_artifact", return_value=fake_output):
             result = _extract_result(state, T07, loader)
         assert result["gate_passed"] is True
-        assert result["output_in_range"] is True
-        assert result["failure_reason"] == "none"
+        # Missing output.csv flips output_in_range=False and promotes the
+        # failure reason to output_shape_mismatch.
+        assert result["output_in_range"] is False
+        assert result["failure_reason"] == "output_shape_mismatch"
+        assert result["output_shape_mismatch"] is True
+        assert "output.csv" in result["output_shape_missing_files"]
 
     def test_registry_match_without_source_code_cannot_validate(self):
         """Registry match without source_code → gate passes but output not validated."""
@@ -287,19 +329,48 @@ class TestExtractResult:
         assert result["output_in_range"] is False
         assert result["failure_reason"] == "output_rejected"
 
+    def test_decomposition_failure_short_circuits_compositional_path(self):
+        state = _make_state(
+            artifacts=[
+                _make_artifact(
+                    name="lead",
+                    cap_type=CapabilityType.AGENT,
+                    source_code=None,
+                ),
+            ],
+            reports=[_make_report(passed=True)],
+            decomposition_succeeded=False,
+            required_capabilities=["parse-timeseries", "assemble-report"],
+            subtasks=[
+                SubTask(description="parse", required_capabilities=["parse-timeseries"]),
+                SubTask(
+                    description="assemble",
+                    required_capabilities=["assemble-report"],
+                    depends_on=[0],
+                ),
+            ],
+        )
+        loader = MagicMock()
+        with patch("tests.evaluation.harness._extract_result_compositional") as mock_extract:
+            result = _extract_result(state, T13, loader)
+        mock_extract.assert_not_called()
+        assert result["gate_passed"] is False
+        assert result["failure_reason"] == "generation_failed"
+        assert result["failed_step_reason"] == "decomposition_failed"
+        assert result["chain_length"] == 2
+        assert result["required_capability_count"] == 2
+        assert result["chain_success"] is False
+
 
 # ---------------------------------------------------------------------------
-# Step 13 — _extract_result_compositional classifies agent timeouts
+# _extract_result_compositional failure classification
 # ---------------------------------------------------------------------------
 
 
 class TestExtractResultCompositionalAgentFailure:
-    """The harness must translate a ChainResult.failed_step_reason into the
-    matching FailureReason enum value so Phase 5 analytics can distinguish
-    agent timeouts from generic chain-step failures."""
+    """The harness maps compositional step failures to record failure reasons."""
 
     def _subtasks(self):
-        from src.schemas.task import SubTask
         return [
             SubTask(
                 description="investigate",
@@ -309,7 +380,6 @@ class TestExtractResultCompositionalAgentFailure:
         ]
 
     def _make_fake_chain_result(self, *, failed_step_reason: str | None):
-        from src.schemas.task import ChainResult
         return ChainResult(
             chain_length=1,
             chain_success=False,
@@ -320,7 +390,6 @@ class TestExtractResultCompositionalAgentFailure:
         )
 
     def _extract(self, chain_result):
-        from tests.evaluation.harness import _extract_result_compositional
         art = GeneratedArtifact(
             capability_name="investigator",
             capability_type=CapabilityType.AGENT,
@@ -335,7 +404,6 @@ class TestExtractResultCompositionalAgentFailure:
                 subtasks=self._subtasks(),
                 artifacts=[art],
                 matches=[],
-                classified_gaps=[],
                 required_capabilities=["investigate"],
                 verification_results=[],
                 attempt_count=1,
@@ -370,7 +438,7 @@ class TestExtractResultCompositionalAgentFailure:
 class TestRunPilot:
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_pilot_records_written(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -390,7 +458,7 @@ class TestRunPilot:
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_pilot_uses_full_condition_by_default(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -399,14 +467,14 @@ class TestRunPilot:
         mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
 
         harness = EvaluationHarness(config)
-        # run_pilot default condition is "full"; pass static explicitly for a fast no-LLM test
+        # Use the static condition here to keep the default-condition assertion fast.
         records = harness.run_pilot([T04], condition="static")
 
         assert records[0].condition == "static"
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_pilot_records_stored_in_db(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -428,7 +496,7 @@ class TestRunPilot:
 class TestRunCondition:
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_run_condition_calls_restore_per_run(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -445,7 +513,7 @@ class TestRunCondition:
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_run_condition_returns_n_runs_times_n_tasks(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -461,7 +529,7 @@ class TestRunCondition:
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_run_condition_non_pilot(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -476,7 +544,7 @@ class TestRunCondition:
 
     @patch("tests.evaluation.harness.restore_clean_snapshot")
     @patch("tests.evaluation.harness.seed_registry")
-    @patch("tests.evaluation.harness.SkillRegistry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
     @patch("tests.evaluation.harness.ToolLoader")
     def test_run_condition_different_seeds_per_run(
         self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
@@ -492,3 +560,61 @@ class TestRunCondition:
         seeds = {r.seed for r in records}
         # With 2 runs the seeds should differ (extremely unlikely to collide)
         assert len(seeds) == 2
+
+    @patch("tests.evaluation.harness.restore_clean_snapshot")
+    @patch("tests.evaluation.harness.seed_registry")
+    @patch("tests.evaluation.harness.CapabilityRegistry")
+    @patch("tests.evaluation.harness.ToolLoader")
+    def test_run_condition_uses_full_uuid_entropy_in_run_id(
+        self, mock_loader_cls, mock_registry_cls, mock_seed, mock_restore, config
+    ):
+        """Chapter 6 condition run IDs use a full 32-hex UUID suffix."""
+        mock_restore.return_value = "snap_abc12345"
+        mock_registry_cls.return_value = MagicMock(get=MagicMock(return_value=None))
+
+        config.n_runs = 2
+        harness = EvaluationHarness(config)
+        records = harness.run_condition("static", [T04])
+
+        suffixes = [record.run_id.rsplit("_", 1)[1] for record in records]
+        assert len(suffixes) == 2
+        for suffix in suffixes:
+            assert len(suffix) == 32
+            int(suffix, 16)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic condition seed derivation
+# ---------------------------------------------------------------------------
+
+
+class TestConditionSeedIsDeterministic:
+    """Condition seeds must be stable across processes and Python versions."""
+
+    def test_derive_condition_seed_stable_across_calls(self):
+        s1 = _derive_condition_seed("full", 42)
+        s2 = _derive_condition_seed("full", 42)
+        assert s1 == s2
+
+    def test_derive_condition_seed_differs_by_condition(self):
+        assert _derive_condition_seed("full", 42) != _derive_condition_seed(
+            "static", 42,
+        )
+
+    def test_derive_condition_seed_differs_by_base(self):
+        assert _derive_condition_seed("full", 42) != _derive_condition_seed(
+            "full", 43,
+        )
+
+    def test_derive_condition_seed_matches_known_value(self):
+        """Pin the expected SHA-256-derived seed for the canonical
+        (full, 42) pair so a future change to the hashing scheme is
+        caught explicitly."""
+        expected = int.from_bytes(
+            hashlib.sha256(b"full|42").digest()[:4], "big",
+        ) % (2**31)
+        assert _derive_condition_seed("full", 42) == expected
+
+    def test_derive_condition_seed_in_expected_range(self):
+        s = _derive_condition_seed("full", 42)
+        assert 0 <= s < 2**31

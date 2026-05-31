@@ -1,23 +1,24 @@
-"""Evaluation harness for Iteration 5 end-to-end testing.
+"""Evaluation harness for thesis evaluation campaigns.
 
-Drives the four baseline conditions across the testbed task set and records
-EvaluationRecord rows to the EvaluationStore.
+Drives the configured baseline conditions across the testbed task set and
+records ``EvaluationRecord`` rows to the ``EvaluationStore``.
 
 Baseline conditions
 -------------------
 full            : full pipeline (JIT + verification + optimizer)
-no_verification : JIT pipeline with verification gate bypassed (gate_fn=None)
-no_optimization : JIT pipeline without optimizer (run_optimizer=False)
-static          : registry lookup only, no JIT generation
+no_verification : JIT + optimizer with verification disabled
+no_optimization : JIT pipeline without optimizer
+static          : seeded registry + hand-written static implementations
 
-Run protocol (per advisor doc)
-------------------------------
-1. Restore clean snapshot at the start of every run.
-2. Randomise task order within each run (different seed per run).
-3. Randomise condition order across runs.
-4. Registry persists within a run (tasks can reuse capabilities generated
-   by earlier tasks in the same run — this is intentional for optimizer data).
-5. Reset between runs (each run starts from the same clean state).
+Run protocol
+------------
+1. Restore a clean snapshot at the start of every run.
+2. Randomize task order within each run using a deterministic seed.
+3. Use deterministic condition order by default; runners may opt into shuffled
+   condition order for methodology checks.
+4. Keep the registry alive within a run so tasks can reuse capabilities created
+   by earlier tasks in the same run — this is intentional for optimizer data.
+5. Reset between runs so each run starts from the same clean state.
 
 Usage::
 
@@ -26,7 +27,6 @@ Usage::
 
     config = HarnessConfig(
         chroma_dir=Path("data/eval/chroma"),
-        mcp_tools_dir=Path("src/mcp_tools"),
         skills_dir=Path("data/eval/skills"),
         db_path="data/eval/metrics.duckdb",
         n_runs=8,
@@ -42,6 +42,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import time
@@ -50,15 +51,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from src.orchestrator.output_contract_resolver import (
-    _extract_output_contract_llm,
-    resolve_output_contract,
-)
+from src.orchestrator.output_contract_resolver import _extract_output_contract_llm
 from src.orchestrator.tool_loader import ToolLoader
 from src.registry.evaluation_store import EvaluationStore
-from src.registry.store import SkillRegistry, seed_registry
+from src.registry.store import CapabilityRegistry, seed_registry
 from src.schemas.evaluation import EvaluationRecord, GeneratedArtifactSnapshot
-from src.schemas.task import GeneratedArtifact, OutputContract, TaskState
+from src.schemas.task import GeneratedArtifact, TaskState
+from tests.evaluation.conditions import get_condition_profile
 from tests.evaluation.snapshots import restore_clean_snapshot, take_clean_snapshot
 from tests.evaluation.tasks import TaskDefinition
 
@@ -70,41 +69,79 @@ class HarnessConfig:
     """Configuration for one evaluation campaign."""
 
     chroma_dir: Path
-    mcp_tools_dir: Path
     skills_dir: Path
 
     # EvaluationStore path (None = in-memory, useful for tests)
     db_path: str | None = None
 
-    # Run parameters
     n_runs: int = 8
     base_seed: int = 42
 
     # ChromaDB settings
     chroma_collection: str = "capabilities"
 
-    # Optional: LangFuse callback handler (passed to pipeline invocations)
+    # Optional LangFuse callback handler passed to pipeline invocations.
     langfuse_handler: Any | None = None
 
-    # Step 14.12: when True, TaskState is initialised with
-    # ``allow_network=True`` for every task in the run; the 400-record
-    # core eval stays offline by default. Tasks that legitimately need
-    # network access (e.g. T21 fetch-and-summarize-public-api) run under
-    # this flag.
+    # When true, every task is initialized with allow_network=True. The current
+    # core evaluation stays offline by default.
     allow_network: bool = False
 
+    # MetricsStore path. Filesystem paths preserve optimizer telemetry across
+    # runs; None keeps an in-memory store for isolated tests.
+    metrics_store_path: str | None = None
+
+
+@dataclass(frozen=True)
+class StaticImplementationResult:
+    """Normalized output from a hand-written static capability implementation."""
+
+    output: dict
+    output_files: dict[str, bytes]
+
+
+def _normalize_static_implementation_result(
+    raw: dict | tuple[dict, dict[str, bytes]] | StaticImplementationResult,
+) -> StaticImplementationResult:
+    """Normalize static implementation output.
+
+    Static implementations may return only an output dict or an output dict
+    paired with generated file bytes.
+    """
+    if isinstance(raw, StaticImplementationResult):
+        return raw
+    if isinstance(raw, tuple):
+        output, output_files = raw
+        return StaticImplementationResult(
+            output=dict(output),
+            output_files=dict(output_files),
+        )
+    return StaticImplementationResult(output=dict(raw), output_files={})
+
 
 # ---------------------------------------------------------------------------
-# Step 18.10 Option B — capture generated artifact sources at record-write
-# time so the post-eval manual contamination audit can read full source
-# bodies even after snapshot isolation has wiped the registry.
+# Capture generated artifact sources at record-write time so later inspection
+# can read full source bodies even after snapshot isolation has reset the
+# registry.
 # ---------------------------------------------------------------------------
+
+
+def _derive_condition_seed(condition: str, base_seed: int) -> int:
+    """Deterministic seed derivation for EvaluationHarness.
+
+    Uses SHA-256 rather than Python's process-randomized ``hash()`` so the same
+    condition and base seed produce the same ordering across processes and
+    Python versions.
+    """
+    import hashlib
+    key = f"{condition}|{int(base_seed)}".encode()
+    return int.from_bytes(hashlib.sha256(key).digest()[:4], "big") % (2**31)
 
 
 def _snapshot_artifacts(
     artifacts: list[GeneratedArtifact] | None,
 ) -> list[GeneratedArtifactSnapshot]:
-    """Build M2-audit snapshots from the pipeline's generated artifacts.
+    """Build source snapshots from the pipeline's generated artifacts.
 
     Source body is polymorphic by type:
         * MCP_TOOL -> source_code (raw Python)
@@ -112,10 +149,9 @@ def _snapshot_artifacts(
         * AGENT    -> json.dumps(agent_config) keeping system_prompt + subagents
 
     Never raises — any artifact whose source body can't be extracted is
-    silently skipped so a single malformed artifact can't break
-    record_run. Empty list in / empty list out.
+    skipped so a single malformed artifact can't break record writing.
+    Empty list in / empty list out.
     """
-    import json as _json
     from src.schemas.capability import CapabilityType
 
     if not artifacts:
@@ -132,14 +168,14 @@ def _snapshot_artifacts(
                 if art.agent_config is None:
                     body = ""
                 elif isinstance(art.agent_config, dict):
-                    body = _json.dumps(art.agent_config, default=str)
+                    body = json.dumps(art.agent_config, default=str)
                 else:
                     body = str(art.agent_config)
             else:
                 body = ""
             if not body:
-                # Still snapshot the name/type so the audit can skip with
-                # a clear reason instead of silently missing an artifact.
+                # Still snapshot the name/type so later inspection can explain
+                # why the source body is absent.
                 body = ""
             out.append(
                 GeneratedArtifactSnapshot(
@@ -161,6 +197,13 @@ class EvaluationHarness:
         self._config = config
         self._store = EvaluationStore(db_path=config.db_path)
         self._snap_id: str | None = None
+        # Accumulate per-task FlushResult objects across every _execute_run call
+        # so runners can fail the campaign when telemetry flushes are partial.
+        from tests.evaluation.cycle_flush import FlushResult
+        self._flush_results: list[FlushResult] = []
+        # Emit a one-time warning listing permissive metadata-only validators.
+        from tests.evaluation.tasks import warn_permissive_validators_once
+        warn_permissive_validators_once()
 
     # -- public API ----------------------------------------------------------
 
@@ -169,7 +212,7 @@ class EvaluationHarness:
 
         Wipes generated artifacts (skills, chroma) and rebuilds a fresh
         seeded registry so the snapshot captures only the baseline state,
-        not leftover artifacts from previous runs or CLI usage.
+        not leftover artifacts from previous runs.
 
         Must be called before any run_* method.  Returns the snapshot ID.
         """
@@ -197,7 +240,7 @@ class EvaluationHarness:
             shutil.rmtree(cfg.chroma_dir)
         cfg.chroma_dir.mkdir(parents=True, exist_ok=True)
 
-        registry = SkillRegistry(
+        registry = CapabilityRegistry(
             persist_directory=str(cfg.chroma_dir),
             collection_name=cfg.chroma_collection,
         )
@@ -205,7 +248,7 @@ class EvaluationHarness:
         logger.info("Rebuilt clean registry with %d seeded capabilities", len(registry.list_all()))
 
         # 3. Take snapshot of the clean state
-        self._snap_id = take_clean_snapshot(cfg.chroma_dir, cfg.mcp_tools_dir, cfg.skills_dir)
+        self._snap_id = take_clean_snapshot(cfg.chroma_dir, cfg.skills_dir)
         logger.info("Clean snapshot taken: %s", self._snap_id)
         return self._snap_id
 
@@ -236,17 +279,19 @@ class EvaluationHarness:
     ) -> list[EvaluationRecord]:
         """Run n_runs of a single condition across all tasks.
 
-        Task order is randomised per run (different seed per run).
+        Task order is randomized per run with deterministic per-condition seeds.
         The registry is restored to the clean snapshot before each run.
         """
         all_records: list[EvaluationRecord] = []
-        # Use condition name in seed to ensure independent orderings per condition
-        condition_seed = hash((condition, self._config.base_seed)) % (2**31)
+        # Include the condition name so each condition gets independent but
+        # reproducible task orderings.
+        condition_seed = _derive_condition_seed(condition, self._config.base_seed)
         rng = random.Random(condition_seed)
         condition_seeds = [rng.randint(0, 2**31) for _ in range(self._config.n_runs)]
 
         for run_idx, seed in enumerate(condition_seeds):
-            run_id = f"{condition}_{run_idx:02d}_{uuid.uuid4().hex[:6]}"
+            # Use full UUID entropy so append/recovery runs cannot collide.
+            run_id = f"{condition}_{run_idx:02d}_{uuid.uuid4().hex}"
             logger.info("Starting run %s (%s, seed=%d)", run_id, condition, seed)
             records = self._execute_run(
                 run_id=run_id,
@@ -268,6 +313,16 @@ class EvaluationHarness:
     def store(self) -> EvaluationStore:
         return self._store
 
+    @property
+    def flush_results(self) -> list[Any]:
+        """Per-task FlushResult objects accumulated across all runs.
+
+        Returns the live list reference so runners can inspect aggregate flush
+        health before deciding their process exit code. Callers should not
+        mutate it.
+        """
+        return self._flush_results
+
     def close(self) -> None:
         self._store.close()
 
@@ -288,7 +343,7 @@ class EvaluationHarness:
         seed: int,
         is_pilot: bool,
     ) -> list[EvaluationRecord]:
-        """Restore snapshot, randomise task order, execute each task, record."""
+        """Restore snapshot, randomize task order, execute each task, record."""
         import gc
 
         cfg = self._config
@@ -296,7 +351,7 @@ class EvaluationHarness:
         # Force-release any ChromaDB PersistentClient from the previous run.
         # Without this, SQLite WAL files may still be held open when
         # restore_clean_snapshot does shutil.rmtree → shutil.copytree,
-        # causing corruption on the next SkillRegistry init.
+        # causing corruption on the next CapabilityRegistry init.
         try:
             import chromadb
 
@@ -305,8 +360,8 @@ class EvaluationHarness:
             logger.debug("ChromaDB cache clear failed (non-critical): %s", exc)
         gc.collect()
 
-        # Step 1: restore clean snapshot
-        snap_id = restore_clean_snapshot(cfg.chroma_dir, cfg.mcp_tools_dir, cfg.skills_dir)
+        # Restore clean snapshot.
+        snap_id = restore_clean_snapshot(cfg.chroma_dir, cfg.skills_dir)
         if self._snap_id and snap_id != self._snap_id:
             msg = (
                 f"Snapshot ID mismatch: expected {self._snap_id}, got {snap_id} "
@@ -315,26 +370,26 @@ class EvaluationHarness:
             logger.error(msg)
             raise RuntimeError(msg)
 
-        # Step 2: rebuild registry and loader from the restored snapshot
-        registry = SkillRegistry(
+        # Rebuild registry and loader from the restored snapshot.
+        registry = CapabilityRegistry(
             persist_directory=str(cfg.chroma_dir),
             collection_name=cfg.chroma_collection,
         )
         seed_registry(registry)
         loader = ToolLoader()
 
-        # Step 3: create a single MetricsStore for this run (shared across tasks
-        # so the optimizer accumulates data from all tasks in the same run)
+        # One MetricsStore backs the run. A configured metrics_store_path
+        # persists optimizer telemetry across runs; tests can stay in-memory.
         from src.registry.metrics import MetricsStore
 
-        metrics_store = MetricsStore()
+        metrics_store = MetricsStore(db_path=self._config.metrics_store_path)
 
-        # Step 4: randomise task order
+        # Randomize task order.
         rng = random.Random(seed)
         shuffled_tasks = list(tasks)
         rng.shuffle(shuffled_tasks)
 
-        # Step 5: execute each task
+        # Execute each task.
         records: list[EvaluationRecord] = []
         from datetime import UTC, datetime
 
@@ -344,18 +399,11 @@ class EvaluationHarness:
                 "──── Task %d/%d: %s (%s) ────",
                 i + 1, len(shuffled_tasks), task.task_id, task.tier,
             )
-            # Step 18.7 follow-up: capture the pre-task timestamp so the
-            # post-task cycle_events flush (below) can filter MetricsStore's
-            # capability_events to just this task's events.
+            # Capture the pre-task timestamp so the post-task cycle_events flush
+            # can filter MetricsStore capability_events to this task only.
             task_events_cutoff = datetime.now(UTC)
-            # Step 13.7 tag-propagation fix (2026-04-19): wrap BOTH
-            # pipeline.invoke AND the post-task flush in trace_context so
-            # events emitted from ThreadPool workers (gate.verify,
-            # adversarial) + LangChain @tool callbacks (sandbox_execute) +
-            # post-pipeline sites (cycle_flush.completed) all inherit
-            # tags/session/user. The pipeline's own config.metadata still
-            # drives the primary path (get_config() inside nodes); this
-            # wrap just closes the fallback for non-node emit sites.
+            # Wrap pipeline invocation and post-task flush so events emitted
+            # outside graph nodes still inherit task tags/session/user.
             _lf_tags = self._build_task_lf_tags(task, condition, is_pilot)
             with trace_context(
                 tags=_lf_tags,
@@ -376,23 +424,37 @@ class EvaluationHarness:
                 self._store.record_run(record)
                 records.append(record)
 
-                # Step 18.5 + 18.7 (2026-04-17): persist per-task cycle state
-                # (invocation_events + cycle_utility_scores + cycle_events) to
-                # the EvaluationStore for Chapter 6 Gini + KL convergence +
-                # per-type op-count analyses. Factored out to
-                # ``tests.evaluation.cycle_flush.flush_task_cycle_state`` so
-                # the longitudinal scripts (which inline their own task loops)
-                # call the same code path. Never-raises.
+                # Persist per-task invocation, utility, and event telemetry
+                # through the same flush helper used by the longitudinal runner.
+                # The harness logs partial flushes and lets top-level runners
+                # decide process exit behavior.
                 from tests.evaluation.cycle_flush import flush_task_cycle_state
-                flush_task_cycle_state(
+                fr = flush_task_cycle_state(
                     eval_store=self._store,
                     metrics_store=metrics_store,
                     registry=registry,
                     run_id=run_id,
                     condition=condition,
                     task_id=task.task_id,
+                    task_family_id=task.family_id,
+                    task_instance_id=task.instance_id,
+                    variant_id=task.variant_id,
+                    benchmark_track=task.benchmark_track,
                     task_events_cutoff=task_events_cutoff,
+                    is_pilot=is_pilot,
                 )
+                # Accumulate flush health for runner-level exit handling.
+                self._flush_results.append(fr)
+                if not fr.all_ok:
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning(
+                        "cycle_flush partial failure for task=%s "
+                        "condition=%s run_id=%s: invocations_ok=%s "
+                        "utility_scores_ok=%s events_ok=%s errors=%s",
+                        task.task_id, condition, run_id,
+                        fr.invocations_ok, fr.utility_scores_ok, fr.events_ok,
+                        fr.errors,
+                    )
 
         return records
 
@@ -404,10 +466,8 @@ class EvaluationHarness:
     ) -> list[str]:
         """Build the per-task LangFuse tag list.
 
-        Extracted from ``_run_jit`` so the outer loop can also apply the
-        same tags to the ``trace_context`` wrap (Step 13.7 tag-propagation
-        fix). Kept in sync with the in-``_run_jit`` invoke_config.metadata
-        tag list — both call sites share this helper.
+        Shared by the outer trace context and the pipeline invocation metadata
+        so task-level traces and post-task events use the same labels.
         """
         _file_formats = list({
             fp.suffix.lower().lstrip(".") for fp in task.fixture_paths
@@ -415,11 +475,16 @@ class EvaluationHarness:
         _tags: list[str] = [
             condition,
             task.task_id,
+            f"task_family:{task.family_id}",
+            f"task_instance:{task.instance_id}",
+            f"benchmark:{task.benchmark_track}",
             f"tier:{task.tier}",
             *(f"format:{fmt}" for fmt in sorted(_file_formats)),
             f"allow_network:{str(self._config.allow_network).lower()}",
             f"static_coverage:{str(task.has_static_coverage).lower()}",
         ]
+        if task.variant_id:
+            _tags.append(f"variant:{task.variant_id}")
         if is_pilot:
             _tags.append("pilot")
         return _tags
@@ -430,7 +495,7 @@ class EvaluationHarness:
         task: TaskDefinition,
         condition: str,
         run_id: str,
-        registry: SkillRegistry,
+        registry: CapabilityRegistry,
         loader: ToolLoader,
         metrics_store: Any,
         seed: int,
@@ -439,9 +504,10 @@ class EvaluationHarness:
     ) -> EvaluationRecord:
         """Execute one task under one condition and return an EvaluationRecord."""
         t_start = time.monotonic()
+        profile = get_condition_profile(condition)
 
-        if condition == "static":
-            result = self._run_static(task, registry)
+        if not profile.jit_enabled:
+            result = self._run_static(task, registry, metrics_store)
         else:
             result = self._run_jit(
                 task,
@@ -459,6 +525,10 @@ class EvaluationHarness:
             run_id=run_id,
             condition=condition,
             task_id=task.task_id,
+            task_family_id=task.family_id,
+            task_instance_id=task.instance_id,
+            variant_id=task.variant_id,
+            benchmark_track=task.benchmark_track,
             task_tier=task.tier,
             attempt_count=result.get("attempt_count", 0),
             capability_type=result.get("capability_type"),
@@ -494,17 +564,24 @@ class EvaluationHarness:
     def _run_static(
         self,
         task: TaskDefinition,
-        registry: SkillRegistry,
+        registry: CapabilityRegistry,
+        metrics_store: Any = None,
     ) -> dict:
-        """Static baseline: registry lookup + execute pre-written implementation."""
+        """Static baseline: registry lookup + execute pre-written implementation.
+
+        Static runs still record invocation telemetry and apply the same output
+        contract checks as JIT runs so baseline rows are comparable.
+        """
         if not task.has_static_coverage:
             return {
                 "gate_passed": False,
                 "output_in_range": False,
                 "failure_reason": "generation_failed",
+                "output_shape_mismatch": False,
+                "output_shape_missing_keys": [],
+                "output_shape_missing_files": [],
             }
 
-        # Check registry has the expected capability by exact name lookup
         cap = registry.get(task.static_capability_name)
         if cap is None:
             logger.warning(
@@ -515,19 +592,71 @@ class EvaluationHarness:
                 "gate_passed": False,
                 "output_in_range": False,
                 "failure_reason": "generation_failed",
+                "output_shape_mismatch": False,
+                "output_shape_missing_keys": [],
+                "output_shape_missing_files": [],
             }
 
         # Execute the pre-written static implementation
         try:
-            output = _run_static_implementation(task.task_id, task.fixture_paths)
-            in_range = task.validator(output)
+            static_result = _normalize_static_implementation_result(
+                _run_static_implementation(task.task_id, task.fixture_paths)
+            )
+            output = static_result.output
+            output_files = static_result.output_files
+            if output_files and task.file_validator is not None:
+                in_range = task.file_validator(output, output_files)
+            else:
+                in_range = task.validator(output)
+            # Apply the same output-contract check JIT paths use.
+            shape_check = (
+                task.output_contract.check(output, output_files)
+                if task.output_contract
+                else None
+            )
+            shape_mismatch = (
+                shape_check is not None and not shape_check.satisfied
+            )
+
+            failure_reason = "none" if in_range else "output_rejected"
+            # Promote shape mismatch and keep output_in_range aligned with the
+            # canonical success predicate.
+            if in_range and shape_mismatch:
+                failure_reason = "output_shape_mismatch"
+                in_range = False
+
+            # Record one invocation so the static condition contributes to
+            # invocation-distribution metrics. Best-effort only.
+            if metrics_store is not None:
+                try:
+                    from src.schemas.metrics import InvocationRecord
+                    metrics_store.record_invocation(InvocationRecord(
+                        capability_id=task.static_capability_name,
+                        task_id=task.task_id,
+                        success=bool(in_range),
+                        token_cost=0,
+                        latency_ms=0,
+                    ))
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "Failed to record static invocation for %s",
+                        task.task_id, exc_info=True,
+                    )
+
             return {
                 "gate_passed": True,  # static implementations don't go through the gate
                 "output_in_range": in_range,
-                "failure_reason": "none" if in_range else "output_rejected",
+                "failure_reason": failure_reason,
                 "capability_type": cap.capability_type,
                 "attempt_count": 0,
                 "verification_tier_reached": None,  # bypassed for static
+                "output_shape_mismatch": shape_mismatch,
+                "output_shape_missing_keys": (
+                    shape_check.missing_keys if shape_check is not None else []
+                ),
+                "output_shape_missing_files": (
+                    shape_check.missing_files if shape_check is not None else []
+                ),
             }
         except Exception as exc:  # noqa: BLE001
             logger.warning("Static implementation for %s failed: %s", task.task_id, exc)
@@ -535,13 +664,16 @@ class EvaluationHarness:
                 "gate_passed": False,
                 "output_in_range": False,
                 "failure_reason": "generation_failed",
+                "output_shape_mismatch": False,
+                "output_shape_missing_keys": [],
+                "output_shape_missing_files": [],
             }
 
     def _run_jit(
         self,
         task: TaskDefinition,
         condition: str,
-        registry: SkillRegistry,
+        registry: CapabilityRegistry,
         loader: ToolLoader,
         metrics_store: Any,
         *,
@@ -551,15 +683,14 @@ class EvaluationHarness:
         """JIT conditions: invoke the pipeline, then validate output."""
         from src.orchestrator.pipeline import create_pipeline
 
-        run_optimizer = condition == "full"
-        verification_enabled = condition != "no_verification"
+        profile = get_condition_profile(condition)
 
         pipeline = create_pipeline(
             registry,
             loader,
-            run_optimizer=run_optimizer,
+            optimizer_config=profile.optimizer_config,
             metrics_store=metrics_store,
-            verification_enabled=verification_enabled,
+            verification_enabled=profile.verification_enabled,
         ).compile()
 
         # Per-task LangFuse tracing: pass task_id and condition via config
@@ -573,27 +704,27 @@ class EvaluationHarness:
                 fp.suffix.lower().lstrip(".") for fp in task.fixture_paths
             }) if task.fixture_paths else []
 
-            # Step 13.7 tagging audit (2026-04-18) — build the tag list
-            # to maximize analysis-time filterability. Axes:
+            # Tags maximize analysis-time filterability. Axes:
             # - condition: which ablation (full / no_verification / ...)
             # - task_id / tier: per-task + per-tier aggregation
             # - format:X: per-file-format behavior
             # - allow_network:{true|false}: network-policy consistency
-            #   with CLI (CLI also tags this)
             # - pilot: fast exclusion of pilot runs from primary metrics
             # - static_coverage:{true|false}: filter retrieval vs synthesis
-            #   tasks (the 6-of-20 that static can handle)
+            #   tasks.
             _tags = self._build_task_lf_tags(task, condition, is_pilot)
 
             invoke_config["metadata"] = {
                 "langfuse_session_id": run_id,
-                # user_id differentiates eval-harness traces from
-                # interactive `mint` CLI traces (which set user_id="mint-cli").
-                # Per-user LangFuse dashboards show eval-aggregate vs
-                # ad-hoc-CLI-aggregate separately.
+                # user_id differentiates eval-harness traces from ad-hoc
+                # programmatic traces in per-user LangFuse dashboards.
                 "langfuse_user_id": "eval-harness",
                 "langfuse_tags": _tags,
                 "task_id": task.task_id,
+                "task_family_id": task.family_id,
+                "task_instance_id": task.instance_id,
+                "variant_id": task.variant_id,
+                "benchmark_track": task.benchmark_track,
                 "condition": condition,
                 "run_id": run_id,
                 "tier": task.tier,
@@ -603,20 +734,11 @@ class EvaluationHarness:
                 "allow_network": self._config.allow_network,
             }
 
-        # Step 14.6 — resolve the output contract via the shared boundary
-        # adapter. The harness path hits tier-1 (authored shortcut) by passing
-        # ``task_definition=task``; zero LLM calls. CLI free-form prompts go
-        # through the same function with ``task_definition=None`` and fall to
-        # the LLM extractor. Same code path, different inputs.
-        contract = resolve_output_contract(task.task_prompt, task_definition=task)
-
-        # Option 1 — token-cost honesty. The CLI's free-form path runs the
-        # LLM extractor at task entry, which costs tokens. The eval would
-        # under-count per-task token cost (one of the four thesis metrics)
-        # if the harness skipped this call. Run the extractor inside the
-        # LangFuse-tagged invocation context so its tokens count toward the
-        # per-task budget; discard the result. The authored ``contract``
-        # above remains the deterministic measurement instrument.
+        # Token-cost honesty. A free-form prompt path would run the LLM
+        # extractor at task entry, which costs tokens. Run the extractor inside
+        # the LangFuse-tagged invocation context so its tokens count toward the
+        # per-task budget; discard the result. The task's authored output
+        # contract remains the deterministic measurement instrument.
         try:
             _extract_output_contract_llm(task.task_prompt)
         except Exception as exc:  # noqa: BLE001
@@ -626,11 +748,15 @@ class EvaluationHarness:
                 exc,
             )
 
-        initial_state = TaskState(
-            task_description=task.task_prompt,
-            output_contract=contract,
-            allow_network=self._config.allow_network,
+        # Use the shared builder so every pipeline entry point stays in sync
+        # on which TaskState fields get populated.
+        from src.orchestrator.task_state_builder import build_initial_state
+        initial_state = build_initial_state(
+            task, allow_network=self._config.allow_network,
         )
+        # Measure pipeline latency in _run_jit's own scope so the LangFuse
+        # latency score uses the same boundary as the pipeline invocation.
+        _t_start_jit = time.monotonic()
         try:
             final_state: TaskState = pipeline.invoke(initial_state, config=invoke_config)
         except Exception as exc:  # noqa: BLE001
@@ -641,10 +767,10 @@ class EvaluationHarness:
                 "failure_reason": "generation_failed",
                 "attempt_count": 0,
             }
+        jit_elapsed_ms = int((time.monotonic() - _t_start_jit) * 1000)
 
-        # Step 13.7 Batch B6 — capture LangFuse root trace ID for
-        # DuckDB↔LangFuse cross-reference. Read after pipeline.invoke
-        # completes; None when LangFuse is disabled. Never raises.
+        # Capture LangFuse root trace ID for DuckDB/LangFuse cross-reference.
+        # None when LangFuse is disabled.
         _lf_trace_id: str | None = None
         if self._config.langfuse_handler is not None:
             try:
@@ -666,20 +792,19 @@ class EvaluationHarness:
         if _lf_trace_id is not None:
             result["langfuse_trace_id"] = _lf_trace_id
 
-            # Step 13.7 Batch B5 — push M1 (success) + M5 (latency) as
-            # LangFuse scores attached to the trace so Chapter 6's
-            # per-metric dashboards are queryable natively. M3 (Gini)
-            # + M6 (KL) are per-aggregate and flow via cycle_utility_scores
-            # / invocation_events. M2 (contamination) is post-eval via
-            # the audit tool. M4 (token cost) already flows via
-            # GENERATION spans.
+            # Push M1 success and M5 latency scores onto the LangFuse trace.
+            # Aggregate metrics flow through DuckDB telemetry tables.
             try:
                 from langfuse import get_client
                 lf = get_client()
-                success_val = (
-                    float(result.get("gate_passed", False))
-                    * float(result.get("output_in_range", False))
-                )
+                # Use the canonical success predicate so LangFuse and DuckDB
+                # success semantics agree.
+                success_val = 1.0 if EvaluationRecord.is_success(
+                    gate_passed=bool(result.get("gate_passed", False)),
+                    output_in_range=bool(result.get("output_in_range", False)),
+                    output_shape_mismatch=bool(result.get("output_shape_mismatch", False)),
+                ) else 0.0
+                latency_val = float(jit_elapsed_ms or 0)
                 for method_name in ("create_score", "score"):
                     _create = getattr(lf, method_name, None)
                     if _create is None:
@@ -691,16 +816,12 @@ class EvaluationHarness:
                             value=success_val,
                             data_type="NUMERIC",
                         )
-                        # M5 only reported on successful runs (precondition
-                        # per proposal §M5; failed runs have no "first correct").
+                        # M5 is only meaningful on successful runs.
                         if success_val > 0:
                             _create(
                                 trace_id=_lf_trace_id,
                                 name="m5.latency_ms",
-                                value=float(
-                                    result.get("chain_result_attempt_latency_ms", 0)
-                                    or 0
-                                ),
+                                value=latency_val,
                                 data_type="NUMERIC",
                             )
                         break
@@ -712,7 +833,7 @@ class EvaluationHarness:
 
 
 # ---------------------------------------------------------------------------
-# Compositional result extraction (Phase 3)
+# Compositional result extraction
 # ---------------------------------------------------------------------------
 
 
@@ -720,7 +841,6 @@ def _extract_result_compositional(
     subtasks: list,
     artifacts: list,
     matches: list,
-    classified_gaps: list,
     required_capabilities: list[str],
     verification_results: list,
     attempt_count: int,
@@ -740,10 +860,9 @@ def _extract_result_compositional(
     """
     from src.orchestrator.composition import CompositionalExecutor, build_resolution_map
 
-    # Check gate: all generated artifacts must have passed verification.
-    # If verification was enabled and any artifact failed, the pipeline
-    # would have retried up to MAX_ATTEMPTS.  We check the latest report
-    # for each artifact.
+    # Generated artifacts must have passed verification. If verification was
+    # enabled and any artifact failed, the pipeline would have retried up to
+    # MAX_ATTEMPTS, so the latest report is authoritative.
     gate_passed = True
     verification_tier_reached: int | None = None
     if verification_results:
@@ -762,12 +881,11 @@ def _extract_result_compositional(
         # No verification reports but artifacts exist = no_verification condition
         gate_passed = True
 
-    # Build resolution map
     resolution = build_resolution_map(
-        required_capabilities, matches, artifacts, classified_gaps,
+        required_capabilities, matches, artifacts,
     )
 
-    # Determine primary capability type (highest priority in chain)
+    # Record the most capable type present in the executed chain.
     cap_types = []
     for ref in resolution.values():
         ct = str(ref.capability_type).split(".")[-1].lower()
@@ -799,17 +917,15 @@ def _extract_result_compositional(
             "failed_step_index": None,
             "failed_step_name": None,
             "failed_step_reason": None,
-            # Step 14.6: gate-blocked runs never reached terminal state, so
-            # the contract check is not meaningfully evaluated here.
+            # Gate-blocked runs never reached terminal state, so the output
+            # contract check is not meaningfully evaluated here.
             "output_shape_mismatch": False,
             "output_shape_missing_keys": [],
             "output_shape_missing_files": [],
-            # Step 18.10: snapshot even gate-rejected artifacts — they're
-            # still relevant for an M2 audit (did the gate catch mocks?).
+            # Snapshot even gate-rejected artifacts for later inspection.
             "generated_artifact_sources": _snapshot_artifacts(artifacts),
         }
 
-    # Run the compositional chain
     executor = CompositionalExecutor(
         subtasks=subtasks,
         resolution=resolution,
@@ -823,9 +939,8 @@ def _extract_result_compositional(
         allow_network=allow_network,
     )
 
-    chain_result = executor.run(task_id=task.task_id)
+    chain_result = executor.run(task_id=task.instance_id)
 
-    # Validate final output
     output_in_range = False
     failure_reason = "generation_failed"
     final_output: dict | None = None
@@ -844,11 +959,9 @@ def _extract_result_compositional(
             )
             failure_reason = "output_rejected"
     elif not chain_result.chain_success:
-        # Step 13: prefer the structured reason from the execution
-        # backend (currently only AGENT) over the generic
-        # ``chain_step_failed`` so Phase 5 analytics can separate
-        # "agent timed out" from "agent crashed" from "everything
-        # else that can go wrong in a chain step".
+        # Prefer the structured reason from the execution backend over the
+        # generic chain_step_failed bucket, so analyzers can separate AGENT
+        # timeouts from AGENT crashes and other chain-step failures.
         if chain_result.failed_step_reason == "agent_execution_timeout":
             failure_reason = "agent_execution_timeout"
         elif chain_result.failed_step_reason == "agent_execution_error":
@@ -856,11 +969,27 @@ def _extract_result_compositional(
         else:
             failure_reason = "chain_step_failed"
 
-    # Step 14.6 — output contract check (orthogonal to validator).
-    # Set comparison on the typed contract; never raises.
-    shape_check = task.output_contract.check(
-        final_output, chain_result.output_files,
-    ) if task.output_contract else None
+    # Output contract check is orthogonal to the validator. Only evaluate it
+    # after the chain reaches terminal state with a concrete output; execution
+    # failures should stay in execution/infrastructure buckets rather than
+    # being reclassified as shape mismatches.
+    if chain_result.chain_success and final_output is not None:
+        shape_check = task.output_contract.check(
+            final_output, chain_result.output_files,
+        ) if task.output_contract else None
+    else:
+        shape_check = None
+
+    # Promote output_shape_mismatch into failure_reason when the validator is
+    # happy but the typed contract is not. Flip output_in_range as well so all
+    # stores share the same success predicate.
+    if (
+        failure_reason == "none"
+        and shape_check is not None
+        and not shape_check.satisfied
+    ):
+        failure_reason = "output_shape_mismatch"
+        output_in_range = False
 
     # Count how many registry matches vs generated artifacts were executed
     matched_count = sum(
@@ -898,7 +1027,7 @@ def _extract_result_compositional(
         "output_shape_missing_files": (
             shape_check.missing_files if shape_check is not None else []
         ),
-        # Step 18.10 — snapshot every generated artifact for M2 audit.
+        # Snapshot every generated artifact for later inspection.
         "generated_artifact_sources": _snapshot_artifacts(artifacts),
     }
 
@@ -926,21 +1055,53 @@ def _extract_result(
     verification_results = _get("verification_results", []) or []
     attempt_count = _get("attempt_count", 0)
     subtasks = _get("subtasks", []) or []
-    classified_gaps = _get("classified_gaps", []) or []
-    # Step 14.12 — preserve task-level network policy through execution.
+    decomposition_succeeded = bool(_get("decomposition_succeeded", True))
+    # Preserve task-level network policy through execution.
     allow_network = bool(_get("allow_network", False))
 
+    # Fail closed when decomposition already reported failure. Later chain
+    # output must not rescue a task whose decomposition step was unsuccessful.
+    if not decomposition_succeeded:
+        logger.warning(
+            "Task %s marked decomposition_succeeded=False; failing closed in eval harness",
+            task.task_id,
+        )
+        return {
+            "gate_passed": False,
+            "output_in_range": False,
+            "failure_reason": "generation_failed",
+            "attempt_count": attempt_count,
+            "capability_type": None,
+            "verification_tier_reached": None,
+            "token_cost": 0,
+            "invocation_record_id": _get("trace_id", None),
+            "required_capability_count": len(required_capabilities),
+            "matched_in_registry_count": len(matches),
+            "chain_length": max(len(subtasks), 1),
+            "chain_success": False,
+            "matched_and_executed_count": 0,
+            "generated_artifact_count": 0,
+            "capability_types": [],
+            "failed_step_index": None,
+            "failed_step_name": None,
+            "failed_step_reason": "decomposition_failed",
+            "generated_artifact_sources": _snapshot_artifacts(artifacts),
+            "output_shape_mismatch": False,
+            "output_shape_missing_keys": [],
+            "output_shape_missing_files": [],
+        }
+
     # ---------------------------------------------------------------
-    # Compositional execution path (Phase 3): when the task was
-    # decomposed into multiple subtasks, run all resolved artifacts
-    # in dependency order via the CompositionalExecutor.
+    # Compositional execution path: when the task was decomposed into multiple
+    # subtasks, run all resolved artifacts in dependency order. A single
+    # lead-with-subagents AGENT artifact can cover multiple subtasks, so one
+    # artifact or match is enough to enter this path.
     # ---------------------------------------------------------------
-    if len(subtasks) > 1 and (len(artifacts) + len(matches) > 1):
+    if len(subtasks) > 1 and (len(artifacts) + len(matches) >= 1):
         return _extract_result_compositional(
             subtasks=subtasks,
             artifacts=artifacts,
             matches=matches,
-            classified_gaps=classified_gaps,
             required_capabilities=required_capabilities,
             verification_results=verification_results,
             attempt_count=attempt_count,
@@ -952,7 +1113,7 @@ def _extract_result(
         )
 
     # ---------------------------------------------------------------
-    # Single-artifact execution path (legacy, Phase 2 and earlier)
+    # Single-artifact execution path
     # ---------------------------------------------------------------
 
     # Determine verification outcome from the last VerificationReport
@@ -1042,13 +1203,33 @@ def _extract_result(
                 failure_reason = "output_rejected"
             elif gate_passed and output_in_range:
                 failure_reason = "none"
+            # Keep invocation recording parity with static and compositional
+            # paths so invocation-distribution metrics include this artifact.
+            if metrics_store is not None:
+                try:
+                    from src.schemas.metrics import InvocationRecord
+                    metrics_store.record_invocation(InvocationRecord(
+                        capability_id=getattr(artifact, "capability_name", None) or "",
+                        task_id=task.task_id[:64],
+                        success=bool(output_in_range),
+                        token_cost=0,
+                        latency_ms=0,
+                    ))
+                except Exception:  # noqa: BLE001
+                    logger.debug("record_invocation failed (single-artifact)", exc_info=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Artifact execution failed for task %s: %s", task.task_id, exc)
     elif gate_passed and not artifacts and task.has_static_coverage:
         # Registry match with static implementation available — execute it.
         try:
-            output = _run_static_implementation(task.task_id, task.fixture_paths)
-            output_in_range = task.validator(output)
+            static_result = _normalize_static_implementation_result(
+                _run_static_implementation(task.task_id, task.fixture_paths)
+            )
+            output = static_result.output
+            if static_result.output_files and task.file_validator is not None:
+                output_in_range = task.file_validator(output, static_result.output_files)
+            else:
+                output_in_range = task.validator(output)
             if not output_in_range:
                 failure_reason = "output_rejected"
             logger.info(
@@ -1056,6 +1237,31 @@ def _extract_result(
                 task.task_id,
                 output_in_range,
             )
+            # Invocation recording parity for the JIT-registry-match path.
+            if metrics_store is not None and matches:
+                try:
+                    from src.schemas.metrics import InvocationRecord
+                    first_match = matches[0]
+                    cap = (
+                        first_match.capability
+                        if hasattr(first_match, "capability")
+                        else first_match.get("capability")
+                    )
+                    cap_name = (
+                        getattr(cap, "capability_name", None)
+                        or (cap.get("capability_name") if isinstance(cap, dict) else None)
+                        or task.static_capability_name
+                        or ""
+                    )
+                    metrics_store.record_invocation(InvocationRecord(
+                        capability_id=cap_name,
+                        task_id=task.task_id[:64],
+                        success=bool(output_in_range),
+                        token_cost=0,
+                        latency_ms=0,
+                    ))
+                except Exception:  # noqa: BLE001
+                    logger.debug("record_invocation failed (registry-match)", exc_info=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Static execution for registry-matched task %s failed: %s",
@@ -1133,8 +1339,7 @@ def _extract_result(
                 task.task_id,
             )
 
-    # Stage 1 compositional fields: defaults that match single-artifact behavior.
-    # Stage 3 CompositionalExecutor will populate these with real chain data.
+    # Compositional fields: defaults that match single-artifact behavior.
     chain_success = bool(gate_passed and output_in_range)
     if artifacts:
         # Generation path: one freshly-generated artifact was executed.
@@ -1149,12 +1354,26 @@ def _extract_result(
         matched_and_executed_count = 0
     capability_types_list = [capability_type] if capability_type is not None else []
 
-    # Step 14.6 — output contract check on the single-artifact path.
+    # Output contract check on the single-artifact path.
     # Single-artifact execution does not surface a separate output_files
     # mapping (file outputs only appear in compositional chains today),
     # so the file-presence check uses an empty dict here. T07/T11 — the
     # only file-producing tasks — go through the compositional path.
-    shape_check = task.output_contract.check(output, {}) if task.output_contract else None
+    # Only evaluate the contract when execution reached terminal state with a
+    # non-None output.
+    if output is not None:
+        shape_check = task.output_contract.check(output, {}) if task.output_contract else None
+    else:
+        shape_check = None
+
+    # Keep shape-mismatch handling symmetric with the compositional branch.
+    if (
+        failure_reason == "none"
+        and shape_check is not None
+        and not shape_check.satisfied
+    ):
+        failure_reason = "output_shape_mismatch"
+        output_in_range = False
 
     return {
         "gate_passed": gate_passed,
@@ -1163,7 +1382,7 @@ def _extract_result(
         "attempt_count": attempt_count,
         "capability_type": capability_type,
         "verification_tier_reached": verification_tier_reached,
-        "token_cost": 0,  # populated from LangFuse in Iteration 6
+        "token_cost": 0,
         "invocation_record_id": _get("trace_id", None),
         "required_capability_count": len(required_capabilities),
         "matched_in_registry_count": len(matches),
@@ -1175,7 +1394,7 @@ def _extract_result(
         "failed_step_index": None,
         "failed_step_name": None,
         "failed_step_reason": None,
-        # Step 18.10 — snapshot generated artifacts for M2 audit.
+        # Snapshot generated artifacts for later inspection.
         "generated_artifact_sources": _snapshot_artifacts(artifacts),
         "output_shape_mismatch": (
             shape_check is not None and not shape_check.satisfied
@@ -1262,18 +1481,17 @@ def _execute_artifact(
                 else:
                     content = host_path.read_text(encoding="utf-8", errors="replace")
                     fixture_preamble += (
-                        f"import pathlib as _pl\n_pl.Path({sandbox_path!r}).write_text({content!r})\n"
+                        "import pathlib as _pl\n"
+                        f"_pl.Path({sandbox_path!r}).write_text({content!r})\n"
                     )
                 # Replace the host path in fixture_inputs with the sandbox path
                 for k, v in fixture_inputs.items():
                     if str(v) == str(fp):
                         fixture_inputs[k] = sandbox_path
 
-    # Build a sandbox invocation (same pattern as behavioral testing).
-    # Use inspect to filter kwargs to only what the function accepts,
-    # since extra_inputs may include params the tool doesn't expose.
-    # Fuzzy-match extra_inputs keys to actual param names (e.g.
-    # "features" matches "feature_columns") to handle LLM naming variance.
+    # Sandbox calls only pass kwargs accepted by the generated function.
+    # Fuzzy matching handles small naming differences such as "features"
+    # versus "feature_columns".
     sandbox_code = f"""
 import asyncio, json, inspect
 __name__ = "not_main"
@@ -1320,7 +1538,7 @@ asyncio.run(_run())
         extra_pkgs = declared_pkgs
     else:
         extra_pkgs = resolve_extra_packages(source_code)
-    # Allow more time when dynamic deps need installation (Phase 1 pip + Phase 2 exec).
+    # Allow more time when dynamic dependencies need installation before exec.
     exec_timeout = 60 if extra_pkgs else 30
     logger.debug("Sandbox extra_packages=%s timeout=%s", extra_pkgs, exec_timeout)
     result = sandbox_execute(
@@ -1348,9 +1566,8 @@ asyncio.run(_run())
                 str(parsed["error"])[:500],
             )
             return {}
-        # Security audit finding #11 (2026-04-19): preserve falsy / non-dict
-        # results via the shared helper.
-        from src.cli.output_coerce import extract_tool_result
+        # Preserve falsy / non-dict results via the shared helper.
+        from src.orchestrator.output_coerce import extract_tool_result
         output = extract_tool_result(parsed)
         logger.info("Sandbox output for %s: %s", func_name, str(output)[:300])
         return output
@@ -1476,19 +1693,48 @@ def _build_fixture_inputs(task: TaskDefinition, source_code: str | None = None) 
 # ---------------------------------------------------------------------------
 
 
-def _run_static_implementation(task_id: str, fixture_paths: list[Path]) -> dict:
-    """Execute a hand-written static implementation for seeded tasks."""
+def _run_static_implementation(
+    task_id: str, fixture_paths: list[Path],
+) -> dict | tuple[dict, dict[str, bytes]]:
+    """Execute a hand-written static implementation for seeded tasks.
+
+    The dispatch table must align with ``has_static_coverage=True`` in
+    ``tests/evaluation/tasks.py``. The module-load-time assertion below fails
+    if the task metadata and implementation table drift apart.
+    """
     if task_id == "T01":
         return _static_t01(fixture_paths[0])
     if task_id == "T02":
         return _static_t02(fixture_paths[0], fixture_paths[1])
-    if task_id == "T03":
-        return _static_t03(fixture_paths[0])
     if task_id == "T05":
         return _static_t05(fixture_paths[0])
     if task_id == "T09":
         return _static_t09(fixture_paths[0])
+    if task_id == "T04":
+        return _static_t04(fixture_paths[0], fixture_paths[1])
+    if task_id == "T11":
+        return _static_t11(fixture_paths[0], fixture_paths[1], fixture_paths[2])
+    if task_id == "T13":
+        return _static_t13(fixture_paths[0], fixture_paths[1])
+    if task_id == "T14":
+        return _static_t14(fixture_paths[0], fixture_paths[1], fixture_paths[2])
+    if task_id == "T15":
+        return _static_t15(fixture_paths[0], fixture_paths[1])
+    if task_id == "T19":
+        return _static_t19(fixture_paths[0])
+    if task_id == "T20":
+        return _static_t20(fixture_paths[0], fixture_paths[1])
     raise ValueError(f"No static implementation for {task_id}")
+
+
+# Tasks for which a hand-written static implementation exists in this
+# module. KEEP IN SYNC with the dispatch above and with
+# ``has_static_coverage=True`` in tests/evaluation/tasks.py — the
+# startup assertion at the bottom of this module enforces the
+# bidirectional invariant.
+_STATIC_IMPLEMENTATION_TASKS: frozenset[str] = frozenset(
+    {"T01", "T02", "T04", "T05", "T09", "T11", "T13", "T14", "T15", "T19", "T20"}
+)
 
 
 def _static_t01(csv_path: Path) -> dict:
@@ -1535,33 +1781,6 @@ def _static_t02(config_path: Path, schema_path: Path) -> dict:
     return {"errors": errors}
 
 
-def _static_t03(doc_path: Path) -> dict:
-    """Compute word count and Flesch readability score."""
-    import re
-
-    text = doc_path.read_text()
-    words = re.findall(r"\b\w+\b", text)
-    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
-
-    def syllables(word: str) -> int:
-        return max(len(re.findall(r"[aeiouAEIOU]+", word)), 1)
-
-    n_words = len(words)
-    n_sentences = max(len(sentences), 1)
-    n_syllables = sum(syllables(w) for w in words)
-    score = round(
-        max(
-            0.0,
-            min(
-                100.0,
-                206.835 - 1.015 * (n_words / n_sentences) - 84.6 * (n_syllables / max(n_words, 1)),
-            ),
-        ),
-        2,
-    )
-    return {"word_count": n_words, "readability_score": score}
-
-
 def _static_t05(csv_path: Path) -> dict:
     """Remove nulls and duplicates, return counts."""
     import csv as _csv
@@ -1585,6 +1804,41 @@ def _static_t05(csv_path: Path) -> dict:
     # Counting on `unique` (which derives from non_null) is correct: the cleaned data has no nulls.
     null_count = sum(1 for r in unique for v in r.values() if not v.strip())
     return {"output_row_count": len(unique), "null_count": null_count}
+
+
+def _static_t04(csv_path: Path, yaml_path: Path) -> dict:
+    """Apply the reorder policy from YAML to the inventory CSV."""
+    import csv as _csv
+    import math as _math
+
+    import yaml
+
+    rules = yaml.safe_load(yaml_path.read_text())
+    min_days = float(rules["min_days_of_stock"])
+    reorder_days = float(rules["reorder_days_supply"])
+    max_order_value = float(rules["max_order_value"])
+
+    with csv_path.open() as f:
+        rows = list(_csv.DictReader(f))
+
+    below_threshold = 0
+    total_cost = 0.0
+    for row in rows:
+        current_stock = float(row["current_stock"])
+        daily_usage = float(row["daily_usage"])
+        unit_cost = float(row["unit_cost"])
+        days_of_stock = current_stock / daily_usage if daily_usage else float("inf")
+        if days_of_stock < min_days:
+            below_threshold += 1
+            reorder_qty = _math.ceil(daily_usage * reorder_days)
+            order_cost = reorder_qty * unit_cost
+            total_cost += min(order_cost, max_order_value)
+
+    return {
+        "product_count": len(rows),
+        "items_below_threshold": below_threshold,
+        "total_reorder_cost": round(total_cost, 2),
+    }
 
 
 def _static_t09(data_path: Path) -> dict:
@@ -1627,5 +1881,271 @@ def _static_t09(data_path: Path) -> dict:
     return {"summary": summary, "stats_table": stats_table, "anomalies": anomalies}
 
 
-# Late import to avoid circular at module level
-import json  # noqa: E402
+def _static_t11(
+    sales_csv_path: Path,
+    products_xlsx_path: Path,
+    targets_csv_path: Path,
+) -> tuple[dict, dict[str, bytes]]:
+    """Join sales/products/targets and emit an Excel summary."""
+    import csv as _csv
+    import io
+
+    import openpyxl
+
+    with sales_csv_path.open() as f:
+        sales = list(_csv.DictReader(f))
+
+    products_wb = openpyxl.load_workbook(products_xlsx_path, read_only=True)
+    product_rows = list(products_wb.active.iter_rows(values_only=True))
+    product_headers = [str(v) for v in product_rows[0]]
+    products = [dict(zip(product_headers, row, strict=False)) for row in product_rows[1:]]
+    products_by_id = {str(p["product_id"]): p for p in products}
+
+    with targets_csv_path.open() as f:
+        targets = list(_csv.DictReader(f))
+    targets_by_region = {row["region"]: float(row["target_revenue"]) for row in targets}
+
+    region_revenues: dict[str, float] = {}
+    for sale in sales:
+        product_id = str(sale["product_id"])
+        if product_id not in products_by_id:
+            continue
+        region = str(sale["region"])
+        revenue = float(sale["quantity"]) * float(sale["unit_price"])
+        region_revenues[region] = region_revenues.get(region, 0.0) + revenue
+
+    sorted_regions = sorted(region_revenues)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "summary"
+    ws.append(["region", "total_revenue", "target_revenue", "meets_target"])
+
+    regions_meeting_target = 0
+    for region in sorted_regions:
+        total_revenue = round(region_revenues[region], 2)
+        target_revenue = float(targets_by_region[region])
+        meets_target = total_revenue >= target_revenue
+        regions_meeting_target += int(meets_target)
+        ws.append([region, total_revenue, target_revenue, meets_target])
+        region_revenues[region] = total_revenue
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    output = {
+        "summary_row_count": len(sorted_regions),
+        "region_revenues": region_revenues,
+        "regions_meeting_target": regions_meeting_target,
+        "output_file": "output.xlsx",
+    }
+    return output, {"output.xlsx": buf.getvalue()}
+
+
+def _static_t13(metrics_csv_path: Path, baselines_json_path: Path) -> dict:
+    """Detect anomalies directly from the metric baselines."""
+    import csv as _csv
+    import json as _json
+
+    baselines = _json.loads(baselines_json_path.read_text())
+    with metrics_csv_path.open() as f:
+        rows = list(_csv.DictReader(f))
+
+    anomalies = []
+    for row in rows:
+        timestamp = row["timestamp"]
+        for metric, bounds in baselines.items():
+            value = float(row[metric])
+            if value < float(bounds["min"]) or value > float(bounds["max"]):
+                anomalies.append({
+                    "timestamp": timestamp,
+                    "metric": metric,
+                    "value": value,
+                })
+
+    return {
+        "anomaly_count": len(anomalies),
+        "anomalies": anomalies,
+        "metrics_analyzed": len(baselines),
+    }
+
+
+def _static_t14(
+    departments_csv_path: Path,
+    transactions_tsv_path: Path,
+    rules_json_path: Path,
+) -> dict:
+    """Aggregate department spending and apply the budget policy."""
+    import csv as _csv
+    import json as _json
+
+    with departments_csv_path.open() as f:
+        departments = list(_csv.DictReader(f))
+    budgets = {
+        row["department"]: float(row["annual_budget"])
+        for row in departments
+    }
+
+    with transactions_tsv_path.open() as f:
+        transactions = list(_csv.DictReader(f, delimiter="\t"))
+
+    rules = _json.loads(rules_json_path.read_text())
+    threshold = float(rules["max_single_transaction"])
+
+    department_spending = {department: 0.0 for department in budgets}
+    flagged_transactions = 0
+    for row in transactions:
+        department = row["department"]
+        amount = float(row["amount"])
+        department_spending[department] = department_spending.get(department, 0.0) + amount
+        if amount > threshold:
+            flagged_transactions += 1
+
+    department_spending = {
+        department: round(total, 2)
+        for department, total in department_spending.items()
+    }
+    over_budget_count = sum(
+        1 for department, total in department_spending.items()
+        if total > budgets[department]
+    )
+    return {
+        "department_count": len(budgets),
+        "department_spending": department_spending,
+        "over_budget_count": over_budget_count,
+        "flagged_transactions": flagged_transactions,
+    }
+
+
+def _static_t15(hourly_metrics_csv_path: Path, config_json_path: Path) -> dict:
+    """Apply config-driven daily aggregations and threshold checks."""
+    import csv as _csv
+    import json as _json
+    from collections import defaultdict
+
+    config = _json.loads(config_json_path.read_text())
+    with hourly_metrics_csv_path.open() as f:
+        rows = list(_csv.DictReader(f))
+
+    by_day: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        day = row["timestamp"].split(" ")[0]
+        by_day[day].append(row)
+
+    alert_days = 0
+    metrics_cfg = config["metrics"]
+    thresholds = config["alert_thresholds"]
+    for day_rows in by_day.values():
+        day_alert = False
+        for metric, aggregations in metrics_cfg.items():
+            values = [float(r[metric]) for r in day_rows]
+            for agg in aggregations:
+                if agg == "mean":
+                    agg_value = sum(values) / len(values)
+                elif agg == "max":
+                    agg_value = max(values)
+                elif agg == "sum":
+                    agg_value = sum(values)
+                else:
+                    continue
+                threshold = thresholds.get(f"{metric}_{agg}")
+                if threshold is not None and agg_value > float(threshold):
+                    day_alert = True
+        alert_days += int(day_alert)
+
+    return {
+        "n_days": len(by_day),
+        "metrics_aggregated": len(metrics_cfg),
+        "alert_days": alert_days,
+    }
+
+
+def _static_t19(csv_path: Path) -> dict:
+    """Exploratory data analysis on product sales CSV.
+
+    The static baseline returns the contract keys checked by ``_validate_t19``:
+    ``n_rows``, ``n_categories``, and ``categories``.
+    """
+    import csv as _csv
+
+    with csv_path.open() as f:
+        reader = _csv.DictReader(f)
+        rows = list(reader)
+
+    categories = sorted({r.get("category", "").strip() for r in rows if r.get("category")})
+    return {
+        "n_rows": len(rows),
+        "n_categories": len(categories),
+        "categories": categories,
+    }
+
+
+def _static_t20(applications_csv_path: Path, policy_json_path: Path) -> dict:
+    """Apply the eligibility rules to every application row."""
+    import csv as _csv
+    import json as _json
+
+    policy = _json.loads(policy_json_path.read_text())
+    rules = policy["rules"]
+
+    with applications_csv_path.open() as f:
+        applications = list(_csv.DictReader(f))
+
+    def _passes_rule(application: dict, rule: dict) -> bool:
+        value = application[rule["field"]]
+        op = rule["operator"]
+        if op == "less_than":
+            return float(value) < float(rule["threshold"])
+        if op == "between":
+            numeric = float(value)
+            return float(rule["min"]) <= numeric <= float(rule["max"])
+        if op == "greater_than_or_equal":
+            return float(value) >= float(rule["threshold"])
+        if op == "in_list":
+            return value in set(rule["allowed"])
+        raise ValueError(f"Unsupported operator: {op}")
+
+    eligible_count = 0
+    ineligible_count = 0
+    for application in applications:
+        passed = all(_passes_rule(application, rule) for rule in rules)
+        if passed:
+            eligible_count += 1
+        else:
+            ineligible_count += 1
+
+    return {
+        "total_applications": len(applications),
+        "eligible_count": eligible_count,
+        "ineligible_count": ineligible_count,
+        "rules_applied": len(rules),
+    }
+
+
+def _assert_static_implementation_coverage() -> None:
+    """Guard that static coverage metadata matches this module's implementations.
+
+    Asserts the ``_STATIC_IMPLEMENTATION_TASKS`` whitelist exactly
+    matches the set of tasks in ``tests/evaluation/tasks.py`` with
+    ``has_static_coverage=True``. Loud-fails on drift in either
+    direction so future edits to ``tasks.py`` or the dispatch table
+    can't silently regress.
+    """
+    try:
+        from tests.evaluation.tasks import ALL_TASKS
+    except Exception:  # noqa: BLE001
+        # During bootstrap (e.g., sphinx build or partial import) tasks
+        # may not be importable; skip the assertion then.
+        return
+    coverage_tasks = {t.task_id for t in ALL_TASKS if t.has_static_coverage}
+    if coverage_tasks != _STATIC_IMPLEMENTATION_TASKS:
+        missing_impl = coverage_tasks - _STATIC_IMPLEMENTATION_TASKS
+        missing_coverage = _STATIC_IMPLEMENTATION_TASKS - coverage_tasks
+        raise AssertionError(
+            "Static implementation whitelist drift. has_static_coverage=True tasks: "
+            f"{sorted(coverage_tasks)}; _STATIC_IMPLEMENTATION_TASKS: "
+            f"{sorted(_STATIC_IMPLEMENTATION_TASKS)}. "
+            f"Missing implementation for: {sorted(missing_impl)}. "
+            f"Missing coverage flag for: {sorted(missing_coverage)}."
+        )
+
+
+_assert_static_implementation_coverage()

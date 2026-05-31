@@ -1,13 +1,10 @@
 """Unit tests for the per-gap capability classifier.
 
-LLM-calling behaviour is covered by ``tests/integration/test_classifier.py``
-with real OpenAI calls.  These tests cover schema validation and the
-classifier node's routing logic (patching ``classify_gap``, not the LLM).
+These tests cover schema validation, mocked LLM success/failure paths, and
+the classifier node's routing logic.
 
-As of Stage 2 of the compositional refactor, ``classifier_node`` iterates
-over ``state.gaps`` and calls ``classify_gap`` per gap. The legacy
-``classify_task`` wrapper is retained for single-gap / whole-task callers
-and is tested separately at the bottom of this file.
+``classifier_node`` iterates over ``state.gaps`` and calls ``classify_gap``
+per gap.
 """
 
 from __future__ import annotations
@@ -17,17 +14,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.orchestrator.classifier import (
-    _normalize_capability_name,
-    _slug_from_task,
+    MAX_CLASSIFICATION_ATTEMPTS,
+    _enforce_file_writer_mcp_tool,
     classifier_node,
     classify_gap,
-    classify_task,
 )
 from src.schemas.capability import CapabilityType
 from src.schemas.task import (
     ClassificationResult,
     ClassifiedGap,
     GapItem,
+    OutputContract,
     TaskState,
     TaskStatus,
 )
@@ -69,7 +66,7 @@ class TestClassificationResult:
         assert roundtripped.capability_name == "exploratory-analyzer"
 
     def test_capability_name_required(self):
-        """capability_name is a required field — missing it must raise."""
+        """capability_name is required; missing it must raise."""
         with pytest.raises(ValueError):
             ClassificationResult(
                 classified_type=CapabilityType.MCP_TOOL,
@@ -79,139 +76,7 @@ class TestClassificationResult:
 
 
 # ---------------------------------------------------------------------------
-# _slug_from_task — deterministic slug generation
-# ---------------------------------------------------------------------------
-
-
-class TestSlugFromTask:
-    def test_deterministic(self):
-        """Same task description always produces the same slug."""
-        desc = "Parse a CSV file and count rows"
-        assert _slug_from_task(desc) == _slug_from_task(desc)
-
-    def test_different_tasks_different_slugs(self):
-        """Different task descriptions produce different slugs."""
-        a = _slug_from_task("Parse a CSV file")
-        b = _slug_from_task("Train a machine-learning model")
-        assert a != b
-
-    def test_slug_format(self):
-        """Slug is hyphen-separated lowercase with a short hash suffix."""
-        slug = _slug_from_task("Parse a CSV file")
-        assert slug.startswith("parse-a-csv-file")
-        # 6-char hex suffix at the end
-        assert len(slug.split("-")[-1]) == 6
-
-    def test_empty_task_falls_back_to_task(self):
-        """Empty or punctuation-only tasks fall back to 'task' as the base."""
-        slug = _slug_from_task("...")
-        assert slug.startswith("task-")
-
-
-# ---------------------------------------------------------------------------
-# _normalize_capability_name — LLM-chosen name validation + normalization
-# ---------------------------------------------------------------------------
-
-
-class TestNormalizeCapabilityName:
-    """Regression tests for the LLM-chosen capability name pipeline.
-
-    Before this change, capability names were derived from the first 40
-    chars of the task description, producing ugly names like
-    ``parse_this_xml_report_data_and_find_the__6b415a`` that:
-    1. Were cosmetically poor (mid-word truncation)
-    2. Risked registry over-matching on surface text (since the name was
-       literally a task-description prefix)
-    3. Confused the LLM in future tasks (same prefix = perceived reuse)
-
-    The fix: classifier returns a semantic kebab-case name in its
-    structured output. ``_normalize_capability_name`` validates and
-    appends a hash suffix for collision safety.
-    """
-
-    def test_clean_kebab_case_preserved(self):
-        """A well-formed LLM name is accepted and gets a hash suffix."""
-        result = _normalize_capability_name(
-            "xml-revenue-extractor", "Parse this XML"
-        )
-        assert result.startswith("xml-revenue-extractor-")
-        assert len(result.split("-")[-1]) == 6
-
-    def test_snake_case_converted_to_kebab(self):
-        """LLM names with underscores are normalized to hyphens."""
-        result = _normalize_capability_name(
-            "xml_revenue_extractor", "task desc"
-        )
-        assert result.startswith("xml-revenue-extractor-")
-
-    def test_mixed_separators_normalized(self):
-        """Spaces, underscores, and other separators collapse to hyphens."""
-        result = _normalize_capability_name(
-            "XML revenue Extractor!", "task desc"
-        )
-        assert result.startswith("xml-revenue-extractor-")
-
-    def test_leading_trailing_hyphens_stripped(self):
-        result = _normalize_capability_name(
-            "---xml-extractor---", "task desc"
-        )
-        assert result.startswith("xml-extractor-")
-        assert not result.startswith("-")
-
-    def test_uppercase_lowercased(self):
-        result = _normalize_capability_name("XML-Extractor", "task desc")
-        assert result.startswith("xml-extractor-")
-
-    def test_deterministic_hash_suffix(self):
-        """Same task description produces the same hash suffix (for retry idempotency)."""
-        task = "Parse XML report data"
-        a = _normalize_capability_name("xml-parser", task)
-        b = _normalize_capability_name("xml-parser", task)
-        assert a == b
-
-    def test_different_tasks_different_suffixes(self):
-        """Same capability name but different tasks get different suffixes."""
-        a = _normalize_capability_name("xml-parser", "task one")
-        b = _normalize_capability_name("xml-parser", "task two")
-        assert a != b
-
-    def test_empty_name_falls_back_to_slug(self):
-        """Empty or whitespace-only LLM name falls back to _slug_from_task."""
-        result = _normalize_capability_name("", "Parse this XML file")
-        # Should get the ugly slug from task description
-        assert result.startswith("parse-this-xml-file-")
-
-    def test_whitespace_only_name_falls_back(self):
-        result = _normalize_capability_name("   ", "Parse this XML file")
-        assert result.startswith("parse-this-xml-file-")
-
-    def test_punctuation_only_falls_back(self):
-        result = _normalize_capability_name("!!!---!!!", "Parse this XML file")
-        assert result.startswith("parse-this-xml-file-")
-
-    def test_overly_long_name_truncated_at_hyphen_boundary(self):
-        """Names over 40 chars are truncated at a hyphen boundary."""
-        # 50-char name
-        long_name = "a-very-long-capability-name-that-exceeds-the-limit"
-        result = _normalize_capability_name(long_name, "task desc")
-        # The part before the hash should be <= 40 chars and end cleanly
-        base = "-".join(result.split("-")[:-1])
-        assert len(base) <= 40
-        assert not base.endswith("-")
-
-    def test_all_caps_no_separators(self):
-        result = _normalize_capability_name("EXTRACTOR", "task desc")
-        assert result.startswith("extractor-")
-
-    def test_numeric_digits_allowed(self):
-        result = _normalize_capability_name(
-            "top-5-extractor", "task desc"
-        )
-        assert result.startswith("top-5-extractor-")
-
-
-# ---------------------------------------------------------------------------
-# classify_task — LLM success and failure paths (mocking _get_llm)
+# classify_gap: LLM success and failure paths (mocking _get_llm)
 # ---------------------------------------------------------------------------
 
 
@@ -227,60 +92,59 @@ def _make_mock_llm(response=None, raises=None):
     return mock_llm
 
 
-class TestClassifyTask:
-    def test_success_returns_classified_gap(self):
-        """Successful LLM call produces a ClassifiedGap using the LLM's
-        chosen capability name (with a hash suffix for collision safety)."""
+class TestClassifyGap:
+    def test_success_returns_classified_gap_with_original_gap_query(self):
+        """Successful LLM call preserves the original gap query for composition."""
         mock_response = ClassificationResult(
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.95,
             rationale="Deterministic parse",
             capability_name="csv-row-column-summarizer",
         )
-        task_desc = "Parse a CSV file and return row count"
+        gap = GapItem(description="Parse the CSV input", query="parse-csv")
 
         with patch(
             "src.orchestrator.classifier._get_llm",
             return_value=_make_mock_llm(mock_response),
         ):
-            result = classify_task(task_desc, required_capabilities=["parse-csv"])
+            result = classify_gap(
+                gap,
+                task_description="Parse a CSV file and return row count",
+                required_capabilities=["parse-csv"],
+            )
 
         assert isinstance(result, ClassifiedGap)
         assert result.classified_type == CapabilityType.MCP_TOOL
         assert result.confidence == 0.95
-        assert task_desc[:40] in result.description
-        # query uses the LLM's semantic name + hash suffix
-        assert result.query.startswith("csv-row-column-summarizer-")
-        assert len(result.query.split("-")[-1]) == 6
+        assert result.description == "Parse the CSV input"
+        assert result.query == "parse-csv"
 
-    def test_llm_failure_falls_back_to_mcp_tool(self):
-        """When LLM raises any exception, classify_task returns MCP_TOOL with confidence 0.3."""
-        task_desc = "Parse a CSV file"
+    def test_llm_failure_returns_none_after_retry_budget(self):
+        """When all attempts fail, classify_gap returns None."""
+        gap = GapItem(description="Parse CSV", query="parse-csv")
 
         with patch(
             "src.orchestrator.classifier._get_llm",
             return_value=_make_mock_llm(raises=RuntimeError("API error")),
         ):
-            result = classify_task(task_desc, required_capabilities=[])
+            result = classify_gap(gap, "Parse a CSV file", required_capabilities=[])
 
-        assert result.classified_type == CapabilityType.MCP_TOOL
-        assert result.confidence == 0.3
-        assert "LLM classification failed" in result.rationale
+        assert result is None
 
-    def test_llm_failure_rationale_contains_error(self):
-        """Fallback rationale includes the original exception message."""
-        task_desc = "Parse a CSV file"
+    def test_llm_failure_retries_max_attempts(self):
+        """Transient classifier failures consume the configured retry budget."""
+        gap = GapItem(description="Parse CSV", query="parse-csv")
+        mock_llm = _make_mock_llm(raises=RuntimeError("rate limit exceeded"))
 
-        with patch(
-            "src.orchestrator.classifier._get_llm",
-            return_value=_make_mock_llm(raises=ValueError("rate limit exceeded")),
-        ):
-            result = classify_task(task_desc, required_capabilities=[])
+        with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
+            result = classify_gap(gap, "Parse a CSV file", required_capabilities=[])
 
-        assert "rate limit exceeded" in result.rationale
+        assert result is None
+        invoke = mock_llm.with_structured_output.return_value.invoke
+        assert invoke.call_count == MAX_CLASSIFICATION_ATTEMPTS
 
     def test_uses_structured_output_with_classification_result(self):
-        """classify_task calls with_structured_output(ClassificationResult)."""
+        """classify_gap calls with_structured_output(ClassificationResult)."""
         mock_response = ClassificationResult(
             classified_type=CapabilityType.SKILL,
             confidence=0.8,
@@ -288,17 +152,18 @@ class TestClassifyTask:
             capability_name="multi-step-processor",
         )
         mock_llm = _make_mock_llm(mock_response)
+        gap = GapItem(description="Some capability", query="some-cap")
 
         with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
-            classify_task("Some task", required_capabilities=["cap-a"])
+            classify_gap(gap, "Some task", required_capabilities=["cap-a"])
 
         mock_llm.with_structured_output.assert_called_once_with(ClassificationResult)
 
     def test_invoke_called_without_explicit_callbacks(self):
-        """classify_task does not pass a per-node callbacks config to structured_llm.invoke.
+        """classify_gap does not pass a per-node callbacks config to structured_llm.invoke.
 
         The pipeline-level LangFuse CallbackHandler propagates automatically via
-        LangChain's contextvar inheritance — no per-node handler is needed.
+        LangChain's contextvar inheritance, so no per-node handler is needed.
         """
         mock_response = ClassificationResult(
             classified_type=CapabilityType.MCP_TOOL,
@@ -307,16 +172,17 @@ class TestClassifyTask:
             capability_name="test-cap",
         )
         mock_llm = _make_mock_llm(mock_response)
+        gap = GapItem(description="Some capability", query="some-cap")
 
         with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
-            classify_task("Some task", required_capabilities=[])
+            classify_gap(gap, "Some task", required_capabilities=[])
 
         invoke_call = mock_llm.with_structured_output.return_value.invoke
         args, kwargs = invoke_call.call_args
         assert "config" not in kwargs
 
     def test_required_capabilities_included_in_prompt(self):
-        """classify_task passes required_capabilities into the prompt."""
+        """classify_gap passes required_capabilities into the prompt."""
         mock_response = ClassificationResult(
             classified_type=CapabilityType.MCP_TOOL,
             confidence=0.9,
@@ -324,9 +190,11 @@ class TestClassifyTask:
             capability_name="csv-parser",
         )
         mock_llm = _make_mock_llm(mock_response)
+        gap = GapItem(description="Parse CSV", query="parse-csv")
 
         with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
-            classify_task(
+            classify_gap(
+                gap,
                 "Parse CSV",
                 required_capabilities=["parse-csv", "count-rows", "extract-columns"],
             )
@@ -346,9 +214,10 @@ class TestClassifyTask:
             capability_name="csv-parser",
         )
         mock_llm = _make_mock_llm(mock_response)
+        gap = GapItem(description="Parse CSV", query="parse-csv")
 
         with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
-            classify_task("Parse CSV", required_capabilities=[])
+            classify_gap(gap, "Parse CSV", required_capabilities=[])
 
         invoke_call = mock_llm.with_structured_output.return_value.invoke
         prompt_text = invoke_call.call_args[0][0]
@@ -364,9 +233,10 @@ class TestClassifyTask:
         )
         mock_llm = _make_mock_llm(mock_response)
         long_desc = "A" * 5000
+        gap = GapItem(description="long capability", query="long-cap")
 
         with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
-            classify_task(long_desc, required_capabilities=[])
+            classify_gap(gap, long_desc, required_capabilities=[])
 
         invoke_call = mock_llm.with_structured_output.return_value.invoke
         prompt_text = invoke_call.call_args[0][0]
@@ -374,7 +244,7 @@ class TestClassifyTask:
         assert "A" * 1500 in prompt_text
         assert "A" * 1501 not in prompt_text
 
-    def test_task_description_truncated_in_classified_gap(self):
+    def test_gap_description_truncated_in_classified_gap(self):
         """ClassifiedGap.description is capped at 500 chars."""
         mock_response = ClassificationResult(
             classified_type=CapabilityType.MCP_TOOL,
@@ -383,16 +253,16 @@ class TestClassifyTask:
             capability_name="bulk-processor",
         )
         mock_llm = _make_mock_llm(mock_response)
-        long_desc = "B" * 2000
+        gap = GapItem(description="B" * 2000, query="bulk-processing")
 
         with patch("src.orchestrator.classifier._get_llm", return_value=mock_llm):
-            result = classify_task(long_desc, required_capabilities=[])
+            result = classify_gap(gap, "Bulk process", required_capabilities=[])
 
         assert len(result.description) == 500
 
 
 # ---------------------------------------------------------------------------
-# Classifier node — routing logic (patches classify_task, not the LLM)
+# Classifier node: routing logic (patches classify_gap, not the LLM)
 # ---------------------------------------------------------------------------
 
 
@@ -514,7 +384,7 @@ class TestClassifierNode:
 
         mock_classify.assert_not_called()
         # No-op early-return path in classifier_node: the Command update
-        # contains only `status` — classified_gaps is NOT emitted, so the
+        # contains only `status`; classified_gaps is NOT emitted, so the
         # pre-existing state.classified_gaps (empty by default) stays intact.
         assert "classified_gaps" not in cmd.update
         assert cmd.update["status"] == TaskStatus.CLASSIFYING
@@ -571,10 +441,7 @@ class TestClassifierNode:
             assert isinstance(item, ClassifiedGap)
 
     def test_classification_failure_sets_sticky_flag(self):
-        """§12 finding #16: classify_gap returns None on exhaustion →
-        classifier_node flips classification_succeeded=False and records a
-        CLASSIFICATION_FAILED error marker. No silent MCP_TOOL default.
-        """
+        """classifier_node marks the task failed when a gap cannot be classified."""
         state = TaskState(
             task_description="Parse CSV",
             required_capabilities=["parse-csv"],
@@ -583,7 +450,7 @@ class TestClassifierNode:
 
         with patch(
             "src.orchestrator.classifier.classify_gap",
-            return_value=None,  # None = all retries exhausted per finding #16
+            return_value=None,  # None = all retries exhausted.
         ):
             cmd = classifier_node(state)
 
@@ -600,7 +467,7 @@ class TestClassifierNode:
 
     def test_partial_classification_failure_flips_sticky_flag(self):
         """Mixed outcome: one gap classifies successfully, one fails retries.
-        Sticky flag still flips — any classification failure fails the task.
+        Sticky flag still flips because any classification failure fails the task.
         """
         state = TaskState(
             task_description="Parse CSV and summarize",
@@ -637,7 +504,7 @@ class TestClassifierNode:
         When ``state.gaps`` is empty, the node takes the no-op early-return
         branch (classifier.py lines 401-407) and emits only ``{"status": ...}``.
         It does NOT include ``errors`` in the Command update, which means
-        LangGraph keeps whatever ``state.errors`` held before the node ran —
+        LangGraph keeps whatever ``state.errors`` held before the node ran,
         i.e. the decomposition error stays on the task. This test locks in
         that exact non-overwrite contract.
         """
@@ -650,17 +517,17 @@ class TestClassifierNode:
 
         cmd = classifier_node(state)
 
-        # No-op branch does not touch errors — the key is absent from the
+        # No-op branch does not touch errors; the key is absent from the
         # Command update, so pre-existing errors on state survive untouched.
         assert "errors" not in cmd.update
 
     def test_classify_gap_keyboard_interrupt_propagates(self):
         """KeyboardInterrupt (BaseException, not Exception) escapes the retry loop.
 
-        ``classify_gap``'s retry loop catches ``Exception`` (see classifier.py
-        line 216) — every normal failure is swallowed and converted to ``None``
-        after ``MAX_CLASSIFICATION_ATTEMPTS`` per §12 finding #16. This is the
-        intentional fail-closed-without-raising contract.
+        ``classify_gap``'s retry loop catches ``Exception``: every normal
+        failure is swallowed and converted to ``None`` after
+        ``MAX_CLASSIFICATION_ATTEMPTS``. This is the intentional
+        fail-closed-without-raising contract.
 
         However, ``BaseException`` subclasses like ``KeyboardInterrupt``,
         ``SystemExit``, and ``GeneratorExit`` deliberately bypass that net so
@@ -795,7 +662,7 @@ class TestClassifierNode:
 
 
 # ---------------------------------------------------------------------------
-# File-writer override — §12 finding #11 safety net
+# File-writer override: structural safety net
 # ---------------------------------------------------------------------------
 
 
@@ -803,8 +670,6 @@ class TestEnforceFileWriterMcpTool:
     """Direct unit tests for the override helper."""
 
     def test_no_required_files_noop(self):
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
         gaps = [
             ClassifiedGap(
                 query="write-xlsx-file",
@@ -815,20 +680,16 @@ class TestEnforceFileWriterMcpTool:
             ),
         ]
         out, warnings = _enforce_file_writer_mcp_tool(gaps, [])
-        assert out == gaps  # identity — no mutation
+        assert out == gaps  # identity, no mutation
         assert warnings == []
 
     def test_empty_gaps_noop(self):
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
         out, warnings = _enforce_file_writer_mcp_tool([], ["output.csv"])
         assert out == []
         assert warnings == []
 
     def test_writer_classified_agent_gets_overridden(self):
-        """The T16 drift case — parent-task bias folded writer into AGENT."""
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
+        """Parent-task bias can fold a writer gap into AGENT."""
         gaps = [
             ClassifiedGap(
                 query="incident-triage-agent",
@@ -854,12 +715,10 @@ class TestEnforceFileWriterMcpTool:
         # Writer overridden to MCP_TOOL.
         assert out[1].classified_type == CapabilityType.MCP_TOOL
         # Rationale carries the override audit trail.
-        assert "Step 12 finding #11 override" in out[1].rationale
+        assert "[file-writer override]" in out[1].rationale
         assert "Parent is agent-task" in out[1].rationale  # original preserved
 
     def test_writer_classified_skill_gets_overridden(self):
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
         gaps = [
             ClassifiedGap(
                 query="write-csv-file",
@@ -874,9 +733,7 @@ class TestEnforceFileWriterMcpTool:
         assert out[0].classified_type == CapabilityType.MCP_TOOL
 
     def test_writer_already_mcp_tool_noop(self):
-        """The T11 happy path — writer correctly classified; don't touch."""
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
+        """A writer already classified as MCP_TOOL is left unchanged."""
         gaps = [
             ClassifiedGap(
                 query="write-xlsx-file",
@@ -889,13 +746,11 @@ class TestEnforceFileWriterMcpTool:
         out, warnings = _enforce_file_writer_mcp_tool(gaps, ["output.xlsx"])
         assert warnings == []
         assert out[0].classified_type == CapabilityType.MCP_TOOL
-        # Rationale unchanged — no override note added.
+        # Rationale unchanged; no override note added.
         assert "override" not in out[0].rationale.lower()
 
     def test_non_writer_gap_not_touched(self):
         """Non-writer gaps (any classification) are left alone."""
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
         gaps = [
             ClassifiedGap(
                 query="parse-sales-csv",
@@ -918,8 +773,6 @@ class TestEnforceFileWriterMcpTool:
         assert out[1].classified_type == CapabilityType.SKILL
 
     def test_case_insensitive_write_prefix(self):
-        from src.orchestrator.classifier import _enforce_file_writer_mcp_tool
-
         gaps = [
             ClassifiedGap(
                 query="WRITE-XLSX-FILE",  # uppercase
@@ -934,14 +787,12 @@ class TestEnforceFileWriterMcpTool:
         assert out[0].classified_type == CapabilityType.MCP_TOOL
 
 
-class TestClassifierNodeWritererOverride:
-    """Integration-style — classifier_node wires the override correctly."""
+class TestClassifierNodeWriterOverride:
+    """classifier_node wires the file-writer override correctly."""
 
     @patch("src.orchestrator.classifier.classify_gap")
     def test_override_fires_when_contract_declares_files(self, mock_classify):
         """End-to-end: classifier LLM routes writer to AGENT, override fixes it."""
-        from src.schemas.task import OutputContract
-
         mock_classify.side_effect = [
             ClassifiedGap(
                 query="incident-triage-agent",
@@ -993,7 +844,7 @@ class TestClassifierNodeWritererOverride:
             required_capabilities=["write-csv-file"],
             gaps=[GapItem(query="write-csv-file", description="write-csv-file")],
             classified_gaps=[],
-            # No output_contract — override can't fire.
+            # No output_contract, so the override cannot fire.
         )
 
         cmd = classifier_node(state)

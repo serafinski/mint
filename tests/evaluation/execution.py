@@ -1,9 +1,9 @@
-"""SKILL and AGENT artifact execution — three distinct backends.
+"""Evaluation artifact execution — three distinct runtime backends.
 
 Each capability type uses a different execution backend:
 
-- **MCP Tool**: sandbox code execution, no LLM at runtime (handled in harness.py)
-- **SKILL**: constrained LLM with ``sandbox_execute`` tool calling (max 3 calls,
+- **MCP Tool**: sandbox code execution, no LLM at runtime.
+- **SKILL**: constrained LLM with ``sandbox_execute`` tool calling (max 5 calls,
   no planning loop, no ``write_todos``). Prescribed workflow execution.
 - **AGENT**: full DeepAgent with ``sandbox_execute`` + native ``skills=`` parameter
   for progressive disclosure. Adaptive autonomous reasoning.
@@ -18,7 +18,11 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import multiprocessing
+import queue
+import sys
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple
 
@@ -27,22 +31,21 @@ from pydantic import BaseModel, Field, create_model
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Timeouts (seconds) — matching CLAUDE.md operational boundaries
+# Timeouts (seconds) matching the eval runtime boundaries.
 # ---------------------------------------------------------------------------
 
 SKILL_EXECUTION_TIMEOUT_S = 240
-# Step 13 (2026-04-15): raised from 480 → 900 after langfuse trace
-# `aec201273d7aef62c675ce5b4cb9a2ef` showed a T16 incident-triage agent
-# running 598s of genuine forward progress (5 sequential subagent calls,
-# all producing a correct root_cause_metric answer) before the 480s
-# ceiling killed it 118s before completion. 900s matches the observed
-# tail of the distribution with comfortable headroom.
+# AGENT artifacts may perform several sequential analysis/tool rounds, so the
+# base timeout is higher than SKILL while still bounding a single artifact run.
 AGENT_EXECUTION_TIMEOUT_S = 900
+# Lead-with-subagents artifacts can run several subagent calls in sequence.
+# Give that topology extra headroom without inflating every agent run.
+LEAD_WITH_SUBAGENTS_TIMEOUT_S = 1800
 _RECURSION_LIMIT = 100
 
 
 # ---------------------------------------------------------------------------
-# Step 13 (2026-04-15) — sticky failure signal for agent execution
+# Sticky failure signal for agent execution.
 # ---------------------------------------------------------------------------
 #
 # ``execute_agent_artifact`` returns a ``dict`` and falls back to ``{}`` on
@@ -52,10 +55,10 @@ _RECURSION_LIMIT = 100
 # failure vs a legitimately-empty answer.
 #
 # The thread-local below records the outcome of the most recent
-# ``execute_agent_artifact`` call in the calling thread. The harness,
-# CLI, and compositional executor read it immediately after the call to
+# ``execute_agent_artifact`` call in the calling thread. The harness and
+# compositional executor read it immediately after the call to
 # distinguish timeout from error from success. Thread-local scoping is
-# safe because all three callers invoke agent execution synchronously
+# safe because these callers invoke agent execution synchronously
 # from the same thread (no hidden thread hops between the call and the
 # meta read).
 
@@ -68,11 +71,11 @@ class AgentExecutionMeta(NamedTuple):
 
     ``succeeded=True`` means the DeepAgent returned a structured response
     (possibly empty). ``succeeded=False`` with ``failure_reason="timeout"``
-    means the thread-pool ``future.result(timeout=...)`` tripped the
-    ``AGENT_EXECUTION_TIMEOUT_S`` ceiling. ``failure_reason="error"``
-    covers every other exception path (including LLM provider errors,
-    DeepAgents invocation crashes, and LangFuse handler failures that
-    propagate out of the inner loop).
+    means the outer process-level guard hit the execution ceiling and
+    terminated the worker. ``failure_reason="error"`` covers every other
+    exception path (including LLM provider errors, DeepAgents invocation
+    crashes, and LangFuse handler failures that propagate out of the
+    inner loop).
     """
 
     succeeded: bool
@@ -111,6 +114,82 @@ def get_last_agent_execution_meta() -> AgentExecutionMeta | None:
 def clear_last_agent_execution_meta() -> None:
     """Reset the thread-local meta (used by tests and chain callers)."""
     _agent_exec_state.last = None
+
+
+def _agent_timeout_seconds(artifact: Any) -> int:
+    """Return the runtime timeout budget for this AGENT artifact."""
+    agent_config = getattr(artifact, "agent_config", None) or {}
+    return (
+        LEAD_WITH_SUBAGENTS_TIMEOUT_S
+        if agent_config.get("subagents")
+        else AGENT_EXECUTION_TIMEOUT_S
+    )
+
+
+def _agent_process_context():
+    """Choose a multiprocessing context suitable for AGENT workers.
+
+    On macOS, ``fork`` is unsafe once the parent has initialized OpenTelemetry,
+    HTTP clients, or other native-threaded runtimes; the child can die with a
+    hard SIGSEGV before Python-level exception handling runs. Prefer ``spawn``
+    there. Other platforms keep ``fork`` first because it's cheaper and lets
+    tests inherit monkeypatches naturally.
+    """
+    methods = ("spawn", "fork") if sys.platform == "darwin" else ("fork", "spawn")
+    for method in methods:
+        try:
+            return multiprocessing.get_context(method)
+        except ValueError:
+            continue
+    return multiprocessing.get_context()
+
+
+def _execute_agent_inner_child(
+    result_queue: Any,
+    artifact: Any,
+    task: Any,
+    fixture_contents: dict[str, str],
+    *,
+    langfuse_tags: list[str] | None,
+    langfuse_session_id: str | None,
+    output_schema: dict[str, str] | None,
+    allow_network: bool,
+) -> None:
+    """Run ``_execute_agent_inner`` in an isolated process and report the result."""
+    clear_last_agent_execution_meta()
+    try:
+        output = _execute_agent_inner(
+            artifact,
+            task,
+            fixture_contents,
+            langfuse_tags=langfuse_tags,
+            langfuse_session_id=langfuse_session_id,
+            output_schema=output_schema,
+            allow_network=allow_network,
+        )
+        meta = get_last_agent_execution_meta()
+        result_queue.put(
+            {
+                "output": output,
+                "meta": meta._asdict() if meta is not None else None,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Agent child execution failed for %s: %s",
+            getattr(task, "task_id", "?"),
+            exc,
+        )
+        result_queue.put(
+            {
+                "output": {},
+                "meta": {
+                    "succeeded": False,
+                    "failure_reason": "error",
+                    "timeout_seconds": None,
+                },
+            }
+        )
 
 # ---------------------------------------------------------------------------
 # Response models (harness-internal, not pipeline state)
@@ -180,6 +259,12 @@ class T17Result(BaseModel):
     fraud_customer_ids: list
 
 
+class T19Result(BaseModel):
+    n_rows: int
+    n_categories: int
+    categories: list[str]
+
+
 class GenericResult(BaseModel):
     """Fallback for tasks without a dedicated response model."""
     model_config = {"extra": "allow"}
@@ -191,48 +276,30 @@ def _build_dynamic_result_model(
 ) -> type[BaseModel] | None:
     """Build a per-invocation Pydantic response model from a decomposer output_schema.
 
-    **Why (§12 finding #12, 2026-04-16).** The proposal's §3.4 Structured
-    State Communication requires *"strictly typed JSON schemas representing
-    the world state at each handoff point"*. The CLI path for AGENT
-    execution falls back to :class:`GenericResult` (``extra="allow"``),
-    which lets the LLM pick any keys it wants. The T16 second-run failure
-    (`Missing required upstream_data key: metrics_table`) was the
-    empirical consequence: AGENT produced task-level return keys only,
-    the decomposer's declared ``metrics_table`` key never reached the
-    downstream MCP_TOOL writer, writer crashed.
+    Compositional AGENT steps need to return the handoff keys declared by the
+    decomposer so downstream MCP_TOOL writers can read their required fields.
+    A task-level model, or :class:`GenericResult`, may allow the LLM to return
+    final-answer keys instead.
 
-    This helper closes the gap. When a decomposer subtask carries a
-    non-empty ``output_schema``, we build a per-invocation Pydantic
-    model with each key as a required ``object``-typed field and
-    ``extra="forbid"`` — forcing the LLM's structured-output call to
-    produce exactly those keys. The field type is ``object`` (not
-    more specific) because the decomposer's ``output_schema`` values are
-    free-form prose descriptions (``"list[dict] — each dict has ..."``)
-    that we don't parse into concrete types; ``object`` is the widest
-    JSON-schema-compatible type that will accept any LLM-produced value.
+    When a subtask carries a non-empty ``output_schema``, we build a model with
+    each declared key as a required ``object``-typed field. The schema values
+    are free-form prose descriptions rather than concrete Python types, so
+    ``object`` is the widest JSON-schema-compatible field type that accepts any
+    LLM-produced value.
 
-    Returns ``None`` when the schema is empty (fall back to the existing
-    ``TASK_RESULT_MODELS.get(..., GenericResult)`` behavior).
-
-    Layer 1 of the two-layer defense for finding #12. Layer 2 is the
-    runtime output-key validator in
+    Returns ``None`` when the schema is empty, which preserves the normal
+    ``TASK_RESULT_MODELS.get(..., GenericResult)`` behavior. The runtime
+    output-key validator in
     :func:`src.orchestrator.composition.CompositionalExecutor._execute_agent_step`
-    which fails the chain when output keys still don't match the
-    declared schema (e.g. if the LLM's structured-output call itself
-    failed and the DeepAgent fell back to an empty dict).
+    still fails the chain if required handoff keys are missing.
     """
     if not output_schema:
         return None
     # ``object`` is JSON-schema's permissive "any value" type; paired with
     # ``...`` (Ellipsis default) the field is required. ``extra="allow"``
-    # tolerates additional keys beyond the declared ones — necessary for
-    # lead+subagents AGENT artifacts where the lead produces an aggregated
-    # output that covers all collapsed subtasks' schemas + the task-level
-    # return keys. An initial ``extra="forbid"`` design was empirically
-    # too strict (T16 third run 2026-04-16: lead produced task-level keys
-    # as "extras", pydantic rejected them, whole chain failed). The
-    # required-keys enforcement alone gives downstream MCP_TOOL writers
-    # what they need via ``requires_upstream_keys``; the extras are harmless.
+    # tolerates additional keys beyond the declared ones. Lead+subagents AGENT
+    # artifacts may aggregate several subtask schemas plus task-level return
+    # keys, while downstream validation still enforces required handoff keys.
     class _DynamicAgentResultBase(BaseModel):
         model_config = {"extra": "allow"}
 
@@ -242,6 +309,29 @@ def _build_dynamic_result_model(
         __base__=_DynamicAgentResultBase,
         **fields,
     )
+
+
+def _select_result_model(
+    task: Any,
+    *,
+    output_schema: dict[str, str] | None = None,
+    prefer_output_schema: bool = False,
+) -> type[BaseModel]:
+    """Choose the response model for a SKILL/AGENT execution.
+
+    Direct task executions prefer the authored task model where one exists.
+    Compositional chain steps are different: the downstream consumer needs
+    the decomposer-declared handoff keys, not the final task answer shape.
+    For those callers, ``prefer_output_schema=True`` makes the dynamic model
+    built from ``output_schema`` override the task-level model.
+    """
+    task_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
+    dynamic_model = _build_dynamic_result_model(output_schema)
+    if dynamic_model is None:
+        return task_model
+    if prefer_output_schema or task_model is GenericResult:
+        return dynamic_model
+    return task_model
 
 
 TASK_RESULT_MODELS: dict[str, type[BaseModel]] = {
@@ -255,6 +345,7 @@ TASK_RESULT_MODELS: dict[str, type[BaseModel]] = {
     "T15": T15Result,
     "T16": T16Result,
     "T17": T17Result,
+    "T19": T19Result,
 }
 
 
@@ -291,20 +382,14 @@ def _make_network_scoped_sandbox(allow_network: bool, *, silent: bool = False):
     AGENT execution backends bind ``sandbox_execute`` as an LLM tool; the
     LLM cannot set ``allow_network`` itself (it's a keyword-only safety
     knob, not a tool-schema parameter). This wrapper applies the task's
-    declared policy to every invocation. Step 14.12.
+    declared policy to every invocation.
 
-    Fix #1 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
-    ``silent=True`` routes to ``sandbox_execute_silent`` which skips
-    the ``sandbox.execute`` event emission. Use this for the AGENT
-    backend because ``create_deep_agent(tools=[...])`` runs its
-    tool-dispatch inside a LangGraph runnable chain — LangChain's
-    callback handler auto-traces every tool-call as a ``type=TOOL``
-    observation with strictly more detail than the event. Keep
-    ``silent=False`` (default) for the SKILL backend: its manual
-    tool-dispatch loop (``tool_calling_llm.invoke`` → Python ``for``
-    over ``response.tool_calls`` → direct ``sandbox_execute(...)`` call)
-    runs OUTSIDE any LangChain runnable, so LangChain doesn't trace it
-    — the event is the ONLY record.
+    ``silent=True`` routes to ``sandbox_execute_silent`` and skips the custom
+    ``sandbox.execute`` event. Use this for AGENT execution because DeepAgents
+    tool-dispatch runs inside a LangGraph runnable chain that is already traced
+    by LangChain callbacks. Keep ``silent=False`` for SKILL execution because
+    its manual tool-dispatch loop calls the sandbox outside a LangChain
+    runnable, so the explicit event is the execution record.
     """
     if silent:
         from src.verification.sandbox_tool import (
@@ -323,8 +408,7 @@ def _make_network_scoped_sandbox(allow_network: bool, *, silent: bool = False):
         """Execute a Python snippet in an isolated Docker container.
 
         (Network-policy-scoped wrapper: outbound network is permitted iff
-        the enclosing task was invoked with ``--allow-network`` or
-        ``mint config set network.allow true``.)
+        the caller passed ``allow_network=True``.)
         """
         return _base_sandbox_execute(
             code=code,
@@ -350,37 +434,44 @@ def _fixtures_to_workspace_files(fixture_contents: dict[str, str]) -> dict:
     key like ``"t16_incident.yaml"`` will never match: the agent calls
     ``read_file("t16_incident.yaml")``, validate_path turns it into
     ``"/t16_incident.yaml"``, the backend's ``files.get("/t16_incident.yaml")``
-    returns None, and the tool reports ``"Error: File '/t16_incident.yaml'
-    not found"``. The T16 AGENT trace on 2026-04-15 showed this exact
-    failure (trace ``45a39ccd95d0edbedaa7bae3f71b4290``) — the agent tried
-    to read the incident YAML, got the error, then fabricated an answer
-    via ``sandbox_execute`` on no data.
+    returns None, and the tool reports that the file was not found.
 
     Storing with the leading slash makes the lookup match. The agent can
     call ``read_file("t16_incident.yaml")`` OR
     ``read_file("/t16_incident.yaml")`` — validate_path normalizes both to
     the same key.
 
-    **Why this wasn't caught earlier.** SKILL execution uses a plain
-    ``init_chat_model().bind_tools([sandbox_execute])`` — no DeepAgent, no
-    StateBackend, no ``read_file``. Lead-with-subagents AGENT execution
-    (the ≥2-AGENT-gaps path) embeds fixture content directly into
-    ``task(description="...content...")`` calls and bypasses ``read_file``
-    too. Only the **solo AGENT** path (one gap classified as AGENT → one
-    DeepAgent with no subagents) actually exercises this code, and the
-    decomposer only started reliably producing solo-AGENT outputs for
-    multi-file investigation tasks after the 2026-04 decomposition-prompt
-    updates (Rule 11 + Example 4 + Example 7).
+    SKILL execution does not use DeepAgents' workspace backend, and
+    lead-with-subagents AGENT execution can pass fixture content directly in
+    subagent task descriptions. The solo AGENT path is the path that relies on
+    these workspace files.
     """
     files: dict = {}
     for filename, content in fixture_contents.items():
         # Prepend "/" to match what validate_path() produces at read time.
         key = filename if filename.startswith("/") else f"/{filename}"
-        # StateBackend expects splitlines for content. Use keepends=False
-        # (default) so the lines don't carry trailing newlines — matches
-        # how ``_collect_skill_files`` writes skills.
-        files[key] = {"content": content.splitlines()}
+        files[key] = _make_workspace_file_entry(content)
     return files
+
+
+def _make_workspace_file_entry(content: str) -> dict[str, Any]:
+    """Build a DeepAgents ``FileData``-compatible state entry.
+
+    Our eval harness seeds DeepAgents' in-memory ``files`` mapping directly.
+    DeepAgents' documented ``FileData`` shape treats ``created_at`` and
+    ``modified_at`` as optional, but some glob/listing codepaths still sort by
+    ``modified_at`` via direct indexing. Providing timestamps here keeps our
+    payload aligned with the backend contract and avoids integration-only
+    crashes in filesystem tools.
+    """
+    timestamp = datetime.now(UTC).isoformat()
+    # Use splitlines() without keepends so the in-memory representation matches
+    # the format expected by StateBackend and by our skill-file collector.
+    return {
+        "content": content.splitlines(),
+        "created_at": timestamp,
+        "modified_at": timestamp,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +627,7 @@ def execute_skill_artifact(
     *,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    output_schema: dict[str, str] | None = None,
     allow_network: bool = False,
 ) -> dict:
     """Execute a SKILL artifact via constrained LLM with tool calling.
@@ -550,6 +642,7 @@ def execute_skill_artifact(
             artifact, task, fixture_contents,
             langfuse_tags=langfuse_tags,
             langfuse_session_id=langfuse_session_id,
+            output_schema=output_schema,
             allow_network=allow_network,
         )
     except Exception as exc:  # noqa: BLE001
@@ -564,6 +657,7 @@ def _execute_skill_inner(
     *,
     langfuse_tags: list[str] | None = None,
     langfuse_session_id: str | None = None,
+    output_schema: dict[str, str] | None = None,
     allow_network: bool = False,
 ) -> dict:
     from langchain.chat_models import init_chat_model
@@ -571,14 +665,16 @@ def _execute_skill_inner(
 
     from src.config import DEFAULT_LLM_MODEL
 
-    # Step 14.12: wrap sandbox_execute in a closure that enforces the task-
-    # level network policy. The SKILL executor binds this wrapper as the
-    # LLM tool, so every tool call inherits the same policy — the LLM
-    # can't override it mid-execution.
+    # Bind a sandbox wrapper that enforces the task-level network policy for
+    # every tool call; the LLM cannot override it mid-execution.
     sandbox_execute = _make_network_scoped_sandbox(allow_network)
 
     skill_content = getattr(artifact, "skill_content", None) or ""
-    result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
+    result_model = _select_result_model(
+        task,
+        output_schema=output_schema,
+        prefer_output_schema=bool(output_schema),
+    )
 
     system_prompt = (
         _SKILL_EXECUTION_SYSTEM_PROMPT
@@ -646,7 +742,7 @@ def _execute_skill_inner(
         #      cases where the LLM wrote the answer as its final text reply)
         #   3. Only if both fail, do a structured-output LLM call
         #
-        # For GenericResult (CLI path, no task_id), the LLM extraction has no
+        # For GenericResult (no task_id), the LLM extraction has no
         # useful schema to guide it and will produce an empty dict — so we
         # skip it entirely and return whatever the non-LLM fallbacks found,
         # even if that's an empty dict.
@@ -677,7 +773,7 @@ def _execute_skill_inner(
         if result_model is GenericResult:
             logger.warning(
                 "Skill execution produced no extractable JSON output "
-                "(CLI path, GenericResult); returning empty dict"
+                "(GenericResult fallback); returning empty dict"
             )
             return {}
 
@@ -715,7 +811,7 @@ def _execute_skill_inner(
 
 
 # ---------------------------------------------------------------------------
-# MCP_TOOL chain execution (Phase 3 — compositional executor)
+# MCP_TOOL chain execution for the compositional executor.
 # ---------------------------------------------------------------------------
 
 
@@ -727,11 +823,19 @@ def execute_mcp_tool_in_chain(
     capability_name: str = "tool",
     *,
     allow_network: bool = False,
+    depends_on: list[int] | None = None,
 ) -> dict:
     """Execute an MCP_TOOL as one step of a chain with workspace state passing.
 
     Reads inputs from ``/workspace/fixtures/`` and ``/workspace/step_*_output.json``,
     runs the tool function, writes output to ``/workspace/step_<N>_output.json``.
+
+    When ``depends_on`` is provided, the sandbox code only loads
+    ``step_*_output.json`` files whose step index is in the dependency filter
+    set. The caller may pass either the direct dependency list or the transitive
+    closure of declared predecessors; in both cases unrelated parallel branches
+    are excluded. ``depends_on=None`` preserves broad-load behavior for callers
+    that have no dependency information.
 
     Never raises — returns ``{}`` on any failure.
     """
@@ -742,9 +846,21 @@ def execute_mcp_tool_in_chain(
     )
 
     func_name = _extract_function_name(source_code) or capability_name.replace("-", "_")
+    # ``step_index`` reflects execution order, not DAG rootness. In chains with
+    # multiple independent root subtasks (e.g. JSON loader + CSV parser),
+    # later root steps still need broad fixture binding even when their
+    # topological position is > 0.
+    is_root_step = depends_on == [] if depends_on is not None else (step_index == 0)
+
+    # Encode the depends_on filter so the sandbox only merges state from
+    # declared predecessors. Empty list = read nothing; None = read everything.
+    if depends_on is None:
+        _deps_filter_expr = "None"  # marker: sentinel meaning "load all"
+    else:
+        _deps_filter_expr = json.dumps(sorted({int(d) for d in depends_on}))
 
     sandbox_code = f"""\
-import asyncio, json, inspect, os, glob
+import asyncio, json, inspect, os, glob, re
 
 __name__ = "not_main"
 
@@ -755,10 +871,24 @@ async def _run():
         _all_inputs = {{}}
         _fixture_paths = []
 
+        # Only merge state from predecessors declared in depends_on. None means
+        # load all prior step outputs for callers with no dependency info.
+        _deps_filter = {_deps_filter_expr}
+
+        def _step_idx_from_path(_sf_path):
+            _m = re.match(r"step_(\\d+)_output\\.json$", os.path.basename(_sf_path))
+            return int(_m.group(1)) if _m else -1
+
+        def _is_allowed(_sf_path):
+            if _deps_filter is None:
+                return True
+            return _step_idx_from_path(_sf_path) in _deps_filter
+
         # Read upstream step outputs FIRST (higher priority for later steps).
-        # These are the structured JSON handoffs from previous chain steps —
-        # the proposal's "world state at each handoff point".
+        # These are the structured JSON handoffs from previous chain steps.
         for _sf in sorted(glob.glob("/workspace/step_*_output.json")):
+            if not _is_allowed(_sf):
+                continue
             _step_name = os.path.basename(_sf).replace("_output.json", "")
             try:
                 with open(_sf) as _f:
@@ -769,9 +899,10 @@ async def _run():
             except Exception:
                 pass
 
-        # Read fixture files. For step 0, fixture filenames are added to
-        # _all_inputs as generic keys (the parser step needs broad access).
-        # For later steps, fixtures are only in _fixture_paths for explicit
+        # Read fixture files. For root steps (no dependencies), fixture
+        # filenames are added to _all_inputs as generic keys because parser/
+        # loader steps need broad access. For dependent steps, fixtures are
+        # only in _fixture_paths for explicit
         # parameter-name matching — they won't be assigned to unrelated params
         # via the generic fuzzy matcher below.
         _fixtures_dir = "/workspace/fixtures"
@@ -780,7 +911,7 @@ async def _run():
                 _full = os.path.join(_fixtures_dir, _fp)
                 if os.path.isfile(_full):
                     _fixture_paths.append(_full)
-                    if {step_index} == 0:
+                    if {is_root_step!r}:
                         _all_inputs[_fp] = _full
 
         # Match available inputs to function parameters.
@@ -791,10 +922,14 @@ async def _run():
         _sig = inspect.signature({func_name})
         _valid = set(_sig.parameters.keys())
 
-        if {step_index} > 0 and "upstream_data" in _valid:
-            # Collect only upstream step outputs (not fixtures) into one dict
+        if not {is_root_step!r} and "upstream_data" in _valid:
+            # Collect only upstream step outputs (not fixtures) into one dict.
+            # Filter by depends_on so parallel branches don't see each other's
+            # state.
             _upstream = {{}}
             for _sf in sorted(glob.glob("/workspace/step_*_output.json")):
+                if not _is_allowed(_sf):
+                    continue
                 try:
                     with open(_sf) as _uf:
                         _ud = json.load(_uf)
@@ -807,12 +942,13 @@ async def _run():
             _kwargs = {{k: v for k, v in _all_inputs.items() if k in _valid}}
 
         # Path-like parameter matching: assign fixture paths to params
-        # whose names suggest they expect a file path (file_path, csv_path, etc.)
-        # For step 0: any path-like param gets the first unused fixture (broad).
-        # For later steps: only match when the fixture filename overlaps with
-        # the parameter name (e.g. param "xlsx_path" matches "products.xlsx").
-        # This prevents binary fixtures from being blindly assigned to unrelated
-        # params in downstream steps (T11 .xlsx crash reproducer).
+        # whose names suggest they expect a file path (file_path, csv_path, etc.).
+        # Use greedy global best-match assignment by keyword overlap so root
+        # steps don't invert semantically obvious bindings like
+        # hourly_csv_path -> metrics.csv / policy_json_path -> config.json.
+        # Root steps still get a positional fallback for otherwise-ambiguous
+        # fixtures; downstream steps remain overlap-gated to avoid blindly
+        # binding unrelated files.
         _PATH_KEYWORDS = {{"path", "file", "csv", "log", "json", "txt", "xml",
                           "yaml", "yml", "tsv", "xlsx", "doc", "input"}}
         _required = {{
@@ -821,25 +957,48 @@ async def _run():
         }}
         _unmatched = _required - set(_kwargs)
         _used_fixtures = set()
-        for _p in sorted(_unmatched):
-            _p_lower = _p.lower()
-            if any(kw in _p_lower for kw in _PATH_KEYWORDS):
+        def _words(_text):
+            return {{
+                _w.rstrip("s")
+                for _w in _text.lower().replace("_", " ").replace("-", " ").split()
+                if len(_w) > 2
+            }}
+
+        def _score_fixture(_param, _fp):
+            _score = len(_words(_param) & _words(os.path.splitext(os.path.basename(_fp))[0]))
+            _ext = os.path.splitext(_fp)[1].lstrip(".").lower()
+            if _ext and _ext in _param.lower():
+                _score += 2
+            return _score
+
+        _path_params = [
+            _p for _p in sorted(_unmatched)
+            if any(_kw in _p.lower() for _kw in _PATH_KEYWORDS)
+        ]
+        while _path_params:
+            _best = None
+            for _p in _path_params:
                 for _fp in _fixture_paths:
                     if _fp in _used_fixtures:
                         continue
-                    if {step_index} == 0:
-                        # Step 0: broad matching — first unused fixture
-                        _kwargs[_p] = _fp
-                        _used_fixtures.add(_fp)
-                        break
-                    else:
-                        # Later steps: name-aware matching only
-                        _fp_words = set(os.path.splitext(os.path.basename(_fp))[0].lower().replace("_", " ").replace("-", " ").split())
-                        _p_words = set(_p_lower.replace("_", " ").replace("-", " ").split())
-                        if _fp_words & _p_words:
-                            _kwargs[_p] = _fp
-                            _used_fixtures.add(_fp)
-                            break
+                    _score = _score_fixture(_p, _fp)
+                    if _best is None or _score > _best[0]:
+                        _best = (_score, _p, _fp)
+            if _best is None or _best[0] <= 0:
+                break
+            _, _best_param, _best_fp = _best
+            _kwargs[_best_param] = _best_fp
+            _used_fixtures.add(_best_fp)
+            _path_params.remove(_best_param)
+
+        if {is_root_step!r}:
+            for _p in _path_params:
+                for _fp in _fixture_paths:
+                    if _fp in _used_fixtures:
+                        continue
+                    _kwargs[_p] = _fp
+                    _used_fixtures.add(_fp)
+                    break
 
         # Fuzzy word-overlap match for remaining unmatched params
         _still_unmatched = _required - set(_kwargs)
@@ -859,7 +1018,11 @@ async def _run():
         # Diagnostic: log what the tool receives and produces (stderr)
         import sys
         print(f"[CHAIN STEP {step_index}] Function: {func_name}", file=sys.stderr)
-        print(f"[CHAIN STEP {step_index}] _all_inputs keys: {{list(_all_inputs.keys())}}", file=sys.stderr)
+        print(
+            f"[CHAIN STEP {step_index}] _all_inputs keys: "
+            f"{{list(_all_inputs.keys())}}",
+            file=sys.stderr,
+        )
         print(f"[CHAIN STEP {step_index}] _fixture_paths: {{_fixture_paths}}", file=sys.stderr)
         print(f"[CHAIN STEP {step_index}] _kwargs keys: {{list(_kwargs.keys())}}", file=sys.stderr)
         for _k, _v in _kwargs.items():
@@ -868,7 +1031,13 @@ async def _run():
 
         result = await {func_name}(**_kwargs)
 
-        print(f"[CHAIN STEP {step_index}] result keys: {{list(result.keys()) if isinstance(result, dict) else type(result).__name__}}", file=sys.stderr)
+        _result_keys = (
+            list(result.keys()) if isinstance(result, dict) else type(result).__name__
+        )
+        print(
+            f"[CHAIN STEP {step_index}] result keys: {{_result_keys}}",
+            file=sys.stderr,
+        )
 
         # Write output to workspace for downstream steps
         with open(f"/workspace/step_{step_index}_output.json", "w") as _out:
@@ -893,7 +1062,7 @@ asyncio.run(_run())
 
     # Log chain step diagnostics from stderr (always, not just on failure)
     stderr = result.get("stderr") or ""
-    chain_diag = [l for l in stderr.splitlines() if "[CHAIN STEP" in l]
+    chain_diag = [line for line in stderr.splitlines() if "[CHAIN STEP" in line]
     if chain_diag:
         for line in chain_diag:
             logger.info("  %s", line)
@@ -915,9 +1084,8 @@ asyncio.run(_run())
                 "Chain MCP_TOOL %s raised: %s", capability_name, str(parsed["error"])[:500]
             )
             return {}
-        # Security audit finding #11 (2026-04-19): preserve falsy / non-dict
-        # results via the shared helper.
-        from src.cli.output_coerce import extract_tool_result
+        # Preserve falsy / non-dict results via the shared helper.
+        from src.orchestrator.output_coerce import extract_tool_result
         return extract_tool_result(parsed)
     except (json.JSONDecodeError, KeyError, IndexError):
         logger.warning("Chain MCP_TOOL output parse failed for %s", capability_name)
@@ -986,7 +1154,7 @@ def _collect_skill_files(skills_dir: Path | None = None) -> dict:
         if skill_md.exists():
             rel_path = f"{skills_prefix}/{skill_dir.name}/SKILL.md"
             content = skill_md.read_text(encoding="utf-8")
-            skill_files[rel_path] = {"content": content.splitlines()}
+            skill_files[rel_path] = _make_workspace_file_entry(content)
     return skill_files
 
 
@@ -1012,7 +1180,7 @@ def _ensure_skill_on_disk(
     skills_prefix = str(skills_dir).rstrip("/")
     rel_path = f"{skills_prefix}/{name}/SKILL.md"
     if rel_path not in skill_files:
-        skill_files[rel_path] = {"content": skill_content.splitlines()}
+        skill_files[rel_path] = _make_workspace_file_entry(skill_content)
 
 
 def execute_agent_artifact(
@@ -1031,14 +1199,13 @@ def execute_agent_artifact(
     discovers available skills via progressive disclosure (metadata first,
     full content on activation).
 
-    The optional ``output_schema`` parameter (§12 finding #12) carries the
-    decomposer's declared per-subtask output schema. When provided and
-    non-empty, a dynamic Pydantic response model is built from its keys
-    and used as ``response_format`` — forcing the LLM's structured-output
-    call to produce exactly those keys and satisfy the downstream MCP_TOOL
-    writer's ``requires_upstream_keys`` contract. Falls back to
+    The optional ``output_schema`` parameter carries the decomposer's declared
+    per-subtask output schema. When provided and non-empty, a dynamic Pydantic
+    response model is built from its keys and used as ``response_format`` so
+    the LLM's structured-output call returns the handoff keys expected by the
+    downstream MCP_TOOL writer's ``requires_upstream_keys`` contract. Falls back to
     ``TASK_RESULT_MODELS.get(task_id, GenericResult)`` when the schema is
-    empty (CLI free-form tasks without a matching authored task).
+    empty (free-form tasks without a matching authored task).
 
     Never raises — returns ``{}`` on any failure. The sticky outcome
     (success / timeout / error) is recorded via
@@ -1046,26 +1213,61 @@ def execute_agent_artifact(
     the same thread through :func:`get_last_agent_execution_meta`.
     """
     clear_last_agent_execution_meta()
-    try:
-        output = _execute_agent_inner(
-            artifact, task, fixture_contents,
-            langfuse_tags=langfuse_tags,
-            langfuse_session_id=langfuse_session_id,
-            output_schema=output_schema,
-            allow_network=allow_network,
+    timeout_seconds = _agent_timeout_seconds(artifact)
+    ctx = _agent_process_context()
+    result_queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_execute_agent_inner_child,
+        args=(result_queue, artifact, task, fixture_contents),
+        kwargs={
+            "langfuse_tags": langfuse_tags,
+            "langfuse_session_id": langfuse_session_id,
+            "output_schema": output_schema,
+            "allow_network": allow_network,
+        },
+    )
+    proc.start()
+    proc.join(timeout_seconds)
+
+    if proc.is_alive():
+        task_id = getattr(task, "task_id", "?")
+        logger.error(
+            "Agent execution timed out after %ds for %s; terminating worker process",
+            timeout_seconds,
+            task_id,
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Agent execution failed for %s: %s", getattr(task, "task_id", "?"), exc)
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(5)
+        _record_agent_execution_meta(
+            succeeded=False,
+            failure_reason="timeout",
+            timeout_seconds=timeout_seconds,
+        )
+        return {}
+
+    try:
+        payload = result_queue.get_nowait()
+    except queue.Empty:
+        payload = None
+
+    if payload is None:
+        logger.error(
+            "Agent execution failed for %s: worker exited without a payload (exit code=%s)",
+            getattr(task, "task_id", "?"),
+            proc.exitcode,
+        )
         _record_agent_execution_meta(succeeded=False, failure_reason="error")
         return {}
 
-    # _execute_agent_inner sets the meta on its timeout and exception
-    # branches itself; if none of those fired, it reached the structured-
-    # response return path, which counts as success regardless of whether
-    # the payload is empty.
-    if get_last_agent_execution_meta() is None:
+    meta_payload = payload.get("meta")
+    if meta_payload is not None:
+        _record_agent_execution_meta(**meta_payload)
+    elif get_last_agent_execution_meta() is None:
         _record_agent_execution_meta(succeeded=True)
-    return output
+    return payload.get("output", {})
 
 
 def _execute_agent_inner(
@@ -1083,32 +1285,28 @@ def _execute_agent_inner(
 
     from src.config import DEFAULT_LLM_MODEL
 
-    # Step 14.12: wrap sandbox_execute in a closure that enforces the task-
-    # level network policy. The lead agent and every subagent receive the
-    # same wrapper — policy can't be escalated mid-run.
-    #
-    # Fix #1 (2026-04-19): pass ``silent=True`` so the sandbox.execute
-    # event is NOT emitted. create_deep_agent's tool-dispatch auto-traces
-    # each tool-call as a type=TOOL observation with full code + stdout/
-    # stderr + latency + tool_call_id — the event would be pure duplicate.
-    # See docs/langfuse_redundancy_audit_2026_04_19.md Fix #1.
+    # The lead agent and every subagent receive the same sandbox wrapper, so
+    # the task-level network policy cannot be escalated mid-run. AGENT
+    # execution uses the silent wrapper because DeepAgents tool-dispatch is
+    # already traced through LangChain callbacks.
     sandbox_execute = _make_network_scoped_sandbox(allow_network, silent=True)
 
     agent_config = getattr(artifact, "agent_config", None) or {}
     system_prompt = agent_config.get("system_prompt", _AGENT_SYSTEM_FALLBACK)
 
-    # NOTE: skill_content is NO LONGER prepended to system_prompt.
-    # Skills are loaded via progressive disclosure through the skills= parameter.
+    # Skills are loaded via progressive disclosure through the skills=
+    # parameter, not prepended to the system prompt.
 
-    # Determine skills directory — CLI sets SKILLS_OUTPUT_DIR, eval uses default
+    # Determine skills directory — eval uses the generator default unless tests
+    # or custom runners override it.
     from src.orchestrator.generators.skill import SKILLS_OUTPUT_DIR
     skills_dir = SKILLS_OUTPUT_DIR
 
     # If agent has skill_content, ensure it's on disk and pass ONLY that skill
     # for progressive disclosure. In evaluation, passing all skills from disk
     # causes noise (irrelevant skills from other tasks in the same run).
-    # In CLI mode, _collect_skill_files() returns all accumulated skills,
-    # which is the intended progressive discovery behavior.
+    # If no task-local skill was materialized, fall back to discovering all
+    # skills on disk for progressive disclosure.
     skill_files: dict = {}
     skill_content = getattr(artifact, "skill_content", None)
     if not skill_content and agent_config.get("is_deep_agent"):
@@ -1116,50 +1314,44 @@ def _execute_agent_inner(
     if skill_content:
         _ensure_skill_on_disk(artifact, skill_content, skill_files, skills_dir)
 
-    # In CLI mode (skills accumulate), discover all skills on disk.
-    # In eval mode (this agent's skill is already in skill_files), skip
-    # to avoid loading irrelevant skills from earlier tasks in the same run.
+    # When this agent's skill is already in skill_files, skip disk discovery to
+    # avoid loading irrelevant skills from earlier tasks in the same run.
     if not skill_files:
         skill_files = _collect_skill_files(skills_dir)
 
     skills_prefix = str(skills_dir).rstrip("/") + "/"
     skills_param = [skills_prefix] if skill_files else None
 
-    result_model = TASK_RESULT_MODELS.get(getattr(task, "task_id", ""), GenericResult)
+    result_model = _select_result_model(
+        task,
+        output_schema=output_schema,
+        prefer_output_schema=bool(output_schema),
+    )
+    if output_schema:
+        logger.info(
+            "Agent executor: using response_format derived from output_schema "
+            "with keys %s",
+            sorted(output_schema.keys()),
+        )
 
-    # §12 finding #12 (2026-04-16): when the decomposer carries a per-gap
-    # output_schema, use it to build a dynamic Pydantic model that forces
-    # the LLM's structured-output call to produce exactly the declared
-    # keys. Prevents the T16 second-run failure mode where the AGENT
-    # returned task-level keys only and downstream MCP_TOOL writers
-    # crashed on missing upstream keys. The authored-task models in
-    # TASK_RESULT_MODELS still win for named eval tasks (T04, T11, T16,
-    # etc.) — this only activates on CLI free-form tasks that fall
-    # through to GenericResult.
-    if result_model is GenericResult:
-        dynamic_model = _build_dynamic_result_model(output_schema)
-        if dynamic_model is not None:
-            result_model = dynamic_model
-            logger.info(
-                "Agent executor: using dynamic response_format from decomposer "
-                "output_schema with keys %s",
-                sorted(output_schema.keys()),
-            )
-
-    # Build subagents list if this is a lead-with-subagents artifact.
-    # Each subagent config is a dict with name, description, system_prompt, tools.
-    # The tool names are resolved to actual tool objects (only sandbox_execute).
+    # Lead-with-subagents artifacts pass concrete tool objects to DeepAgents.
+    # At execution time, generated subagents only receive sandbox_execute.
     subagents_config = agent_config.get("subagents")
     subagents_param = None
     if subagents_config:
         subagents_param = []
         for sub in subagents_config:
+            sub_name = str(sub["name"])
+            if len(sub_name) > 64:
+                raise ValueError(
+                    f"subagent name too long ({len(sub_name)} chars, max 64): {sub_name}"
+                )
             sub_tools = []
             for tool_name in sub.get("tools", []):
                 if tool_name == "sandbox_execute":
                     sub_tools.append(sandbox_execute)
             subagents_param.append({
-                "name": sub["name"],
+                "name": sub_name,
                 "description": sub["description"],
                 "system_prompt": sub["system_prompt"],
                 "tools": sub_tools,
@@ -1182,13 +1374,11 @@ def _execute_agent_inner(
 
     agent = create_deep_agent(**agent_kwargs)
 
-    # Build the workspace files dict: skills (for progressive disclosure) +
-    # fixtures (so `read_file("filename")` works from the agent's workspace).
-    # Without the fixtures in the workspace, any generated SKILL.md that
-    # tells the agent to `read_file(...)` the input files will fail —
-    # previously the agent sometimes recovered by falling back to
-    # `sandbox_execute` with inline data, but that was LLM non-determinism,
-    # not correct behavior (see T16 MINT CLI failure on 2026-04-08).
+    # Workspace files include skills for progressive disclosure and fixtures
+    # so `read_file("filename")` works from the agent's workspace.
+    # Inline fixture content is still provided in the user message, but the
+    # workspace files make generated skill instructions that call read_file()
+    # deterministic instead of relying on fallback behavior.
     workspace_files: dict = dict(skill_files)  # start with skills
     fixture_workspace = _fixtures_to_workspace_files(fixture_contents)
     for filename, entry in fixture_workspace.items():
@@ -1245,10 +1435,11 @@ def _execute_agent_inner(
     if workspace_files:
         invoke_input["files"] = workspace_files
 
+    timeout_seconds = _agent_timeout_seconds(artifact)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         future = pool.submit(agent.invoke, invoke_input, config)
-        result = future.result(timeout=AGENT_EXECUTION_TIMEOUT_S)
+        result = future.result(timeout=timeout_seconds)
         pool.shutdown(wait=False)
 
         task_id = getattr(task, "task_id", "?")
@@ -1270,12 +1461,12 @@ def _execute_agent_inner(
         task_id = getattr(task, "task_id", "?")
         logger.error(
             "Agent execution timed out after %ds for %s",
-            AGENT_EXECUTION_TIMEOUT_S, task_id,
+            timeout_seconds, task_id,
         )
         _record_agent_execution_meta(
             succeeded=False,
             failure_reason="timeout",
-            timeout_seconds=AGENT_EXECUTION_TIMEOUT_S,
+            timeout_seconds=timeout_seconds,
         )
         return {}
 

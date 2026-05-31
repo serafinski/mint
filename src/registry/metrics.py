@@ -1,14 +1,20 @@
+"""DuckDB-backed operational metrics for registry optimization."""
+
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import duckdb
 
 from src.schemas.metrics import GranularityMetrics, InvocationRecord
+
+logger = logging.getLogger(__name__)
 
 # Cap per-row JSON payload size so DuckDB rows don't bloat on large
 # tool outputs (e.g., a multi-MB CSV blob stuffed into a result dict).
@@ -20,12 +26,9 @@ from src.schemas.metrics import GranularityMetrics, InvocationRecord
 _INVOCATION_FIELD_MAX_BYTES = 64 * 1024
 
 # Conservative error-shape key list. A non-empty dict is truthy in
-# Python, so ``bool({"error": "..."})`` evaluates True — the old
-# ``success=bool(output)`` predicate mis-classified error-shaped
-# returns as successes, which then failed the ``success=FALSE``
-# filter in ``get_recent_failures`` and never reached the Pillar 3
-# Split coverage path. Key list is intentionally narrow (not a
-# generic "any key containing 'error'" heuristic) to avoid
+# Python, so ``bool({"error": "..."})`` evaluates True. These keys let
+# invocation writers classify error-shaped outputs as failures so split
+# coverage can replay them later. The list is intentionally narrow to avoid
 # misfiring on legitimate outputs like ``{"error_count": 0}``.
 _ERROR_KEY_CANDIDATES: frozenset[str] = frozenset(
     {"error", "exception", "traceback", "sandbox_error"}
@@ -43,15 +46,11 @@ def serialize_for_invocation(value: Any) -> str | None:
     Uses ``default=str`` to tolerate non-JSON-native types (``Path``,
     ``datetime``, ``Decimal``, custom objects).
 
-    **Truncation policy (security audit finding #16, 2026-04-20):** when
-    the serialized payload exceeds ``_INVOCATION_FIELD_MAX_BYTES``,
-    returns a **valid-JSON sentinel** carrying the original size rather
-    than a broken string-literal. Pre-fix the function emitted
-    ``f'{head}..."__TRUNCATED__"'`` which did not parse and caused every
-    downstream ``json.loads`` (Pillar 3 coverage replay in particular)
-    to silently treat the case as unreproducible. The sentinel shape
-    is ``{"__truncated__": true, "__original_size_bytes__": N}`` — small,
-    valid, detectable by consumers via ``parsed.get("__truncated__")``.
+    When the serialized payload exceeds ``_INVOCATION_FIELD_MAX_BYTES``,
+    returns a valid-JSON sentinel carrying the original size rather than a
+    truncated JSON fragment. The sentinel shape is
+    ``{"__truncated__": true, "__original_size_bytes__": N}``, which is small,
+    parseable, and detectable by consumers via ``parsed.get("__truncated__")``.
     """
     if value is None:
         return None
@@ -118,16 +117,22 @@ CREATE TABLE IF NOT EXISTS capability_events (
     details VARCHAR,
     occurred_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Previous utility scores for optimizer KL continuity. Evaluation runners
+-- compile a fresh pipeline per task, so this table carries the baseline
+-- across pipeline invocations within a run, and across process restarts
+-- when MetricsStore is opened with a persistent db_path.
+CREATE TABLE IF NOT EXISTS optimizer_prev_utility (
+    capability_id VARCHAR PRIMARY KEY,
+    utility_score DOUBLE NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
-# Step 4 (B1 Pillar 3, 2026-04-15): forward-migrate existing invocation
-# tables by adding ``input_args`` and ``actual_output`` as nullable
-# columns. ADD COLUMN IF NOT EXISTS is idempotent — no-op on fresh
-# databases (the columns are already in _INIT_SQL) and safe to run
-# on every MetricsStore construction. Old rows get NULL; new rows get
-# whatever the caller serialized. Needed by Step 8's split operation
-# which reads recent failures and replays their inputs against new
-# variants in the Tier 4 coverage verifier.
+# Forward-migrate existing invocation tables by adding replay columns.
+# ADD COLUMN IF NOT EXISTS is idempotent: no-op on fresh databases and safe to
+# run on every MetricsStore construction. Older rows get NULL; new rows get
+# serialized inputs/outputs so split coverage can replay recent failures.
 _MIGRATION_SQL = """
 ALTER TABLE invocations ADD COLUMN IF NOT EXISTS input_args VARCHAR;
 ALTER TABLE invocations ADD COLUMN IF NOT EXISTS actual_output VARCHAR;
@@ -140,13 +145,10 @@ class MetricsStore:
     def __init__(self, *, db_path: str | None = None) -> None:
         """Initialize DuckDB connection. If *db_path* is ``None``, use in-memory."""
         if db_path and db_path != ":memory:":
-            from pathlib import Path
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = duckdb.connect(db_path or ":memory:")
         self._conn.execute(_INIT_SQL)
-        # Forward-migrate existing invocation tables (Step 4). Idempotent
-        # via ADD COLUMN IF NOT EXISTS — safe to run on fresh databases
-        # and on databases created before 2026-04-15.
+        # Idempotent forward migration for existing invocation tables.
         self._conn.execute(_MIGRATION_SQL)
 
     # -- lifecycle --------------------------------------------------------
@@ -168,6 +170,52 @@ class MetricsStore:
             pass
 
     # -- recording --------------------------------------------------------
+
+    # -- optimizer previous-utility state persistence ----------------------
+
+    def load_previous_utility_scores(self) -> dict[str, float]:
+        """Return the optimizer's previous-run utility scores.
+
+        The harness and longitudinal runners compile a fresh pipeline per
+        task. Persisting this map in MetricsStore lets the next task read the
+        just-computed scores as its KL baseline instead of starting from an
+        empty distribution.
+        """
+        rows = self._conn.execute(
+            "SELECT capability_id, utility_score FROM optimizer_prev_utility"
+        ).fetchall()
+        return {r[0]: float(r[1]) for r in rows}
+
+    def persist_utility_scores(self, scores: dict[str, float]) -> None:
+        """Overwrite the persisted previous-utility map with ``scores``.
+
+        Called by the pipeline's ``_optimizer_node`` after each subgraph
+        invocation so the next task reads the just-computed scores as its
+        baseline.
+
+        Empty-map calls are treated as no-op writes with a warning. This
+        prevents an optimizer failure from accidentally erasing the last known
+        baseline for the next cycle.
+        """
+        if not scores:
+            logger.warning(
+                "persist_utility_scores called with empty map — no-op write. "
+                "Pass scores explicitly to replace persisted optimizer history."
+            )
+            return
+
+        # Idempotent replace: DELETE + INSERT is simpler than UPSERT and
+        # fine for small registries (20-50 entries typical). Only run the
+        # DELETE when we have a non-empty replacement to write, so an
+        # empty-map persistence never wipes the historical baseline.
+        self._conn.execute("DELETE FROM optimizer_prev_utility")
+        now = datetime.now(UTC)
+        rows = [(cid, float(s), now) for cid, s in scores.items()]
+        self._conn.executemany(
+            "INSERT INTO optimizer_prev_utility (capability_id, utility_score, updated_at) "
+            "VALUES (?, ?, ?)",
+            rows,
+        )
 
     def record_invocation(self, record: InvocationRecord) -> None:
         """Insert an invocation row from the Pydantic model."""
@@ -324,9 +372,8 @@ class MetricsStore:
         Used by the evaluation harness to flush per-task capability_events
         (prune / split / merged / verification_rollback / etc.) to the
         persistent EvaluationStore's cycle_events table after each task's
-        pipeline.invoke (Step 18.7 follow-up). Caller passes a pre-task
-        timestamp snapshot so only events from this task's pipeline run
-        are returned.
+        pipeline.invoke. Caller passes a pre-task timestamp snapshot so only
+        events from this task's pipeline run are returned.
 
         Each returned dict matches the shape
         ``EvaluationStore.record_cycle_events`` expects:
@@ -352,26 +399,34 @@ class MetricsStore:
             for row in rows
         ]
 
-    def fetch_invocations_for_task(self, task_id: str) -> list[dict]:
-        """Return all invocations recorded against a given task_id.
+    def fetch_invocations_for_task(
+        self,
+        task_id: str,
+        *,
+        since: datetime | None = None,
+    ) -> list[dict]:
+        """Return invocations recorded against a given task_id.
 
-        Used by the evaluation harness to flush per-task invocations to
-        the persistent EvaluationStore's ``invocation_events`` table
-        after each task's chain execution completes (Step 18.5 Gini
-        analysis pipeline). Each returned dict matches the shape
-        ``EvaluationStore.record_invocation_events`` expects.
+        When ``since`` is provided, only rows with ``invoked_at >= since`` are
+        returned. Per-task flush callers capture a timestamp before
+        ``pipeline.invoke`` and pass it here so repeated task IDs do not
+        duplicate older-cycle invocations in persistent eval telemetry.
 
-        Returns an empty list if no invocations exist for the task.
+        Each returned dict matches the shape
+        ``EvaluationStore.record_invocation_events`` expects. Returns an
+        empty list if no matching invocations exist.
         """
-        rows = self._conn.execute(
-            """
-            SELECT capability_id, success, token_cost, latency_ms
-            FROM invocations
-            WHERE task_id = ?
-            ORDER BY invoked_at
-            """,
-            [task_id],
-        ).fetchall()
+        query = (
+            "SELECT capability_id, success, token_cost, latency_ms "
+            "FROM invocations WHERE task_id = ?"
+        )
+        params: list = [task_id]
+        if since is not None:
+            query += " AND invoked_at >= ?"
+            params.append(since)
+        query += " ORDER BY invoked_at"
+
+        rows = self._conn.execute(query, params).fetchall()
         return [
             {
                 "capability_id": row[0],
@@ -386,84 +441,6 @@ class MetricsStore:
         """Total invocations across all capabilities."""
         row = self._conn.execute("SELECT COUNT(*) FROM invocations").fetchone()
         return row[0] if row else 0
-
-    def flag_most_recent_invocation_wrong(
-        self,
-        reason: str,
-        *,
-        capability_id: str | None = None,
-    ) -> InvocationRecord | None:
-        """Mark the most recent invocation as ``success=False`` with a user reason.
-
-        Implements §12 finding #6b — the CLI feedback loop so Step 8 split's
-        wrong-output-case semantics can fire on subsequent splits. Without
-        this, CLI ``InvocationRecord``s only ever get ``success=False`` from
-        crashes (``error_message`` populated by the executor); user-judgment
-        wrong-output-flagging had no path into the metrics store.
-
-        The flagged row's ``error_message`` is set to ``reason`` (so the
-        coverage verifier's error-case branch can read it) while preserving
-        the row's existing ``actual_output`` (so the wrong-output-case branch
-        can compare against it).
-
-        Args:
-            reason: User-provided reason the output was wrong. Stored as
-                ``error_message`` so downstream queries can distinguish
-                user-flagged-wrong rows from crashes by the reason text.
-            capability_id: When provided, flag the most recent invocation of
-                THIS capability. When ``None``, flag the most recent
-                invocation across all capabilities.
-
-        Returns:
-            The flagged ``InvocationRecord`` (post-update), or ``None`` when
-            no matching invocation exists (nothing to flag).
-
-        Also records a ``user_flagged_wrong`` capability event via
-        :meth:`record_event` so Chapter 6 can count CLI user-feedback signal.
-        """
-        if capability_id is not None:
-            query = (
-                "SELECT id, capability_id, task_id, success, token_cost, "
-                "latency_ms, error_message, input_args, actual_output, "
-                "invoked_at FROM invocations WHERE capability_id = ? "
-                "ORDER BY invoked_at DESC LIMIT 1"
-            )
-            params: list = [capability_id]
-        else:
-            query = (
-                "SELECT id, capability_id, task_id, success, token_cost, "
-                "latency_ms, error_message, input_args, actual_output, "
-                "invoked_at FROM invocations ORDER BY invoked_at DESC LIMIT 1"
-            )
-            params = []
-
-        row = self._conn.execute(query, params).fetchone()
-        if row is None:
-            return None
-
-        row_id = row[0]
-        self._conn.execute(
-            """
-            UPDATE invocations
-            SET success = FALSE, error_message = ?
-            WHERE id = ?
-            """,
-            [reason, row_id],
-        )
-
-        self.record_event(row[1], "user_flagged_wrong", reason)
-
-        return InvocationRecord(
-            capability_id=row[1],
-            task_id=row[2],
-            success=False,
-            token_cost=row[4],
-            latency_ms=row[5],
-            error_message=reason,
-            input_args=row[7],
-            actual_output=row[8],
-            invoked_at=row[9],
-        )
 
     def list_capabilities(self) -> list[str]:
         """All unique capability IDs that have been invoked."""
@@ -536,13 +513,12 @@ class MetricsStore:
     ) -> list[InvocationRecord]:
         """Most recent FAILED invocations for a capability, newest first.
 
-        Used by Step 8's split operation to pull recorded failure cases
-        for a high-reuse / low-success capability, which the
-        ``verify_coverage`` helper then replays against newly-generated
-        split variants. A failure case is an invocation with
-        ``success=False``; ``error_message``, ``input_args``, and
-        ``actual_output`` are all available on the returned records for
-        downstream use.
+        Used by split operations to pull recorded failure cases for a
+        high-reuse / low-success capability. The ``verify_coverage`` helper
+        replays those cases against newly generated split variants. A failure
+        case is an invocation with ``success=False``; ``error_message``,
+        ``input_args``, and ``actual_output`` are available on returned records
+        for downstream use.
 
         Returns records where ``input_args`` is populated AND at least
         one of ``actual_output`` or ``error_message`` is populated:
@@ -563,18 +539,9 @@ class MetricsStore:
         failure case without a captured input is useless as a replay
         probe. Rows missing BOTH ``actual_output`` AND ``error_message``
         are also skipped — we can't verify a failure we have no record
-        of. Pre-Step-4 rows (all three fields NULL) are skipped for
-        the same reason.
-
-        **2026-04-16 fix:** an earlier version of this query also
-        required ``actual_output IS NOT NULL``, which silently excluded
-        every error-case (where parent raised before producing output).
-        That made Step 8's error-case coverage branch CLI-dead-code. The
-        bug was empirically caught by ``scripts/test_split_merge.py
-        --split-mcp-only``'s "Seeded N failure case(s) for replay" log
-        line not matching the expected count. See §12 pre-registered
-        finding #5 (coverage verifier semantics) for why error-cases
-        are the stronger signal anyway.
+        of. Older rows with all replay fields NULL are skipped for the same
+        reason. Error cases with no ``actual_output`` are intentionally kept
+        as long as ``error_message`` is present; they are useful replay probes.
         """
         rows = self._conn.execute(
             """

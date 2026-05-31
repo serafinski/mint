@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
+import duckdb
 import pytest
 
-from src.registry.metrics import GranularityMetrics, InvocationRecord, MetricsStore
+from src.registry.metrics import (
+    GranularityMetrics,
+    InvocationRecord,
+    MetricsStore,
+    extract_error_message,
+    looks_like_error,
+    serialize_for_invocation,
+)
 
 # -- helpers --------------------------------------------------------------
 
@@ -40,9 +50,9 @@ def test_init_creates_parent_directory_if_missing(tmp_path):
     """``MetricsStore(db_path=...)`` mkdirs missing parent dirs.
 
     Regression guard: ``duckdb.connect(db_path)`` raises FileNotFoundError
-    when the parent directory doesn't exist. CLI + eval harness relied on
-    upstream code (e.g., ``_create_infra``) to pre-mkdir; tests that bypass
-    that path crashed. Defensive init closes the class of bug.
+    when the parent directory doesn't exist. Runners relied on upstream code
+    (e.g., ``_create_infra``) to pre-mkdir; tests that bypass that path
+    crashed. Defensive init closes the class of bug.
     """
     nested = tmp_path / "nested" / "sub" / "dir" / "metrics.duckdb"
     assert not nested.parent.exists()
@@ -233,12 +243,11 @@ def test_record_event(store: MetricsStore):
     assert burden == pytest.approx(1.0 / 30.0)
 
 
-# -- Step 4 (B1 Pillar 3): input_args + actual_output + get_recent_failures ----
+# -- replay fields: input_args + actual_output + get_recent_failures -------
 
 
 class TestInvocationRecordFailureReplayFields:
-    """Step 4: InvocationRecord carries serialized input/output for the
-    Tier 4 coverage verifier's failure-case replay in Step 8 split."""
+    """InvocationRecord carries serialized input/output for failure replay."""
 
     def test_input_args_defaults_to_none(self):
         record = _make_record()
@@ -280,7 +289,7 @@ class TestInvocationRecordFailureReplayFields:
         assert recent[0].actual_output == '{"y": 2}'
 
     def test_null_input_args_round_trip(self, store: MetricsStore):
-        """Legacy callers that don't populate the new fields still work."""
+        """Callers that do not populate replay fields still work."""
         store.record_invocation(_make_record())  # no input_args / actual_output
         recent = store.recent_invocations("fibonacci", limit=1)
         assert recent[0].input_args is None
@@ -288,8 +297,7 @@ class TestInvocationRecordFailureReplayFields:
 
 
 class TestGetRecentFailures:
-    """Step 4: get_recent_failures is Step 8's failure-case query for
-    the Tier 4 coverage verifier."""
+    """get_recent_failures returns replayable failure cases."""
 
     def test_empty_returns_empty_list(self, store: MetricsStore):
         assert store.get_recent_failures("cap-a") == []
@@ -350,16 +358,11 @@ class TestGetRecentFailures:
         assert store.get_recent_failures("fibonacci") == []
 
     def test_includes_error_cases_without_actual_output(self, store: MetricsStore):
-        """Error-cases (parent raised, no actual_output) MUST be returned.
+        """Error cases with captured input are useful without actual output.
 
-        2026-04-16 fix: an earlier version of get_recent_failures also
-        required ``actual_output IS NOT NULL`` in the SQL filter, which
-        silently dropped every error-case. That made Step 8's
-        error-case coverage branch CLI-dead-code because crash-path
-        InvocationRecords never reached verify_coverage. The bug was
-        empirically caught by scripts/test_split_merge.py --split-mcp-only
-        when "Seeded 1 failure case(s) for replay" didn't match the
-        expected 2. This test is the regression guard.
+        Crash-path invocations may have only ``error_message`` and no
+        ``actual_output``. They still need to reach coverage replay so split
+        variants can prove they handle the same input without raising.
         """
         store.record_invocation(
             _make_record(
@@ -425,8 +428,7 @@ class TestGetRecentFailures:
 
 
 class TestDuckDBMigration:
-    """Step 4: ADD COLUMN IF NOT EXISTS migration runs on every init
-    so old databases pick up the new columns without data loss."""
+    """Replay-column migration runs on every init without data loss."""
 
     def test_fresh_database_has_new_columns(self, store: MetricsStore):
         """Fresh DBs get the columns via _INIT_SQL; no-op migration."""
@@ -436,15 +438,12 @@ class TestDuckDBMigration:
         recent = store.recent_invocations("fibonacci", limit=1)
         assert recent[0].input_args == '{"x": 1}'
 
-    def test_migration_adds_columns_to_legacy_schema(self, tmp_path):
-        """Simulate a pre-Step-4 database by creating the invocations
-        table with the old schema, then reopen via MetricsStore and
-        verify the migration added the columns."""
-        db_file = str(tmp_path / "legacy.duckdb")
+    def test_migration_adds_columns_to_older_schema(self, tmp_path):
+        """Older invocation tables pick up replay columns on open."""
+        db_file = str(tmp_path / "older.duckdb")
 
-        # Create a legacy table without input_args / actual_output.
-        import duckdb as _duckdb
-        _conn = _duckdb.connect(db_file)
+        # Older table shape before input_args / actual_output existed.
+        _conn = duckdb.connect(db_file)
         _conn.execute(
             """
             CREATE TABLE invocations (
@@ -463,14 +462,14 @@ class TestDuckDBMigration:
             """
             INSERT INTO invocations (id, capability_id, task_id, success,
                                      token_cost, latency_ms, error_message, invoked_at)
-            VALUES ('legacy-1', 'fibonacci', 'task-old', TRUE, 100, 50.0, NULL, CURRENT_TIMESTAMP)
+            VALUES ('older-1', 'fibonacci', 'task-old', TRUE, 100, 50.0, NULL, CURRENT_TIMESTAMP)
             """
         )
         _conn.close()
 
         # Open via MetricsStore — migration should run and add the columns.
         with MetricsStore(db_path=db_file) as store:
-            # Legacy row reads cleanly with new fields as None.
+            # Older row reads cleanly with new fields as None.
             recent = store.recent_invocations("fibonacci", limit=1)
             assert len(recent) == 1
             assert recent[0].task_id == "task-old"
@@ -490,96 +489,7 @@ class TestDuckDBMigration:
             assert new_row.input_args == '{"fresh": true}'
             assert new_row.actual_output == '{"ok": 1}'
 
-
-# ---------------------------------------------------------------------------
-# §12 finding #6b — user-judgment wrong-output flagging
-# ---------------------------------------------------------------------------
-
-
-class TestFlagMostRecentInvocationWrong:
-    def test_no_invocations_returns_none(self, store):
-        assert store.flag_most_recent_invocation_wrong("reason") is None
-
-    def test_flags_most_recent_across_all_capabilities(self, store):
-        """With no capability filter, flag the globally-most-recent row."""
-        # Insert three rows in order; the last one should be flagged.
-        store.record_invocation(_make_record(
-            capability_id="tool-a", task_id="t1",
-            actual_output='{"x": 1}',
-        ))
-        store.record_invocation(_make_record(
-            capability_id="tool-b", task_id="t2",
-            actual_output='{"y": 2}',
-        ))
-        store.record_invocation(_make_record(
-            capability_id="tool-c", task_id="t3",
-            actual_output='{"z": 3}',
-        ))
-
-        flagged = store.flag_most_recent_invocation_wrong("got it wrong")
-
-        assert flagged is not None
-        assert flagged.capability_id == "tool-c"
-        assert flagged.task_id == "t3"
-        assert flagged.success is False
-        assert flagged.error_message == "got it wrong"
-        # Original actual_output preserved for Step 8 wrong-output-case
-        # branch to replay against.
-        assert flagged.actual_output == '{"z": 3}'
-
-    def test_capability_filter_flags_most_recent_for_that_cap_only(self, store):
-        store.record_invocation(_make_record(capability_id="tool-a", task_id="a1"))
-        store.record_invocation(_make_record(capability_id="tool-b", task_id="b1"))
-        store.record_invocation(_make_record(capability_id="tool-a", task_id="a2"))
-        store.record_invocation(_make_record(capability_id="tool-b", task_id="b2"))
-
-        flagged = store.flag_most_recent_invocation_wrong(
-            "wrong", capability_id="tool-a",
-        )
-        assert flagged is not None
-        assert flagged.capability_id == "tool-a"
-        assert flagged.task_id == "a2"  # most recent for tool-a, not b2
-
-    def test_capability_filter_no_match_returns_none(self, store):
-        store.record_invocation(_make_record(capability_id="tool-a"))
-        assert store.flag_most_recent_invocation_wrong(
-            "reason", capability_id="nonexistent",
-        ) is None
-
-    def test_flagged_row_visible_to_get_recent_failures(self, store):
-        """Downstream: flagged rows become Step 8 split-candidate failure cases."""
-        store.record_invocation(_make_record(
-            capability_id="parser", task_id="t1",
-            input_args='{"value": 150}', actual_output='{"clamped": 150}',
-        ))
-
-        store.flag_most_recent_invocation_wrong(
-            "expected clamp to 100", capability_id="parser",
-        )
-
-        failures = store.get_recent_failures("parser", limit=5)
-        assert len(failures) == 1
-        assert failures[0].success is False
-        assert failures[0].error_message == "expected clamp to 100"
-        assert failures[0].input_args == '{"value": 150}'
-        assert failures[0].actual_output == '{"clamped": 150}'
-
-    def test_records_user_flagged_wrong_event(self, store):
-        """Chapter 6 analytics signal — count user-feedback events."""
-        store.record_invocation(_make_record(capability_id="tool-a"))
-        store.flag_most_recent_invocation_wrong("bad answer")
-
-        # The event is stored in capability_events; query it directly.
-        rows = store._conn.execute(
-            "SELECT event_type, details, capability_id FROM capability_events "
-            "WHERE event_type = 'user_flagged_wrong'"
-        ).fetchall()
-        assert len(rows) == 1
-        assert rows[0][1] == "bad answer"
-        assert rows[0][2] == "tool-a"
-
-
-# -- fetch_invocations_for_task (Step 18.5) -------------------------------
+# -- fetch_invocations_for_task -------------------------------------------
 
 
 def test_fetch_empty_store_returns_empty_list(store: MetricsStore):
@@ -621,29 +531,56 @@ def test_fetch_preserves_invocation_order(store: MetricsStore):
     assert [r["capability_id"] for r in rows] == ["first", "second", "third"]
 
 
+def test_fetch_with_since_filter_excludes_prior_rows(store: MetricsStore):
+    """Repeated task IDs only flush invocations from the current cycle.
+
+    A repeating task_id in a longitudinal sequence must not re-read all prior
+    cycles' invocations and duplicate them in ``invocation_events``. The
+    ``since`` filter uses the cutoff captured before the cycle's pipeline
+    invocation so only this cycle's rows are returned.
+    """
+    # Cycle 1: record 2 invocations at t=1min
+    t_cycle1 = datetime.now(UTC) - timedelta(minutes=10)
+    for cap in ("cap-a", "cap-b"):
+        r = _make_record(capability_id=cap, task_id="T01")
+        object.__setattr__(r, "invoked_at", t_cycle1)
+        store.record_invocation(r)
+
+    # Cycle 2: record 1 more invocation at t=5min
+    t_cycle2_start = datetime.now(UTC) - timedelta(minutes=5)
+    r = _make_record(capability_id="cap-c", task_id="T01")
+    object.__setattr__(r, "invoked_at", t_cycle2_start + timedelta(seconds=30))
+    store.record_invocation(r)
+
+    # Without since: returns all 3 rows for the repeated task ID.
+    all_rows = store.fetch_invocations_for_task("T01")
+    assert len(all_rows) == 3
+
+    # With since=t_cycle2_start: returns only cycle 2's row.
+    cycle2_rows = store.fetch_invocations_for_task("T01", since=t_cycle2_start)
+    assert len(cycle2_rows) == 1, (
+        f"Flush should only read cycle 2 rows. Got {len(cycle2_rows)} "
+        "rows; expected 1."
+    )
+    assert cycle2_rows[0]["capability_id"] == "cap-c"
+
+
 # ---------------------------------------------------------------------------
-# Shared invocation-recording helpers (2026-04-19 fix for
-# docs/invocation_recording_gap_2026_04_19.md).
+# Shared invocation-recording helpers.
 # ---------------------------------------------------------------------------
 
 
 class TestSerializeForInvocation:
     def test_none_returns_none(self):
-        from src.registry.metrics import serialize_for_invocation
         assert serialize_for_invocation(None) is None
 
     def test_empty_dict_returns_none(self):
         """Empty dicts carry no information — treat as None so the row
         fails the ``input_args IS NOT NULL`` filter and isn't used as
         a no-op replay probe."""
-        from src.registry.metrics import serialize_for_invocation
         assert serialize_for_invocation({}) is None
 
     def test_populated_dict_round_trips(self):
-        import json
-
-        from src.registry.metrics import serialize_for_invocation
-
         value = {"b": 2, "a": 1}
         s = serialize_for_invocation(value)
         assert s is not None
@@ -652,27 +589,12 @@ class TestSerializeForInvocation:
         assert json.loads(s) == value
 
     def test_non_json_types_serialize_via_default_str(self):
-        from pathlib import Path
-
-        from src.registry.metrics import serialize_for_invocation
-
         s = serialize_for_invocation({"p": Path("/tmp/x.csv")})
         assert s is not None
         assert "/tmp/x.csv" in s
 
     def test_oversize_payload_truncates_to_valid_json_sentinel(self):
-        """Security audit finding #16 (2026-04-20): oversize payloads
-        return a valid-JSON sentinel, NOT a broken string literal. Pre-
-        fix the function emitted ``f'{head}..."__TRUNCATED__"'`` which
-        failed to parse — every downstream ``json.loads`` (Pillar 3
-        coverage replay in particular) silently treated the case as
-        unreproducible. Post-fix the sentinel parses to a dict carrying
-        the original size so consumers can distinguish "truncated"
-        from "bad data"."""
-        import json
-
-        from src.registry.metrics import serialize_for_invocation
-
+        """Oversize payloads return a valid-JSON truncation sentinel."""
         big = {"blob": "x" * 100_000}
         s = serialize_for_invocation(big)
         assert s is not None
@@ -687,8 +609,6 @@ class TestSerializeForInvocation:
     def test_unserializable_returns_none(self):
         """Objects that json.dumps cannot encode even with default=str
         (e.g., circular references) must return None rather than raise."""
-        from src.registry.metrics import serialize_for_invocation
-
         a: dict = {}
         a["self"] = a  # cyclic
         assert serialize_for_invocation(a) is None
@@ -696,35 +616,28 @@ class TestSerializeForInvocation:
 
 class TestLooksLikeError:
     def test_error_key_detected(self):
-        from src.registry.metrics import looks_like_error
         assert looks_like_error({"error": "oops"}) is True
 
     def test_exception_key_detected(self):
-        from src.registry.metrics import looks_like_error
         assert looks_like_error({"exception": "RuntimeError"}) is True
 
     def test_traceback_key_detected(self):
-        from src.registry.metrics import looks_like_error
         assert looks_like_error({"traceback": "..."}) is True
 
     def test_sandbox_error_key_detected(self):
-        from src.registry.metrics import looks_like_error
         assert looks_like_error({"sandbox_error": "timeout"}) is True
 
     def test_error_count_not_an_error(self):
         """Legitimate keys containing ``error`` as substring (e.g.,
         ``error_count``, ``error_rate``) must NOT trigger the heuristic.
         Conservative keyset avoids this misfire."""
-        from src.registry.metrics import looks_like_error
         assert looks_like_error({"error_count": 0}) is False
         assert looks_like_error({"error_rate": 0.01}) is False
 
     def test_success_dict_not_an_error(self):
-        from src.registry.metrics import looks_like_error
         assert looks_like_error({"result": 42, "rows": 10}) is False
 
     def test_non_mapping_returns_false(self):
-        from src.registry.metrics import looks_like_error
         assert looks_like_error(None) is False
         assert looks_like_error("error") is False
         assert looks_like_error(42) is False
@@ -733,7 +646,6 @@ class TestLooksLikeError:
 
 class TestExtractErrorMessage:
     def test_error_key_extracted(self):
-        from src.registry.metrics import extract_error_message
         assert extract_error_message({"error": "oops"}) == "oops"
 
     def test_prefers_error_over_exception(self):
@@ -741,32 +653,26 @@ class TestExtractErrorMessage:
         is returned first (iteration order of the frozenset is stable but
         not guaranteed; this test documents the extracted value must be
         one of the valid error keys)."""
-        from src.registry.metrics import extract_error_message
         out = extract_error_message({"error": "A", "exception": "B"})
         assert out in ("A", "B")
 
     def test_long_message_truncated_to_500_chars(self):
-        from src.registry.metrics import extract_error_message
         out = extract_error_message({"error": "x" * 1000})
         assert out is not None
         assert len(out) == 500
 
     def test_non_error_output_returns_none(self):
-        from src.registry.metrics import extract_error_message
         assert extract_error_message({"result": 42}) is None
         assert extract_error_message(None) is None
 
     def test_none_error_value_returns_none(self):
         """``{"error": None}`` — the key exists but carries no message."""
-        from src.registry.metrics import extract_error_message
         assert extract_error_message({"error": None}) is None
 
     def test_empty_string_error_returns_none(self):
-        from src.registry.metrics import extract_error_message
         assert extract_error_message({"error": ""}) is None
 
     def test_non_string_error_value_coerced(self):
-        from src.registry.metrics import extract_error_message
         out = extract_error_message({"error": {"code": 500}})
         assert out is not None
         assert "500" in out

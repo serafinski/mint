@@ -1,4 +1,4 @@
-"""Unit tests for src/verification/gate.py.
+"""Tests for the tiered verification gate.
 
 All external calls (behavioral.run, adversarial.probe, import_check.run_import_check)
 are mocked so these tests run without Docker or API keys.
@@ -580,12 +580,13 @@ def thing():
 
 @patch("src.verification.gate.adversarial.probe")
 @patch("src.verification.gate.behavioral.run")
-def test_skill_prose_placeholder_not_flagged_t04_regression(
+def test_skill_prose_placeholder_not_flagged(
     mock_behavioral, mock_adversarial
 ):
-    """T04 regression: a SKILL.md with the word 'placeholder' in the prose
-    body but NO Python code fence must NOT be flagged. The layered scanner
-    must only run AST checks on fenced code, never on prose.
+    """SKILL.md prose with ``placeholder`` must not be flagged.
+
+    The layered scanner must only run AST checks on fenced code, never on
+    prose.
     """
     skill = '''\
 ---
@@ -743,35 +744,36 @@ def test_agent_no_fence_prose_passes(mock_behavioral, mock_adversarial):
     assert report.overall_passed is True
 
 
-# ---------------------------------------------------------------------------
-# verify() never raises — exception swallowing
-# ---------------------------------------------------------------------------
-
-
 @patch("src.verification.gate._static_scan")
 def test_verify_never_raises_on_unexpected_exception(mock_static_scan):
-    """verify() must catch all exceptions and return a report, never raise."""
-    mock_static_scan.side_effect = OSError("Simulated filesystem failure in _run_skill_precheck")
+    """verify() must catch exceptions and fail closed.
+
+    The gate emits a CRITICAL ``gate_error`` finding with
+    ``overall_passed=False`` so infrastructure errors do not manufacture
+    PASS verdicts.
+    """
+    mock_static_scan.side_effect = OSError("Simulated filesystem failure in static scan")
     artifact = _make_artifact(
         cap_type=CapabilityType.SKILL,
         source_code=None,
         skill_content=_VALID_SKILL_MD,
     )
 
-    # Must not raise even when internal scan raises
+    # Must not raise even when internal scan raises (never-raises contract
+    # preserved).
     report = verify(artifact)
 
     assert isinstance(report, VerificationReport)
     assert report.capability_name == "test-cap"
-    # Fails open (MEDIUM, not CRITICAL) so the pipeline can continue
+    # Fails closed (CRITICAL); the node's retry loop will regenerate.
     assert any(f.category == "gate_error" for f in report.findings)
     gate_finding = next(f for f in report.findings if f.category == "gate_error")
-    assert gate_finding.severity == Severity.MEDIUM
-    assert report.overall_passed is True  # fail open
+    assert gate_finding.severity == Severity.CRITICAL
+    assert report.overall_passed is False
 
 
 # ---------------------------------------------------------------------------
-# Step 14.12 — allow_network plumbing
+# allow_network plumbing
 # ---------------------------------------------------------------------------
 
 
@@ -790,6 +792,37 @@ def test_verify_forwards_allow_network_true(mock_behavioral, mock_adversarial):
 
     mock_behavioral.assert_called_once_with(artifact, allow_network=True)
     mock_adversarial.assert_called_once_with(artifact, allow_network=True)
+
+
+@patch("src.verification.gate.adversarial.probe")
+@patch("src.verification.gate.behavioral.run")
+def test_verify_forwards_allow_network_true_to_static_scan(
+    mock_behavioral, mock_adversarial
+):
+    """Tier 1 missing-external-call severity follows the task network policy."""
+    code = """\
+def fetch_records():
+    return []
+"""
+    artifact = _make_artifact(source_code=code)
+    mock_behavioral.return_value = [
+        VerificationFinding(
+            tier=2,
+            category="network_behavior",
+            severity=Severity.HIGH,
+            message="Injected Tier 2 finding so Tier 1 HIGH is not cleared",
+        )
+    ]
+    mock_adversarial.return_value = _passing_report("test-cap", tier=3)
+
+    report = verify(artifact, allow_network=True)
+
+    findings = [
+        f for f in report.findings
+        if f.category == "missing_external_calls"
+    ]
+    assert findings
+    assert findings[0].severity == Severity.HIGH
 
 
 @patch("src.verification.gate.adversarial.probe")

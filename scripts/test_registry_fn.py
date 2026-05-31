@@ -1,4 +1,4 @@
-"""Registry false-negative audit (proposal §Pillar 1 line 77).
+"""Registry false-negative audit for the Pillar 1 gap-detection claim.
 
 Closes the symmetric gap with ``scripts/test_registry_matching.py`` which
 audits **false positives** (superficial keyword matches that produce
@@ -8,7 +8,7 @@ claim in the proposal:
     "The registry uses hierarchical embeddings (domain → capability →
     specific skill) to prevent both false positives (superficial keyword
     matches) AND false negatives (semantically equivalent but differently
-    named skills)." — thesis_proposal.md, line 77
+    named skills)." — thesis_proposal.md, Pillar 1 gap-detection paragraph
 
 Methodology
 -----------
@@ -24,6 +24,13 @@ Methodology
      - top-3 lenient:  target cap anywhere in top-3
      - above-threshold: target cap above the default cosine threshold
    The **top-1 miss rate** is the proposal-literal FN metric.
+
+This is a lower-level registry audit, not a full eval-protocol
+``gap_detection_node`` simulation. The eval pipeline uses the same
+``CapabilityRegistry`` / ChromaDB search layer, but wraps it through
+``registry.detect_gaps()`` with slug+description dual-query retrieval,
+optional taxonomy filtering, and post-match compatibility checks. This
+script isolates the semantic-search false-negative question.
 
 Exit code 0 if aggregate top-3 recall >= 0.90 (the proposal's
 "hierarchical embeddings prevent FN" claim is empirically defensible at
@@ -49,8 +56,9 @@ Usage
     # Per-cap detail
     uv run scripts/test_registry_fn.py --verbose
 
-Cost: 1 LLM call per capability (~19 caps seeded by ``seed_registry``,
-~$0.02 at gpt-5-mini, temp=0.7 for paraphrase diversity). Runs in ~60s.
+Cost: 1 LLM call per seeded capability, using ``DEFAULT_LLM_MODEL`` with
+temperature 0.7 for paraphrase diversity. Runtime depends on the current
+``seed_registry()`` inventory and model latency.
 """
 
 from __future__ import annotations
@@ -62,20 +70,19 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Step 13.6 / Fix #1: route dev-script LangFuse emissions to test env.
+# Route dev-script LangFuse emissions to the test environment.
 os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
-
-from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
-from pydantic import BaseModel, Field  # noqa: E402
-
 from src.config import DEFAULT_LLM_MODEL  # noqa: E402
-from src.registry.store import SkillRegistry, seed_registry  # noqa: E402
+from src.registry.store import CapabilityRegistry, seed_registry  # noqa: E402
 from src.schemas.capability import CapabilityDescriptor  # noqa: E402
 
 logging.basicConfig(
@@ -133,7 +140,7 @@ def generate_paraphrases(
 ) -> list[str]:
     """Ask the LLM for ``n`` semantically-equivalent paraphrases."""
     prompt = (
-        "You are helping audit a skill registry for false-negative "
+        "You are helping audit a capability registry for false-negative "
         "retrieval (queries that should match an existing capability but "
         "miss it due to vocabulary differences).\n\n"
         f"Original capability name: {cap.name}\n"
@@ -163,7 +170,7 @@ def generate_paraphrases(
 
 
 def probe_cap(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     cap: CapabilityDescriptor,
     paraphrases: list[str],
     *,
@@ -233,20 +240,28 @@ def main() -> int:
     parser.add_argument(
         "--verbose", action="store_true", help="Print per-paraphrase ranks"
     )
+    # Require enough capability coverage that recall is not computed on a
+    # biased subset.
+    parser.add_argument(
+        "--min-cap-coverage", type=float, default=0.9,
+        help="Minimum fraction of capabilities that must be probed after "
+             "the paraphrase-generation retry pass (default 0.9). Below "
+             "this, exit 2 instead of reporting recall on a biased "
+             "subset.",
+    )
     args = parser.parse_args()
 
     print("=" * 70)
-    print("  REGISTRY FALSE-NEGATIVE AUDIT (proposal §Pillar 1 line 77)")
+    print("  REGISTRY FALSE-NEGATIVE AUDIT (proposal §Pillar 1 gap detection)")
     print("=" * 70)
 
     # Seed an ephemeral registry so we don't touch any persistent state.
     print("\nSeeding ephemeral registry...")
-    registry = SkillRegistry()  # ephemeral = no persist_directory
+    registry = CapabilityRegistry()  # ephemeral = no persist_directory
     seed_registry(registry)
     caps = registry.list_all()
     print(f"Seeded {len(caps)} capabilities.")
 
-    # Build the paraphrase LLM.
     try:
         structured_llm = _build_paraphrase_llm()
     except Exception as exc:  # noqa: BLE001
@@ -261,6 +276,7 @@ def main() -> int:
     )
 
     results: list[CapProbeResult] = []
+    skipped_caps: list[str] = []
     for i, cap in enumerate(caps, 1):
         if args.verbose:
             print(
@@ -272,6 +288,7 @@ def main() -> int:
         )
         if not paraphrases:
             print(f"  WARNING: skipped {cap.name} (no paraphrases generated)")
+            skipped_caps.append(cap.name)
             continue
 
         result = probe_cap(
@@ -291,12 +308,56 @@ def main() -> int:
                 f"@thr={result.above_threshold_hits}/{result.total}"
             )
 
+    # Retry transient paraphrase-generation failures once; anything still
+    # failing is handled by the coverage gate below.
+    if skipped_caps:
+        print(
+            f"\n  Retrying {len(skipped_caps)} skipped capability/ies once "
+            f"(paraphrase-generation transient?)..."
+        )
+        still_skipped: list[str] = []
+        for cap in caps:
+            if cap.name not in skipped_caps:
+                continue
+            paraphrases = generate_paraphrases(
+                cap, args.paraphrases_per_cap, structured_llm
+            )
+            if not paraphrases:
+                still_skipped.append(cap.name)
+                continue
+            result = probe_cap(
+                registry, cap, paraphrases,
+                threshold=args.threshold, verbose=args.verbose,
+            )
+            results.append(result)
+            print(
+                f"    {cap.name:30s} recovered on retry: "
+                f"top3={result.top3_hits}/{result.total}"
+            )
+        skipped_caps = still_skipped
+
     # ------------------------------------------------------------------
     # Report
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("  AGGREGATE FALSE-NEGATIVE AUDIT REPORT")
     print("=" * 70)
+
+    # Refuse to report recall when too many capabilities were skipped.
+    _MIN_CAP_COVERAGE = args.min_cap_coverage
+    cap_coverage = len(results) / len(caps) if caps else 1.0
+    if cap_coverage < _MIN_CAP_COVERAGE:
+        print(
+            f"\nERROR: paraphrase-generation coverage is {cap_coverage:.1%} "
+            f"({len(results)}/{len(caps)} capabilities probed, "
+            f"{len(skipped_caps)} skipped after retry). Below threshold "
+            f"{_MIN_CAP_COVERAGE:.0%} — refusing to report recall on a "
+            f"biased subset. Skipped: {skipped_caps[:10]}"
+            f"{' (+more)' if len(skipped_caps) > 10 else ''}. "
+            f"Exit 2.",
+            file=sys.stderr,
+        )
+        return 2
 
     total_queries = sum(r.total for r in results)
     if total_queries == 0:

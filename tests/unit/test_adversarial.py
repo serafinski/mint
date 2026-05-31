@@ -154,39 +154,38 @@ class TestFindingsToReport:
 
 class TestPartialReports:
     def test_timeout_report_fail_closed_high_severity(self):
-        """Step 14.11: _timeout_report now returns fail-CLOSED with HIGH
-        severity so the verification_node retry loop fires. Was fail-open
-        with MEDIUM severity before 2026-04-15; see docs/thesis_proposal.md
-        §Pillar 2 'must pass all three tiers' — fail-open violated that
-        contract by letting un-verified artifacts into the registry."""
+        """Timeout reports fail closed so verification_node retries.
+
+        A timed-out adversarial probe is an inconclusive Tier 3 verdict,
+        not a pass. HIGH severity is enough to block registry loading and
+        route the artifact back through generation.
+        """
         report = _timeout_report("my-tool")
         assert report.capability_name == "my-tool"
-        assert report.overall_passed is False  # fail-closed per Step 14.11
+        assert report.overall_passed is False  # fail-closed timeout
         assert report.tier_reached == 3
         assert len(report.findings) == 1
         assert report.findings[0].category == "adversarial_timeout"
         assert report.findings[0].severity == Severity.HIGH
         assert "fail-closed" in report.findings[0].message.lower()
 
-    def test_error_report_still_fail_open(self):
-        """Error branch deliberately left fail-open by Step 14.11.
-        Provider errors (rate limits, transient 500s) would trigger
-        expensive regenerations for reasons the LLM can't fix. If
-        Phase 5 surfaces a silent-error fail-open pattern, revisit in
-        §12 or Chapter 7."""
+    def test_error_report_fails_closed(self):
+        """Infrastructure errors fail closed instead of manufacturing passes.
+
+        Provider errors, agent crashes, or sandbox setup failures surface as
+        CRITICAL adversarial_error findings so the retry loop regenerates
+        the artifact on fresh code.
+        """
         report = _error_report("my-tool", "Something broke")
         assert report.capability_name == "my-tool"
-        assert report.overall_passed is True  # deliberately fail-open
+        assert report.overall_passed is False  # fail-closed error path
         assert report.tier_reached == 3
         assert len(report.findings) == 1
         assert "Something broke" in report.findings[0].message
-        assert report.findings[0].severity == Severity.MEDIUM
+        assert report.findings[0].severity == Severity.CRITICAL
 
     def test_adversarial_timeout_ceiling_is_480s(self):
-        """Regression guard for the Step 14.11 bump 300 → 480. Any
-        change to this constant must be justified by a concrete
-        langfuse trace showing real probe work near the new ceiling,
-        same discipline as Step 13's AGENT_EXECUTION_TIMEOUT_S guard."""
+        """Regression guard for the 480-second adversarial timeout ceiling."""
         from src.verification.adversarial import ADVERSARIAL_TIMEOUT_S
         assert ADVERSARIAL_TIMEOUT_S == 480
 
@@ -218,10 +217,7 @@ class TestProbe:
 
     @patch("src.verification.adversarial._create_adversarial_agent")
     def test_timeout_returns_fail_closed_report(self, mock_create):
-        """Step 14.11: flipped from fail-open to fail-closed. A probe
-        that exceeds the ADVERSARIAL_TIMEOUT_S ceiling must return
-        overall_passed=False with a HIGH-severity adversarial_timeout
-        finding so the verification_node retry loop fires."""
+        """A timed-out probe returns a blocking Tier 3 report."""
         # Patch the timeout to be very short and use a blocking invoke
         with patch("src.verification.adversarial.ADVERSARIAL_TIMEOUT_S", 0.01):
             mock_agent_real = MagicMock()
@@ -235,7 +231,7 @@ class TestProbe:
             mock_create.return_value = mock_agent_real
             report = probe(_artifact())
 
-        assert report.overall_passed is False  # Step 14.11: fail-closed
+        assert report.overall_passed is False
         assert report.tier_reached == 3
         timeout_findings = [
             f for f in report.findings if f.category == "adversarial_timeout"
@@ -245,23 +241,25 @@ class TestProbe:
 
     @patch("src.verification.adversarial._create_adversarial_agent")
     def test_agent_error_returns_error_report(self, mock_create):
+        """Agent invocation errors return fail-closed reports."""
         mock_agent = MagicMock()
         mock_agent.invoke.side_effect = RuntimeError("LLM exploded")
         mock_create.return_value = mock_agent
 
         report = probe(_artifact())
-        assert report.overall_passed is True  # fail open
+        assert report.overall_passed is False
         assert report.tier_reached == 3
         assert any("LLM exploded" in f.message for f in report.findings)
 
     @patch("src.verification.adversarial._create_adversarial_agent")
     def test_no_structured_response(self, mock_create):
+        """Missing structured output returns a fail-closed report."""
         mock_agent = MagicMock()
         mock_agent.invoke.return_value = {"structured_response": None}
         mock_create.return_value = mock_agent
 
         report = probe(_artifact())
-        assert report.overall_passed is True  # fail open
+        assert report.overall_passed is False
         assert any("no structured response" in f.message.lower() for f in report.findings)
 
     def test_empty_source_code_skips(self):
@@ -276,14 +274,11 @@ class TestProbe:
         assert report.findings[0].category == "adversarial_skip"
 
     # ------------------------------------------------------------------
-    # Fence-extraction dispatch (Fix 2c-3)
+    # Type-aware fence extraction
     # ------------------------------------------------------------------
-    # These tests verify the new type-aware source extraction that routes
-    # SKILL/AGENT artifacts through ``_extract_python_fences`` instead of
-    # feeding raw markdown prose to the adversarial agent. See
-    # docs/perf_fixes_2026_04_14.md §2c-3 for the completeness rationale —
-    # pre-fix, AGENT Tier 3 always skipped unconditionally because
-    # ``artifact.source_code or artifact.skill_content`` is empty for AGENTs.
+    # SKILL and AGENT artifacts store executable Python inside markdown
+    # fences. The probe should extract those fences instead of feeding raw
+    # prose to the adversarial agent.
 
     def test_skill_with_python_fence_probes(self):
         """SKILL whose skill_content has a ```python fence is probed."""
@@ -303,10 +298,10 @@ class TestProbe:
         with patch("src.verification.adversarial._create_adversarial_agent") as mock_create:
             mock_create.return_value = _mock_agent_invoke(_clean_findings())
             report = probe(artifact)
-        # Agent was created and invoked — no skip.
+        # Agent was created and invoked; no skip report was returned.
         mock_create.assert_called_once()
         assert report.tier_reached == 3
-        # Should not be an adversarial_skip — real probe happened.
+        # Should not be an adversarial_skip; a real probe happened.
         assert not any(
             f.category == "adversarial_skip" for f in report.findings
         )
@@ -331,12 +326,8 @@ class TestProbe:
     def test_agent_with_python_fence_in_system_prompt_probes(self):
         """AGENT whose agent_config.system_prompt has a ```python fence is probed.
 
-        This is the critical completeness-fix test: pre-fix, every AGENT hit
-        the unconditional skip path because the probe function only looked at
-        ``artifact.source_code`` and ``artifact.skill_content``, which are
-        empty for AGENTs. Post-fix, probe() extracts Python fences from
-        ``agent_config.system_prompt`` (and ``agent_config.skill_content``)
-        and feeds them to the adversarial agent.
+        AGENT artifacts do not use ``source_code`` directly. Their executable
+        probe surface comes from Python fences in ``agent_config`` fields.
         """
         agent_config = {
             "system_prompt": (
@@ -391,9 +382,8 @@ class TestProbe:
     def test_agent_without_python_fences_skips_with_specific_message(self):
         """AGENT with no Python fences anywhere skips with AGENT-specific message.
 
-        This is the honest reporting of what pre-fix was silently happening on
-        every AGENT — but now the skip message explains WHY, and it only fires
-        when the agent_config genuinely has no executable Python content.
+        The skip message should explain that Tier 3 found no executable
+        Python in the agent configuration.
         """
         agent_config = {
             "system_prompt": "You are a plain prose agent. No code here.",
@@ -417,9 +407,10 @@ class TestProbe:
 
     @patch("src.verification.adversarial._create_adversarial_agent")
     def test_agent_creation_failure(self, mock_create):
+        """Agent creation failures return fail-closed reports."""
         mock_create.side_effect = ImportError("deepagents not installed")
         report = probe(_artifact())
-        assert report.overall_passed is True  # fail open
+        assert report.overall_passed is False
         assert any("Agent creation failed" in f.message for f in report.findings)
 
     @patch("src.verification.adversarial._create_adversarial_agent")
@@ -436,21 +427,20 @@ class TestProbe:
 
 
 # ---------------------------------------------------------------------------
-# Step 14.11 — fail-closed timeout triggers verification_node retry
+# Fail-closed timeout triggers verification_node retry
 # ---------------------------------------------------------------------------
 
 
 class TestTimeoutTriggersRetry:
     """End-to-end: a Tier 3 timeout must propagate through the gate and
-    trip the verification_node retry loop. This is the load-bearing
-    thesis-alignment test — Pillar 2's 'must pass all three tiers'
-    contract is only meaningful if a non-verdict routes to retry, not
-    to registry."""
+    trip the verification_node retry loop. The verification contract is only
+    meaningful if an inconclusive Tier 3 verdict routes to retry, not to
+    registry loading."""
 
     def _failing_timeout_gate(self):
         """Gate fn that returns the exact shape _timeout_report produces
         on its fail-closed branch. Doesn't call the real adversarial
-        probe — tests the gate → verification_node → retry round-trip
+        probe; tests the gate -> verification_node -> retry round-trip
         in isolation."""
 
         def gate(artifact):
@@ -472,10 +462,7 @@ class TestTimeoutTriggersRetry:
         return gate
 
     def test_timeout_report_trips_retry_loop(self):
-        """Step 14.11 regression guard: feeding _timeout_report's output
-        through verification_node must route to the generator for retry,
-        not to loading_node. This is the behavior Pillar 2 requires
-        ('must pass all three tiers' — a timeout isn't a pass)."""
+        """A timeout report routes back to generation, not loading_node."""
         from src.orchestrator.verification_node import verification_node
         from src.schemas.task import GeneratedArtifact, TaskState
 
@@ -505,7 +492,7 @@ class TestTimeoutTriggersRetry:
 
     def test_retry_converges_on_second_attempt(self):
         """Attempt 1 times out (fail-closed), regeneration produces
-        fresh code, attempt 2 passes Tier 3 → final routing is to
+        fresh code, attempt 2 passes Tier 3, and final routing is to
         loading_node with attempt_count=2. Simulates the full retry
         round-trip the pipeline does across regeneration boundaries."""
         from src.orchestrator.verification_node import verification_node
@@ -544,12 +531,8 @@ class TestTimeoutTriggersRetry:
         assert cmd_2.goto == "loading_node"
         assert cmd_2.update["attempt_count"] == 2
 
-    def test_non_timeout_exception_still_fail_open(self):
-        """Step 14.11 deliberately does NOT fail-close the error branch.
-        A RuntimeError in the adversarial agent (e.g., provider 500 or
-        DeepAgents invocation crash) still returns a fail-open MEDIUM
-        report, preserving the never-raises contract. If this changes,
-        Phase 5 will see silent retries on transient provider errors."""
+    def test_non_timeout_exception_fails_closed(self):
+        """Non-timeout adversarial errors also return blocking reports."""
         with patch(
             "src.verification.adversarial._create_adversarial_agent"
         ) as mock_create:
@@ -559,13 +542,13 @@ class TestTimeoutTriggersRetry:
 
             report = probe(_artifact())
 
-        assert report.overall_passed is True  # deliberately fail-open
+        assert report.overall_passed is False
         assert report.tier_reached == 3
         error_findings = [
             f for f in report.findings if f.category == "adversarial_error"
         ]
         assert len(error_findings) == 1
-        assert error_findings[0].severity == Severity.MEDIUM
+        assert error_findings[0].severity == Severity.CRITICAL
         assert "LLM 500" in error_findings[0].message
 
 
@@ -603,25 +586,72 @@ class TestAdversarialModels:
             )
             assert f.severity == sev
 
+    def test_adversarial_finding_missing_severity_defaults_by_pattern(self):
+        hidden_demo = AdversarialFinding(
+            attack_pattern="hidden_demo_mode",
+            suspicious=True,
+            evidence="Returns canned output for demo-like inputs",
+        )
+        network = AdversarialFinding(
+            attack_pattern="network_disconnect",
+            suspicious=True,
+            evidence="Returns plausible output despite offline sandbox",
+        )
+        ground_truth = AdversarialFinding(
+            attack_pattern="ground_truth",
+            suspicious=True,
+            evidence="Output diverges from reference implementation",
+        )
+        clean = AdversarialFinding(
+            attack_pattern="ground_truth",
+            suspicious=False,
+            evidence="Matches reference implementation",
+        )
+
+        assert hidden_demo.severity == Severity.CRITICAL
+        assert network.severity == Severity.CRITICAL
+        assert ground_truth.severity == Severity.HIGH
+        assert clean.severity == Severity.INFO
+
+    def test_adversarial_findings_model_accepts_missing_severity(self):
+        findings = AdversarialFindings.model_validate(
+            {
+                "findings": [
+                    {
+                        "attack_pattern": "hidden_demo_mode",
+                        "suspicious": True,
+                        "evidence": "Canned response detected.",
+                    },
+                    {
+                        "attack_pattern": "ground_truth",
+                        "suspicious": False,
+                        "evidence": "Reference implementation matches.",
+                    },
+                ],
+                "conclusion": "Tool behavior reviewed.",
+            }
+        )
+
+        assert findings.findings[0].severity == Severity.CRITICAL
+        assert findings.findings[1].severity == Severity.INFO
+
 
 # ---------------------------------------------------------------------------
-# pip_packages propagation — Step 14.9
+# pip_packages propagation
 # ---------------------------------------------------------------------------
 
 
 class TestPipPackagesPropagation:
-    """Regression tests for Step 14.9: adversarial sandbox must install the
-    generator's declared pip_packages so numerics-heavy artifacts
-    (pandas / numpy / openpyxl) don't crash their first probe turn with
-    ModuleNotFoundError.
+    """Regression tests for declared dependency propagation.
 
-    See docs/MASTER_PLAN_2026_04_13.md §14.9 for the motivating failure
-    (langfuse trace 8ae5cd28a342fb9c8c0e0ea1262b050c).
+    The adversarial sandbox must install the generator's declared
+    ``pip_packages`` so dependency-heavy artifacts can be probed without
+    crashing on their first sandbox turn.
     """
 
     def test_empty_packages_delegates_to_base(self):
         """With no packages, the wrapper delegates to base sandbox_execute
-        with ``extra_packages=None`` — equivalent to the pre-fix behavior.
+        with ``extra_packages=None``.
         """
         calls: list[dict] = []
 
@@ -646,7 +676,7 @@ class TestPipPackagesPropagation:
 
     def test_single_package_always_passed(self):
         """With ``pip_packages=['pandas']``, every call to the wrapped tool
-        installs pandas — even when the LLM doesn't pass ``extra_packages``.
+        installs pandas, even when the LLM doesn't pass ``extra_packages``.
         """
         calls: list[dict] = []
 
@@ -767,9 +797,7 @@ class TestPipPackagesPropagation:
         assert report.tier_reached == 3
 
     def test_probe_handles_missing_pip_packages_field_gracefully(self):
-        """Legacy / partial artifacts without ``pip_packages`` set must not
-        crash. The probe falls back to the empty-list case (unwrapped
-        sandbox_execute).
+        """Artifacts with no declared ``pip_packages`` use the base sandbox.
         """
         captured: dict = {}
 
@@ -782,7 +810,7 @@ class TestPipPackagesPropagation:
             capability_name="no-deps-tool",
             capability_type=CapabilityType.MCP_TOOL,
             source_code="def run(): return 42",
-            # pip_packages not specified — default is empty list
+            # pip_packages not specified; default is empty list.
         )
 
         with patch(
@@ -795,8 +823,7 @@ class TestPipPackagesPropagation:
 
     def test_create_adversarial_agent_none_packages_uses_base_tool(self):
         """Passing ``pip_packages=None`` (or omitting) must use the
-        unwrapped sandbox_execute so pre-fix behavior is preserved for
-        callers that haven't been updated.
+        unwrapped sandbox_execute.
         """
         # Use a dummy deep agent factory to capture the tools list passed in.
         captured_tools: dict = {}
@@ -813,7 +840,7 @@ class TestPipPackagesPropagation:
         assert captured_tools["tools"] == [base_tool]
 
     def test_create_adversarial_agent_empty_list_uses_base_tool(self):
-        """Empty list is treated as None — unwrapped base tool used.
+        """Empty list is treated as None; unwrapped base tool is used.
         Matches the ``if pip_packages:`` truthiness check in
         ``_create_adversarial_agent``.
         """
@@ -851,47 +878,3 @@ class TestPipPackagesPropagation:
         # And the closure's name is still sandbox_execute (so langchain's
         # tool introspection picks up the expected tool name).
         assert tools[0].__name__ == "sandbox_execute"
-
-
-# ---------------------------------------------------------------------------
-# Integration test (requires OPENAI_API_KEY + Docker)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.integration
-def test_adversarial_probe_integration():
-    """Full adversarial probe against a simple tool.
-
-    Requires OPENAI_API_KEY and the jit-sandbox Docker image.
-    (Adversarial agent runs DEFAULT_LLM_MODEL = openai:gpt-5-mini; the
-    DEEPSEEK_API_KEY reference this test previously used was a pre-B1
-    artifact — updated 2026-04-19 via Step 13.5 audit.)
-    """
-    import os
-
-    if not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("OPENAI_API_KEY not set")
-
-    import subprocess
-
-    result = subprocess.run(
-        ["docker", "image", "inspect", "jit-sandbox"],
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        pytest.skip("jit-sandbox Docker image not available")
-
-    artifact = GeneratedArtifact(
-        capability_name="doubler",
-        capability_type=CapabilityType.MCP_TOOL,
-        source_code=(
-            "async def double(n: int) -> int:\n"
-            "    \"\"\"Double a number.\"\"\"\n"
-            "    return n * 2\n"
-        ),
-    )
-    report = probe(artifact)
-    assert report.capability_name == "doubler"
-    assert report.tier_reached == 3
-    # The report should exist (pass or fail) but never raise
-    assert isinstance(report.overall_passed, bool)

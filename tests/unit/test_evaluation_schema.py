@@ -1,4 +1,4 @@
-"""Unit tests for src/schemas/evaluation.py."""
+"""Unit tests for persisted evaluation schema models."""
 
 from __future__ import annotations
 
@@ -32,37 +32,45 @@ _BASE = dict(
 )
 
 
+def _record(**overrides) -> EvaluationRecord:
+    return EvaluationRecord(**{**_BASE, **overrides})
+
+
 class TestEvaluationRecord:
     def test_valid_full_record(self):
-        r = EvaluationRecord(**_BASE)
+        r = _record()
         assert r.run_id == "run_001"
         assert r.condition == "full"
         assert r.success is True
 
     def test_success_composite(self):
-        r = EvaluationRecord(**{**_BASE, "gate_passed": True, "output_in_range": True})
+        r = _record(gate_passed=True, output_in_range=True)
         assert r.success is True
 
     def test_success_requires_both(self):
-        r1 = EvaluationRecord(**{**_BASE, "gate_passed": False, "output_in_range": True})
+        r1 = _record(gate_passed=False, output_in_range=True)
         assert r1.success is False
-        r2 = EvaluationRecord(**{**_BASE, "gate_passed": True, "output_in_range": False})
+        r2 = _record(gate_passed=True, output_in_range=False)
         assert r2.success is False
 
     def test_optional_fields_default_to_none(self):
-        r = EvaluationRecord(**{**_BASE, "capability_type": None, "human_label": None,
-                                "invocation_record_id": None, "verification_tier_reached": None})
+        r = _record(
+            capability_type=None,
+            human_label=None,
+            invocation_record_id=None,
+            verification_tier_reached=None,
+        )
         assert r.capability_type is None
         assert r.human_label is None
         assert r.invocation_record_id is None
 
     def test_is_pilot_defaults_false(self):
-        r = EvaluationRecord(**_BASE)
+        r = _record()
         assert r.is_pilot is False
 
     def test_timestamp_defaults_to_utc_now(self):
         before = datetime.now(UTC)
-        r = EvaluationRecord(**_BASE)
+        r = _record()
         assert r.timestamp >= before
 
     def test_extra_fields_forbidden(self):
@@ -71,48 +79,48 @@ class TestEvaluationRecord:
 
     def test_attempt_count_non_negative(self):
         with pytest.raises(Exception):
-            EvaluationRecord(**{**_BASE, "attempt_count": -1})
+            _record(attempt_count=-1)
 
     def test_token_cost_non_negative(self):
         with pytest.raises(Exception):
-            EvaluationRecord(**{**_BASE, "token_cost": -1})
+            _record(token_cost=-1)
 
     def test_invalid_condition_rejected(self):
         with pytest.raises(Exception):
-            EvaluationRecord(**{**_BASE, "condition": "unknown"})
+            _record(condition="unknown")
 
     def test_invalid_failure_reason_rejected(self):
         with pytest.raises(Exception):
-            EvaluationRecord(**{**_BASE, "failure_reason": "not_a_reason"})
+            _record(failure_reason="not_a_reason")
 
     def test_invalid_human_label_rejected(self):
         with pytest.raises(Exception):
-            EvaluationRecord(**{**_BASE, "human_label": "wrong"})
+            _record(human_label="wrong")
 
     def test_verification_tier_reached_bounds(self):
-        EvaluationRecord(**{**_BASE, "verification_tier_reached": 0})
-        EvaluationRecord(**{**_BASE, "verification_tier_reached": 3})
+        _record(verification_tier_reached=0)
+        _record(verification_tier_reached=3)
         with pytest.raises(Exception):
-            EvaluationRecord(**{**_BASE, "verification_tier_reached": 4})
+            _record(verification_tier_reached=4)
 
     def test_all_conditions_valid(self):
-        for cond in ["full", "no_verification", "no_optimization", "static"]:
-            r = EvaluationRecord(**{**_BASE, "condition": cond})
+        for cond in BaselineCondition:
+            r = _record(condition=cond)
             assert r.condition == cond
 
     def test_all_tiers_valid(self):
-        for tier in ["trivial", "moderate", "complex"]:
-            r = EvaluationRecord(**{**_BASE, "task_tier": tier})
+        for tier in TaskTier:
+            r = _record(task_tier=tier)
             assert r.task_tier == tier
 
     def test_all_failure_reasons_valid(self):
-        for reason in ["none", "generation_failed", "tier1", "tier2", "tier3", "output_rejected", "no_source_code"]:
-            r = EvaluationRecord(**{**_BASE, "failure_reason": reason})
+        for reason in FailureReason:
+            r = _record(failure_reason=reason)
             assert r.failure_reason == reason
 
     def test_all_capability_types_valid(self):
         for ct in ["mcp_tool", "skill", "agent", None]:
-            r = EvaluationRecord(**{**_BASE, "capability_type": ct})
+            r = _record(capability_type=ct)
             assert r.capability_type == ct
 
 
@@ -122,17 +130,11 @@ class TestStrEnums:
         assert BaselineCondition.NO_VERIFICATION == "no_verification"
         assert BaselineCondition.NO_OPTIMIZATION == "no_optimization"
         assert BaselineCondition.STATIC == "static"
-        # Step 18.7 (2026-04-17): LONGITUDINAL added for run_longitudinal.py.
-        # Not one of the four proposal ablation conditions — it's a separate
-        # sequencing protocol. Analyzers filter by condition explicitly.
         assert BaselineCondition.LONGITUDINAL == "longitudinal"
+        assert BaselineCondition.LONGITUDINAL_SHIFT == "longitudinal_shift"
 
     def test_longitudinal_accepted_on_evaluation_record(self):
-        """run_longitudinal.py writes condition='longitudinal'; this pins
-        that the schema accepts the value without raising. Pre-Step-18.7
-        this would raise ValidationError and run_longitudinal.py would
-        crash on first record_run — a latent bug surfaced by Step 18.7's
-        sanity check."""
+        """Longitudinal records use a distinct accepted condition label."""
         rec = EvaluationRecord(
             run_id="longitudinal_test",
             condition="longitudinal",
@@ -162,11 +164,11 @@ class TestStrEnums:
         assert FailureReason.TIER3 == "tier3"
         assert FailureReason.OUTPUT_REJECTED == "output_rejected"
         assert FailureReason.NO_SOURCE_CODE == "no_source_code"
-        # Post-Step-13 additions (2026-04-15): chain-step / agent-execution failure reasons
-        # surfaced by the compositional executor's sticky failure meta.
         assert FailureReason.CHAIN_STEP_FAILED == "chain_step_failed"
         assert FailureReason.AGENT_EXECUTION_TIMEOUT == "agent_execution_timeout"
         assert FailureReason.AGENT_EXECUTION_ERROR == "agent_execution_error"
+        assert FailureReason.OUTPUT_SHAPE_MISMATCH == "output_shape_mismatch"
+        assert FailureReason.WATCHDOG_ABORT == "watchdog_abort"
 
     def test_human_label_values(self):
         assert HumanLabel.CORRECT == "correct"

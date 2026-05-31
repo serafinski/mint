@@ -1,7 +1,8 @@
-"""DuckDB-backed store for evaluation run records (Iteration 5).
+"""DuckDB-backed store for evaluation campaign records.
 
-Separate from the operational MetricsStore — this table tracks experimental
-outcomes across the five baseline conditions for thesis analysis.
+Separate from the operational MetricsStore, this store persists campaign
+outcomes and per-cycle telemetry for the evaluation protocol and Chapter 6
+analysis artifacts.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 import duckdb
 
@@ -16,6 +18,7 @@ from src.schemas.evaluation import (
     BaselineCondition,
     EvaluationRecord,
     FailureReason,
+    GeneratedArtifactSnapshot,
     TaskTier,
 )
 
@@ -25,6 +28,10 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     run_id                    VARCHAR NOT NULL,
     condition                 VARCHAR NOT NULL,
     task_id                   VARCHAR NOT NULL,
+    task_family_id            VARCHAR NOT NULL,
+    task_instance_id          VARCHAR NOT NULL,
+    variant_id                VARCHAR,
+    benchmark_track           VARCHAR NOT NULL DEFAULT 'breadth',
     task_tier                 VARCHAR NOT NULL,
     attempt_count             INTEGER NOT NULL DEFAULT 0,
     capability_type           VARCHAR,
@@ -57,23 +64,29 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     timestamp                 TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Step 18.5 (2026-04-17): persistent per-capability invocation log keyed
--- by (run_id, condition, task_id) for Chapter 6 Gini-coefficient analysis
--- on capability reuse distribution (proposal §Metrics). MetricsStore is
--- in-memory per _execute_run call (for optimizer accumulation within a
--- single run); this table persists the flushed invocations to disk so
--- analyze_results.py can compute per-(condition, run) and aggregate
--- Gini over the full 400-record eval.
+-- Persistent per-capability invocation log keyed by run identity and task
+-- identity. MetricsStore is in-memory for optimizer accumulation within a
+-- run; this table persists flushed invocations so analyzers can compute
+-- capability-reuse distributions.
 CREATE TABLE IF NOT EXISTS invocation_events (
     id                        VARCHAR PRIMARY KEY,
     run_id                    VARCHAR NOT NULL,
     condition                 VARCHAR NOT NULL,
     task_id                   VARCHAR NOT NULL,
+    task_family_id            VARCHAR NOT NULL DEFAULT '',
+    task_instance_id          VARCHAR NOT NULL DEFAULT '',
+    variant_id                VARCHAR,
+    benchmark_track           VARCHAR NOT NULL DEFAULT 'breadth',
     capability_id             VARCHAR NOT NULL,
     capability_type           VARCHAR,
     success                   BOOLEAN NOT NULL,
     token_cost                INTEGER NOT NULL DEFAULT 0,
     latency_ms                INTEGER NOT NULL DEFAULT 0,
+    -- Mirror evaluation_runs.is_pilot so M3 Gini can exclude pilot
+    -- invocations. DuckDB does not support adding a NOT NULL DEFAULT
+    -- column through ALTER, so migrated DBs may contain NULL until the
+    -- backfill below runs.
+    is_pilot                  BOOLEAN,
     occurred_at               TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_invocation_events_condition
@@ -81,20 +94,19 @@ CREATE INDEX IF NOT EXISTS idx_invocation_events_condition
 CREATE INDEX IF NOT EXISTS idx_invocation_events_cap
     ON invocation_events(capability_id);
 
--- Step 18.7 follow-up (2026-04-17 end of session): persistent per-cycle
--- utility-score snapshot for proposal-aligned KL convergence analysis.
--- Proposal §Pillar 3 §Formal Framework defines utility as
--- U(c) = α·reuse·success − β·token_cost − γ·maintenance. The online
--- metric (src/optimizer/loop.py::_compute_kl_divergence) uses exactly
--- this — we now persist it so post-hoc analyzers (Step 18.7 analyze_
--- longitudinal.py) can compute the SAME KL series, not an invocation-
--- count proxy. Flushed by the harness after each task's pipeline.invoke
--- via compute_all_utilities(registry, metrics_store).
+-- Per-cycle utility-score snapshots for KL convergence analysis. The
+-- optimizer computes utility distributions online; this table persists
+-- those distributions so post-hoc analyzers can reproduce the same KL
+-- series instead of using invocation-count proxies.
 CREATE TABLE IF NOT EXISTS cycle_utility_scores (
     id                        VARCHAR PRIMARY KEY,
     run_id                    VARCHAR NOT NULL,
     condition                 VARCHAR NOT NULL,
     task_id                   VARCHAR NOT NULL,
+    task_family_id            VARCHAR NOT NULL DEFAULT '',
+    task_instance_id          VARCHAR NOT NULL DEFAULT '',
+    variant_id                VARCHAR,
+    benchmark_track           VARCHAR NOT NULL DEFAULT 'breadth',
     capability_id             VARCHAR NOT NULL,
     utility_score             DOUBLE NOT NULL,
     occurred_at               TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -102,17 +114,18 @@ CREATE TABLE IF NOT EXISTS cycle_utility_scores (
 CREATE INDEX IF NOT EXISTS idx_cycle_utility_run
     ON cycle_utility_scores(run_id, condition);
 
--- Step 18.7 follow-up: persistent per-cycle capability_events log,
--- mirroring MetricsStore.capability_events which is in-memory per run.
--- Enables true per-type operation counts (prune / split / merge /
--- verification_rollback / etc.) per cycle in the longitudinal analyzer,
--- replacing the active-cap-delta proxy of the pre-follow-up
--- analyze_longitudinal.py.
+-- Per-cycle capability_events log mirroring MetricsStore.capability_events,
+-- which is in-memory per run. Enables operation counts (prune / split /
+-- merge / verification_rollback / etc.) per cycle in analyzers.
 CREATE TABLE IF NOT EXISTS cycle_events (
     id                        VARCHAR PRIMARY KEY,
     run_id                    VARCHAR NOT NULL,
     condition                 VARCHAR NOT NULL,
     task_id                   VARCHAR NOT NULL,
+    task_family_id            VARCHAR NOT NULL DEFAULT '',
+    task_instance_id          VARCHAR NOT NULL DEFAULT '',
+    variant_id                VARCHAR,
+    benchmark_track           VARCHAR NOT NULL DEFAULT 'breadth',
     capability_id             VARCHAR NOT NULL,
     event_type                VARCHAR NOT NULL,
     details                   VARCHAR NOT NULL DEFAULT '',
@@ -124,13 +137,15 @@ CREATE INDEX IF NOT EXISTS idx_cycle_events_type
     ON cycle_events(event_type);
 """
 
-# Idempotent migrations for upgrading existing DBs to the Stage 1
-# compositional schema. DuckDB does NOT support `ADD COLUMN ... NOT NULL
-# DEFAULT ...` via ALTER (Parser Error: "Adding columns with constraints
-# not yet supported"), so the ALTER variants omit constraints. New rows
-# inserted via record_run() always supply explicit values, and old rows
-# with NULL are coerced to safe defaults in _row_to_record().
+# Idempotent migrations for opening older evaluation DBs with the current
+# schema. DuckDB does not support `ADD COLUMN ... NOT NULL DEFAULT ...` through
+# ALTER, so migrated columns are nullable. New rows inserted by record_run()
+# supply explicit values, and old NULLs are coerced in _row_to_record().
 _MIGRATIONS = [
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS task_family_id VARCHAR",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS task_instance_id VARCHAR",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS variant_id VARCHAR",
+    "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS benchmark_track VARCHAR",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS chain_length INTEGER",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS chain_success BOOLEAN",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS matched_and_executed_count INTEGER",
@@ -138,22 +153,110 @@ _MIGRATIONS = [
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS capability_types VARCHAR",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_index INTEGER",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_name VARCHAR",
-    # Step 13.8 — free-text reason string from CompositionalExecutor (§12 finding
-    # #12 schema-key violations + AGENT timeout/error). Needed to classify
-    # compression_loss_subtask failures in scripts/analyze_compression_loss.py.
+    # Free-text reason string from CompositionalExecutor; lets analysis
+    # distinguish chain-step failures from validation failures.
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS failed_step_reason VARCHAR",
-    # Step 14.6 — output contract check
+    # Output contract check fields.
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_mismatch BOOLEAN",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_missing_keys VARCHAR",
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS output_shape_missing_files VARCHAR",
-    # Step 18.10 Option B — per-record source-body snapshots for M2 audit.
-    # Needed because snapshot isolation wipes the registry between runs, so
-    # post-eval audit tool cannot reconstruct source from chroma alone.
+    # Per-record source-body snapshots for optional manual contamination audit.
+    # Snapshot isolation resets registry state between runs, so persisted source
+    # bodies keep old DBs auditable without reconstructing ChromaDB state.
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS generated_artifact_sources VARCHAR",
-    # Step 13.7 Batch B6 — LangFuse root trace ID cross-reference.
-    # Enables jump-navigation from DuckDB eval row → LangFuse trace UI
-    # without a timestamp/session join.
+    # LangFuse root trace ID cross-reference for debugging without a
+    # timestamp/session join.
     "ALTER TABLE evaluation_runs ADD COLUMN IF NOT EXISTS langfuse_trace_id VARCHAR",
+    # Mirror is_pilot onto invocation_events so M3 Gini can exclude pilot rows.
+    # Nullable on migrate; backfilled below.
+    "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS is_pilot BOOLEAN",
+    "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS task_family_id VARCHAR",
+    "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS task_instance_id VARCHAR",
+    "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS variant_id VARCHAR",
+    "ALTER TABLE invocation_events ADD COLUMN IF NOT EXISTS benchmark_track VARCHAR",
+    "ALTER TABLE cycle_utility_scores ADD COLUMN IF NOT EXISTS task_family_id VARCHAR",
+    "ALTER TABLE cycle_utility_scores ADD COLUMN IF NOT EXISTS task_instance_id VARCHAR",
+    "ALTER TABLE cycle_utility_scores ADD COLUMN IF NOT EXISTS variant_id VARCHAR",
+    "ALTER TABLE cycle_utility_scores ADD COLUMN IF NOT EXISTS benchmark_track VARCHAR",
+    "ALTER TABLE cycle_events ADD COLUMN IF NOT EXISTS task_family_id VARCHAR",
+    "ALTER TABLE cycle_events ADD COLUMN IF NOT EXISTS task_instance_id VARCHAR",
+    "ALTER TABLE cycle_events ADD COLUMN IF NOT EXISTS variant_id VARCHAR",
+    "ALTER TABLE cycle_events ADD COLUMN IF NOT EXISTS benchmark_track VARCHAR",
+]
+
+# Backfill is_pilot on older invocation_events rows by joining to the
+# evaluation_runs row that produced them. Safe on fresh DBs and idempotent:
+# only rows where is_pilot IS NULL are touched.
+_INVOCATION_IS_PILOT_BACKFILL_SQL = """
+UPDATE invocation_events AS ie
+SET is_pilot = COALESCE(er.is_pilot, FALSE)
+FROM evaluation_runs AS er
+WHERE ie.run_id = er.run_id
+  AND ie.task_id = er.task_id
+  AND ie.is_pilot IS NULL
+"""
+
+_TASK_IDENTITY_BACKFILL_SQL = [
+    """
+    UPDATE evaluation_runs
+    SET task_family_id = task_id
+    WHERE task_family_id IS NULL
+    """,
+    """
+    UPDATE evaluation_runs
+    SET task_instance_id = task_id
+    WHERE task_instance_id IS NULL
+    """,
+    """
+    UPDATE evaluation_runs
+    SET benchmark_track = 'breadth'
+    WHERE benchmark_track IS NULL
+    """,
+    """
+    UPDATE invocation_events
+    SET task_family_id = task_id
+    WHERE task_family_id IS NULL
+    """,
+    """
+    UPDATE invocation_events
+    SET task_instance_id = task_id
+    WHERE task_instance_id IS NULL
+    """,
+    """
+    UPDATE invocation_events
+    SET benchmark_track = 'breadth'
+    WHERE benchmark_track IS NULL
+    """,
+    """
+    UPDATE cycle_utility_scores
+    SET task_family_id = task_id
+    WHERE task_family_id IS NULL
+    """,
+    """
+    UPDATE cycle_utility_scores
+    SET task_instance_id = task_id
+    WHERE task_instance_id IS NULL
+    """,
+    """
+    UPDATE cycle_utility_scores
+    SET benchmark_track = 'breadth'
+    WHERE benchmark_track IS NULL
+    """,
+    """
+    UPDATE cycle_events
+    SET task_family_id = task_id
+    WHERE task_family_id IS NULL
+    """,
+    """
+    UPDATE cycle_events
+    SET task_instance_id = task_id
+    WHERE task_instance_id IS NULL
+    """,
+    """
+    UPDATE cycle_events
+    SET benchmark_track = 'breadth'
+    WHERE benchmark_track IS NULL
+    """,
 ]
 
 
@@ -162,12 +265,16 @@ class EvaluationStore:
 
     def __init__(self, *, db_path: str | None = None) -> None:
         if db_path and db_path != ":memory:":
-            from pathlib import Path
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = duckdb.connect(db_path or ":memory:")
         self._conn.execute(_INIT_SQL)
-        # Idempotent ALTERs so existing DBs gain the Stage 1 compositional columns.
+        # Idempotent ALTERs so existing DBs gain current schema columns.
         for stmt in _MIGRATIONS:
+            self._conn.execute(stmt)
+        # Backfill invocation_events.is_pilot from evaluation_runs for older
+        # rows. No-op on fresh DBs.
+        self._conn.execute(_INVOCATION_IS_PILOT_BACKFILL_SQL)
+        for stmt in _TASK_IDENTITY_BACKFILL_SQL:
             self._conn.execute(stmt)
 
     # -- lifecycle -----------------------------------------------------------
@@ -195,7 +302,8 @@ class EvaluationStore:
         self._conn.execute(
             """
             INSERT INTO evaluation_runs (
-                id, run_id, condition, task_id, task_tier,
+                id, run_id, condition, task_id, task_family_id, task_instance_id,
+                variant_id, benchmark_track, task_tier,
                 attempt_count, capability_type, verification_tier_reached,
                 gate_passed, output_in_range, token_cost, attempt_latency_ms,
                 failure_reason, registry_snapshot_id, invocation_record_id,
@@ -207,13 +315,22 @@ class EvaluationStore:
                 output_shape_mismatch, output_shape_missing_keys, output_shape_missing_files,
                 generated_artifact_sources, langfuse_trace_id,
                 timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?
+            )
             """,
             [
                 row_id,
                 record.run_id,
                 record.condition,
                 record.task_id,
+                record.task_family_id,
+                record.task_instance_id,
+                record.variant_id,
+                record.benchmark_track,
                 record.task_tier,
                 record.attempt_count,
                 record.capability_type,
@@ -250,19 +367,34 @@ class EvaluationStore:
         )
         return row_id
 
-    def update_human_label(self, row_id: str, label: str | None) -> bool:
-        """Set ``human_label`` on one evaluation_runs row. Step 18.10.
+    def update_human_label(
+        self,
+        row_id: str,
+        label: str | None,
+        *,
+        allow_overwrite: bool = False,
+    ) -> bool:
+        """Set ``human_label`` on one evaluation_runs row.
 
-        Returns True if a row was updated, False if ``row_id`` did not exist.
-        Label must be one of ``HumanLabel`` enum values (correct /
-        contaminated / partial) or None to clear. Idempotent — re-labeling
-        the same row with the same value is a no-op from the caller's
-        perspective.
+        This helper supports the optional manual contamination-audit workflow.
+        That workflow was deferred out of the Chapter 6 evidence set because
+        there was not enough project time to run and cross-check a human audit
+        sample. The DB column remains for compatibility and for future audit
+        work, so this method keeps a guarded write path instead of requiring
+        ad-hoc SQL updates.
+
+        Returns True iff the row existed AND was either unlabeled or
+        ``allow_overwrite=True``. Returns False when the row is missing
+        OR when another audit session already labeled it (optimistic
+        concurrency check).
+
+        The default UPDATE is guarded by ``AND human_label IS NULL`` so two
+        audit sessions cannot silently overwrite one another. ``allow_overwrite``
+        keeps the ability to clear or relabel when explicitly invoked.
 
         Raises ``ValueError`` if ``label`` is not a known HumanLabel
-        value and not None; this catches typos in the audit tool before
-        a bad value hits the DB (the column is VARCHAR and would accept
-        anything otherwise).
+        value and not None; this catches typos before a bad value hits
+        the DB (the column is VARCHAR and would accept anything).
         """
         valid = {"correct", "contaminated", "partial", None}
         if label not in valid:
@@ -270,17 +402,32 @@ class EvaluationStore:
                 f"label must be one of {sorted(v for v in valid if v)} "
                 f"or None; got {label!r}"
             )
-        cursor = self._conn.execute(
-            "UPDATE evaluation_runs SET human_label = ? WHERE id = ?",
-            [label, row_id],
-        )
-        # DuckDB's execute returns the connection, not an affected-rows
-        # count. We check whether the row existed by doing a SELECT after.
         existed = self._conn.execute(
-            "SELECT 1 FROM evaluation_runs WHERE id = ? LIMIT 1",
+            "SELECT human_label FROM evaluation_runs WHERE id = ? LIMIT 1",
             [row_id],
         ).fetchone()
-        return existed is not None
+        if existed is None:
+            return False
+        prior_label = existed[0]
+        if (
+            prior_label is not None
+            and label is not None
+            and not allow_overwrite
+        ):
+            # Optimistic concurrency: another session already labeled.
+            return False
+        if allow_overwrite:
+            self._conn.execute(
+                "UPDATE evaluation_runs SET human_label = ? WHERE id = ?",
+                [label, row_id],
+            )
+        else:
+            self._conn.execute(
+                "UPDATE evaluation_runs SET human_label = ? "
+                "WHERE id = ? AND (human_label IS NULL OR ? IS NULL)",
+                [label, row_id, label],
+            )
+        return True
 
     def record_invocation_events(
         self,
@@ -288,7 +435,12 @@ class EvaluationStore:
         run_id: str,
         condition: str,
         task_id: str,
+        task_family_id: str | None = None,
+        task_instance_id: str | None = None,
+        variant_id: str | None = None,
+        benchmark_track: str = "breadth",
         events: list[dict],
+        is_pilot: bool = False,
     ) -> int:
         """Persist a batch of capability invocation events for one task-run.
 
@@ -296,20 +448,25 @@ class EvaluationStore:
         ``capability_type`` (optional str), ``success`` (required bool),
         ``token_cost`` (optional int), ``latency_ms`` (optional int).
         All rows share the same ``run_id`` / ``condition`` / ``task_id``
-        context — that's the unit the harness flushes after each task's
-        chain execution completes.
+        / ``is_pilot`` context — that's the unit the harness flushes after
+        each task's chain execution completes.
+
+        ``is_pilot`` threads through from the harness so M3 Gini can exclude
+        pilot rows via a direct ``WHERE NOT is_pilot`` clause, symmetric with
+        evaluation_runs. The default False keeps helper callers simple; the
+        harness supplies the real flag during eval runs.
 
         Returns the number of rows inserted. Zero on empty ``events``.
 
-        This is the persistence layer for Step 18.5's Gini-coefficient
-        analysis (proposal §Metrics capability reuse distribution). The
-        in-memory MetricsStore the optimizer shares across tasks within
-        one ``_execute_run`` call is flushed here to disk so post-eval
-        analysis can compute per-(condition, run) and aggregate Gini
-        over the full 400-record eval.
+        This is the persistence layer for capability-reuse Gini analysis. The
+        in-memory MetricsStore that the optimizer shares across tasks within
+        one run is flushed here to disk so post-eval analysis can compute
+        per-run and aggregate reuse distributions.
         """
         if not events:
             return 0
+        task_family_id = task_family_id or task_id
+        task_instance_id = task_instance_id or task_id
         rows = []
         now = datetime.now(UTC)
         for ev in events:
@@ -318,19 +475,26 @@ class EvaluationStore:
                 run_id,
                 condition,
                 task_id,
+                task_family_id,
+                task_instance_id,
+                variant_id,
+                benchmark_track,
                 ev["capability_id"],
                 ev.get("capability_type"),
                 bool(ev["success"]),
                 int(ev.get("token_cost", 0) or 0),
                 int(ev.get("latency_ms", 0) or 0),
+                bool(is_pilot),
                 now,
             ])
         self._conn.executemany(
             """
             INSERT INTO invocation_events (
-                id, run_id, condition, task_id, capability_id,
-                capability_type, success, token_cost, latency_ms, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, run_id, condition, task_id, task_family_id, task_instance_id,
+                variant_id, benchmark_track, capability_id,
+                capability_type, success, token_cost, latency_ms,
+                is_pilot, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -342,6 +506,10 @@ class EvaluationStore:
         run_id: str,
         condition: str,
         task_id: str,
+        task_family_id: str | None = None,
+        task_instance_id: str | None = None,
+        variant_id: str | None = None,
+        benchmark_track: str = "breadth",
         scores: dict[str, float],
         occurred_at: datetime | None = None,
     ) -> int:
@@ -349,20 +517,20 @@ class EvaluationStore:
 
         Expected caller: the harness, after ``pipeline.invoke()`` returns,
         calls ``src.optimizer.utility.compute_all_utilities(registry,
-        metrics_store)`` and passes the result here. Enables post-hoc
-        proposal-aligned KL convergence analysis using the actual utility
-        score distribution, not an invocation-count proxy.
+        metrics_store)`` and passes the result here. Enables post-hoc KL
+        convergence analysis using the actual utility-score distribution, not
+        an invocation-count proxy.
 
         ``occurred_at`` defaults to ``datetime.now(UTC)`` at insert time.
-        Tests that need deterministic per-cycle bucketing (security audit
-        finding #18: the analyzer buckets utility rows into cycles by
-        timestamp window) can pass an explicit value to ensure the row
-        lands in its intended cycle.
+        Tests that need deterministic per-cycle bucketing can pass an explicit
+        value to ensure the row lands in its intended cycle.
 
         Returns number of rows inserted; 0 on empty input.
         """
         if not scores:
             return 0
+        task_family_id = task_family_id or task_id
+        task_instance_id = task_instance_id or task_id
         now = occurred_at if occurred_at is not None else datetime.now(UTC)
         rows = [
             [
@@ -370,6 +538,10 @@ class EvaluationStore:
                 run_id,
                 condition,
                 task_id,
+                task_family_id,
+                task_instance_id,
+                variant_id,
+                benchmark_track,
                 cap_name,
                 float(score),
                 now,
@@ -379,9 +551,10 @@ class EvaluationStore:
         self._conn.executemany(
             """
             INSERT INTO cycle_utility_scores (
-                id, run_id, condition, task_id, capability_id,
+                id, run_id, condition, task_id, task_family_id, task_instance_id,
+                variant_id, benchmark_track, capability_id,
                 utility_score, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -393,6 +566,10 @@ class EvaluationStore:
         run_id: str,
         condition: str,
         task_id: str,
+        task_family_id: str | None = None,
+        task_instance_id: str | None = None,
+        variant_id: str | None = None,
+        benchmark_track: str = "breadth",
         events: list[dict],
         occurred_at: datetime | None = None,
     ) -> int:
@@ -405,19 +582,17 @@ class EvaluationStore:
         Expected caller: the harness, after ``pipeline.invoke()``, fetches
         MetricsStore.capability_events entries that occurred during that
         task's pipeline invocation (typically via a timestamp cursor) and
-        passes them here. Enables true per-type operation counts per
-        cycle in the Step 18.7 analyzer, replacing the active-cap-delta
-        proxy.
+        passes them here. Enables true per-type operation counts per cycle.
 
         ``occurred_at`` defaults to ``datetime.now(UTC)``. Tests that need
-        deterministic per-cycle bucketing can pass an explicit value —
-        the Step 18.7 analyzer buckets rows into cycles by timestamp
-        window (security audit finding #18).
+        deterministic per-cycle bucketing can pass an explicit value.
 
         Returns number of rows inserted; 0 on empty input.
         """
         if not events:
             return 0
+        task_family_id = task_family_id or task_id
+        task_instance_id = task_instance_id or task_id
         now = occurred_at if occurred_at is not None else datetime.now(UTC)
         rows = []
         for ev in events:
@@ -426,6 +601,10 @@ class EvaluationStore:
                 run_id,
                 condition,
                 task_id,
+                task_family_id,
+                task_instance_id,
+                variant_id,
+                benchmark_track,
                 ev["capability_id"],
                 ev["event_type"],
                 ev.get("details", "") or "",
@@ -434,9 +613,10 @@ class EvaluationStore:
         self._conn.executemany(
             """
             INSERT INTO cycle_events (
-                id, run_id, condition, task_id, capability_id,
+                id, run_id, condition, task_id, task_family_id, task_instance_id,
+                variant_id, benchmark_track, capability_id,
                 event_type, details, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -470,7 +650,8 @@ class EvaluationStore:
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self._conn.execute(
             f"""
-            SELECT run_id, condition, task_id, task_tier, attempt_count,
+            SELECT run_id, condition, task_id, task_family_id, task_instance_id,
+                   variant_id, benchmark_track, task_tier, attempt_count,
                    capability_type, verification_tier_reached, gate_passed,
                    output_in_range, token_cost, attempt_latency_ms,
                    failure_reason, registry_snapshot_id, invocation_record_id,
@@ -571,7 +752,8 @@ class EvaluationStore:
 
 def _row_to_record(row: tuple) -> EvaluationRecord:
     (
-        run_id, condition, task_id, task_tier, attempt_count,
+        run_id, condition, task_id, task_family_id, task_instance_id,
+        variant_id, benchmark_track, task_tier, attempt_count,
         capability_type, verification_tier_reached, gate_passed,
         output_in_range, token_cost, attempt_latency_ms,
         failure_reason, registry_snapshot_id, invocation_record_id,
@@ -604,10 +786,8 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
     def _decode_artifact_sources(blob: object) -> list:
         """Parse the generated_artifact_sources JSON column into snapshots.
 
-        Never raises — malformed JSON / old rows → empty list, which
-        triggers the audit tool's fallback (registry lookup) path.
+        Never raises: malformed JSON or older rows decode to an empty list.
         """
-        from src.schemas.evaluation import GeneratedArtifactSnapshot
         if not blob:
             return []
         try:
@@ -630,6 +810,10 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         run_id=run_id,
         condition=BaselineCondition(condition),
         task_id=task_id,
+        task_family_id=task_family_id or task_id,
+        task_instance_id=task_instance_id or task_id,
+        variant_id=variant_id,
+        benchmark_track=benchmark_track or "breadth",
         task_tier=TaskTier(task_tier),
         attempt_count=attempt_count,
         capability_type=capability_type,
@@ -654,7 +838,11 @@ def _row_to_record(row: tuple) -> EvaluationRecord:
         failed_step_index=failed_step_index,
         failed_step_name=failed_step_name,
         failed_step_reason=failed_step_reason,
-        output_shape_mismatch=bool(output_shape_mismatch) if output_shape_mismatch is not None else False,
+        output_shape_mismatch=(
+            bool(output_shape_mismatch)
+            if output_shape_mismatch is not None
+            else False
+        ),
         output_shape_missing_keys=_decode_str_list(output_shape_missing_keys),
         output_shape_missing_files=_decode_str_list(output_shape_missing_files),
         generated_artifact_sources=_decode_artifact_sources(generated_artifact_sources),

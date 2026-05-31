@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.optimizer.operations import (
+    _MAX_AGENT_SUBAGENT_BUDGET,
     MergeAgentsResult,
     MergeAgentsSubagent,
     MergeSkillsResult,
@@ -19,22 +21,14 @@ from src.optimizer.operations import (
     SplitSkillVariant,
     SplitToolsResult,
     SplitToolVariant,
-    _MAX_AGENT_SUBAGENT_BUDGET,
-    _merge_agents,
-    _merge_skills,
-    _merge_tools,
-    _register_artifact_directly,
-    _split_agents,
-    _split_skills,
-    _split_tools,
     _summarize_failures_for_prompt,
     merge,
     prune,
     split,
     verify_and_register_or_rollback,
 )
-from src.schemas.metrics import InvocationRecord
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
+from src.schemas.metrics import InvocationRecord
 from src.schemas.task import GeneratedArtifact
 from src.schemas.verification import (
     Severity,
@@ -61,11 +55,30 @@ def _make_cap(
 
 
 class TestPrune:
+    def test_skips_freshly_created_capabilities_inside_prune_window(self):
+        registry = MagicMock()
+        fresh_cap = _make_cap("fresh-cap").model_copy(
+            update={"created_at": datetime.now(UTC)}
+        )
+        registry.list_all.return_value = [fresh_cap]
+
+        store = MagicMock()
+
+        result = prune(registry, store, window_days=30)
+
+        assert result == []
+        registry.deactivate.assert_not_called()
+        store.invocations_since.assert_not_called()
+
     def test_prunes_zero_invocation_capabilities(self):
         registry = MagicMock()
         registry.list_all.return_value = [
-            _make_cap("cap-a"),
-            _make_cap("cap-b"),
+            _make_cap("cap-a").model_copy(
+                update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+            ),
+            _make_cap("cap-b").model_copy(
+                update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+            ),
         ]
 
         store = MagicMock()
@@ -80,8 +93,12 @@ class TestPrune:
     def test_skips_capabilities_with_recent_invocations(self):
         registry = MagicMock()
         registry.list_all.return_value = [
-            _make_cap("cap-a"),
-            _make_cap("cap-b"),
+            _make_cap("cap-a").model_copy(
+                update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+            ),
+            _make_cap("cap-b").model_copy(
+                update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+            ),
         ]
 
         store = MagicMock()
@@ -93,6 +110,26 @@ class TestPrune:
         assert result == ["cap-b"]
         registry.deactivate.assert_called_once_with("cap-b")
 
+
+class TestAgentSubagentNameValidation:
+    def test_merge_agents_subagent_name_over_64_chars_is_rejected(self):
+        with pytest.raises(Exception, match="64"):
+            MergeAgentsSubagent(
+                name="x" * 65,
+                description="subagent",
+                system_prompt="prompt",
+                tools=["sandbox_execute"],
+            )
+
+    def test_split_agents_subagent_name_over_64_chars_is_rejected(self):
+        with pytest.raises(Exception, match="64"):
+            SplitAgentVariantSubagent(
+                name="x" * 65,
+                description="subagent",
+                system_prompt="prompt",
+                tools=["sandbox_execute"],
+            )
+
     def test_empty_registry(self):
         registry = MagicMock()
         registry.list_all.return_value = []
@@ -103,24 +140,32 @@ class TestPrune:
 
     def test_custom_window_days(self):
         registry = MagicMock()
-        registry.list_all.return_value = [_make_cap("cap-a")]
+        registry.list_all.return_value = [
+            _make_cap("cap-a").model_copy(
+                update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+            )
+        ]
 
         store = MagicMock()
         store.invocations_since.return_value = 0
 
         prune(registry, store, window_days=7)
 
-        # Verify the cutoff was passed correctly
         args = store.invocations_since.call_args
         cutoff = args[0][1]
         now = datetime.now(UTC)
-        # Cutoff should be ~7 days ago
+        # Allow small wall-clock drift around the seven-day cutoff.
         assert (now - cutoff).days in (6, 7)
 
     def test_prune_skips_pinned_capability(self):
         """Pinned capabilities are never pruned, even with zero invocations."""
         pinned_cap = _make_cap("csv-parser")
-        pinned_cap = pinned_cap.model_copy(update={"metadata": {"pinned": "true"}})
+        pinned_cap = pinned_cap.model_copy(
+            update={
+                "created_at": datetime(2020, 1, 1, tzinfo=UTC),
+                "metadata": {"pinned": "true"},
+            }
+        )
         registry = MagicMock()
         registry.list_all.return_value = [pinned_cap]
         store = MagicMock()
@@ -141,7 +186,9 @@ class TestPrune:
         drift when the prune helper is refactored.
         """
         registry = MagicMock()
-        cap = _make_cap("ephemeral")
+        cap = _make_cap("ephemeral").model_copy(
+            update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+        )
         # Explicitly no "pinned" key in metadata (empty {})
         assert cap.metadata == {}
         registry.list_all.return_value = [cap]
@@ -161,11 +208,20 @@ class TestPrune:
         assert event_call[0][1] == "pruned"
 
     def test_prune_mixed_registry_only_deactivates_unpinned(self):
-        """Mixed registry: pinned survives, active-with-invocations survives, idle-unpinned pruned."""
+        """Mixed registry: pinned and active survive; idle-unpinned is pruned."""
         pinned = _make_cap("pinned-cap")
-        pinned = pinned.model_copy(update={"metadata": {"pinned": "true"}})
-        active = _make_cap("active-cap")
-        idle = _make_cap("idle-cap")
+        pinned = pinned.model_copy(
+            update={
+                "created_at": datetime(2020, 1, 1, tzinfo=UTC),
+                "metadata": {"pinned": "true"},
+            }
+        )
+        active = _make_cap("active-cap").model_copy(
+            update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+        )
+        idle = _make_cap("idle-cap").model_copy(
+            update={"created_at": datetime(2020, 1, 1, tzinfo=UTC)}
+        )
 
         registry = MagicMock()
         registry.list_all.return_value = [pinned, active, idle]
@@ -186,7 +242,7 @@ class TestPrune:
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — verify_and_register_or_rollback helper
+# verify_and_register_or_rollback helper
 # ---------------------------------------------------------------------------
 
 
@@ -227,7 +283,7 @@ def _skill_artifact(name: str = "merged-skill") -> GeneratedArtifact:
 
 
 class TestVerifyAndRegisterOrRollback:
-    """Step 5 — the shared helper that merge and split funnel through."""
+    """The shared helper that merge and split funnel through."""
 
     @patch("src.verification.gate.verify")
     def test_gate_pass_registers_skill_and_records_event(self, mock_verify):
@@ -343,7 +399,7 @@ class TestVerifyAndRegisterOrRollback:
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — merge() dispatch + per-type merge functions
+# merge() dispatch + per-type merge functions
 # ---------------------------------------------------------------------------
 
 
@@ -363,14 +419,13 @@ def _cap_with_source(
     ``metadata['skill_content']`` / ``metadata['agent_config']``. Merge
     helpers pull parent executable content from these metadata keys.
     """
-    import json as _json
     metadata: dict[str, str] = {"generated": "true"}
     if source_code is not None:
         metadata["source_code"] = source_code
     if skill_content is not None:
         metadata["skill_content"] = skill_content
     if agent_config is not None:
-        metadata["agent_config"] = _json.dumps(agent_config)
+        metadata["agent_config"] = json.dumps(agent_config)
     return CapabilityDescriptor(
         name=name,
         description=f"Description for {name}",
@@ -458,6 +513,7 @@ class TestMergeTools:
     """_merge_tools: MCP_TOOL parents → combined FastMCP source."""
 
     def _mcp_cap(self, name: str, tags: list[str] | None = None) -> CapabilityDescriptor:
+        func_name = name.replace("-", "_")
         return _cap_with_source(
             name,
             cap_type=CapabilityType.MCP_TOOL,
@@ -468,7 +524,8 @@ class TestMergeTools:
                 "from pydantic import Field\n"
                 f"mcp = FastMCP(\"{name}\")\n"
                 "@mcp.tool()\n"
-                f"async def {name.replace('-', '_')}(x: Annotated[int, Field(description='x')]) -> dict:\n"
+                f"async def {func_name}("
+                "x: Annotated[int, Field(description='x')]) -> dict:\n"
                 "    return {'y': x}\n"
             ),
             tags=tags,
@@ -613,7 +670,10 @@ class TestMergeSkills:
             ),
             tags=tags,
             domain="analytics",
-        )
+        ).model_copy(update={
+            "input_schema": {"request": "str"},
+            "output_schema": {"result": "str"},
+        })
 
     @patch("src.verification.gate.verify")
     @patch("src.optimizer.operations.init_chat_model")
@@ -683,22 +743,43 @@ class TestMergeSkills:
 class TestMergeAgents:
     """_merge_agents: AGENT parents → combined agent_config, budget ceiling enforced."""
 
-    def _agent_cap(self, name: str, subagents: list[dict] | None = None) -> CapabilityDescriptor:
+    def _agent_cap(
+        self,
+        name: str,
+        subagents: list[dict] | None = None,
+        *,
+        input_schema: dict[str, str] | None = None,
+        output_schema: dict[str, str] | None = None,
+    ) -> CapabilityDescriptor:
         cfg: dict = {"system_prompt": f"You are {name}."}
         if subagents is not None:
             cfg["subagents"] = subagents
-        return _cap_with_source(
+        cap = _cap_with_source(
             name,
             cap_type=CapabilityType.AGENT,
             agent_config=cfg,
             domain="research",
         )
+        if input_schema is not None or output_schema is not None:
+            cap = cap.model_copy(update={
+                "input_schema": input_schema or {},
+                "output_schema": output_schema or {},
+            })
+        return cap
 
     @patch("src.verification.gate.verify")
     @patch("src.optimizer.operations.init_chat_model")
     def test_happy_path_solo_agents(self, mock_init, mock_verify):
-        cap_a = self._agent_cap("agent-a")
-        cap_b = self._agent_cap("agent-b")
+        cap_a = self._agent_cap(
+            "agent-a",
+            input_schema={"question": "str"},
+            output_schema={"summary": "str"},
+        )
+        cap_b = self._agent_cap(
+            "agent-b",
+            input_schema={"context": "str"},
+            output_schema={"answer": "str"},
+        )
         registry = MagicMock()
         registry.get.side_effect = lambda n: {
             "agent-a": cap_a, "agent-b": cap_b, "merged-agent": None,
@@ -724,18 +805,27 @@ class TestMergeAgents:
         descriptor = registry.add.call_args[0][0]
         assert descriptor.capability_type == CapabilityType.AGENT
         # agent_config is stored as JSON string in metadata
-        import json as _json
-        agent_cfg = _json.loads(descriptor.metadata["agent_config"])
+        agent_cfg = json.loads(descriptor.metadata["agent_config"])
         assert agent_cfg["system_prompt"] == "You investigate both X and Y."
         # No subagents key when the list is empty
         assert "subagents" not in agent_cfg
+        assert descriptor.input_schema == {"question": "str", "context": "str"}
+        assert descriptor.output_schema == {"summary": "str", "answer": "str"}
         assert registry.deactivate.call_count == 2
 
     @patch("src.verification.gate.verify")
     @patch("src.optimizer.operations.init_chat_model")
     def test_happy_path_with_subagents_under_budget(self, mock_init, mock_verify):
-        cap_a = self._agent_cap("agent-a")
-        cap_b = self._agent_cap("agent-b")
+        cap_a = self._agent_cap(
+            "agent-a",
+            input_schema={"left": "str"},
+            output_schema={"left_result": "str"},
+        )
+        cap_b = self._agent_cap(
+            "agent-b",
+            input_schema={"right": "str"},
+            output_schema={"right_result": "str"},
+        )
         registry = MagicMock()
         registry.get.side_effect = lambda n: {
             "agent-a": cap_a, "agent-b": cap_b, "merged-agent": None,
@@ -770,18 +860,53 @@ class TestMergeAgents:
 
         result = merge(registry, store, ["agent-a", "agent-b"])
         assert result == "merged-agent"
-        import json as _json
-        agent_cfg = _json.loads(registry.add.call_args[0][0].metadata["agent_config"])
+        descriptor = registry.add.call_args[0][0]
+        agent_cfg = json.loads(descriptor.metadata["agent_config"])
         assert len(agent_cfg["subagents"]) == 2
         assert agent_cfg["subagents"][0]["name"] == "sub-1"
+        assert descriptor.input_schema == {"left": "str", "right": "str"}
+        assert descriptor.output_schema == {
+            "left_result": "str",
+            "right_result": "str",
+        }
+
+    @patch("src.verification.gate.verify")
+    @patch("src.optimizer.operations.init_chat_model")
+    def test_parents_without_schemas_fail_closed_before_registration(
+        self, mock_init, mock_verify
+    ):
+        cap_a = self._agent_cap("agent-a")
+        cap_b = self._agent_cap("agent-b")
+        registry = MagicMock()
+        registry.get.side_effect = lambda n: {
+            "agent-a": cap_a, "agent-b": cap_b, "merged-agent": None,
+        }.get(n)
+        store = MagicMock()
+        mock_verify.return_value = _passing_report("merged-agent")
+
+        mock_llm = MagicMock()
+        mock_init.return_value = mock_llm
+        mock_structured = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        mock_structured.invoke.return_value = MergeAgentsResult(
+            name="merged-agent",
+            description="Merged agent",
+            rationale="Both investigate",
+            combined_system_prompt="You investigate both X and Y.",
+            combined_subagents=[],
+        )
+
+        result = merge(registry, store, ["agent-a", "agent-b"])
+        assert result is None
+        registry.add.assert_not_called()
+        registry.deactivate.assert_not_called()
 
     @patch("src.verification.gate.verify")
     @patch("src.optimizer.operations.init_chat_model")
     def test_budget_ceiling_rejects_merge_without_calling_gate(
         self, mock_init, mock_verify
     ):
-        """Step 6d: more than 8 subagents → abort, parents stay active,
-        gate is NOT called (cheaper to reject than to run Tier 3)."""
+        """More than 8 subagents aborts before gate, keeping parents active."""
         cap_a = self._agent_cap("agent-a")
         cap_b = self._agent_cap("agent-b")
         registry = MagicMock()
@@ -848,7 +973,7 @@ class TestMergeAgents:
 
 
 # ---------------------------------------------------------------------------
-# Step 8 — per-type split dispatch + helpers
+# per-type split dispatch + helpers
 # ---------------------------------------------------------------------------
 
 
@@ -1151,7 +1276,10 @@ class TestSplitSkills:
             ),
             tags=["workflow"],
             domain="analytics",
-        )
+        ).model_copy(update={
+            "input_schema": {"request": "str"},
+            "output_schema": {"result": "str"},
+        })
 
     def _variant(self, name: str) -> SplitSkillVariant:
         return SplitSkillVariant(
@@ -1254,7 +1382,10 @@ class TestSplitAgents:
             cap_type=CapabilityType.AGENT,
             agent_config={"system_prompt": f"You are {name}."},
             domain="research",
-        )
+        ).model_copy(update={
+            "input_schema": {"question": "str"},
+            "output_schema": {"answer": "str"},
+        })
 
     def _variant(self, name: str, n_subagents: int = 0) -> SplitAgentVariant:
         subagents = [
@@ -1424,23 +1555,14 @@ class TestSplitAgents:
 
 
 class TestSummarizeFailuresForPrompt:
-    """Guards the Pillar 3 Split LLM-prompt summarizer against the 2026-04-19
-    invocation-recording regression. Pre-fix, both production writers left
-    ``input_args`` and ``actual_output`` as None, so ``get_recent_failures``
-    returned an empty list and this summarizer hit its degraded-mode fallback
-    on every real-telemetry split. This test asserts the summarizer produces
-    real LLM-ready context when fed rows in the shape the post-fix writers
-    now produce. See ``docs/invocation_recording_gap_2026_04_19.md``.
-    """
+    """Guards the split LLM-prompt failure-case summarizer."""
 
     def test_empty_failures_returns_degraded_fallback(self):
         summary = _summarize_failures_for_prompt([])
         assert summary.startswith("No recorded failure cases.")
 
     def test_populated_failures_produce_real_context(self):
-        """The critical post-fix invariant: when production writers populate
-        input_args + error_message, the summarizer must NOT return the
-        degraded fallback."""
+        """Rows with replay input and an error produce real prompt context."""
         failures = [
             InvocationRecord(
                 capability_id="row-aggregator",
@@ -1474,7 +1596,7 @@ class TestSummarizeFailuresForPrompt:
                 token_cost=0,
                 latency_ms=1.0,
                 input_args='{"x": 1}',
-                actual_output='{"label": "B"}',  # user flagged this as wrong
+                actual_output='{"label": "B"}',
                 error_message=None,
             ),
         ]

@@ -1,6 +1,6 @@
 """Unit tests for src/orchestrator/generators/utils.build_task_context.
 
-Verifies that verification feedback is injected into task_context on retry
+Verifies that verification feedback is injected into task context on retry
 (attempt_count > 0) and that the first attempt is unchanged.
 """
 
@@ -56,7 +56,7 @@ def _state(
 
 
 # ---------------------------------------------------------------------------
-# First attempt — no feedback injected
+# First attempt: no feedback injected
 # ---------------------------------------------------------------------------
 
 
@@ -74,7 +74,7 @@ def test_first_attempt_with_results_still_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# Retry — feedback injected
+# Retry: feedback injected
 # ---------------------------------------------------------------------------
 
 
@@ -96,13 +96,19 @@ def test_retry_only_includes_critical_and_high():
                 capability_name="tool",
                 findings=[
                     VerificationFinding(
-                        tier=1, category="critical_cat", severity=Severity.CRITICAL, message="Critical issue"
+                        tier=1,
+                        category="critical_cat",
+                        severity=Severity.CRITICAL,
+                        message="Critical issue",
                     ),
                     VerificationFinding(
                         tier=2, category="high_cat", severity=Severity.HIGH, message="High issue"
                     ),
                     VerificationFinding(
-                        tier=2, category="medium_cat", severity=Severity.MEDIUM, message="Medium issue"
+                        tier=2,
+                        category="medium_cat",
+                        severity=Severity.MEDIUM,
+                        message="Medium issue",
                     ),
                     VerificationFinding(
                         tier=2, category="low_cat", severity=Severity.LOW, message="Low issue"
@@ -149,7 +155,7 @@ def test_retry_multiple_failed_reports_all_included():
 
 
 def test_retry_failed_report_with_only_low_findings_returns_unchanged():
-    """If failed report has only LOW findings, no feedback lines → unchanged."""
+    """If failed report has only LOW findings, no feedback lines are added."""
     state = _state(
         attempt_count=1,
         verification_results=[
@@ -166,5 +172,5 @@ def test_retry_failed_report_with_only_low_findings_returns_unchanged():
         ],
     )
     result = build_task_context(state)
-    # overall_passed=False but only LOW severity — no feedback lines added
+    # overall_passed=False but only LOW severity, so no feedback lines are added.
     assert result == "compute fibonacci number"

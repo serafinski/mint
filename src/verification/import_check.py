@@ -5,10 +5,9 @@ verification gate. Catches three failure modes cheaply, before the gate
 burns Tier 2/3 token budget:
 
 1. **Wrong PyPI package name** (MCP_TOOL) — generator declares
-   ``pip_packages=["yaml"]`` instead of ``"pyyaml"``. Currently Tier 2
-   would catch this as a medium-severity execution failure, but only
-   after paying the Tier 2 cost. Step 14.9 also threads pip_packages
-   into Tier 3, so a bad name wastes Tier 3 budget too.
+   ``pip_packages=["yaml"]`` instead of ``"pyyaml"``. Tier 2 or Tier 3
+   can also surface this, but only after paying higher runtime and token
+   cost.
 2. **Runtime import / NameError / SyntaxError in a code path the AST
    walker does not exercise** — a one-time ``python -c "import tool"``
    inside the sandbox catches this for free.
@@ -33,8 +32,9 @@ Contract
 --------
 ``run_import_check(artifact) -> VerificationReport`` — never raises.
 Any internal failure is caught and reported as MEDIUM ``import_check_error``
-with ``overall_passed=True`` (fail-open; same policy as the outer
-gate's exception handler).
+with ``overall_passed=True``. This fail-open path is specific to Tier 1.5
+tooling failures: import-check is a cheap acceleration before Tier 2/3, so
+Docker outages or internal probe bugs should not block the rest of the gate.
 """
 
 from __future__ import annotations
@@ -74,12 +74,10 @@ def _check_mcp_tool(
     ``import tool``. Matches ``tool_loader.py``'s runtime mechanism, so
     any import failure here will also fire at runtime.
 
-    ``allow_network`` (Step 14.12 / 2026-04-19 audit closure): when True,
-    the probe sandbox runs with ``--network bridge`` so import-time
-    network calls (e.g. ``from openai import OpenAI`` with eager API
-    initialization) don't spuriously fail Tier 1.5 under a task policy
-    that does permit network access. Default False preserves the offline
-    regime for the vast majority of tasks.
+    When ``allow_network=True``, the probe sandbox runs with
+    ``--network bridge`` so import-time network calls do not spuriously
+    fail Tier 1.5 under a task policy that permits network access. Default
+    False preserves the offline regime.
     """
     import base64
 
@@ -119,12 +117,9 @@ def _check_mcp_tool(
     if result.get("success", False):
         return []
 
-    # Security audit finding #6 (2026-04-19): when the sandbox dropped ALL
-    # pip requirements as malformed (PEP 508 parse failure), the result
-    # carries ``pip_requirement_rejected``. Surface as its own finding
-    # category so the Pillar 2 gate attributes the failure to the
-    # requirement string, not to ``import_error`` / ``wrong_pip_package``
-    # which would blame the source code or PyPI name.
+    # Malformed requirements are distinct from source import errors and
+    # wrong PyPI names. Keep a separate category so retry feedback points
+    # at the requirement string.
     rejected = result.get("pip_requirement_rejected")
     if rejected:
         return [
@@ -271,11 +266,10 @@ def run_import_check(
     internal bug), the gate proceeds to Tier 2 normally rather than
     blocking on a tooling failure.
 
-    ``allow_network`` (Step 14.12 / 2026-04-19 audit closure): forwarded
-    to the MCP_TOOL Docker-import sandbox so the probe runs in the same
-    network regime the artifact will execute under. SKILL / AGENT paths
-    are in-process compile-checks — ``allow_network`` has no effect on
-    those branches.
+    ``allow_network`` is forwarded to the MCP_TOOL Docker-import sandbox
+    so the probe runs in the same network regime the artifact will execute
+    under. SKILL / AGENT paths are in-process compile-checks, so
+    ``allow_network`` has no effect on those branches.
     """
     name = artifact.capability_name
     try:

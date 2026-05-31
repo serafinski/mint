@@ -8,25 +8,17 @@ Runs three attack patterns against generated capabilities:
 The DeepAgent uses ``sandbox_execute`` for Docker-isolated code execution
 and ``response_format=AdversarialFindings`` for structured output.
 
-Operational boundaries (from CLAUDE.md):
+Operational boundaries:
 - ``recursion_limit=50``
-- Node-level timeout: 480 s (bumped 2026-04-15 from 300 s; Step 14.11)
+- Node-level timeout: 480 s
 - Fresh agent per invocation
 - On timeout: return fail-CLOSED report (HIGH severity) so the
-  verification_node retry loop fires and regenerates the artifact
-  (Step 14.11 — aligns with ``docs/thesis_proposal.md`` §Pillar 2
-  *"Every generated capability must pass all three tiers before
-  entering the production skill registry."*). The previous fail-open
-  behavior silently classified timed-out probes as PASS, which
-  violated the "must pass" contract by letting un-verified artifacts
-  into the registry.
-- On non-timeout error: return fail-OPEN report (MEDIUM severity),
-  preserving the never-raises contract but NOT triggering retry.
-  Error-branch fail-closing is deliberately out of scope for Step
-  14.11 — provider errors are often transient and flipping them to
-  fail-closed would trigger regenerations for reasons the LLM can't
-  fix. If Phase 5 surfaces a pattern of silent-error fail-opens,
-  revisit in §12 or Chapter 7.
+  verification_node retry loop regenerates the artifact.
+- On non-timeout error: return fail-CLOSED report (CRITICAL severity).
+  Tier 3 never raises to callers, but infrastructure or agent failures
+  must not manufacture PASS verdicts.
+- If an artifact has no executable Python surface to probe, return an
+  INFO skip report because Tier 3 is not applicable.
 """
 
 from __future__ import annotations
@@ -35,7 +27,7 @@ import concurrent.futures
 import logging
 from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.task import GeneratedArtifact
@@ -52,15 +44,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ADVERSARIAL_RECURSION_LIMIT = 50
-# Step 14.11 (2026-04-15): raised from 300 → 480 s. The 300 s ceiling
-# was an operational default not grounded in any proposal constraint;
-# the 2026-04-15 post-Step-13 test_mint run surfaced a T09 run where
-# the adversarial agent hit the 300 s cap and the gate fail-opened,
-# letting an un-verified artifact into the registry. Bump to 480 s
-# (1.6x, conservative match to Step 13's 480 → 900 ratio) gives
-# probes more room to converge without extending indefinite hangs.
-# See docs/MASTER_PLAN_2026_04_13.md §14.11 for the full rationale.
+# Gives the DeepAgent enough room to run all fixed probes while still
+# bounding hangs. Timeouts fail closed and trigger regeneration.
 ADVERSARIAL_TIMEOUT_S = 480
+
+
+def _adversarial_reasoning_effort() -> str:
+    """Read the adversarial reasoning_effort knob from config.
+
+    Lazy-import via function so circular-import edge cases don't bite
+    at module-load time.
+    """
+    from src.config import ADVERSARIAL_REASONING_EFFORT
+    return ADVERSARIAL_REASONING_EFFORT
+
 
 # Module-level LangFuse metadata, set by verification_node before
 # spawning the ThreadPoolExecutor. probe() reads this since
@@ -94,11 +91,40 @@ class AdversarialFinding(BaseModel):
     evidence: str = Field(
         ..., description="Evidence supporting the finding"
     )
-    severity: Severity = Field(
-        ..., description="Severity level of the finding"
+    severity: Severity | None = Field(
+        default=None,
+        description=(
+            "Severity level of the finding. If omitted, infer it from "
+            "attack_pattern and suspiciousness."
+        ),
     )
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _fill_missing_severity(self) -> AdversarialFinding:
+        """Backfill omitted severity from the attack pattern.
+
+        The adversarial DeepAgent sometimes returns otherwise-valid findings
+        but omits ``severity``. Accept the record and recover a conservative
+        default so Tier 3 does not crash on schema parsing.
+        """
+        if self.severity is not None:
+            return self
+
+        if not self.suspicious:
+            self.severity = Severity.INFO
+            return self
+
+        default_by_pattern = {
+            "hidden_demo_mode": Severity.CRITICAL,
+            "network_disconnect": Severity.CRITICAL,
+            "ground_truth": Severity.HIGH,
+        }
+        self.severity = default_by_pattern.get(
+            self.attack_pattern, Severity.HIGH
+        )
+        return self
 
 
 class AdversarialFindings(BaseModel):
@@ -197,7 +223,7 @@ area.
 
 _ALLOW_NETWORK_PROMPT_ADDENDUM = """\
 
-## Network policy note (Step 14.12)
+## Network policy note
 
 This probe run was invoked with the **network-allowed** policy — the \
 sandbox defaults to outbound network access. The Network-Disconnect \
@@ -216,44 +242,20 @@ def _make_probe_sandbox_execute(pip_packages: list[str], *, allow_network: bool 
     """Return a ``sandbox_execute`` variant that auto-unions *pip_packages*
     into every call's ``extra_packages`` argument.
 
-    **Why this exists.** The prober LLM receives the artifact's source code
-    as text and decides what Python snippets to run inside
-    ``sandbox_execute``. For pandas/numpy/openpyxl-dependent artifacts the
-    prober must pass ``extra_packages=["pandas", ...]`` or the sandbox
-    crashes with ``ModuleNotFoundError`` on the first import. The prober
-    is good at reasoning about behavior but bad at consistently remembering
-    to declare package dependencies — and when the sandbox crashes, the
-    gate fail-opens, which means numerics-heavy artifacts silently skip
-    Tier 3 probing.
+    The prober LLM receives the artifact's source as text and writes
+    sandbox snippets itself. Generated artifacts can depend on packages
+    such as pandas, numpy, or openpyxl; the wrapper ensures those
+    declared dependencies are installed even if the LLM omits them from
+    an individual probe call. Any extra packages requested by the LLM are
+    preserved, deduplicated, and appended in order.
 
-    **The fix.** Wrap ``sandbox_execute`` in a closure that always unions
-    the artifact's generator-declared ``pip_packages`` into whatever
-    ``extra_packages`` the LLM supplies. The LLM keeps its usual freedom
-    to add adversarial testing libraries; the artifact's declared
-    dependencies are installed regardless. Deduplicated, order-preserving.
-
-    **Observed failure (2026-04-15 T11 test_mint run, trace
-    ``8ae5cd28a342fb9c8c0e0ea1262b050c``):** probe against
-    ``parse_sales_products_and_targets_3f7485`` called ``sandbox_execute``
-    with the tool source inlined, got back
-    ``ModuleNotFoundError: No module named 'pandas'`` on the first probe
-    turn, and the follow-up model call crashed with an unrelated
-    library-level 400. That 400 is out of scope (langchain_openai serdes
-    bug), but the ``ModuleNotFoundError`` is our bug — the chain executor
-    threads ``pip_packages`` through to the compositional run but the
-    prober never learned how.
-
-    See ``docs/MASTER_PLAN_2026_04_13.md`` §14.9 for the full rationale.
+    The same wrapper also applies the task-level network policy by
+    default while still letting the prober explicitly flip
+    ``allow_network`` for the network-disconnect differential attack.
     """
-    # Fix #1 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
-    # Use the silent variant. The adversarial prober is a DeepAgent, so
-    # LangGraph's auto-tracing emits a ``type=TOOL, name=sandbox_execute``
-    # observation with full code + output + latency for every probe
-    # invocation. Using ``sandbox_execute`` (event-emitting) would double-
-    # trace — the extra ``sandbox.execute`` EVENT is pure duplicate of the
-    # TOOL observation. ~23% of sandbox.execute event volume dropped;
-    # zero information loss (TOOL observations remain, strictly more
-    # detailed than the events were).
+    # Use the silent variant because DeepAgent tool calls are already
+    # traced by LangGraph with code, output, and latency. Emitting an
+    # additional sandbox event here would duplicate the same probe call.
     from src.verification.sandbox_tool import (
         sandbox_execute_silent as _base_sandbox_execute,
     )
@@ -262,11 +264,9 @@ def _make_probe_sandbox_execute(pip_packages: list[str], *, allow_network: bool 
     # of the caller's list don't affect in-flight probes.
     _baseline = list(pip_packages)
 
-    # Step 14.12: the probe wrapper now carries a task-level network
-    # policy (``_scope_allow_network``). Every probe call defaults to that
-    # policy unless the LLM explicitly passes ``allow_network`` to
-    # override — which is intentional for the Network-Disconnect attack
-    # pattern, where the prober probes both states to compare.
+    # Every probe call defaults to the task-level network policy unless
+    # the LLM explicitly overrides it. That override is intentional for
+    # the network-disconnect attack, where both states are compared.
     _scope_allow_network = allow_network
 
     def sandbox_execute(
@@ -314,16 +314,11 @@ def _create_adversarial_agent(
 ):
     """Create a fresh adversarial DeepAgent for each invocation.
 
-    ``reasoning_effort="low"`` is set on the model: the three attack patterns
-    are fixed in both the system prompt and the ``AdversarialFinding.attack_pattern``
-    schema (the LLM cannot invent new attack names and have them pass structured-
-    output validation), so reasoning mode at default effort burns tokens on
-    planning ceremony rather than producing novel attacks. ``"low"`` preserves
-    the reasoning that genuinely helps when writing the Python test snippets
-    inside each ``sandbox_execute`` call, while dropping the ~2k reasoning
-    tokens per call that were restating the system prompt back at itself.
-    Drops typical probe latency ~120-230s → ~40-90s.
-    See docs/perf_fixes_2026_04_14.md §2c-1.
+    The reasoning effort is read from config. The attack patterns are fixed
+    in both the system prompt and the ``AdversarialFinding.attack_pattern``
+    schema, so low effort is usually sufficient for writing the concrete
+    sandbox snippets while keeping probe latency bounded. Higher effort can
+    still be configured for manual ablations.
 
     When *pip_packages* is a non-empty list OR *allow_network* is True, the
     ``sandbox_execute`` tool is wrapped in a closure (see
@@ -331,13 +326,12 @@ def _create_adversarial_agent(
     auto-unions those packages into every call's ``extra_packages`` argument.
     For *allow_network*, the wrapper applies the task-level network policy
     by default while letting the LLM explicitly override for the Network-
-    Disconnect differential attack. Otherwise the unwrapped tool is used —
-    behavior unchanged from pre-fix.
+    Disconnect differential attack. Otherwise the unwrapped tool is used.
     """
     from deepagents import create_deep_agent
     from langchain.chat_models import init_chat_model
 
-    from src.config import DEFAULT_LLM_MODEL
+    from src.config import ADVERSARIAL_REASONING_EFFORT, DEFAULT_LLM_MODEL
 
     if pip_packages or allow_network:
         probe_sandbox = _make_probe_sandbox_execute(
@@ -350,8 +344,13 @@ def _create_adversarial_agent(
     if allow_network:
         system_prompt = system_prompt + _ALLOW_NETWORK_PROMPT_ADDENDUM
 
+    # Configurable so protocol runs can stay cost-bounded while manual
+    # ablations can raise the reasoning effort.
     return create_deep_agent(
-        model=init_chat_model(DEFAULT_LLM_MODEL, reasoning_effort="low"),
+        model=init_chat_model(
+            DEFAULT_LLM_MODEL,
+            reasoning_effort=ADVERSARIAL_REASONING_EFFORT,
+        ),
         tools=[probe_sandbox],
         system_prompt=system_prompt,
         response_format=AdversarialFindings,
@@ -394,26 +393,14 @@ def _findings_to_report(
 def _timeout_report(capability_name: str) -> VerificationReport:
     """Return a fail-closed report when the adversarial agent times out.
 
-    Step 14.11 (2026-04-15): this used to be fail-open
-    (``overall_passed=True``, ``severity=MEDIUM``). That violated
-    ``docs/thesis_proposal.md`` §Pillar 2's *"Every generated
-    capability must pass all three tiers before entering the
-    production skill registry"* contract — a timed-out probe is
-    structurally *"couldn't reach a verdict"*, not *"pass"*.
-
-    The new behavior classifies the timeout as ``overall_passed=False``
-    with a HIGH severity ``adversarial_timeout`` finding, which
-    propagates through the verification gate and trips the
-    ``verification_node`` retry loop (MAX_ATTEMPTS=3). The retry
-    regenerates the artifact with fresh code and re-runs the full
-    three-tier gate; only an attempt that affirmatively passes Tier 3
-    enters the registry. After three timeouts, the artifact is
-    classified as ``generation_failed``.
+    A timed-out probe is structurally "couldn't reach a verdict", not
+    "pass". The report therefore uses ``overall_passed=False`` with a HIGH
+    severity ``adversarial_timeout`` finding. That finding propagates through
+    the verification gate and trips the ``verification_node`` retry loop.
 
     HIGH (rather than CRITICAL) is the honest label: a timeout is
     "inconclusive, needs further review", not "definitively
-    contaminated". Both severities trip the boolean retry gate
-    equivalently; HIGH is more accurate in Chapter 6 analytics.
+    contaminated". Both severities trip the boolean retry gate equivalently.
     """
     return VerificationReport(
         capability_name=capability_name,
@@ -424,9 +411,8 @@ def _timeout_report(capability_name: str) -> VerificationReport:
                 severity=Severity.HIGH,
                 message=(
                     f"Adversarial probing timed out after {ADVERSARIAL_TIMEOUT_S}s. "
-                    "Classified as fail-closed per Step 14.11 — verification_node "
-                    "retry loop will regenerate the artifact and re-run Tier 3 "
-                    "on fresh code."
+                    "Classified as fail-closed; verification_node retry loop "
+                    "will regenerate the artifact and re-run Tier 3 on fresh code."
                 ),
             )
         ],
@@ -436,18 +422,24 @@ def _timeout_report(capability_name: str) -> VerificationReport:
 
 
 def _error_report(capability_name: str, error: str) -> VerificationReport:
-    """Return a partial report when the adversarial agent hits an error."""
+    """Return a FAIL report when the adversarial agent hits an error.
+
+    Infrastructure errors during Tier 3, such as model provider failures,
+    sandbox image problems, or agent-creation crashes, must not manufacture
+    PASS verdicts. The report is fail-closed so the node-level retry loop can
+    regenerate the artifact and re-run Tier 3 on fresh code.
+    """
     return VerificationReport(
         capability_name=capability_name,
         findings=[
             VerificationFinding(
                 tier=3,
                 category="adversarial_error",
-                severity=Severity.MEDIUM,
+                severity=Severity.CRITICAL,
                 message=f"Adversarial probing error: {error}",
             )
         ],
-        overall_passed=True,  # fail open on error
+        overall_passed=False,
         tier_reached=3,
     )
 
@@ -484,15 +476,10 @@ def _extract_probe_source(artifact: GeneratedArtifact) -> str | None:
     """Return the Python source to feed to the adversarial agent.
 
     Dispatch by capability type so Tier 3 probes the same executable surface
-    that Tier 1's layered static scanner already targets. See
-    ``src/verification/gate.py::_extract_python_fences`` for the reused
-    extractor, and docs/perf_fixes_2026_04_14.md §2c-3 for the completeness
-    rationale — pre-fix, AGENT Tier 3 unconditionally hit the empty-source
-    skip path because ``artifact.source_code`` and ``artifact.skill_content``
-    are both empty for AGENTs.
+    that Tier 1's layered static scanner already targets.
 
     Returns:
-        * For MCP_TOOL: ``artifact.source_code`` (unchanged pre-fix behavior).
+        * For MCP_TOOL: ``artifact.source_code``.
         * For SKILL: concatenated ```python fences extracted from
           ``skill_content``, or ``None`` if no fences exist (pure-prose skill).
         * For AGENT: concatenated ```python fences extracted from
@@ -548,11 +535,11 @@ def probe(
     Returns a ``VerificationReport`` with tier=3 findings.
     Never raises -- timeout and recursion failures return a partial report.
 
-    Step 14.12: when ``allow_network=True``, the probe sandbox defaults to
-    outbound network access (``--network bridge``). The prober is also
-    instructed to run the Network-Disconnect Behavioral Change attack
-    pattern as a differential — once with network on, once explicitly off
-    — to catch silent fallbacks on tools that claim to use the network.
+    When ``allow_network=True``, the probe sandbox defaults to outbound
+    network access (``--network bridge``). The prober is also instructed to
+    run the Network-Disconnect Behavioral Change attack pattern as a
+    differential: once with network on, once explicitly off. That catches
+    silent fallbacks on tools that claim to use the network.
     """
     capability_name = artifact.capability_name
     source_code = _extract_probe_source(artifact)
@@ -560,10 +547,7 @@ def probe(
     if source_code is None or not source_code.strip():
         # Dispatch a type-aware skip message so post-mortem inspection can
         # distinguish "AGENT with no Python fences" from "MCP_TOOL with empty
-        # source_code" from "SKILL with pure-prose content". Pre-fix this
-        # was a single opaque "No source code to probe." message; the new
-        # form makes the verification completeness story visible in
-        # verification.json.
+        # source_code" from "SKILL with pure-prose content".
         from src.schemas.capability import CapabilityType
         if artifact.capability_type == CapabilityType.SKILL:
             reason = (
@@ -580,11 +564,9 @@ def probe(
             reason = "No source code to probe."
         return _skip_report(capability_name, reason)
 
-    # Step 14.9: thread the generator's declared ``pip_packages`` into the
-    # sandbox tool so pandas/numpy/openpyxl-dependent artifacts don't crash
-    # their first probe turn with ``ModuleNotFoundError``. Empty list is
-    # treated as None and falls through to the unwrapped sandbox_execute.
-    # See ``_make_probe_sandbox_execute`` for the full rationale.
+    # Thread the generator's declared ``pip_packages`` into the sandbox tool
+    # so dependency-heavy artifacts can be probed without the LLM remembering
+    # to repeat every package on each sandbox call.
     artifact_pip_packages: list[str] = list(
         getattr(artifact, "pip_packages", None) or []
     )
@@ -610,12 +592,9 @@ def probe(
         f"## Source code:\n```python\n{source_code}\n```"
     )
 
-    # Inherit LangFuse tags from the pipeline config (must extract before
-    # entering ThreadPoolExecutor — get_config() is thread-local).
     # Inherit LangFuse metadata. probe() runs inside a ThreadPoolExecutor
-    # spawned by verification_node, so get_config() won't work (thread-local).
-    # Instead, read from the module-level _langfuse_metadata set by
-    # set_langfuse_metadata() before the thread pool starts.
+    # spawned by verification_node, so get_config() is not available here.
+    # Read the module-level metadata set before the thread pool starts.
     langfuse_metadata: dict = dict(_langfuse_metadata)
 
     config: dict = {
@@ -633,9 +612,13 @@ def probe(
     if langfuse_metadata:
         config["metadata"] = langfuse_metadata
 
+    # Propagate ContextVar state into the worker thread so adversarial
+    # LangFuse events nest under the parent pipeline trace context.
+    from src.orchestrator.tracing import submit_with_context
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        future = pool.submit(
+        future = submit_with_context(
+            pool,
             agent.invoke,
             {"messages": [{"role": "user", "content": user_message}]},
             config,
@@ -679,26 +662,17 @@ def probe(
 
     except concurrent.futures.TimeoutError:
         pool.shutdown(wait=False)
-        # Step 14.11: downgraded from logger.error to logger.warning
-        # because a timeout is no longer a terminal error — the gate
-        # is fail-closed, so the verification_node retry loop will
-        # regenerate the artifact and try again. Grep for "fail-closed
-        # retry will trigger" in Phase 5 logs to count timeout events.
+        # Warning-level log: the gate fails closed and the verification_node
+        # retry loop will regenerate the artifact.
         logger.warning(
             "Adversarial Tier 3 timed out after %ds for %s — classified "
             "as fail-closed, retry will trigger",
             ADVERSARIAL_TIMEOUT_S,
             capability_name,
         )
-        # Step 13.7 Batch B3: ERROR level per Step 14.11 fail-closed
-        # semantics — Tier 3 timeout causes verification rejection, which
-        # is an ERROR-class event for Chapter 4.5's retry analysis.
-        # Step 13.7 Batch B7 (partial): record agent metadata + tier-3
-        # trace context so Chapter 4.5 reviewers can count sub-probes
-        # completed before timeout via the LangFuse UI under the parent
-        # trace. True sub-probe-count instrumentation would require
-        # hooking the DeepAgent's tool-call loop — deferred to Chapter 7
-        # alongside the other DeepAgent internals.
+        # ERROR-level event because a Tier 3 timeout causes verification
+        # rejection. The metadata is enough to inspect the parent LangFuse
+        # trace for tool calls completed before timeout.
         emit_langfuse_event(
             None,
             "adversarial.timeout",
@@ -708,7 +682,7 @@ def probe(
                 "capability_name": capability_name,
                 "capability_type": artifact.capability_type.value,
                 "classification": "fail_closed",
-                "reasoning_effort": "low",  # hardcoded in _create_adversarial_agent
+                "reasoning_effort": _adversarial_reasoning_effort(),
                 "recursion_limit": ADVERSARIAL_RECURSION_LIMIT,
                 "note": (
                     "Sub-probe count not instrumented at timeout — "

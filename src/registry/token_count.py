@@ -1,13 +1,13 @@
-"""Definition-string token cost for Pillar 3 M3 (Step 18.6).
+"""Static definition-token cost for registered capabilities.
 
-The thesis proposal defines M3 as the token count of the *capability's
-definition* — the JSON schema for MCP tools, the SKILL.md body for skills,
-the system prompt for agents. This module tokenizes that definition with
-tiktoken so Chapter 5/6 can report it side-by-side with the runtime
-per-invocation cost that actually drives U(c).
+The evaluation reports a capability's static definition footprint: the JSON
+schema visible for MCP tools, the SKILL.md body for skills, or the parent
+system prompt for agents. The count is stored separately from runtime
+per-invocation token cost and is used by registry utility scoring and Chapter
+6 analysis.
 
-Never-raises: any tokenizer exception returns 0 and logs a warning, so a
-missing tokenizer or unexpected input shape cannot break registration.
+Never raises: serialization or tokenizer failures return 0 and log a warning,
+so token accounting cannot block capability registration.
 """
 
 from __future__ import annotations
@@ -17,12 +17,29 @@ import logging
 
 import tiktoken
 
+from src.config import DEFAULT_LLM_MODEL
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
 
 logger = logging.getLogger(__name__)
 
-_ENCODING_MODEL = "gpt-4"
+_PROVIDER_PREFIXES = ("openai:", "azure:")
+
+
+def _tiktoken_model_name(model_name: str) -> str:
+    """Return the model identifier expected by ``tiktoken``.
+
+    LangChain model identifiers commonly include provider prefixes such as
+    ``openai:gpt-5-mini``. ``tiktoken`` expects the raw model name, so strip
+    known provider prefixes before resolving the encoding.
+    """
+    for prefix in _PROVIDER_PREFIXES:
+        if model_name.startswith(prefix):
+            return model_name[len(prefix):]
+    return model_name
+
+
+_ENCODING_MODEL = _tiktoken_model_name(DEFAULT_LLM_MODEL)
 _encoding: tiktoken.Encoding | None = None
 
 
@@ -70,6 +87,7 @@ def count_definition_tokens(artifact: GeneratedArtifact) -> int:
 
 
 def _serialize_definition(artifact: GeneratedArtifact) -> str:
+    """Serialize only the static definition surface for an artifact."""
     cap_type = artifact.capability_type
 
     if cap_type == CapabilityType.MCP_TOOL:

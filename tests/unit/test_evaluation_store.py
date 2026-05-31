@@ -1,4 +1,4 @@
-"""Unit tests for src/registry/evaluation_store.py."""
+"""Tests for the DuckDB-backed evaluation store."""
 
 from __future__ import annotations
 
@@ -39,10 +39,10 @@ class TestInitParentDirAutocreation:
     def test_init_creates_parent_directory_if_missing(self, tmp_path):
         """``EvaluationStore(db_path=...)`` mkdirs missing parent dirs.
 
-        Regression guard: run_pilot.py / run_longitudinal*.py instantiate
-        ``EvaluationStore(db_path=args.db)`` on fresh data paths. If parent
-        dir doesn't exist, DuckDB raises FileNotFoundError. Defensive init
-        closes the class of bug.
+        Regression guard: eval runners instantiate
+        ``EvaluationStore(db_path=args.db)`` on fresh data paths. If the
+        parent dir doesn't exist, DuckDB raises FileNotFoundError. Defensive
+        init closes the class of bug.
         """
         nested = tmp_path / "nested" / "sub" / "dir" / "eval.duckdb"
         assert not nested.parent.exists()
@@ -110,7 +110,7 @@ class TestRecordAndRetrieve:
 
     def test_compositional_fields_default_on_minimal_record(self, store):
         """Records constructed without compositional fields should round-trip
-        with the documented Stage 1 defaults."""
+        with the documented defaults."""
         store.record_run(_record())
         r = store.get_runs()[0]
         assert r.chain_length == 1
@@ -122,7 +122,7 @@ class TestRecordAndRetrieve:
         assert r.failed_step_name is None
 
     def test_compositional_fields_roundtrip(self, store):
-        """All Stage 1 compositional fields round-trip via DuckDB."""
+        """All compositional fields round-trip via DuckDB."""
         original = _record(
             capability_type="skill",
             chain_length=3,
@@ -144,36 +144,90 @@ class TestRecordAndRetrieve:
         assert r.failed_step_name == "agent-final-step"
 
 
+class TestHumanLabelUpdate:
+    def test_optimistic_concurrency_and_override(self, store):
+        """Manual audit labels cannot be overwritten unless explicitly allowed."""
+        row_id = store.record_run(_record())
+
+        assert store.update_human_label(row_id, "correct") is True
+        assert store.update_human_label(row_id, "partial") is False
+        assert store.update_human_label(
+            row_id,
+            "partial",
+            allow_overwrite=True,
+        ) is True
+        assert store.update_human_label("missing-row", "correct") is False
+
+
 class TestSuccessRate:
     def test_all_succeed(self, store):
         for i in range(4):
-            store.record_run(_record(task_id=f"T0{i+1}", gate_passed=True, output_in_range=True))
+            store.record_run(
+                _record(task_id=f"T0{i+1}", gate_passed=True, output_in_range=True)
+            )
         assert store.compute_success_rate("full") == 1.0
 
     def test_none_succeed(self, store):
-        store.record_run(_record(gate_passed=False, output_in_range=False,
-                                 failure_reason="generation_failed"))
+        store.record_run(
+            _record(
+                gate_passed=False,
+                output_in_range=False,
+                failure_reason="generation_failed",
+            )
+        )
         assert store.compute_success_rate("full") == 0.0
 
     def test_partial_success(self, store):
         store.record_run(_record(task_id="T01", gate_passed=True, output_in_range=True))
-        store.record_run(_record(task_id="T02", gate_passed=True, output_in_range=False,
-                                 failure_reason="output_rejected"))
+        store.record_run(
+            _record(
+                task_id="T02",
+                gate_passed=True,
+                output_in_range=False,
+                failure_reason="output_rejected",
+            )
+        )
         assert store.compute_success_rate("full") == 0.5
 
     def test_pilot_excluded_by_default(self, store):
-        store.record_run(_record(task_id="T01", gate_passed=True, output_in_range=True, is_pilot=False))
-        store.record_run(_record(task_id="T02", gate_passed=False, output_in_range=False,
-                                 failure_reason="generation_failed", is_pilot=True))
+        store.record_run(
+            _record(
+                task_id="T01",
+                gate_passed=True,
+                output_in_range=True,
+                is_pilot=False,
+            )
+        )
+        store.record_run(
+            _record(
+                task_id="T02",
+                gate_passed=False,
+                output_in_range=False,
+                failure_reason="generation_failed",
+                is_pilot=True,
+            )
+        )
         # Only the non-pilot record counts
         assert store.compute_success_rate("full") == 1.0
 
     def test_filter_by_tier(self, store):
-        store.record_run(_record(task_id="T01", task_tier="trivial",
-                                 gate_passed=True, output_in_range=True))
-        store.record_run(_record(task_id="T06", task_tier="moderate",
-                                 gate_passed=False, output_in_range=False,
-                                 failure_reason="generation_failed"))
+        store.record_run(
+            _record(
+                task_id="T01",
+                task_tier="trivial",
+                gate_passed=True,
+                output_in_range=True,
+            )
+        )
+        store.record_run(
+            _record(
+                task_id="T06",
+                task_tier="moderate",
+                gate_passed=False,
+                output_in_range=False,
+                failure_reason="generation_failed",
+            )
+        )
         assert store.compute_success_rate("full", task_tier="trivial") == 1.0
         assert store.compute_success_rate("full", task_tier="moderate") == 0.0
 
@@ -203,7 +257,7 @@ class TestFailureBreakdown:
 
 
 class TestRecordInvocationEvents:
-    """Step 18.5: persistent per-capability invocation log for Gini analysis."""
+    """Persistent per-capability invocation log for Gini analysis."""
 
     def test_empty_events_is_zero_rows(self, store):
         n = store.record_invocation_events(
@@ -275,7 +329,8 @@ class TestRecordInvocationEvents:
                 events=[{"capability_id": "csv-parser", "success": True}],
             )
         counts = store._conn.execute(
-            "SELECT condition, COUNT(*) FROM invocation_events GROUP BY condition ORDER BY condition"
+            "SELECT condition, COUNT(*) FROM invocation_events "
+            "GROUP BY condition ORDER BY condition"
         ).fetchall()
         assert counts == [("full", 1), ("no_verification", 1)]
 

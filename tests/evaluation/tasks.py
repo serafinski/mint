@@ -1,4 +1,4 @@
-"""Testbed task definitions for Iteration 5 evaluation.
+"""Canonical task definitions for the evaluation testbed.
 
 Each TaskDefinition bundles:
 - metadata (id, tier, static coverage)
@@ -14,12 +14,14 @@ Reuse clusters
 CSV cluster  : T01, T04, T05, T07  (tabular ingestion variants)
 Analytics    : T08, T09             (T09 can reuse T08's cleaned output)
 
-Pilot tasks: T01 (seeded retrieval), T07 (moderate JIT), T05 (moderate JIT, static coverage).
+Pilot tasks: T01 (seeded retrieval), T07 (moderate JIT), T05 (moderate JIT,
+static coverage).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,8 +29,46 @@ from typing import Literal
 
 from src.schemas.task import OutputContract
 
+logger = logging.getLogger(__name__)
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 _EV_PATH = FIXTURES_DIR / "expected_values.json"
+
+# Tasks whose validators check metadata/shape only and do not fully cross-check
+# output content against fixture ground truth. The disclosure is preserved for
+# interpretation: all evaluated conditions used the same validators, so this is
+# a uniform permissiveness limitation rather than a condition-specific bias.
+# T05, T09, T10, and T13 were tightened; the rest remain permissive by design
+# because extra tightening had low eval-integrity payoff relative to cost.
+_PERMISSIVE_VALIDATOR_TASK_IDS: frozenset[str] = frozenset({
+    "T02",  # errors list length only
+    "T08",  # n_rows/n_columns shape + quality_issues_found > 0 (trivially met)
+    "T12",  # clean_row_count exact + violations > 0 (count-based)
+    "T15",  # n_days/metrics_aggregated/alert_days exact (but metadata only)
+    "T16",  # root_cause_metric exact + cascade_chain length >= 2 (structural)
+})
+
+_PERMISSIVE_WARN_EMITTED = False
+
+
+def warn_permissive_validators_once() -> None:
+    """Emit a one-time WARN at harness startup naming permissive validators.
+
+    Called by ``EvaluationHarness.__init__``. Idempotent.
+    """
+    global _PERMISSIVE_WARN_EMITTED
+    if _PERMISSIVE_WARN_EMITTED:
+        return
+    _PERMISSIVE_WARN_EMITTED = True
+    if not _PERMISSIVE_VALIDATOR_TASK_IDS:
+        return
+    ids = ", ".join(sorted(_PERMISSIVE_VALIDATOR_TASK_IDS))
+    logger.warning(
+        "The following testbed tasks rely on metadata-only validators "
+        "(no fixture-content cross-check); success rates are permissive and the "
+        "uniform-validator limitation must be disclosed: %s",
+        ids,
+    )
 
 # Load expected values at import time — generate.py must have been run first.
 if not _EV_PATH.exists():
@@ -62,25 +102,34 @@ class TaskDefinition:
     file_validator: Callable[[dict, dict[str, bytes]], bool] | None = field(
         default=None, compare=False,
     )
-    # Step 14.6: declared output shape — first-class typed contract counterpart
-    # to the prose task_prompt and the bespoke validator closures. Every task
-    # MUST declare a contract; an empty OutputContract is a deliberate signal
-    # that the task has no shape requirements (none currently do). The harness
-    # copies this directly into TaskState.output_contract at task entry, and
-    # the runner's terminal-state check set-compares against the actual output.
+    # Declared output shape: first-class typed contract counterpart to the
+    # prose task_prompt and bespoke validator closures. The harness copies this
+    # directly into TaskState.output_contract at task entry and uses it for the
+    # terminal output-shape check.
     output_contract: OutputContract = field(default_factory=OutputContract)
-    # Step 18.5 (2026-04-17): author-assigned ground-truth primary capability
-    # type for Pillar 1 RQ #1 classification-accuracy analysis. Must be one of
-    # "mcp_tool" / "skill" / "agent" OR None. None means "no ground-truth
-    # assignment" (registry-retrieval tasks like T01-T03 where the expected
-    # behavior is a registry match, not a fresh classification). The
-    # `print_classification_accuracy()` analyzer in scripts/analyze_results.py
-    # cross-tabs this against evaluation_runs.capability_type to produce a
-    # confusion matrix + per-type row/column accuracy. Assignments are
-    # judgment calls made by reading the task_prompt and identifying the
-    # "core work" type — see assignments per task definition below.
+    # Author-assigned ground-truth primary capability type for task-level
+    # classification-accuracy analysis. The analyzer cross-tabs this against
+    # evaluation_runs.capability_type. Assignments are judgment calls made by
+    # reading task_prompt and identifying the "core work" type.
     expected_type: Literal["mcp_tool", "skill", "agent"] | None = None
-    is_pilot: bool = False
+    # Recurrence-track identity. Breadth tasks leave these at their defaults.
+    # Recurrence task instances keep task_id stable as the canonical family key
+    # (e.g. "T11") and thread the variantized identity through the dedicated
+    # fields below instead of inventing synthetic task IDs like "T11_V01".
+    task_family_id: str | None = None
+    task_instance_id: str | None = None
+    variant_id: str | None = None
+    benchmark_track: Literal["breadth", "recurrence"] = "breadth"
+
+    @property
+    def family_id(self) -> str:
+        """Stable family-level task key used across breadth/recurrence."""
+        return self.task_family_id or self.task_id
+
+    @property
+    def instance_id(self) -> str:
+        """Concrete task-instance key; equals task_id for breadth runs."""
+        return self.task_instance_id or self.task_id
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +199,10 @@ def _validate_t02(output: dict) -> bool:
 T02 = TaskDefinition(
     task_id="T02",
     tier="trivial",
-    description="Validate a JSON config against a JSON Schema and return the list of validation errors",
+    description=(
+        "Validate a JSON config against a JSON Schema and return the list of "
+        "validation errors"
+    ),
     task_prompt=(
         "Validate the JSON file at tests/evaluation/fixtures/t02_config.json "
         "against the schema at tests/evaluation/fixtures/t02_schema.json. "
@@ -221,18 +273,24 @@ def _validate_t04(output: dict) -> bool:
 T04 = TaskDefinition(
     task_id="T04",
     tier="complex",
-    description="Inventory reorder pipeline: apply domain-specific reorder policy from YAML rules to inventory data",
+    description=(
+        "Inventory reorder pipeline: apply domain-specific reorder policy from "
+        "YAML rules to inventory data"
+    ),
     task_prompt=(
         "Apply the inventory reorder policy defined in the rules file to the inventory data.\n\n"
         "The reorder policy is a domain-specific workflow:\n"
         "- The YAML rules at tests/evaluation/fixtures/t04_reorder_rules.yaml encode the business "
-        "policy (min_days_of_stock threshold, reorder_days_supply multiplier, max_order_value cap).\n"
-        "- The inventory CSV at tests/evaluation/fixtures/t04_inventory.csv contains the stock data "
+        "policy (min_days_of_stock threshold, reorder_days_supply multiplier, "
+        "max_order_value cap).\n"
+        "- The inventory CSV at tests/evaluation/fixtures/t04_inventory.csv "
+        "contains the stock data "
         "(columns: product_id, product_name, current_stock, daily_usage, unit_cost, warehouse).\n\n"
         "The policy workflow is:\n"
         "(1) Load both data sources.\n"
         "(2) For each product, compute days_of_stock = current_stock / daily_usage.\n"
-        "(3) Apply the policy rule: products where days_of_stock < min_days_of_stock need reordering.\n"
+        "(3) Apply the policy rule: products where days_of_stock < "
+        "min_days_of_stock need reordering.\n"
         "(4) For each product needing reorder, apply the reorder formula: "
         "reorder_qty = ceil(daily_usage * reorder_days_supply), "
         "then order_cost = reorder_qty * unit_cost, capped at max_order_value per the policy.\n"
@@ -242,8 +300,8 @@ T04 = TaskDefinition(
         "- 'items_below_threshold' (int): number of products needing reorder\n"
         "- 'total_reorder_cost' (float): sum of capped order costs"
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="inventory-reorder-policy",
     fixture_paths=[
         FIXTURES_DIR / "t04_inventory.csv",
         FIXTURES_DIR / "t04_reorder_rules.yaml",
@@ -262,13 +320,25 @@ _t05_ev = _EV["T05"]
 
 
 def _validate_t05(output: dict) -> bool:
-    """output_row_count < input_row_count AND null_count == 0."""
+    """output_row_count in a plausible cleaned-range AND null_count == 0.
+
+    A simple ``out_count < input_row_count AND null_count == 0`` predicate accepts
+    hallucinated outputs such as ``{output_row_count: 1, null_count: 0}``, so this
+    requires the output count to fall inside a plausible range:
+    ``expected_max_output_row_count * 0.5 <= out_count <= expected_max_output_row_count``.
+    The max is the upper-bound ground-truth (dedup + null drop) from the fixture
+    generator; the 50% floor rejects severely-truncated hallucinations while
+    tolerating validator variance in interpretation of "null or empty".
+    """
     try:
         out_count = int(output.get("output_row_count", -1))
         null_count = int(output.get("null_count", -1))
+        max_expected = int(_t05_ev["expected_max_output_row_count"])
+        min_expected = max_expected // 2  # 50% floor for truncated outputs
         ok_reduced = out_count < _t05_ev["input_row_count"]
+        ok_range = min_expected <= out_count <= max_expected
         ok_nulls = null_count == 0
-        return ok_reduced and ok_nulls
+        return ok_reduced and ok_range and ok_nulls
     except (TypeError, ValueError):
         return False
 
@@ -340,7 +410,6 @@ T06 = TaskDefinition(
     },
     validator=_validate_t06,
     output_contract=OutputContract(required_keys=["null_count", "column_variances"]),
-    is_pilot=False,
 )
 
 # ---------------------------------------------------------------------------
@@ -361,16 +430,20 @@ def _validate_t07(output: dict) -> bool:
 
 
 def _file_validate_t07(output: dict, output_files: dict[str, bytes]) -> bool:
-    """CSV file has expected_join_count data rows AND row_count in metadata."""
+    """CSV file has expected_join_count data rows AND row_count in metadata.
+
+    T07's file validator is only reached when ``output_contract.required_files``
+    is non-empty, so a missing ``output.csv`` is a contract violation, not a
+    graceful-degradation case. Fail closed on missing or undecodable files.
+    """
     import csv
     import io
     try:
-        # Check metadata dict
         ok_count = int(output.get("row_count", -1)) == _t07_ev["expected_join_count"]
-        # Check CSV file content
         csv_bytes = output_files.get("output.csv")
         if csv_bytes is None:
-            return ok_count  # fall back to dict-only validation
+            # Dict-only output violates the task's required file contract.
+            return False
         text = csv_bytes.decode("utf-8")
         reader = csv.reader(io.StringIO(text))
         rows = list(reader)
@@ -378,7 +451,7 @@ def _file_validate_t07(output: dict, output_files: dict[str, bytes]) -> bool:
         data_rows = len(rows) - 1 if len(rows) > 1 else 0
         ok_file_rows = data_rows == _t07_ev["expected_join_count"]
         return ok_count and ok_file_rows
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, UnicodeDecodeError, csv.Error):
         return False
 
 
@@ -406,7 +479,6 @@ T07 = TaskDefinition(
         required_keys=["row_count", "null_count_on_key", "output_file"],
         required_files=["output.csv"],
     ),
-    is_pilot=True,  # pilot task
 )
 
 # ---------------------------------------------------------------------------
@@ -431,7 +503,10 @@ def _validate_t08(output: dict) -> bool:
 T08 = TaskDefinition(
     task_id="T08",
     tier="complex",
-    description="Investigate data quality issues iteratively: profile, hypothesize root causes, verify, and prioritize",
+    description=(
+        "Investigate data quality issues iteratively: profile, hypothesize root "
+        "causes, verify, and prioritize"
+    ),
     task_prompt=(
         "You are investigating data quality issues in a messy employee dataset.\n"
         "Dataset: tests/evaluation/fixtures/t08_messy_data.csv "
@@ -474,11 +549,35 @@ _t09_ev = _EV["T09"]
 
 
 def _validate_t09(output: dict) -> bool:
-    """output has required keys AND anomalies list has exactly 5 items."""
+    """output has required keys AND anomalies list shape + content checks.
+
+    Counting only ``len(anomalies) == N`` accepts fabricated stand-in strings
+    such as ``["fake", "fake", "fake", "fake", "fake"]``. Each anomaly must
+    be a dict or a string containing at least one digit, because real anomalies
+    reference revenue/unit numbers from the XML, and entries must be unique.
+    """
     try:
         if not _check_keys_present(output, _t09_ev["required_keys"]):
             return False
-        return len(output.get("anomalies", [])) == _t09_ev["expected_anomaly_count"]
+        anomalies = output.get("anomalies", [])
+        if len(anomalies) != _t09_ev["expected_anomaly_count"]:
+            return False
+        seen: set[str] = set()
+        for item in anomalies:
+            if isinstance(item, dict):
+                # Real structured anomaly — accept.
+                key = json.dumps(item, sort_keys=True, default=str)
+            elif isinstance(item, str):
+                # String anomaly must reference a number (revenue/units/returns).
+                if not any(ch.isdigit() for ch in item):
+                    return False
+                key = item
+            else:
+                return False
+            if key in seen:
+                return False
+            seen.add(key)
+        return True
     except (TypeError, ValueError):
         return False
 
@@ -513,13 +612,35 @@ _t10_ev = _EV["T10"]
 
 
 def _validate_t10(output: dict) -> bool:
-    """trend_direction == 'upward' AND n_weeks matches AND forecast provided."""
+    """trend_direction upward AND n_weeks matches AND forecast is numeric + plausible.
+
+    This rejects plausible-looking but fabricated forecasts by requiring exactly
+    ``n_forecast_weeks`` numeric entries, rejecting constant forecasts, and
+    requiring the forecast mean to sit within
+    ``[avg_last_4_weeks * 0.3, avg_last_4_weeks * 3.0]``.
+    """
     try:
-        ok_trend = output.get("trend_direction", "").lower() in ("upward", "up", "increasing", "positive")
+        ok_trend = output.get("trend_direction", "").lower() in (
+            "upward", "up", "increasing", "positive",
+        )
         ok_weeks = int(output.get("n_weeks", -1)) == _t10_ev["n_weeks"]
-        # Agent should provide some forecast (list of numbers or a summary)
         forecast = output.get("forecast")
-        ok_forecast = forecast is not None and isinstance(forecast, list)
+        if not isinstance(forecast, list):
+            return False
+        n_expected = int(_t10_ev["n_forecast_weeks"])
+        if len(forecast) != n_expected:
+            return False
+        try:
+            values = [float(v) for v in forecast]
+        except (TypeError, ValueError):
+            return False
+        if len(set(values)) == 1:
+            # All-constant forecast (includes the [0, 0, 0] hallucination case).
+            return False
+        mean_forecast = sum(values) / len(values)
+        recent_avg = float(_t10_ev["avg_last_4_weeks"])
+        low, high = recent_avg * 0.3, recent_avg * 3.0
+        ok_forecast = low <= mean_forecast <= high
         return ok_trend and ok_weeks and ok_forecast
     except (TypeError, ValueError):
         return False
@@ -528,7 +649,10 @@ def _validate_t10(output: dict) -> bool:
 T10 = TaskDefinition(
     task_id="T10",
     tier="complex",
-    description="Adaptive trend analysis: try multiple forecasting methods, compare errors, select best with justification",
+    description=(
+        "Adaptive trend analysis: try multiple forecasting methods, compare "
+        "errors, select best with justification"
+    ),
     task_prompt=(
         "You are analyzing weekly sales data to detect trends and make forecasts.\n"
         "Dataset: tests/evaluation/fixtures/t10_weekly_sales.csv "
@@ -581,46 +705,72 @@ def _validate_t11(output: dict) -> bool:
                 return False
             if not _within_pct(float(actual), expected_rev, tol):
                 return False
-        ok_meeting = int(output.get("regions_meeting_target", -1)) == _t11_ev["regions_meeting_target"]
+        ok_meeting = (
+            int(output.get("regions_meeting_target", -1))
+            == _t11_ev["regions_meeting_target"]
+        )
         return ok_meeting
     except (TypeError, ValueError, AttributeError):
         return False
 
 
 def _file_validate_t11(output: dict, output_files: dict[str, bytes]) -> bool:
-    """Excel file exists with a 'Summary' sheet containing region revenue rows."""
+    """Excel file exists with a 'Summary' sheet containing region revenue rows.
+
+    Missing or corrupt files are contract violations. The only graceful
+    degradation path is ``ImportError`` when a developer environment lacks
+    openpyxl; parse failures remain invalid.
+    """
+    # Dict validation still required for metadata
+    if not _validate_t11(output):
+        return False
+    xlsx_bytes = output_files.get("output.xlsx")
+    if xlsx_bytes is None:
+        # The file is contract-required.
+        return False
     try:
-        # Dict validation still required for metadata
-        if not _validate_t11(output):
-            return False
-        # Check Excel file
-        xlsx_bytes = output_files.get("output.xlsx")
-        if xlsx_bytes is None:
-            return True  # dict passed, no file — still valid
         import io
+
         import openpyxl
+    except ImportError:
+        # Graceful degradation only when openpyxl is unavailable in this
+        # dev env. The supported eval environment includes the eval dependency
+        # group, so this branch fires only in narrow developer setups.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "openpyxl unavailable; T11 falling back to dict-only validation."
+        )
+        return True
+    try:
         wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), read_only=True)
-        # Should have at least one sheet
         if len(wb.sheetnames) == 0:
             return False
-        # Check first sheet has data rows (header + at least 4 region rows)
         ws = wb.active
         row_count = sum(1 for _ in ws.iter_rows(min_row=1))
         return row_count >= 5  # header + 4 regions
     except Exception:  # noqa: BLE001
-        return True  # fall back to dict-only if openpyxl not available
+        # Parse failures (BadZipFile, InvalidFileException, etc.) on a
+        # file that WAS produced but is corrupt → contract violation.
+        return False
 
 
 T11 = TaskDefinition(
     task_id="T11",
     tier="complex",
-    description="Multi-source data integration: join, compute regional revenue, output summary as Excel file",
+    description=(
+        "Multi-source data integration: join, compute regional revenue, output "
+        "summary as Excel file"
+    ),
     task_prompt=(
         "Build a data integration pipeline using these three data sources:\n"
-        "1. Sales CSV at tests/evaluation/fixtures/t11_sales.csv (columns: order_id, product_id, quantity, unit_price, region)\n"
-        "2. Product catalog Excel at tests/evaluation/fixtures/t11_products.xlsx (columns: product_id, name, category)\n"
-        "3. Regional targets CSV at tests/evaluation/fixtures/t11_targets.csv (columns: region, target_revenue)\n\n"
-        "Steps: (1) Join the sales data with the product catalog on product_id to enrich sales records with product names and categories. "
+        "1. Sales CSV at tests/evaluation/fixtures/t11_sales.csv (columns: "
+        "order_id, product_id, quantity, unit_price, region)\n"
+        "2. Product catalog Excel at tests/evaluation/fixtures/t11_products.xlsx "
+        "(columns: product_id, name, category)\n"
+        "3. Regional targets CSV at tests/evaluation/fixtures/t11_targets.csv "
+        "(columns: region, target_revenue)\n\n"
+        "Steps: (1) Join the sales data with the product catalog on product_id "
+        "to enrich sales records with product names and categories. "
         "(2) Compute per-region revenue totals by summing quantity * unit_price for each region. "
         "(3) Compare each region's total revenue against its target from the targets CSV.\n\n"
         "Output the regional summary as an Excel file (write it to /workspace/output.xlsx) "
@@ -630,8 +780,8 @@ T11 = TaskDefinition(
         "'regions_meeting_target' (int, count of regions where revenue >= target), "
         "and 'output_file' (str, 'output.xlsx')."
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="sales-integration-report",
     fixture_paths=[
         FIXTURES_DIR / "t11_sales.csv",
         FIXTURES_DIR / "t11_products.xlsx",
@@ -671,17 +821,24 @@ def _validate_t12(output: dict) -> bool:
 T12 = TaskDefinition(
     task_id="T12",
     tier="complex",
-    description="Apply a domain-specific data quality policy (encoded as JSON rules) to enforce constraints on raw data",
+    description=(
+        "Apply a domain-specific data quality policy (encoded as JSON rules) to "
+        "enforce constraints on raw data"
+    ),
     task_prompt=(
         "Apply the data quality policy defined in the rules configuration to the raw dataset.\n\n"
         "The quality policy is encoded as a JSON rules file at "
         "tests/evaluation/fixtures/t12_rules.json — this is the domain expertise that defines "
         "what 'clean data' means for this organization. The raw data CSV is at "
-        "tests/evaluation/fixtures/t12_raw_data.csv (columns: id, name, age, score, department).\n\n"
+        "tests/evaluation/fixtures/t12_raw_data.csv (columns: id, name, age, "
+        "score, department).\n\n"
         "The policy prescribes three sequential quality rules:\n"
-        "(1) Non-null enforcement: drop rows where any column listed in 'non_null_columns' is empty or null.\n"
-        "(2) Range constraints: drop rows where values fall outside the min/max range specified in 'range_constraints'.\n"
-        "(3) Deduplication: remove duplicate rows based on the columns listed in 'dedup_key_columns'.\n\n"
+        "(1) Non-null enforcement: drop rows where any column listed in "
+        "'non_null_columns' is empty or null.\n"
+        "(2) Range constraints: drop rows where values fall outside the min/max "
+        "range specified in 'range_constraints'.\n"
+        "(3) Deduplication: remove duplicate rows based on the columns listed "
+        "in 'dedup_key_columns'.\n\n"
         "Apply these rules in the prescribed order — the sequencing matters because each rule "
         "filters the input for the next. "
         "Return a dict with keys 'clean_row_count' (int, rows remaining after all rules), "
@@ -708,12 +865,29 @@ _t13_ev = _EV["T13"]
 
 
 def _validate_t13(output: dict) -> bool:
-    """anomaly_count >= 3 (tolerant) AND anomalies list non-empty AND metrics_analyzed > 0."""
+    """anomaly_count >= 3 AND anomalies reference real metric names from the fixture.
+
+    A non-empty anomalies list with ``anomaly_count >= 3`` is not enough: each
+    anomaly must be a dict whose ``metric`` value is one of the four real metric
+    names enumerated in the task prompt. A ``timestamp`` key is also required so
+    count-only hallucinations cannot pass.
+    """
+    valid_metrics = {"cpu_usage", "memory_mb", "request_latency_ms", "error_rate"}
     try:
         anomaly_count = int(output.get("anomaly_count", 0))
         anomalies = output.get("anomalies", [])
         metrics_analyzed = int(output.get("metrics_analyzed", 0))
-        return anomaly_count >= 3 and len(anomalies) > 0 and metrics_analyzed > 0
+        if anomaly_count < 3 or metrics_analyzed <= 0 or len(anomalies) == 0:
+            return False
+        for item in anomalies:
+            if not isinstance(item, dict):
+                return False
+            metric = item.get("metric")
+            if metric not in valid_metrics:
+                return False
+            if "timestamp" not in item:
+                return False
+        return True
     except (TypeError, ValueError):
         return False
 
@@ -721,7 +895,10 @@ def _validate_t13(output: dict) -> bool:
 T13 = TaskDefinition(
     task_id="T13",
     tier="complex",
-    description="Iterative anomaly investigation: detect anomalies, then investigate correlations and temporal clustering",
+    description=(
+        "Iterative anomaly investigation: detect anomalies, then investigate "
+        "correlations and temporal clustering"
+    ),
     task_prompt=(
         "Investigate anomalies in the metrics dataset. You have two data sources:\n"
         "1. Time-series metrics CSV at tests/evaluation/fixtures/t13_metrics.csv "
@@ -743,8 +920,8 @@ T13 = TaskDefinition(
         "'anomalies' (list of dicts, each with keys 'timestamp', 'metric', 'value'), "
         "and 'metrics_analyzed' (int, number of unique metrics you examined)."
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="anomaly-investigation-agent",
     fixture_paths=[
         FIXTURES_DIR / "t13_metrics.csv",
         FIXTURES_DIR / "t13_baselines.json",
@@ -763,7 +940,7 @@ _t14_ev = _EV["T14"]
 
 
 def _validate_t14(output: dict) -> bool:
-    """department_count correct AND spending within ±5% AND over_budget_count exact AND flagged_transactions exact."""
+    """department_count correct AND spending, budget, and flag counts match."""
     try:
         if int(output.get("department_count", -1)) != _t14_ev["department_count"]:
             return False
@@ -787,21 +964,26 @@ def _validate_t14(output: dict) -> bool:
 T14 = TaskDefinition(
     task_id="T14",
     tier="complex",
-    description="Apply budget allocation policy (encoded as JSON rules) to reconcile departmental spending against budgets",
+    description=(
+        "Apply budget allocation policy (encoded as JSON rules) to reconcile "
+        "departmental spending against budgets"
+    ),
     task_prompt=(
         "Apply the organization's budget allocation policy to reconcile departmental spending.\n\n"
         "The policy is encoded in three data sources:\n"
         "1. Department budgets CSV at tests/evaluation/fixtures/t14_departments.csv "
         "(columns: department, annual_budget) — the spending limits per department.\n"
         "2. Transactions TSV at tests/evaluation/fixtures/t14_transactions.tsv "
-        "(tab-separated, columns: txn_id, department, amount, category, date) — the actual spending.\n"
+        "(tab-separated, columns: txn_id, department, amount, category, date) "
+        "— the actual spending.\n"
         "3. Allocation rules JSON at tests/evaluation/fixtures/t14_rules.json "
         "(contains max_single_transaction threshold and category_caps as fraction of budget) — "
         "the compliance rules that define what spending patterns are flagged.\n\n"
         "The reconciliation policy workflow is:\n"
         "(1) Load all three data sources.\n"
         "(2) Aggregate total spending per department from the transactions.\n"
-        "(3) Apply the budget compliance rule: departments where spending > annual_budget are over-budget.\n"
+        "(3) Apply the budget compliance rule: departments where spending > "
+        "annual_budget are over-budget.\n"
         "(4) Apply the transaction flag rule: individual transactions exceeding "
         "max_single_transaction from the rules are flagged for review.\n\n"
         "Return a dict with keys:\n"
@@ -810,8 +992,8 @@ T14 = TaskDefinition(
         "- 'over_budget_count' (int): number of departments where spending > annual_budget\n"
         "- 'flagged_transactions' (int): count of transactions exceeding max_single_transaction"
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="budget-allocation-policy",
     fixture_paths=[
         FIXTURES_DIR / "t14_departments.csv",
         FIXTURES_DIR / "t14_transactions.tsv",
@@ -852,9 +1034,13 @@ def _validate_t15(output: dict) -> bool:
 T15 = TaskDefinition(
     task_id="T15",
     tier="complex",
-    description="Apply a config-driven monitoring policy to aggregate hourly metrics and detect threshold breaches",
+    description=(
+        "Apply a config-driven monitoring policy to aggregate hourly metrics "
+        "and detect threshold breaches"
+    ),
     task_prompt=(
-        "Apply the monitoring aggregation policy defined in the configuration to the raw metrics data.\n\n"
+        "Apply the monitoring aggregation policy defined in the configuration "
+        "to the raw metrics data.\n\n"
         "The policy is encoded in the aggregation config JSON at "
         "tests/evaluation/fixtures/t15_agg_config.json — it specifies the monitoring rules:\n"
         "- 'aggregation_interval': 'daily' — group hourly rows by date\n"
@@ -867,16 +1053,18 @@ T15 = TaskDefinition(
         "The monitoring policy workflow is:\n"
         "(1) Load the hourly metrics and parse timestamps.\n"
         "(2) Group rows by day per the policy's aggregation_interval.\n"
-        "(3) For each day, compute the aggregations specified in the policy config for each metric.\n"
+        "(3) For each day, compute the aggregations specified in the policy "
+        "config for each metric.\n"
         "(4) Apply the policy's alert thresholds: count alert days "
-        "(a day is an alert day if ANY of its aggregated values exceeds the corresponding threshold).\n\n"
+        "(a day is an alert day if ANY of its aggregated values exceeds the "
+        "corresponding threshold).\n\n"
         "Return a dict with keys:\n"
         "- 'n_days' (int): number of unique days in the data\n"
         "- 'metrics_aggregated' (int): number of distinct metrics processed\n"
         "- 'alert_days' (int): number of days where at least one threshold was breached"
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="monitoring-aggregation-policy",
     fixture_paths=[
         FIXTURES_DIR / "t15_hourly_metrics.csv",
         FIXTURES_DIR / "t15_agg_config.json",
@@ -914,11 +1102,15 @@ def _validate_t16(output: dict) -> bool:
 T16 = TaskDefinition(
     task_id="T16",
     tier="complex",
-    description="Root cause diagnosis: investigate a cascading system failure, identify the root cause metric and the cascade chain",
+    description=(
+        "Root cause diagnosis: investigate a cascading system failure, "
+        "identify the root cause metric and the cascade chain"
+    ),
     task_prompt=(
         "You are investigating a service degradation incident. You have:\n"
         "1. System metrics CSV at tests/evaluation/fixtures/t16_system_metrics.csv "
-        "(columns: timestamp, db_connections, query_latency_ms, request_queue_depth, error_rate, cpu_usage)\n"
+        "(columns: timestamp, db_connections, query_latency_ms, "
+        "request_queue_depth, error_rate, cpu_usage)\n"
         "2. Incident report YAML at tests/evaluation/fixtures/t16_incident.yaml "
         "(contains title, symptoms, onset_time, affected_service)\n\n"
         "The incident involves a cascading failure where one metric spiked first and "
@@ -967,7 +1159,7 @@ _t17_ev = _EV["T17"]
 
 
 def _validate_t17(output: dict) -> bool:
-    """high_severity_alerts correct AND at least 2 of 3 fraud customers identified AND total_alerts correct."""
+    """total/high-severity alert counts match AND at least 2 fraud customers match."""
     try:
         if int(output.get("total_alerts", -1)) != _t17_ev["total_alerts"]:
             return False
@@ -1002,7 +1194,10 @@ def _validate_t17(output: dict) -> bool:
 T17 = TaskDefinition(
     task_id="T17",
     tier="complex",
-    description="Fraud investigation: cross-reference transactions, customers, and alerts to identify fraud patterns and prioritize",
+    description=(
+        "Fraud investigation: cross-reference transactions, customers, and "
+        "alerts to identify fraud patterns and prioritize"
+    ),
     task_prompt=(
         "You are investigating potential fraud. You have three data sources:\n"
         "1. Customers CSV at tests/evaluation/fixtures/t17_customers.csv "
@@ -1017,7 +1212,8 @@ T17 = TaskDefinition(
         "and customer profile (account age, risk score) to assess legitimacy.\n"
         "(3) Identify which customers are involved in genuine fraud by looking for patterns: "
         "multiple high-amount transactions, high-severity alerts, or unusually high risk scores.\n"
-        "(4) Distinguish true fraud from false positive alerts (some alerts flag normal transactions).\n\n"
+        "(4) Distinguish true fraud from false positive alerts (some alerts "
+        "flag normal transactions).\n\n"
         "Adapt your investigation based on what you find — if a customer has multiple "
         "high-severity alerts, investigate their full transaction history. If an alert "
         "seems like a false positive (low amount, old account), deprioritize it.\n\n"
@@ -1061,7 +1257,10 @@ def _validate_t18(output: dict) -> bool:
 T18 = TaskDefinition(
     task_id="T18",
     tier="moderate",
-    description="Deduplicate records by hashing: compute hash per row, identify exact duplicates, return counts",
+    description=(
+        "Deduplicate records by hashing: compute hash per row, identify exact "
+        "duplicates, return counts"
+    ),
     task_prompt=(
         "Deduplicate the orders CSV at tests/evaluation/fixtures/t18_orders_with_dupes.csv. "
         "The file contains exact duplicate rows (same values in all columns). "
@@ -1103,7 +1302,10 @@ def _validate_t19(output: dict) -> bool:
 T19 = TaskDefinition(
     task_id="T19",
     tier="moderate",
-    description="Exploratory data analysis: profile product sales data, summarize by category, identify patterns",
+    description=(
+        "Exploratory data analysis: profile product sales data, summarize by "
+        "category, identify patterns"
+    ),
     task_prompt=(
         "Perform exploratory data analysis on the product sales dataset at "
         "tests/evaluation/fixtures/t19_product_sales.csv "
@@ -1138,7 +1340,7 @@ _t20_ev = _EV["T20"]
 
 
 def _validate_t20(output: dict) -> bool:
-    """eligible_count + ineligible_count == total AND eligible_count correct AND rules_applied == 4."""
+    """eligible/ineligible counts sum to total and rule count matches."""
     try:
         total = int(output.get("total_applications", -1))
         eligible = int(output.get("eligible_count", -1))
@@ -1157,7 +1359,10 @@ def _validate_t20(output: dict) -> bool:
 T20 = TaskDefinition(
     task_id="T20",
     tier="moderate",
-    description="Apply an eligibility policy (encoded as JSON rules) to classify business grant applications",
+    description=(
+        "Apply an eligibility policy (encoded as JSON rules) to classify "
+        "business grant applications"
+    ),
     task_prompt=(
         "Apply the eligibility policy to classify grant applications.\n\n"
         "The eligibility policy is encoded as a JSON rules file at "
@@ -1175,8 +1380,8 @@ T20 = TaskDefinition(
         "- 'ineligible_count' (int): number of applications failing at least one rule\n"
         "- 'rules_applied' (int): number of rules in the policy that were applied"
     ),
-    has_static_coverage=False,
-    static_capability_name=None,
+    has_static_coverage=True,
+    static_capability_name="eligibility-policy-classifier",
     fixture_paths=[
         FIXTURES_DIR / "t20_applications.csv",
         FIXTURES_DIR / "t20_eligibility_policy.json",
@@ -1196,9 +1401,9 @@ T20 = TaskDefinition(
 # Registry
 # ---------------------------------------------------------------------------
 
-# Step 18.5 (2026-04-17): author-assigned ground-truth primary capability type
-# per task for Pillar 1 RQ #1 classification-accuracy analysis. Assignments are
-# judgment calls based on each task's task_prompt and core-work shape:
+# Author-assigned ground-truth primary capability type per task for
+# classification-accuracy analysis. Assignments are judgment calls based on
+# each task's task_prompt and core-work shape:
 #
 # - MCP_TOOL: deterministic, stateless operation with a fixed input/output
 #   contract (parse, validate, compute, transform, deduplicate).
@@ -1252,7 +1457,11 @@ ALL_TASKS: list[TaskDefinition] = [
     T11, T12, T13, T14, T15, T16, T17, T18, T19, T20,
 ]
 
-PILOT_TASKS: list[TaskDefinition] = [T01, T07, T05]  # retrieval + moderate JIT (fuzzy-join) + moderate JIT (data-cleaning, static coverage)
+PILOT_TASKS: list[TaskDefinition] = [
+    T01,  # seeded retrieval
+    T07,  # moderate JIT fuzzy join
+    T05,  # moderate JIT data cleaning with static coverage
+]
 
 _TASK_MAP: dict[str, TaskDefinition] = {t.task_id: t for t in ALL_TASKS}
 

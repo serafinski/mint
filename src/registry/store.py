@@ -9,7 +9,7 @@ from src.config import DEFAULT_LLM_MODEL
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 
 
-class SkillRegistry:
+class CapabilityRegistry:
     """ChromaDB-backed capability registry with hierarchical semantic search."""
 
     def __init__(
@@ -37,41 +37,14 @@ class SkillRegistry:
         (``raw_description``); this summary is used only for the embedding
         document so that search-time token costs stay bounded.
 
-        50-word cap keeps typical documents well under the 256-token
-        all-MiniLM-L6-v2 limit even with the B1 inputs/outputs lines.
-        Reducing the cap further (tried 30) measurably hurt Phase A
-        recall because it diluted the summary signal relative to the
-        added schema tokens.
+        The 50-word cap keeps typical embedding documents compact while
+        preserving enough prose signal for seed retrieval. Shorter caps
+        reduced recall in retrieval probes.
         """
         words = description.split()
         if len(words) <= max_words:
             return description
         return " ".join(words[:max_words]) + "…"
-
-    @staticmethod
-    def _format_signature(schema: dict | None) -> str:
-        """Format a schema dict as a comma-separated list of parameter names.
-
-        B1 (enriched hierarchical embedding): flattens an input or output
-        schema into a compact list of identifiers for inclusion in the
-        embedding document. **Only the parameter/output names are
-        emitted, not their types.** Type tokens like ``int``, ``str``,
-        ``list``, ``dict`` carry almost no semantic signal for realistic
-        caller queries (which rarely mention types explicitly) and their
-        inclusion measurably dilutes prose-query recall — an earlier
-        ``name:type`` format regressed Phase A recall by 6-12pp on
-        probes whose semantics aligned with the description.
-
-        Accepts:
-          - ``None`` or empty dict → returns ``""``
-          - ``{"file_path": "str"}`` → ``"file_path"``
-          - ``{"row_count": "int", "column_names": "list[str]"}``
-            → ``"row_count, column_names"``
-          - ``{"n": {"type": "int"}}`` → ``"n"`` (JSON-Schema-ish input)
-        """
-        if not schema:
-            return ""
-        return ", ".join(str(name) for name in schema.keys())
 
     @staticmethod
     def _build_document(capability: CapabilityDescriptor) -> str:
@@ -82,25 +55,15 @@ class SkillRegistry:
         The description is truncated to ~50 words for embedding efficiency;
         the full description is kept in metadata (``raw_description``).
 
-        **B1 design decision (2026-04-13):** the embedding document
-        remains prose-only. We tried three variants of enriching the
-        document with structural signatures (multi-line labeled,
-        single-line with ``||`` delimiter, and natural-prose
-        ``Parameters:`` / ``Returns:``) and all regressed Phase A
-        recall by 6-12pp because the added tokens dilute the prose
-        signal for borderline-threshold probes. Instead, the
-        structural signal is exposed through ``input_schema`` /
-        ``output_schema`` on ``CapabilityDescriptor`` (already
-        persisted in ChromaDB metadata), and consumed directly by
-        (a) Pillar 3 Merge's Jaccard similarity over schema keys,
-        and (b) gap detection's optional post-filter that cross-checks
-        query/capability schema overlap after embedding fires. This
-        preserves prose-query recall while still delivering the
-        proposal's "overlapping input schemas" Merge criterion and
-        catching silent-poisoning matches.
+        The embedding text intentionally stays prose-only. Structural
+        contract fields are persisted as ``input_schema`` / ``output_schema``
+        metadata and consumed directly by merge scoring and gap-detection
+        compatibility checks. Keeping schema keys out of the embedding avoids
+        diluting semantic retrieval while preserving the contract signal for
+        code paths that need it.
         """
         domain = getattr(capability, "domain", "general")
-        summary = SkillRegistry._summarize_description(capability.description)
+        summary = CapabilityRegistry._summarize_description(capability.description)
         return (
             f"{domain} > {capability.capability_type.value} > "
             f"{capability.name}: {summary}"
@@ -117,7 +80,8 @@ class SkillRegistry:
             "version": capability.version,
             "created_at": capability.created_at.isoformat(),
             "raw_description": capability.description,
-            # New fields — use getattr for schema compatibility
+            # Optional descriptor fields are read defensively for compatibility
+            # with older persisted rows and test descriptors.
             "domain": getattr(capability, "domain", "general"),
             "is_generic": getattr(capability, "is_generic", False),
             "is_active": getattr(capability, "is_active", True),
@@ -127,6 +91,9 @@ class SkillRegistry:
             "tags": ",".join(getattr(capability, "tags", [])),
             "input_schema": json.dumps(getattr(capability, "input_schema", {})),
             "output_schema": json.dumps(getattr(capability, "output_schema", {})),
+            "pip_packages": json.dumps(
+                list(getattr(capability, "pip_packages", []) or [])
+            ),
             "extra_metadata": json.dumps(
                 getattr(capability, "metadata", {}), default=str
             ),
@@ -154,7 +121,7 @@ class SkillRegistry:
             except (ValueError, TypeError):
                 kwargs["created_at"] = datetime.now(UTC)
 
-        # Conditionally add fields the schema supports
+        # Conditionally add fields the schema supports.
         if "domain" in model_fields and "domain" in meta:
             kwargs["domain"] = meta["domain"]
         if "is_generic" in model_fields and "is_generic" in meta:
@@ -176,6 +143,14 @@ class SkillRegistry:
             kwargs["input_schema"] = json.loads(meta["input_schema"])
         if "output_schema" in model_fields and "output_schema" in meta:
             kwargs["output_schema"] = json.loads(meta["output_schema"])
+        if "pip_packages" in model_fields and "pip_packages" in meta:
+            try:
+                raw_pp = json.loads(meta["pip_packages"])
+                kwargs["pip_packages"] = (
+                    [str(p) for p in raw_pp] if isinstance(raw_pp, list) else []
+                )
+            except (ValueError, TypeError):
+                kwargs["pip_packages"] = []
         if "metadata" in model_fields and "extra_metadata" in meta:
             kwargs["metadata"] = json.loads(meta["extra_metadata"])
 
@@ -253,7 +228,8 @@ class SkillRegistry:
         Args:
             capability_type: Filter by type (MCP_TOOL, SKILL, AGENT).
             domain: Filter by domain string.
-            is_active: Filter by active status (default True = active only). Pass None to include all.
+            is_active: Filter by active status. The default returns active
+                capabilities only; pass ``None`` to include all.
         """
         where_conditions: list[dict] = []
         if capability_type is not None:
@@ -304,20 +280,16 @@ class SkillRegistry:
             domain: Optional domain filter. When set, restricts results to
                 capabilities whose ``domain`` metadata matches (with the
                 ``include_generic`` exception below). When ``None`` (default)
-                no domain filtering is applied — pre-B1 behaviour preserved.
-                Realises the proposal's "hierarchical embeddings (domain →
-                capability → specific skill)" criterion as a cheap pre-filter.
+                no domain filtering is applied. This realizes hierarchical
+                retrieval as a cheap pre-filter.
             include_generic: When ``True`` (default), capabilities flagged
                 ``is_generic=True`` are always included in results regardless
                 of the ``domain`` filter. This handles the generic-capability
-                edge case surfaced by Phase E (B1 Step 3.5b): a genuinely
-                generic cap like ``parse_csv_and_return_stats`` would be
-                falsely rejected by strict domain-equality filtering on
-                queries inferred as ``inventory`` / ``operations`` / etc.,
-                even though the cap's implementation has zero hardcoded
-                business assumptions. Set ``False`` to disable the bypass
-                (useful for diagnostic measurements). Has no effect when
-                ``domain`` is ``None``.
+                edge case where a genuinely generic cap like
+                ``parse_csv_and_return_stats`` would be falsely rejected by
+                strict domain-equality filtering on business-domain queries.
+                Set ``False`` to disable the bypass for diagnostic
+                measurements. Has no effect when ``domain`` is ``None``.
         """
         query_kwargs: dict = {"query_texts": [query], "n_results": n_results}
         if domain is not None:
@@ -373,12 +345,11 @@ class SkillRegistry:
                 the auxiliary description — and takes the MAX score for the
                 threshold check. Strictly additive: setting an auxiliary to
                 None or passing ``auxiliary_queries=None`` reproduces the
-                pre-fix single-query behaviour exactly. Use this to work
+                single-query behaviour exactly. Use this to work
                 around the short-slug-vs-prose-document embedding asymmetry
                 where short slugs systematically fall below the 0.6
                 threshold against prose-style ``_build_document()`` output
-                even when semantically equivalent. See
-                ``docs/registry_retrieval_fix_plan.md`` Part A.
+                even when semantically equivalent.
             threshold: Minimum similarity score to count as a match.
             domain: Optional domain filter threaded through to :meth:`search`.
                 When ``None`` (default) the search is unrestricted. See
@@ -386,7 +357,7 @@ class SkillRegistry:
             include_generic: Threaded through to :meth:`search`. When True
                 (default), capabilities flagged ``is_generic=True`` bypass
                 the domain filter. See :meth:`search` docstring for the
-                Phase E rationale.
+                generic-capability rationale.
 
         Returns:
             matches: list of (capability, score, original_query) above threshold.
@@ -399,7 +370,7 @@ class SkillRegistry:
         matches: list[tuple[CapabilityDescriptor, float, str]] = []
         gaps: list[tuple[str, str]] = []
 
-        # Normalise auxiliary_queries to the same length as queries. None
+        # Normalize auxiliary_queries to the same length as queries. None
         # entries are treated as "no auxiliary — single-query behaviour".
         if auxiliary_queries is None:
             aux_list: list[str | None] = [None] * len(queries)
@@ -454,11 +425,9 @@ class SkillRegistry:
             if best_cap is not None and best_score >= threshold:
                 matches.append((best_cap, best_score, query))
             else:
-                # Check whether a deactivated capability would have matched on
-                # the primary (slug) query. The deactivated-check intentionally
-                # only considers the primary for consistency with existing
-                # behaviour — augmenting it with auxiliary searches for
-                # deactivated caps would add noise without changing outcomes.
+                # The deactivated check only uses the primary slug query.
+                # Adding auxiliary searches would add noise without changing
+                # matching outcomes.
                 if (
                     unfiltered
                     and unfiltered[0][1] >= threshold
@@ -485,13 +454,17 @@ class SkillRegistry:
         return self._collection.count()
 
 
-def seed_registry(registry: SkillRegistry) -> None:
+# Backwards-compatible alias for older scripts and tests.
+SkillRegistry = CapabilityRegistry
+
+
+def seed_registry(registry: CapabilityRegistry) -> None:
     """Seed with diverse capabilities spanning all three types."""
     # Local imports to avoid circular deps at module import time.
     from src.registry.token_count import count_definition_tokens
     from src.schemas.task import GeneratedArtifact
 
-    # Build kwargs for optional fields — only include if schema supports them
+    # Optional fields are only passed when the schema supports them.
     model_fields = CapabilityDescriptor.model_fields
     has_domain = "domain" in model_fields
     has_tags = "tags" in model_fields
@@ -507,6 +480,7 @@ def seed_registry(registry: SkillRegistry) -> None:
         agent_config: str | None = None,
         input_schema: dict | None = None,
         output_schema: dict | None = None,
+        pip_packages: list[str] | None = None,
     ) -> CapabilityDescriptor:
         metadata: dict = {"pinned": "true"}  # all seeded caps are pinned
         if source_code is not None:
@@ -516,22 +490,15 @@ def seed_registry(registry: SkillRegistry) -> None:
         if agent_config is not None:
             metadata["agent_config"] = agent_config
 
-        # Compute Pillar 3 M3 definition-string token cost (Step 18.6).
-        # Build a throwaway GeneratedArtifact snapshot so the same tokenizer
-        # helper the JIT / optimizer paths use also runs on seeded caps —
-        # keeps seeded-vs-evolved Chapter-5 comparisons apples-to-apples.
-        # Security audit finding #9 (2026-04-19): use the shared
-        # ``decode_agent_config_metadata`` helper.
+        # Compute the definition-string token cost for seeded capabilities
+        # using the same serializer as generated artifacts. This keeps seeded
+        # and evolved capabilities comparable in evaluation analysis.
         from src.schemas.task import decode_agent_config_metadata
 
         agent_config_dict = decode_agent_config_metadata(agent_config)
         if agent_config_dict is None and isinstance(agent_config, str) and agent_config:
-            # Preserve the pre-fix behaviour at THIS site: when the string
-            # isn't valid JSON, wrap it as a bare system_prompt so the
-            # tokenizer still sees something. (Other sites prefer None —
-            # they're reconstruction paths that need a proper dict or
-            # nothing; this site is a tokenization snapshot that's fine
-            # with a best-effort wrapper.)
+            # Tokenizer snapshots can represent non-JSON agent prompts as
+            # bare system prompts.
             agent_config_dict = {"system_prompt": agent_config}
         snapshot = GeneratedArtifact(
             capability_name=name,
@@ -560,6 +527,8 @@ def seed_registry(registry: SkillRegistry) -> None:
             kwargs["input_schema"] = input_schema
         if output_schema:
             kwargs["output_schema"] = output_schema
+        if pip_packages:
+            kwargs["pip_packages"] = list(pip_packages)
         return CapabilityDescriptor(**kwargs)
 
     seeds = [
@@ -613,7 +582,8 @@ def seed_registry(registry: SkillRegistry) -> None:
                 '    with open(file_path) as f:\n'
                 '        reader = csv.DictReader(f)\n'
                 '        rows = list(reader)\n'
-                '        return {"row_count": len(rows), "column_names": list(reader.fieldnames or [])}\n'
+                '        return {"row_count": len(rows), '
+                '"column_names": list(reader.fieldnames or [])}\n'
                 'if __name__ == "__main__":\n'
                 '    mcp.run()\n'
             ),
@@ -664,6 +634,9 @@ def seed_registry(registry: SkillRegistry) -> None:
             domain="data-processing",
             input_schema={"config_path": "str", "schema_path": "str"},
             output_schema={"errors": "list[str]"},
+            # Declare the jsonschema runtime dependency explicitly so
+            # registry-matched uses of this seed install it in the sandbox.
+            pip_packages=["jsonschema"],
             source_code=(
                 "from typing import Annotated\n"
                 "from mcp.server.fastmcp import FastMCP\n"
@@ -701,7 +674,9 @@ def seed_registry(registry: SkillRegistry) -> None:
                 'import re\n'
                 'mcp = FastMCP("text-statistics")\n'
                 '@mcp.tool()\n'
-                'async def text_statistics(file_path: Annotated[str, "Path to text file"]) -> dict:\n'
+                'async def text_statistics(\n'
+                '    file_path: Annotated[str, "Path to text file"]\n'
+                ') -> dict:\n'
                 '    """Compute word count and Flesch readability score."""\n'
                 '    text = open(file_path).read()\n'
                 '    words = re.findall(r"\\b\\w+\\b", text)\n'
@@ -711,7 +686,8 @@ def seed_registry(registry: SkillRegistry) -> None:
                 '    n_w = len(words)\n'
                 '    n_s = max(len(sentences), 1)\n'
                 '    n_syl = sum(syllables(w) for w in words)\n'
-                '    score = round(max(0.0, min(100.0, 206.835 - 1.015*(n_w/n_s) - 84.6*(n_syl/max(n_w,1)))), 2)\n'
+                '    raw_score = 206.835 - 1.015*(n_w/n_s) - 84.6*(n_syl/max(n_w, 1))\n'
+                '    score = round(max(0.0, min(100.0, raw_score)), 2)\n'
                 '    return {"word_count": n_w, "readability_score": score}\n'
                 'if __name__ == "__main__":\n'
                 '    mcp.run()\n'
@@ -794,6 +770,148 @@ def seed_registry(registry: SkillRegistry) -> None:
                 "top 5 records).\n"
             ),
         ),
+        _cap(
+            "inventory-reorder-policy",
+            (
+                "Apply a fixed inventory reorder workflow to stock data using "
+                "reorder thresholds and capped order values from a YAML policy. "
+                "Returns product_count, items_below_threshold, and total_reorder_cost."
+            ),
+            CapabilityType.SKILL,
+            domain="inventory-management",
+            input_schema={"inventory_csv_path": "str", "rules_yaml_path": "str"},
+            output_schema={
+                "product_count": "int",
+                "items_below_threshold": "int",
+                "total_reorder_cost": "float",
+            },
+            skill_content=(
+                "---\n"
+                "name: inventory-reorder-policy\n"
+                "description: Apply a deterministic reorder policy to inventory data\n"
+                "---\n\n"
+                "# Inventory Reorder Policy\n\n"
+                "1. Load inventory rows and reorder rules.\n"
+                "2. Compute days_of_stock = current_stock / daily_usage.\n"
+                "3. Mark items below min_days_of_stock for reorder.\n"
+                "4. Compute reorder_qty = ceil(daily_usage * reorder_days_supply).\n"
+                "5. Cap order_cost at max_order_value and sum the total.\n"
+            ),
+        ),
+        _cap(
+            "sales-integration-report",
+            (
+                "Integrate sales CSV data with a product catalog and target table, "
+                "then emit a regional revenue summary as an Excel workbook."
+            ),
+            CapabilityType.SKILL,
+            domain="sales-analytics",
+            input_schema={
+                "sales_csv_path": "str",
+                "products_xlsx_path": "str",
+                "targets_csv_path": "str",
+            },
+            output_schema={
+                "summary_row_count": "int",
+                "region_revenues": "dict",
+                "regions_meeting_target": "int",
+                "output_file": "str",
+            },
+            skill_content=(
+                "---\n"
+                "name: sales-integration-report\n"
+                "description: Join sales, products, and targets into a regional summary workbook\n"
+                "---\n\n"
+                "# Sales Integration Report\n\n"
+                "1. Parse sales CSV and product catalog workbook.\n"
+                "2. Join on product_id.\n"
+                "3. Aggregate quantity * unit_price by region.\n"
+                "4. Compare each region against its target.\n"
+                "5. Write an Excel summary with region, revenue, target, and meets_target.\n"
+            ),
+        ),
+        _cap(
+            "budget-allocation-policy",
+            (
+                "Aggregate departmental transactions, compare the totals against "
+                "budget limits, and count flagged transactions over a fixed threshold."
+            ),
+            CapabilityType.SKILL,
+            domain="budget-reconciliation",
+            input_schema={
+                "departments_csv_path": "str",
+                "transactions_tsv_path": "str",
+                "rules_json_path": "str",
+            },
+            output_schema={
+                "department_count": "int",
+                "department_spending": "dict",
+                "over_budget_count": "int",
+                "flagged_transactions": "int",
+            },
+            skill_content=(
+                "---\n"
+                "name: budget-allocation-policy\n"
+                "description: Reconcile spending against budget policy thresholds\n"
+                "---\n\n"
+                "# Budget Allocation Policy\n\n"
+                "1. Load department budgets and transactions.\n"
+                "2. Sum transaction amounts per department.\n"
+                "3. Flag departments above annual budget.\n"
+                "4. Count transactions above max_single_transaction.\n"
+            ),
+        ),
+        _cap(
+            "monitoring-aggregation-policy",
+            (
+                "Aggregate hourly monitoring data into daily metrics using a "
+                "JSON policy and count alert days where thresholds are exceeded."
+            ),
+            CapabilityType.SKILL,
+            domain="monitoring",
+            input_schema={"hourly_csv_path": "str", "config_json_path": "str"},
+            output_schema={
+                "n_days": "int",
+                "metrics_aggregated": "int",
+                "alert_days": "int",
+            },
+            skill_content=(
+                "---\n"
+                "name: monitoring-aggregation-policy\n"
+                "description: Apply daily monitoring aggregations and alert thresholds\n"
+                "---\n\n"
+                "# Monitoring Aggregation Policy\n\n"
+                "1. Group hourly metric rows by day.\n"
+                "2. Apply configured aggregations per metric.\n"
+                "3. Count days where any aggregated metric breaches a threshold.\n"
+            ),
+        ),
+        _cap(
+            "eligibility-policy-classifier",
+            (
+                "Apply a fixed eligibility-rule set to application rows and "
+                "return eligible/ineligible counts plus the number of rules applied."
+            ),
+            CapabilityType.SKILL,
+            domain="eligibility",
+            input_schema={"applications_csv_path": "str", "policy_json_path": "str"},
+            output_schema={
+                "total_applications": "int",
+                "eligible_count": "int",
+                "ineligible_count": "int",
+                "rules_applied": "int",
+            },
+            skill_content=(
+                "---\n"
+                "name: eligibility-policy-classifier\n"
+                "description: Classify applications using a deterministic rule set\n"
+                "---\n\n"
+                "# Eligibility Policy Classifier\n\n"
+                "1. Load the policy JSON and application rows.\n"
+                "2. Apply every rule to every row.\n"
+                "3. Count eligible and ineligible applications.\n"
+            ),
+        ),
         # AGENT type
         _cap(
             "data-analysis-agent",
@@ -825,6 +943,30 @@ def seed_registry(registry: SkillRegistry) -> None:
                 '"node_config": {"name": "data_analysis_node", '
                 f'"model": "{DEFAULT_LLM_MODEL}", '
                 '"description": "Autonomous EDA agent"}, '
+                '"is_deep_agent": true}'
+            ),
+        ),
+        _cap(
+            "anomaly-investigation-agent",
+            (
+                "Investigate time-series metrics against declared baselines, "
+                "identify every out-of-range point, and summarize anomalies."
+            ),
+            CapabilityType.AGENT,
+            domain="monitoring",
+            input_schema={"metrics_csv_path": "str", "baselines_json_path": "str"},
+            output_schema={
+                "anomaly_count": "int",
+                "anomalies": "list[dict]",
+                "metrics_analyzed": "int",
+            },
+            agent_config=(
+                '{"system_prompt": "You investigate monitoring anomalies by reading '
+                'metrics and baseline files, identifying out-of-range values, and '
+                'returning a structured anomaly list.", '
+                '"node_config": {"name": "anomaly_investigation_node", '
+                f'"model": "{DEFAULT_LLM_MODEL}", '
+                '"description": "Deterministic anomaly investigation agent"}, '
                 '"is_deep_agent": true}'
             ),
         ),

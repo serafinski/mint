@@ -1,14 +1,13 @@
 """Unit tests for the verification node.
 
 Tests cover:
-- Stub gate always passes (default behaviour until Iteration 3)
+- Stub gate always passes for the no-verification baseline
 - Correct routing to loading_node vs generate_mcp_tool
 - Artifact replacement: failed artifacts removed from state on retry
-- **Fail-closed behaviour at MAX_ATTEMPTS** (§12 finding #14, 2026-04-16):
+- Fail-closed behaviour at MAX_ATTEMPTS:
   flips ``verification_succeeded=False``, drops partially-produced artifacts,
   emits ERROR-level LangFuse event, proceeds to terminal state via
-  the never-raises contract. Pre-fix behaviour (fail-OPEN) is preserved
-  in git history only — any test here asserts the fail-CLOSED outcome.
+  the never-raises contract.
 - attempt_count incremented on every call
 - Errors accumulated from Critical/High findings
 - Existing verification_results preserved
@@ -162,14 +161,14 @@ def test_failed_artifacts_removed_on_retry():
 
 
 # ---------------------------------------------------------------------------
-# Max-attempts fail open
+# Max-attempts fail closed
 # ---------------------------------------------------------------------------
 
 
 def test_max_attempts_routes_to_loading_node():
     """Terminal state on exhaustion: still routes to loading_node (never-raises contract),
     but the sticky verification_succeeded flag flips to False so downstream layers
-    classify the run as VERIFICATION_FAILED (§12 finding #14).
+    classify the run as VERIFICATION_FAILED.
     """
     state = TaskState(
         task_description="t",
@@ -182,10 +181,7 @@ def test_max_attempts_routes_to_loading_node():
 
 
 def test_max_attempts_drops_failed_artifacts():
-    """§12 finding #14: fail-closed — failed artifacts MUST be dropped so they
-    never register in production, per the proposal's Pillar 2 contract
-    ('Only verified capabilities enter production'). Passed siblings stay.
-    """
+    """Fail-closed artifacts are dropped before registry insertion."""
     state = TaskState(
         task_description="t",
         generated_artifacts=[_artifact("good"), _artifact("bad")],
@@ -199,9 +195,7 @@ def test_max_attempts_drops_failed_artifacts():
 
 
 def test_max_attempts_sets_sticky_fail_flag():
-    """§12 finding #14: sticky verification_succeeded flag flips to False
-    so CLI runner + harness classify the task as VERIFICATION_FAILED.
-    """
+    """Sticky verification_succeeded flips to False on verification exhaustion."""
     state = TaskState(
         task_description="t",
         generated_artifacts=[_artifact("bad")],
@@ -241,8 +235,8 @@ def test_max_attempts_all_pass_keeps_sticky_flag_true():
 
 
 def test_max_attempts_records_fail_closed_error():
-    """Errors list should carry a VERIFICATION_FAILED marker that the CLI
-    runner and eval harness can surface.
+    """Errors list should carry a VERIFICATION_FAILED marker that terminal
+    callers can surface.
     """
     state = TaskState(
         task_description="t",
@@ -252,7 +246,7 @@ def test_max_attempts_records_fail_closed_error():
     cmd = verification_node(state, gate_fn=_gate_failing_for("bad"))
 
     assert any(
-        "VERIFICATION_FAILED" in e or "Pillar 2 contract" in e
+        "VERIFICATION_FAILED" in e or "Failed artifacts dropped" in e
         for e in cmd.update["errors"]
     )
 
@@ -410,7 +404,7 @@ def test_status_is_verifying():
 
 
 # ---------------------------------------------------------------------------
-# Fix 6: Parallel verification
+# Parallel verification
 # ---------------------------------------------------------------------------
 
 
@@ -463,3 +457,126 @@ def test_parallel_preserves_prior_verification_results():
     results = cmd.update["verification_results"]
     assert results[0].capability_name == "prior_tool"
     assert any(r.capability_name == "new_tool" for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Artifact-hash-aware retry skip
+# ---------------------------------------------------------------------------
+
+
+class TestAlreadyPassedSkipHashMatch:
+    """Retry skip trusts prior PASS reports only when the artifact hash matches."""
+
+    def test_skip_when_hash_matches(self):
+        """Same artifact as before → skipped (preserves perf optimization)."""
+        from src.verification.gate import compute_artifact_hash
+
+        art = _artifact("stable_tool")
+        prior = VerificationReport(
+            capability_name="stable_tool",
+            findings=[],
+            overall_passed=True,
+            tier_reached=3,
+            artifact_hash=compute_artifact_hash(art),
+        )
+
+        calls: list[str] = []
+
+        def _gate_fn(a):
+            calls.append(a.capability_name)
+            return VerificationReport(
+                capability_name=a.capability_name, findings=[],
+                overall_passed=True, tier_reached=3,
+            )
+
+        state = TaskState(
+            task_description="t",
+            generated_artifacts=[art],
+            verification_results=[prior],
+            attempt_count=1,
+        )
+        verification_node(state, gate_fn=_gate_fn)
+
+        # Gate was skipped — prior PASS hash matched.
+        assert calls == [], (
+            f"Stable artifact should have been skipped on retry; gate called "
+            f"with {calls}"
+        )
+
+    def test_re_verify_when_hash_mismatches(self):
+        """Regenerated artifact with same name but modified content →
+        gate must re-run rather than trusting the prior PASS report."""
+        art_v1 = GeneratedArtifact(
+            capability_name="tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code="async def tool(): return 1",
+        )
+        art_v2 = GeneratedArtifact(
+            capability_name="tool",
+            capability_type=CapabilityType.MCP_TOOL,
+            source_code="async def tool(): return 2",  # content changed
+        )
+        from src.verification.gate import compute_artifact_hash
+
+        prior_pass = VerificationReport(
+            capability_name="tool",
+            findings=[],
+            overall_passed=True,
+            tier_reached=3,
+            artifact_hash=compute_artifact_hash(art_v1),  # v1's hash
+        )
+
+        calls: list[str] = []
+
+        def _gate_fn(a):
+            calls.append(a.capability_name)
+            return VerificationReport(
+                capability_name=a.capability_name, findings=[],
+                overall_passed=True, tier_reached=3,
+            )
+
+        state = TaskState(
+            task_description="t",
+            generated_artifacts=[art_v2],  # v2 — content changed
+            verification_results=[prior_pass],  # but old report present
+            attempt_count=1,
+        )
+        verification_node(state, gate_fn=_gate_fn)
+
+        # Gate MUST re-run because v2's hash differs from v1's hash.
+        assert calls == ["tool"], (
+            f"v2 differs from v1 — gate must re-verify. Got calls={calls}"
+        )
+
+    def test_empty_hash_forces_reverification(self):
+        """Reports without artifact_hash must not be silently trusted."""
+        art = _artifact("empty_hash")
+        prior = VerificationReport(
+            capability_name="empty_hash",
+            findings=[],
+            overall_passed=True,
+            tier_reached=3,
+            artifact_hash="",
+        )
+
+        calls: list[str] = []
+
+        def _gate_fn(a):
+            calls.append(a.capability_name)
+            return VerificationReport(
+                capability_name=a.capability_name, findings=[],
+                overall_passed=True, tier_reached=3,
+            )
+
+        state = TaskState(
+            task_description="t",
+            generated_artifacts=[art],
+            verification_results=[prior],
+            attempt_count=1,
+        )
+        verification_node(state, gate_fn=_gate_fn)
+
+        assert calls == ["empty_hash"], (
+            "Empty artifact_hash on the prior report must force re-verification "
+            "(safe default for older persisted rows)."
+        )

@@ -1,21 +1,26 @@
-"""Unit tests for tests/evaluation/execution.py — SKILL/AGENT execution via DeepAgent."""
+"""Tests for evaluation artifact execution helpers."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from tests.evaluation.execution import (
     AGENT_EXECUTION_TIMEOUT_S,
+    LEAD_WITH_SUBAGENTS_TIMEOUT_S,
     TASK_RESULT_MODELS,
     AgentExecutionMeta,
     GenericResult,
     T11Result,
     T12Result,
     T13Result,
+    T19Result,
+    _agent_process_context,
+    _agent_timeout_seconds,
+    _build_dynamic_result_model,
     _extract_last_ai_json,
     _extract_last_json_object,
     _extract_last_sandbox_json,
@@ -23,11 +28,59 @@ from tests.evaluation.execution import (
     _format_fixture_message,
     _read_fixture_contents,
     _record_agent_execution_meta,
+    _select_result_model,
     clear_last_agent_execution_meta,
     execute_agent_artifact,
+    execute_mcp_tool_in_chain,
     execute_skill_artifact,
     get_last_agent_execution_meta,
 )
+
+
+def _inline_agent_process_context():
+    class _InlineQueue:
+        def __init__(self):
+            self._items: list[dict] = []
+
+        def put(self, item):
+            self._items.append(item)
+
+        def get_nowait(self):
+            return self._items.pop(0)
+
+    class _InlineProcess:
+        def __init__(self, target, args, kwargs):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs
+            self.exitcode = 0
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            self._target(*self._args, **self._kwargs)
+            self._alive = False
+
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return self._alive
+
+        def terminate(self):
+            self._alive = False
+
+        def kill(self):
+            self._alive = False
+
+    class _InlineContext:
+        def Queue(self, maxsize=1):
+            return _InlineQueue()
+
+        def Process(self, target, args=(), kwargs=None):
+            return _InlineProcess(target, args, kwargs or {})
+
+    return _InlineContext()
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +90,11 @@ from tests.evaluation.execution import (
 
 class TestResultModels:
     def test_t11_result_valid(self):
-        r = T11Result(summary_row_count=4, region_revenues={"North": 1000.0}, regions_meeting_target=2)
+        r = T11Result(
+            summary_row_count=4,
+            region_revenues={"North": 1000.0},
+            regions_meeting_target=2,
+        )
         assert r.summary_row_count == 4
 
     def test_t12_result_valid(self):
@@ -45,8 +102,16 @@ class TestResultModels:
         assert r.rules_applied == 3
 
     def test_t13_result_valid(self):
-        r = T13Result(anomaly_count=5, anomalies=[{"ts": "a", "m": "b", "v": 1}], metrics_analyzed=4)
+        r = T13Result(
+            anomaly_count=5,
+            anomalies=[{"ts": "a", "m": "b", "v": 1}],
+            metrics_analyzed=4,
+        )
         assert r.anomaly_count == 5
+
+    def test_t19_result_valid(self):
+        r = T19Result(n_rows=25, n_categories=3, categories=["A", "B", "C"])
+        assert r.n_rows == 25
 
     def test_generic_result(self):
         r = GenericResult(result={"key": "value"})
@@ -56,7 +121,67 @@ class TestResultModels:
         assert TASK_RESULT_MODELS["T11"] is T11Result
         assert TASK_RESULT_MODELS["T12"] is T12Result
         assert TASK_RESULT_MODELS["T13"] is T13Result
+        assert TASK_RESULT_MODELS["T19"] is T19Result
         assert "T01" not in TASK_RESULT_MODELS
+
+
+class TestLeadWithSubagentValidation:
+    def test_execute_agent_artifact_rejects_overlong_subagent_name(self):
+        clear_last_agent_execution_meta()
+        artifact = SimpleNamespace(
+            agent_config={
+                "system_prompt": "You are an agent.",
+                "subagents": [{
+                    "name": "x" * 65,
+                    "description": "worker",
+                    "system_prompt": "do work",
+                    "tools": [],
+                }],
+            }
+        )
+        task = SimpleNamespace(
+            task_id="T17",
+            fixture_paths=[],
+            output_contract=SimpleNamespace(required_keys=[]),
+        )
+        result = execute_agent_artifact(artifact, task, {})
+        assert result == {}
+        meta = get_last_agent_execution_meta()
+        assert meta is not None
+        assert meta.succeeded is False
+        assert meta.failure_reason == "error"
+
+
+class TestSelectResultModel:
+    def test_named_task_prefers_task_model_without_output_schema(self):
+        task = SimpleNamespace(task_id="T19")
+        model = _select_result_model(task)
+        assert model is T19Result
+
+    def test_chain_step_output_schema_overrides_task_model(self):
+        task = SimpleNamespace(task_id="T15")
+        schema = {
+            "daily_aggregates": "list[dict]",
+            "metrics_processed": "int",
+        }
+        model = _select_result_model(
+            task,
+            output_schema=schema,
+            prefer_output_schema=True,
+        )
+        assert model is not TASK_RESULT_MODELS["T15"]
+        assert set(model.model_fields.keys()) == set(schema.keys())
+
+    def test_generic_task_uses_dynamic_model_when_output_schema_present(self):
+        task = SimpleNamespace(task_id="")
+        schema = {"records": "list[dict]"}
+        model = _select_result_model(
+            task,
+            output_schema=schema,
+            prefer_output_schema=True,
+        )
+        assert model is not GenericResult
+        assert set(model.model_fields.keys()) == {"records"}
 
 
 # ---------------------------------------------------------------------------
@@ -100,11 +225,19 @@ class TestFormatFixtureMessage:
 class TestExecuteSkillArtifact:
     @patch("tests.evaluation.execution._execute_skill_inner")
     def test_returns_dict_on_success(self, mock_inner):
-        mock_inner.return_value = {"summary_row_count": 4, "region_revenues": {}, "regions_meeting_target": 2}
+        mock_inner.return_value = {
+            "summary_row_count": 4,
+            "region_revenues": {},
+            "regions_meeting_target": 2,
+        }
         task = SimpleNamespace(task_id="T11", task_prompt="test", fixture_paths=[])
         artifact = SimpleNamespace(skill_content="# Test Skill", capability_type="skill")
         result = execute_skill_artifact(artifact, task, {})
-        assert result == {"summary_row_count": 4, "region_revenues": {}, "regions_meeting_target": 2}
+        assert result == {
+            "summary_row_count": 4,
+            "region_revenues": {},
+            "regions_meeting_target": 2,
+        }
 
     @patch("tests.evaluation.execution._execute_skill_inner")
     def test_returns_empty_on_exception(self, mock_inner):
@@ -113,6 +246,64 @@ class TestExecuteSkillArtifact:
         artifact = SimpleNamespace(skill_content="# Test Skill", capability_type="skill")
         result = execute_skill_artifact(artifact, task, {})
         assert result == {}
+
+
+class TestExecuteMcpToolInChain:
+    @patch("src.verification.sandbox_tool.sandbox_execute_in_workspace")
+    def test_later_root_step_uses_root_fixture_binding(self, mock_sandbox, tmp_path):
+        captured: dict[str, str] = {}
+
+        def _fake_sandbox(code, **kwargs):
+            captured["code"] = code
+            return {"success": True, "stdout": '{"result": {"hourly_rows": []}}', "stderr": ""}
+
+        mock_sandbox.side_effect = _fake_sandbox
+
+        source_code = """
+async def parse_csv_with_timestamps(csv_path: str) -> dict:
+    return {"hourly_rows": []}
+"""
+        result = execute_mcp_tool_in_chain(
+            source_code=source_code,
+            step_index=1,
+            workspace_path=tmp_path,
+            capability_name="parse-csv-with-timestamps",
+            depends_on=[],
+        )
+
+        assert result == {"hourly_rows": []}
+        assert "if True:\n                        _all_inputs[_fp] = _full" in captured["code"]
+        assert 'if not True and "upstream_data" in _valid:' in captured["code"]
+        assert "Use greedy global best-match assignment by keyword overlap" in captured["code"]
+        assert "if True:\n            for _p in _path_params:" in captured["code"]
+
+    @patch("src.verification.sandbox_tool.sandbox_execute_in_workspace")
+    def test_downstream_step_preserves_non_root_binding(self, mock_sandbox, tmp_path):
+        captured: dict[str, str] = {}
+
+        def _fake_sandbox(code, **kwargs):
+            captured["code"] = code
+            return {"success": True, "stdout": '{"result": {"daily_aggregates": {}}}', "stderr": ""}
+
+        mock_sandbox.side_effect = _fake_sandbox
+
+        source_code = """
+async def aggregate_metrics(upstream_data: dict) -> dict:
+    return {"daily_aggregates": {}}
+"""
+        result = execute_mcp_tool_in_chain(
+            source_code=source_code,
+            step_index=2,
+            workspace_path=tmp_path,
+            capability_name="aggregate-metrics",
+            depends_on=[0, 1],
+        )
+
+        assert result == {"daily_aggregates": {}}
+        assert "if False:\n                        _all_inputs[_fp] = _full" in captured["code"]
+        assert 'if not False and "upstream_data" in _valid:' in captured["code"]
+        assert "Use greedy global best-match assignment by keyword overlap" in captured["code"]
+        assert "if False:\n            for _p in _path_params:" in captured["code"]
 
     @patch("tests.evaluation.execution._execute_skill_inner")
     def test_returns_empty_on_timeout(self, mock_inner):
@@ -139,7 +330,11 @@ class TestExecuteAgentArtifact:
             skill_content=None,
             capability_type="agent",
         )
-        result = execute_agent_artifact(artifact, task, {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            result = execute_agent_artifact(artifact, task, {})
         assert result["anomaly_count"] == 5
 
     @patch("tests.evaluation.execution._execute_agent_inner")
@@ -147,7 +342,11 @@ class TestExecuteAgentArtifact:
         mock_inner.side_effect = RuntimeError("boom")
         task = SimpleNamespace(task_id="T13", task_prompt="test", fixture_paths=[])
         artifact = SimpleNamespace(agent_config={}, skill_content=None, capability_type="agent")
-        result = execute_agent_artifact(artifact, task, {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            result = execute_agent_artifact(artifact, task, {})
         assert result == {}
 
     @patch("tests.evaluation.execution._execute_agent_inner")
@@ -156,12 +355,16 @@ class TestExecuteAgentArtifact:
         mock_inner.side_effect = concurrent.futures.TimeoutError()
         task = SimpleNamespace(task_id="T13", task_prompt="test", fixture_paths=[])
         artifact = SimpleNamespace(agent_config={}, skill_content=None, capability_type="agent")
-        result = execute_agent_artifact(artifact, task, {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            result = execute_agent_artifact(artifact, task, {})
         assert result == {}
 
 
 # ---------------------------------------------------------------------------
-# Step 13 — sticky agent execution meta
+# Sticky agent execution metadata
 # ---------------------------------------------------------------------------
 
 
@@ -245,7 +448,11 @@ class TestExecuteAgentArtifactMeta:
     @patch("tests.evaluation.execution._execute_agent_inner")
     def test_success_records_succeeded_true(self, mock_inner):
         mock_inner.return_value = {"result": "ok"}
-        execute_agent_artifact(self._artifact(), self._task(), {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            execute_agent_artifact(self._artifact(), self._task(), {})
         meta = get_last_agent_execution_meta()
         assert meta is not None
         assert meta.succeeded is True
@@ -254,7 +461,11 @@ class TestExecuteAgentArtifactMeta:
     @patch("tests.evaluation.execution._execute_agent_inner")
     def test_exception_in_inner_records_error(self, mock_inner):
         mock_inner.side_effect = RuntimeError("boom")
-        execute_agent_artifact(self._artifact(), self._task(), {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            execute_agent_artifact(self._artifact(), self._task(), {})
         meta = get_last_agent_execution_meta()
         assert meta is not None
         assert meta.succeeded is False
@@ -275,7 +486,11 @@ class TestExecuteAgentArtifactMeta:
         import tests.evaluation.execution as exec_mod
         monkeypatch.setattr(exec_mod, "_execute_agent_inner", _fake_inner)
 
-        result = execute_agent_artifact(self._artifact(), self._task(), {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            result = execute_agent_artifact(self._artifact(), self._task(), {})
         assert result == {}
         meta = get_last_agent_execution_meta()
         assert meta is not None
@@ -287,26 +502,48 @@ class TestExecuteAgentArtifactMeta:
     def test_meta_cleared_between_calls(self, mock_inner):
         # First call records error.
         mock_inner.side_effect = RuntimeError("boom")
-        execute_agent_artifact(self._artifact(), self._task(), {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            execute_agent_artifact(self._artifact(), self._task(), {})
         assert get_last_agent_execution_meta().failure_reason == "error"
 
         # Second call succeeds — must overwrite, not leak prior error.
         mock_inner.side_effect = None
         mock_inner.return_value = {"ok": True}
-        execute_agent_artifact(self._artifact(), self._task(), {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=_inline_agent_process_context(),
+        ):
+            execute_agent_artifact(self._artifact(), self._task(), {})
         meta = get_last_agent_execution_meta()
         assert meta.succeeded is True
         assert meta.failure_reason is None
 
     def test_timeout_ceiling_is_900s(self):
-        # Regression guard for the 480→900 bump. If this fires, update
-        # the value in tests/evaluation/execution.py and re-read the
-        # langfuse trace that justified it.
+        # Keep the AGENT artifact budget aligned with the eval runner.
         assert AGENT_EXECUTION_TIMEOUT_S == 900
+
+    def test_lead_with_subagents_timeout_is_extended(self):
+        artifact = SimpleNamespace(
+            agent_config={
+                "system_prompt": "You are an agent.",
+                "subagents": [
+                    {
+                        "name": "worker",
+                        "description": "x",
+                        "system_prompt": "y",
+                        "tools": [],
+                    }
+                ],
+            }
+        )
+        assert _agent_timeout_seconds(artifact) == LEAD_WITH_SUBAGENTS_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------
-# JSON extraction helpers — regression for CLI T11-style empty-output bug
+# SKILL JSON extraction helpers
 # ---------------------------------------------------------------------------
 
 
@@ -320,13 +557,7 @@ def _ai_msg(content: str) -> SimpleNamespace:
 
 
 class TestExtractLastSandboxJson:
-    """Regression tests for the CLI T11 empty-output bug.
-
-    The original implementation only parsed the LAST LINE of sandbox stdout,
-    which broke on `print(json.dumps(result, indent=2))` output (last line
-    would be just `}`). This caused MINT CLI SKILL runs to return empty dicts
-    when the generated skill used pretty-printed JSON output.
-    """
+    """Sandbox output parsing accepts realistic debug and JSON formats."""
 
     def test_single_line_json(self):
         import json
@@ -340,10 +571,14 @@ class TestExtractLastSandboxJson:
         assert result == {"summary_row_count": 60, "regions_meeting_target": 3}
 
     def test_multiline_pretty_printed_json(self):
-        """Regression for CLI T11 bug — pretty-printed multi-line JSON."""
+        """Pretty-printed multi-line JSON is accepted."""
         import json
         pretty = json.dumps(
-            {"summary_row_count": 60, "region_revenues": {"East": 15019.57}, "regions_meeting_target": 3},
+            {
+                "summary_row_count": 60,
+                "region_revenues": {"East": 15019.57},
+                "regions_meeting_target": 3,
+            },
             indent=2,
         )
         tool_content = json.dumps({
@@ -474,26 +709,17 @@ class TestExtractLastJsonObject:
 
 
 # ---------------------------------------------------------------------------
-# Fixture → workspace file conversion — regression for T16 AGENT filesystem bug
+# Fixture → workspace file conversion for AGENT file access
 # ---------------------------------------------------------------------------
 
 
 class TestFixturesToWorkspaceFiles:
-    """Regression tests for solo-AGENT fixture file access (T16 bug).
+    """AGENT fixtures are keyed exactly as DeepAgents workspace reads expect.
 
     Keys MUST be absolute virtual paths (leading ``/``). DeepAgents'
     ``validate_path`` normalizes every ``read_file`` argument to start with
     ``/`` before ``StateBackend.read`` does a dict lookup, so bare-basename
-    keys will never match. The T16 agent trace on 2026-04-15
-    (``45a39ccd95d0edbedaa7bae3f71b4290``) showed the exact failure mode:
-    the agent called ``read_file("t16_incident.yaml")`` and got back
-    ``"Error: File '/t16_incident.yaml' not found"``, then fabricated an
-    answer via ``sandbox_execute`` on no data.
-
-    An earlier version of this helper stored fixtures under bare basenames
-    and these tests codified that wrong behavior. The test suite thus
-    passed while the runtime silently failed — a case of tests enshrining
-    the bug the code introduced.
+    keys will never match.
     """
 
     def test_empty_fixtures(self):
@@ -505,9 +731,12 @@ class TestFixturesToWorkspaceFiles:
         # Key MUST start with "/" to match validate_path normalization.
         assert "/t16_incident.yaml" in result
         assert "t16_incident.yaml" not in result
-        assert result["/t16_incident.yaml"] == {
-            "content": ["onset_time: '2024-07-01 05:00:00'", "affected: api"]
-        }
+        assert result["/t16_incident.yaml"]["content"] == [
+            "onset_time: '2024-07-01 05:00:00'",
+            "affected: api",
+        ]
+        assert "created_at" in result["/t16_incident.yaml"]
+        assert "modified_at" in result["/t16_incident.yaml"]
 
     def test_multiple_fixtures_all_absolute(self):
         fixtures = {
@@ -517,6 +746,8 @@ class TestFixturesToWorkspaceFiles:
         result = _fixtures_to_workspace_files(fixtures)
         assert set(result.keys()) == {"/t16_system_metrics.csv", "/t16_incident.yaml"}
         assert result["/t16_system_metrics.csv"]["content"] == ["ts,cpu,mem", "0,10,50", "1,11,52"]
+        assert "created_at" in result["/t16_system_metrics.csv"]
+        assert "modified_at" in result["/t16_system_metrics.csv"]
 
     def test_already_absolute_path_not_double_prefixed(self):
         """If a caller passes a key that already starts with ``/``, the
@@ -530,7 +761,7 @@ class TestFixturesToWorkspaceFiles:
     def test_keys_round_trip_through_validate_path(self):
         """Every key this helper produces must equal what DeepAgents'
         ``validate_path`` returns for the corresponding filename. This is
-        the direct invariant the T16 bug violated.
+        the direct workspace-read invariant.
         """
         from deepagents.backends.utils import validate_path
 
@@ -563,7 +794,7 @@ class TestFixturesToWorkspaceFiles:
         validated = validate_path("t16_incident.yaml")
         assert files.get(validated) is not None, (
             "StateBackend lookup would fail — bare-basename read_file call "
-            "does not resolve. This is the T16 bug."
+            "does not resolve."
         )
 
         # Agent calls read_file("/t16_incident.yaml") — the absolute form.
@@ -581,6 +812,8 @@ class TestFixturesToWorkspaceFiles:
         assert "content" in entry
         assert isinstance(entry["content"], list)
         assert all(isinstance(line, str) for line in entry["content"])
+        assert isinstance(entry["created_at"], str)
+        assert isinstance(entry["modified_at"], str)
 
     def test_preserves_blank_lines_but_strips_newlines(self):
         """splitlines() drops trailing newlines but preserves blank lines
@@ -594,12 +827,16 @@ class TestFixturesToWorkspaceFiles:
     def test_empty_file_content(self):
         fixtures = {"empty.txt": ""}
         result = _fixtures_to_workspace_files(fixtures)
-        assert result["/empty.txt"] == {"content": []}
+        assert result["/empty.txt"]["content"] == []
+        assert "created_at" in result["/empty.txt"]
+        assert "modified_at" in result["/empty.txt"]
 
     def test_single_line_no_trailing_newline(self):
         fixtures = {"oneline.txt": "just one line"}
         result = _fixtures_to_workspace_files(fixtures)
-        assert result["/oneline.txt"] == {"content": ["just one line"]}
+        assert result["/oneline.txt"]["content"] == ["just one line"]
+        assert "created_at" in result["/oneline.txt"]
+        assert "modified_at" in result["/oneline.txt"]
 
 
 # ---------------------------------------------------------------------------
@@ -627,8 +864,7 @@ class TestAgentInvokeInput:
         )
 
     def test_fixtures_placed_in_workspace_files(self, tmp_path):
-        """Regression: fixtures must land in invoke_input['files'] so the
-        agent's read_file tool can access them."""
+        """Fixtures must land in invoke_input['files'] for read_file access."""
         from tests.evaluation import execution as exec_mod
 
         artifact = self._make_agent_artifact()
@@ -671,6 +907,10 @@ class TestAgentInvokeInput:
             "onset_time: '2024-07-01 05:00:00'"
         ]
         assert files["/t16_system_metrics.csv"]["content"] == ["timestamp,cpu", "0,10"]
+        assert "created_at" in files["/t16_incident.yaml"]
+        assert "modified_at" in files["/t16_incident.yaml"]
+        assert "created_at" in files["/t16_system_metrics.csv"]
+        assert "modified_at" in files["/t16_system_metrics.csv"]
 
     def test_user_message_lists_workspace_filenames(self, tmp_path):
         """Agent's user message must tell the LLM which workspace filenames
@@ -743,10 +983,7 @@ class TestAgentInvokeInput:
         Semantic invariant (NOT a dict.update ordering side-effect):
         ``_execute_agent_inner`` seeds ``workspace_files`` with the skill
         files first, then iterates fixture entries and only inserts each
-        one when its key is NOT already present. Pinned to the
-        ``if filename not in workspace_files`` guard at
-        ``tests/evaluation/execution.py`` around line 1193 (the for-loop
-        below ``workspace_files = dict(skill_files)``).
+        one when its key is NOT already present.
 
         The assertion below verifies the invariant by semantic intent:
         when a skill and a fixture share the same absolute-virtual path
@@ -788,20 +1025,16 @@ class TestAgentInvokeInput:
 
 
 # ---------------------------------------------------------------------------
-# §12 finding #12 — dynamic response_format from decomposer output_schema
+# Dynamic response_format from decomposer output_schema
 # ---------------------------------------------------------------------------
 
 
 class TestBuildDynamicResultModel:
     def test_empty_schema_returns_none(self):
-        from tests.evaluation.execution import _build_dynamic_result_model
-
         assert _build_dynamic_result_model(None) is None
         assert _build_dynamic_result_model({}) is None
 
     def test_builds_model_with_declared_keys(self):
-        from tests.evaluation.execution import _build_dynamic_result_model
-
         schema = {
             "metrics_table": "list[dict]",
             "root_cause_metric": "str",
@@ -819,26 +1052,13 @@ class TestBuildDynamicResultModel:
     def test_model_allows_extra_keys(self):
         """extra='allow' tolerates additional keys beyond the declared ones.
 
-        This is an INTENTIONAL design decision — see CLAUDE.md
-        §12 finding #12 ("AGENT output_schema compliance") and
-        ``MEMORY.md`` topic file
-        ``project_agent_output_schema_compliance.md``. Do NOT tighten to
-        ``extra='forbid'`` without revisiting that finding.
-
-        Important for lead+subagents AGENTs where the lead produces
-        aggregated output covering multiple collapsed gaps plus task-level
-        return keys. An earlier extra='forbid' design empirically failed
-        on the T16 third-run incident (2026-04-16): the lead produced
-        task-level keys as "extras", Pydantic rejected them, and the
-        whole compositional chain failed — that run is the reason this
-        test exists and the reason the decomposer's declared keys are
-        treated as a required floor with extras tolerated on top.
+        Lead-with-subagents AGENTs can return required handoff keys plus
+        task-level result keys. The decomposer-declared fields are therefore a
+        required floor, not an exhaustive schema.
 
         Required-key enforcement is NOT weakened — see
         ``test_model_still_requires_declared_keys`` below.
         """
-        from tests.evaluation.execution import _build_dynamic_result_model
-
         model = _build_dynamic_result_model({"a": "int"})
         # Declared key must be present.
         instance = model(a=1, b=2, c="extra")
@@ -849,11 +1069,6 @@ class TestBuildDynamicResultModel:
 
     def test_model_still_requires_declared_keys(self):
         """extra='allow' doesn't weaken required-key enforcement."""
-        import pytest
-        from pydantic import ValidationError
-
-        from tests.evaluation.execution import _build_dynamic_result_model
-
         model = _build_dynamic_result_model({"a": "int"})
         # Missing declared key must be rejected even with extra='allow'.
         with pytest.raises(ValidationError):
@@ -861,11 +1076,13 @@ class TestBuildDynamicResultModel:
 
 
 class TestExecuteAgentArtifactDynamicResponseFormat:
+    @staticmethod
+    def _inline_process_context():
+        return _inline_agent_process_context()
+
     @patch("tests.evaluation.execution._execute_agent_inner")
     def test_output_schema_threaded_through(self, mock_inner):
         """execute_agent_artifact forwards output_schema to _execute_agent_inner."""
-        from tests.evaluation.execution import execute_agent_artifact
-
         mock_inner.return_value = {"metrics_table": [], "root_cause_metric": "x"}
 
         artifact = SimpleNamespace(agent_config={"system_prompt": "you are"})
@@ -875,10 +1092,14 @@ class TestExecuteAgentArtifactDynamicResponseFormat:
             "metrics_table": "list[dict]",
             "root_cause_metric": "str",
         }
-        execute_agent_artifact(
-            artifact, task, {},
-            output_schema=output_schema,
-        )
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=self._inline_process_context(),
+        ):
+            execute_agent_artifact(
+                artifact, task, {},
+                output_schema=output_schema,
+            )
 
         # _execute_agent_inner received output_schema as a keyword arg.
         _, kwargs = mock_inner.call_args
@@ -886,14 +1107,80 @@ class TestExecuteAgentArtifactDynamicResponseFormat:
 
     @patch("tests.evaluation.execution._execute_agent_inner")
     def test_default_no_output_schema(self, mock_inner):
-        """Existing callers without output_schema still work — param defaults to None."""
-        from tests.evaluation.execution import execute_agent_artifact
-
+        """Callers without output_schema still get the default response model."""
         mock_inner.return_value = {}
         artifact = SimpleNamespace(agent_config={"system_prompt": "you are"})
         task = SimpleNamespace(task_id="", task_prompt="test")
 
-        execute_agent_artifact(artifact, task, {})
+        with patch(
+            "tests.evaluation.execution._agent_process_context",
+            return_value=self._inline_process_context(),
+        ):
+            execute_agent_artifact(artifact, task, {})
+
+        _, kwargs = mock_inner.call_args
+        assert kwargs["output_schema"] is None
+
+
+class TestAgentProcessContext:
+    def test_prefers_spawn_on_darwin(self, monkeypatch):
+        import tests.evaluation.execution as exec_mod
+
+        calls = []
+
+        def _fake_get_context(method=None):
+            calls.append(method)
+            return method
+
+        monkeypatch.setattr(exec_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(exec_mod.multiprocessing, "get_context", _fake_get_context)
+
+        ctx = _agent_process_context()
+        assert ctx == "spawn"
+        assert calls == ["spawn"]
+
+    def test_prefers_fork_off_darwin(self, monkeypatch):
+        import tests.evaluation.execution as exec_mod
+
+        calls = []
+
+        def _fake_get_context(method=None):
+            calls.append(method)
+            return method
+
+        monkeypatch.setattr(exec_mod.sys, "platform", "linux")
+        monkeypatch.setattr(exec_mod.multiprocessing, "get_context", _fake_get_context)
+
+        ctx = _agent_process_context()
+        assert ctx == "fork"
+        assert calls == ["fork"]
+
+
+class TestExecuteSkillArtifactDynamicResponseFormat:
+    @patch("tests.evaluation.execution._execute_skill_inner")
+    def test_output_schema_threaded_through(self, mock_inner):
+        mock_inner.return_value = {"summary": "ok", "counts": {}}
+
+        artifact = SimpleNamespace(skill_content="# skill")
+        task = SimpleNamespace(task_id="T04", task_prompt="test")
+        output_schema = {"summary": "str", "counts": "dict"}
+
+        execute_skill_artifact(
+            artifact, task, {},
+            output_schema=output_schema,
+        )
+
+        _, kwargs = mock_inner.call_args
+        assert kwargs["output_schema"] == output_schema
+
+    @patch("tests.evaluation.execution._execute_skill_inner")
+    def test_default_no_output_schema(self, mock_inner):
+        mock_inner.return_value = {}
+
+        artifact = SimpleNamespace(skill_content="# skill")
+        task = SimpleNamespace(task_id="T04", task_prompt="test")
+
+        execute_skill_artifact(artifact, task, {})
 
         _, kwargs = mock_inner.call_args
         assert kwargs["output_schema"] is None

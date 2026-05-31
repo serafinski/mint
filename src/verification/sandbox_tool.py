@@ -1,7 +1,7 @@
-"""Docker-based sandbox execution for adversarial and behavioral verification.
+"""Docker-based sandbox execution shared by verification and eval runtime paths.
 
-IMPORTANT: Always use sandbox_execute for running untrusted code — never
-sys.executable or ToolLoader.execute_tool, which run on the host.
+Use these helpers for generated or otherwise untrusted Python. Do not run
+untrusted snippets through ``sys.executable`` or host-side tool loaders.
 """
 
 import ast
@@ -15,9 +15,9 @@ from typing import Annotated
 from langchain.chat_models import init_chat_model
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
-
 from src.config import DOCKER_PREINSTALLED, SANDBOX_IMAGE
+
+logger = logging.getLogger(__name__)
 
 _BASE_PACKAGES = frozenset(sys.stdlib_module_names) | DOCKER_PREINSTALLED
 
@@ -32,8 +32,10 @@ _pip_resolution_cache: dict[str, str] = {}
 
 class _PackageMapping(BaseModel):
     """LLM response: mapping from Python import names to PyPI package names."""
+
     mappings: dict[str, str] = Field(
-        description="Dict mapping each Python import name to its PyPI package name"
+        default_factory=dict,
+        description="Dict mapping each Python import name to its PyPI package name",
     )
 
 
@@ -44,7 +46,6 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
     Results are cached in ``_pip_resolution_cache`` for the session.
     Falls back to identity mapping (import name = pip name) on any error.
     """
-    # Check cache — only query uncached imports.
     uncached = [name for name in import_names if name not in _pip_resolution_cache]
     if not uncached:
         return {name: _pip_resolution_cache[name] for name in import_names}
@@ -66,7 +67,22 @@ def _resolve_imports_via_llm(import_names: list[str]) -> dict[str, str]:
 
         result: _PackageMapping = structured_llm.invoke(prompt)
 
-        # Update cache with LLM results.
+        if not result.mappings:
+            logger.warning(
+                "LLM package resolution returned an empty mapping for imports %s. "
+                "Falling back to identity mapping (import name = pip name).",
+                list(uncached),
+            )
+        else:
+            missing = [name for name in uncached if name not in result.mappings]
+            if missing:
+                logger.warning(
+                    "LLM package resolution returned a partial mapping for imports %s. "
+                    "Missing %s; falling back to identity mapping for missing imports.",
+                    list(uncached),
+                    missing,
+                )
+
         for name in uncached:
             pip_name = result.mappings.get(name, name)
             _pip_resolution_cache[name] = pip_name
@@ -160,9 +176,9 @@ def sandbox_execute(
 
     Raises nothing — all failures are captured in the return dict.
 
-    Step 13.7 Batch C3: emits a ``sandbox.execute`` LangFuse event with
-    execution metadata so programmatic (non-LangChain) sandbox invocations
-    are discoverable in the UI. Use this variant for:
+    Emits a ``sandbox.execute`` LangFuse event with execution metadata so
+    programmatic, non-LangChain sandbox invocations are visible in traces.
+    Use this variant for:
 
     - Generated SKILL runtime's manual tool-dispatch loop (``tests/evaluation/
       execution.py:617``) — the loop calls ``sandbox_execute`` OUTSIDE any
@@ -171,24 +187,18 @@ def sandbox_execute(
     - Tier 1.5 import check (``src/verification/import_check.py``)
     - Tier 2 behavioral probes (``src/verification/behavioral.py``)
     - Coverage replay (``src/verification/coverage.py``)
-    - CLI execution (``src/cli/runner.py``)
 
     For DeepAgent-dispatched invocations (adversarial Tier 3 + generated
     AGENT runtime via ``create_deep_agent(tools=[...])``), use
     ``sandbox_execute_silent`` instead — those are auto-traced by
     LangChain as ``type=TOOL`` observations with strictly more detail
     (full code, full stdout/stderr, precise latency, tool_call_id, LangGraph
-    graph position). The event would be pure duplicate. See
-    ``docs/langfuse_redundancy_audit_2026_04_19.md`` Fix #1.
+    graph position). The explicit event would duplicate that observation.
     """
     result = _sandbox_execute_impl(code, timeout, extra_packages, allow_network=allow_network)
 
-    # C3 span emission — best effort. Route through emit_langfuse_event
-    # rather than lf.create_event directly so the trace_context fallback
-    # applies: sandbox_execute is called from inside bind_tools LLMs and
-    # DeepAgents where LangGraph's get_config() returns None, so without
-    # the fallback the event lands as a top-level untagged trace
-    # (Step 13.7 tag-propagation fix, 2026-04-19).
+    # Best effort. Route through emit_langfuse_event so trace_context fallback
+    # metadata applies even when LangGraph config is not available.
     try:
         from src.orchestrator.tracing import emit_langfuse_event
 
@@ -233,23 +243,17 @@ def sandbox_execute_silent(
     - LangGraph graph position (``langgraph_step``, ``langgraph_node``,
       ``langgraph_checkpoint_ns``)
 
-    Emitting the event on top would produce a redundant child of the TOOL
-    observation — same information, less detail. Using the silent variant
-    here drops ~23% of ``sandbox.execute`` event volume per run with zero
-    information loss.
+    Emitting our event on top would produce a redundant child of the TOOL
+    observation with less detail.
 
     Call sites using this variant:
       - ``src/verification/adversarial.py``: DeepAgent prober's tool-call
       - ``tests/evaluation/execution.py`` (AGENT runtime): ``tools=[sandbox_execute_silent]``
         passed to ``create_deep_agent``
 
-    DO NOT use for programmatic callers (Tier 1.5/2, coverage, CLI) or
+    DO NOT use for programmatic callers (Tier 1.5/2, coverage) or
     SKILL runtime's manual loop — those are NOT auto-traced, and the
-    silent variant would leave them invisible. See
-    ``docs/langfuse_redundancy_audit_2026_04_19.md`` Fix #1 for the
-    empirical trail (38 TOOL observations mapped 1:1 to the redundant
-    subset of the 162 ``sandbox.execute`` events observed in the
-    longitudinal-shift probe).
+    silent variant would leave them invisible.
     """
     return _sandbox_execute_impl(code, timeout, extra_packages, allow_network=allow_network)
 
@@ -328,11 +332,11 @@ def _sandbox_execute_with_install(
     code: str, timeout: int, packages: list[str],
     *, workspace_path: Path | None = None, allow_network: bool = False,
 ) -> dict:
-    """Install extra packages (with network), then run code (without network).
+    """Install extra packages, then run code under the requested network policy.
 
     Uses a two-phase approach:
     1. ``docker run`` with network to ``uv pip install`` packages into a committed layer
-    2. ``docker run --network none`` to execute the script against that layer
+    2. ``docker run`` to execute the script against that layer
 
     The ephemeral image is cleaned up after execution.
     """
@@ -340,19 +344,10 @@ def _sandbox_execute_with_install(
 
     ephemeral_tag = f"jit-sandbox-eph-{uuid.uuid4().hex[:8]}"
 
-    # Security audit finding #6 (2026-04-19): validate package names via
-    # the PEP 508 grammar (``packaging.requirements.Requirement``) rather
-    # than a narrow regex that false-rejects legitimate forms like
-    # ``pandas>=2.0,<3`` (compound versions), ``pydantic[email]`` (extras),
-    # or ``requests ; python_version > "3.8"`` (env markers). The previous
-    # regex silently stripped those entries and — when ALL entries were
-    # rejected — fell through to a no-install ``sandbox_execute`` call,
-    # causing the code to fail with ``ModuleNotFoundError`` that the
-    # Pillar 2 gate mis-attributed to the generated source.
-    #
-    # Defence-in-depth against argv injection remains intact: the install
-    # call at line ~357 uses ``subprocess.run([...])`` list-form, so each
-    # package is a separate argv entry — no shell interpretation.
+    # Validate package names via the PEP 508 grammar so legitimate forms like
+    # version ranges, extras, and environment markers are accepted. The docker
+    # call uses subprocess list-form, so each package is a separate argv entry
+    # with no shell interpretation.
     from packaging.requirements import InvalidRequirement, Requirement
 
     good: list[str] = []
@@ -372,11 +367,8 @@ def _sandbox_execute_with_install(
 
     if not good:
         # Loud-fail: do NOT fall through to a no-install sandbox_execute.
-        # Pre-fix that path masked the real cause (rejected requirements)
-        # behind a ``ModuleNotFoundError`` in the generated code, which
-        # the Pillar 2 gate then blamed on the artifact. Return a
-        # ``pip_requirement_rejected`` shaped dict so callers can surface
-        # it as the correct VerificationReport finding category.
+        # Return a ``pip_requirement_rejected`` shaped dict so callers can
+        # surface the malformed requirement as the real failure cause.
         return {
             "stdout": "",
             "stderr": (
@@ -391,7 +383,7 @@ def _sandbox_execute_with_install(
 
     packages = good
 
-    # Phase 1: install packages (with network, 60s timeout)
+    # Install packages with network access into an ephemeral image.
     pip_args = ", ".join(repr(p) for p in packages)
     install_script = (
         "import subprocess; "
@@ -411,7 +403,9 @@ def _sandbox_execute_with_install(
             ],
             capture_output=True,
             text=True,
-            timeout=60,
+            # Heavy data-science stacks can exceed a minute on cold PyPI
+            # installs or slow mirrors. Keep the install bounded but generous.
+            timeout=180,
         )
         if install_proc.returncode != 0:
             # Cleanup container
@@ -421,6 +415,7 @@ def _sandbox_execute_with_install(
                 "stderr": f"uv pip install failed: {install_proc.stderr}",
                 "exit_code": install_proc.returncode,
                 "success": False,
+                "error_category": "dependency_install_failure",
             }
 
         # Commit container to ephemeral image
@@ -437,12 +432,12 @@ def _sandbox_execute_with_install(
         return {
             "stdout": "", "stderr": "Timeout during uv pip install",
             "exit_code": -1, "success": False,
+            "error_category": "dependency_install_timeout",
         }
     except Exception as exc:
         subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
         return {"stdout": "", "stderr": str(exc), "exit_code": -1, "success": False}
 
-    # Phase 2: run the actual code against ephemeral image
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(code)
         script_path = f.name
@@ -481,3 +476,186 @@ def _sandbox_execute_with_install(
         Path(script_path).unlink(missing_ok=True)
         # Cleanup ephemeral image
         subprocess.run(["docker", "rmi", "-f", ephemeral_tag], capture_output=True)
+
+
+# ---------------------------------------------------------------------------
+# Cached-image probe batching
+# ---------------------------------------------------------------------------
+#
+# Tier 2 can run several probes against the same dependency-heavy artifact.
+# Prepare one image per task, share it across probes, and clean it up at the
+# end instead of reinstalling packages for every probe.
+
+
+def prepare_cached_image(
+    packages: list[str],
+) -> tuple[str, dict | None]:
+    """Build a single ephemeral image with the declared packages installed.
+
+    Downstream Tier 2 probes invoke ``sandbox_execute_with_cached_image``
+    against the returned tag, paying only the ``docker run`` overhead per
+    probe with no reinstall.
+
+    Returns ``(image_tag, error_dict_or_None)``. On install failure the
+    error_dict matches the shape returned by ``_sandbox_execute_with_install``
+    (``{"success": False, "error_category": ..., ...}``) so callers can
+    propagate the failure to all probes uniformly.
+
+    Caller is responsible for ``cleanup_cached_image(tag)`` in a finally
+    block. The image tag is unique per call (UUID-suffixed).
+    """
+    import uuid
+
+    if not packages:
+        return SANDBOX_IMAGE, None
+
+    # Reuse the install logic from _sandbox_execute_with_install. We
+    # can't call it directly because it commits then immediately uses
+    # the image; refactoring would risk regression in the single-call
+    # path. Inline the install phase here, keeping the validation +
+    # error-shape behaviour identical.
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    good: list[str] = []
+    rejected: list[tuple[str, str]] = []
+    for p in packages:
+        try:
+            Requirement(p)
+            good.append(p)
+        except InvalidRequirement as exc:
+            rejected.append((p, str(exc)))
+
+    if rejected:
+        logger.warning(
+            "prepare_cached_image: dropping malformed pip requirements "
+            "(not PEP 508): %s",
+            rejected,
+        )
+
+    if not good:
+        return "", {
+            "stdout": "",
+            "stderr": (
+                "All pip requirements rejected as malformed — no-install "
+                "fallback would mask missing deps. "
+                f"Rejected: {rejected}"
+            ),
+            "exit_code": -1,
+            "success": False,
+            "pip_requirement_rejected": rejected,
+        }
+
+    ephemeral_tag = f"jit-sandbox-cached-{uuid.uuid4().hex[:8]}"
+    pip_args = ", ".join(repr(p) for p in good)
+    install_script = (
+        "import subprocess; "
+        f"subprocess.check_call(['uv', 'pip', 'install', '--system', '--no-cache', {pip_args}])"
+    )
+    try:
+        install_proc = subprocess.run(
+            [
+                "docker", "run",
+                "--name", ephemeral_tag,
+                "--network", "bridge",
+                "--memory", "256m",
+                "--cpus", "0.5",
+                "--user", "root",
+                SANDBOX_IMAGE,
+                "-c", install_script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if install_proc.returncode != 0:
+            subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
+            return "", {
+                "stdout": "",
+                "stderr": f"uv pip install failed: {install_proc.stderr}",
+                "exit_code": install_proc.returncode,
+                "success": False,
+                "error_category": "dependency_install_failure",
+            }
+
+        subprocess.run(
+            ["docker", "commit", ephemeral_tag, ephemeral_tag],
+            capture_output=True,
+            timeout=30,
+        )
+        subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
+
+    except subprocess.TimeoutExpired:
+        subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
+        return "", {
+            "stdout": "", "stderr": "Timeout during uv pip install (prepare_cached_image)",
+            "exit_code": -1, "success": False,
+            "error_category": "dependency_install_timeout",
+        }
+    except Exception as exc:
+        subprocess.run(["docker", "rm", "-f", ephemeral_tag], capture_output=True)
+        return "", {"stdout": "", "stderr": str(exc), "exit_code": -1, "success": False}
+
+    return ephemeral_tag, None
+
+
+def cleanup_cached_image(image_tag: str) -> None:
+    """Remove a cached image produced by ``prepare_cached_image``.
+
+    Safe to call with the base image tag (``SANDBOX_IMAGE``) — the
+    function no-ops in that case so callers don't need to guard.
+    """
+    if not image_tag or image_tag == SANDBOX_IMAGE:
+        return
+    subprocess.run(["docker", "rmi", "-f", image_tag], capture_output=True)
+
+
+def sandbox_execute_with_cached_image(
+    code: str,
+    image_tag: str,
+    *,
+    timeout: int = 30,
+    workspace_path: str | Path | None = None,
+    allow_network: bool = False,
+) -> dict:
+    """Execute ``code`` against a pre-built cached image.
+
+    Skips the pip-install phase entirely. Pass ``image_tag=SANDBOX_IMAGE``
+    (or whatever ``prepare_cached_image`` returned when ``packages`` was
+    empty) to run against the bare base image.
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(code)
+        script_path = f.name
+
+    network_flag = "bridge" if allow_network else "none"
+    docker_args = [
+        "docker", "run", "--rm",
+        "--network", network_flag,
+        "--memory", "128m",
+        "--cpus", "0.5",
+        "--user", "sandbox",
+        "-v", f"{script_path}:/sandbox/script.py:ro",
+    ]
+    if workspace_path is not None:
+        docker_args += ["-v", f"{workspace_path}:/workspace"]
+    docker_args += [image_tag, "/sandbox/script.py"]
+
+    try:
+        proc = subprocess.run(
+            docker_args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return {
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "exit_code": proc.returncode,
+            "success": proc.returncode == 0,
+        }
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "Timeout", "exit_code": -1, "success": False}
+    except Exception as exc:
+        return {"stdout": "", "stderr": str(exc), "exit_code": -1, "success": False}
+    finally:
+        Path(script_path).unlink(missing_ok=True)

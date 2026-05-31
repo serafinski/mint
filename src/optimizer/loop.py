@@ -18,7 +18,8 @@ from src.config import AUTO_OPTIMIZER_THRESHOLD
 from src.optimizer.operations import merge, prune, split
 from src.optimizer.utility import compute_all_utilities
 from src.registry.metrics import MetricsStore
-from src.registry.store import SkillRegistry
+from src.registry.store import CapabilityRegistry
+from src.schemas.capability import CapabilityDescriptor
 from src.schemas.metrics import GranularityMetrics
 from src.schemas.optimizer_config import OptimizerConfig
 
@@ -61,8 +62,8 @@ class OptimizerState(BaseModel):
     allow_network: bool = Field(
         default=False,
         description=(
-            "Network policy inherited from the enclosing TaskState (Step "
-            "14.12). When True, merge/split variant verification runs with "
+            "Network policy inherited from the enclosing TaskState. When "
+            "True, merge/split variant verification runs with "
             "``--network bridge`` in Tier 2 / Tier 3, and MCP_TOOL coverage "
             "replay honors the same policy. Offline-by-default preserves "
             "the standard safety posture."
@@ -84,9 +85,9 @@ def _compute_kl_divergence(
 
     NOTE — this is the *online* convergence metric stored in
     ``OptimizerState.kl_divergence`` and propagated across pipeline
-    invocations via ``_prev_optimizer_scores``.  A separate histogram-based
-    KL implementation exists in ``simulation.py`` for visualisation; the two
-    measure different aspects of convergence (see ``_kl_divergence`` there).
+    invocations via ``_prev_optimizer_scores``. The longitudinal analyzer uses
+    the same utility-score distribution semantics as the longitudinal
+    convergence analyzer.
     """
     if not prev_scores or not curr_scores:
         # Empty distribution signals catastrophic failure (e.g. all pruned),
@@ -116,9 +117,7 @@ def _compute_kl_divergence(
     return float(entropy(curr, prev))
 
 
-def _schema_jaccard(
-    cap_a: "CapabilityDescriptor", cap_b: "CapabilityDescriptor"
-) -> float:
+def _schema_jaccard(cap_a: CapabilityDescriptor, cap_b: CapabilityDescriptor) -> float:
     """Jaccard similarity over the union of input+output schema key names.
 
     Implements the proposal's second Merge conjunct: *"overlapping input
@@ -148,7 +147,7 @@ def _schema_jaccard(
 
 
 def create_optimization_loop(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     metrics_store: MetricsStore,
     *,
     prune_window_days: int = 30,
@@ -161,21 +160,19 @@ def create_optimization_loop(
     """Build the LangGraph optimization loop.
 
     Args:
-        optimizer_config: Per-operation enable/disable config (§12 finding
-            #8). When ``None``, defaults to all-``"on"`` — preserves the
-            pre-finding-#8 semantic where the loop unconditionally ran
-            all three operations whenever invoked. Threshold gating
-            belongs to the caller (``create_pipeline`` decides whether to
-            invoke the loop at all based on invocation_count vs
+        optimizer_config: Per-operation enable/disable config. When ``None``,
+            defaults to all-``"on"`` so the loop unconditionally runs all
+            three operations whenever invoked. Threshold gating belongs to
+            the caller (``create_pipeline`` decides whether to invoke the
+            loop at all based on invocation_count vs
             ``AUTO_OPTIMIZER_THRESHOLD``); once invoked, each operation
             honors its per-config setting.
 
     Returns a compiled StateGraph.
     """
-    # Default to all-"on" when caller doesn't specify — preserves the
-    # pre-finding-#8 loop semantic (operations always fire when invoked).
-    # The threshold gate is enforced upstream by create_pipeline / the CLI
-    # runner, not by this loop.
+    # Default to all-"on" when caller doesn't specify: operations always fire
+    # when this loop is invoked. The threshold gate is enforced upstream by
+    # create_pipeline / callers, not by this loop.
     _config = optimizer_config or OptimizerConfig.all_on()
 
     def compute_metrics_node(state: OptimizerState) -> Command:
@@ -189,13 +186,11 @@ def create_optimization_loop(
                 goto="identify_candidates",
             )
 
-        # Compute KL divergence against previous cycle
         kl = _compute_kl_divergence(state.previous_utility_scores, scores)
 
-        # Step 13.7 Batch A4 — emit KL as a LangFuse score attached to
-        # the active trace so Chapter 5.4 convergence analysis is
-        # queryable via LangFuse dashboards (not just DuckDB
-        # cycle_utility_scores). Never raises.
+        # Emit KL as a LangFuse score attached to the active trace so
+        # convergence analysis is queryable via dashboards, not just DuckDB
+        # cycle_utility_scores. Never raises.
         try:
             from langfuse import get_client
             try:
@@ -256,16 +251,16 @@ def create_optimization_loop(
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to compute metrics for '%s': %s", cap_id, e)
 
-        # Build merge pairs: low-reuse capability pairs with high embedding
-        # similarity AND overlapping I/O schemas (the second proposal conjunct).
+        # Merge pairs need low reuse, high embedding similarity, and
+        # overlapping I/O schemas (the second proposal conjunct).
         # Use registry.search() to find semantically similar partners rather
         # than pairing consecutive capabilities (which would be arbitrary).
         #
         # Type scoping: candidates are collected across all three capability
         # types (MCP_TOOL, SKILL, AGENT). Pairing within the search loop
-        # enforces same-type pairs — cross-type merge is not supported
-        # because merge() dispatches on type and the combined executable
-        # content only makes sense within a type (Ch 7 future work).
+        # enforces same-type pairs — cross-type merge is not supported because
+        # merge() dispatches on type and the combined executable content only
+        # makes sense within a type.
         low_reuse: list[str] = []
         for cap_id in state.capabilities_snapshot:
             cap = registry.get(cap_id)
@@ -332,10 +327,10 @@ def create_optimization_loop(
     def apply_operations_node(state: OptimizerState) -> Command:
         """Apply prune, split, and merge operations.
 
-        Each operation is gated independently against ``optimizer_config``
-        per §12 finding #8. The gate resolves ``"auto"`` against the
-        current ``AUTO_OPTIMIZER_THRESHOLD`` using ``invocation_count`` from
-        the metrics store; ``"on"`` always runs; ``"off"`` always skips.
+        Each operation is gated independently against ``optimizer_config``.
+        The gate resolves ``"auto"`` against the current
+        ``AUTO_OPTIMIZER_THRESHOLD`` using ``invocation_count`` from the
+        metrics store; ``"on"`` always runs; ``"off"`` always skips.
         """
         errors = list(state.errors)
         pruned: list[str] = []
@@ -434,7 +429,6 @@ def create_optimization_loop(
             goto=END,
         )
 
-    # Build graph
     graph = StateGraph(OptimizerState)
     graph.add_node("compute_metrics", compute_metrics_node)
     graph.add_node("identify_candidates", identify_candidates_node)

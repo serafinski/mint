@@ -1,27 +1,15 @@
-"""Coverage verifier — the "Pillar 2 meets Pillar 3" coverage cross-check for split.
+"""Split coverage verifier for optimizer split operations.
 
-Step 7 of the B1 Pillar 3 main block (2026-04-16). Runs newly-generated
-split variants against the parent capability's recorded failure cases
-and asserts each variant collectively fixes the specific failure modes
-recorded on the parent. This is a genuinely new piece of verification
-infrastructure that couples Pillar 3 Split to the parent's recorded
-failure history — an **additive strengthening** beyond the proposal's
-explicit requirements, in the same category as Step 5's atomic rollback
-helper (`verify_and_register_or_rollback`).
+This module replays newly generated split variants against the parent
+capability's recorded failure cases. It is not an additional verification
+tier. The three-tier gate certifies each variant as a standalone artifact;
+this coverage check verifies whether the variants collectively address the
+parent's observed failure modes.
 
-**Not a fourth Pillar 2 tier.** Earlier master plan prose called this a
-"Tier 4 coverage verifier" which oversold the relationship to the
-three-tier gate. It is NOT a fourth tier — it is a separate coverage
-cross-check orthogonal to the gate. The three-tier gate certifies each
-variant as a standalone artifact (safety). The coverage verifier
-certifies that the variants COLLECTIVELY cover the parent's failure
-modes (specialization). They operate on different axes.
-
-**"Handled" semantics — failure-mode-fix, not correctness-verified.**
-Without external ground truth or an LLM judge, we cannot assert
-"variant X produces the right answer on failure case Y". What we CAN
-verify is whether the variant fixes the specific failure mode recorded
-in the parent's ``InvocationRecord``:
+"Handled" means "the recorded failure mode changed", not "the variant is
+proven correct". Without external ground truth or an LLM judge, this module
+can only compare replay behavior against the parent's recorded
+``InvocationRecord``:
 
 - **Error-case** (parent's ``error_message is not None``): variant
   handles the case iff it runs on the recorded ``input_args`` without
@@ -36,47 +24,16 @@ in the parent's ``InvocationRecord``:
   the strongest achievable signal. Medium signal.
 
 - **Same-output-case** (variant produces the same output as the parent
-  on the same input): cannot verify, flagged as ``unverifiable``. The
-  wrong-output case wasn't actually fixed — both return the same wrong
-  thing.
+  on the same input): not handled. The variant did not differentiate from
+  the parent's recorded wrong output.
 
-See ``docs/MASTER_PLAN_2026_04_13.md`` §12 pre-registered finding #5
-for the full semantic gap + Chapter 4 disclosure text + the Pillar 1 ×
-Pillar 3 tension analysis justifying the MCP_TOOL-only scope below.
-
-**MCP_TOOL-only scope.** Coverage verification is implemented for
-``MCP_TOOL`` variants only. SKILL and AGENT variants return a
-``CoverageReport(all_covered=True, status="unverifiable_type")`` that
-counts as vacuously passing. This is NOT an infrastructure-complexity
-decision — it is the correct response to an implicit assumption in
-the proposal's Pillar 3 Split clause that only holds for deterministic
-execution:
-
-- The proposal's Pillar 1 classification explicitly labels MCP_TOOL as
-  ``Deterministic + stateless`` and SKILL/AGENT as
-  ``Procedural + domain-specific`` / ``Stateful + requires planning``
-  respectively. MCP_TOOL is the deterministic path; SKILL/AGENT are
-  LLM-mediated.
-- The proposal's Pillar 3 Split clause frames specialization in terms
-  of *"input subspaces where the capability breaks"*, which presupposes
-  stable per-input failure semantics — some inputs always break, some
-  always work. For deterministic MCP_TOOL this holds. For LLM-mediated
-  SKILL/AGENT it does not: same input yields different outputs per
-  invocation, so "breaks on X" is a per-invocation event rather than a
-  per-input property, and there is no stable subspace to specialize
-  variants for.
-- The coverage verifier's *"did the variant fix the failure on input
-  X?"* question is well-defined only for deterministic executors. For
-  nondeterministic executors it collapses into *"did the variant
-  happen to succeed on this replay?"*, which tells us nothing — the
-  parent might also happen to succeed on replay, purely from LLM
-  variance with no variant involved.
-
-For SKILL/AGENT splits, the three-tier verification gate still runs
-per variant (artifact safety check) — coverage verification is simply
-not applicable. Full correctness verification for nondeterministic
-executors (per-variant replay statistics or LLM-judged correctness) is
-Chapter 7 future work.
+Coverage replay is implemented for deterministic ``MCP_TOOL`` variants.
+``SKILL`` and ``AGENT`` variants return
+``CoverageReport(all_covered=True, status="unverifiable_type")`` because
+their execution is LLM-mediated and does not provide stable per-input
+failure semantics. For those capability types, the three-tier verification
+gate still runs per variant; collective replay coverage is simply not
+applicable.
 
 **Never raises.** All failure paths are captured in the returned
 ``CoverageReport`` with ``execution_errors`` populated. Callers
@@ -130,9 +87,9 @@ class CoverageReport(BaseModel):
         description=(
             "True iff every recorded failure case has at least one "
             "variant that handled it, vacuously True for empty failure "
-            "case lists, vacuously True for non-MCP_TOOL variant types "
-            "per the MCP_TOOL-only scope documented in "
-            "docs/MASTER_PLAN_2026_04_13.md §12 finding #5."
+            "case lists, and vacuously True for non-MCP_TOOL variant "
+            "types because deterministic replay coverage is not "
+            "applicable to LLM-mediated executors."
         ),
     )
     status: CoverageStatus = Field(
@@ -145,7 +102,7 @@ class CoverageReport(BaseModel):
             "is trivially satisfied. "
             "``unverifiable_type`` — variants are SKILL or AGENT, which "
             "fall outside the coverage verifier's deterministic-execution "
-            "scope per Pillar 1 × Pillar 3 tension (finding #5). "
+            "scope. "
             "``error`` — replay infrastructure itself failed; "
             "``execution_errors`` contains details and ``all_covered`` "
             "is set to ``False`` to trigger rollback."
@@ -156,8 +113,8 @@ class CoverageReport(BaseModel):
         description=(
             "Maps failure-case task_id to the list of variant "
             "capability names that handled it. Populated only under "
-            "``status='verified'``. Used by Chapter 4 / Chapter 6 "
-            "analysis to understand which variants specialized where."
+            "``status='verified'`` so callers can inspect which "
+            "variants specialized where."
         ),
     )
     uncovered_cases: list[str] = Field(
@@ -222,16 +179,10 @@ def _build_replay_code(
                 return
             try:
                 result = await {func_name}(**_kwargs)
-                # Serialize the result to JSON for comparison with the
-                # parent's recorded ``actual_output``. Security audit
-                # finding #15 (2026-04-20): ``sort_keys=True`` MUST match
-                # ``serialize_for_invocation``'s policy at the parent
-                # side — pre-fix the asymmetry caused semantically-
-                # identical dicts (same data, different Python iteration
-                # order) to string-compare unequal, which
-                # ``_variant_handles_case`` then reported as handled=True
-                # (false-positive split coverage).
-                print(json.dumps({{"result": json.dumps(result, default=str, sort_keys=True), "error": None}}))
+                # Sort keys so replay output compares consistently with
+                # the parent's recorded ``actual_output``.
+                serialized = json.dumps(result, default=str, sort_keys=True)
+                print(json.dumps({{"result": serialized, "error": None}}))
             except Exception as exc:
                 print(json.dumps({{
                     "result": None,
@@ -243,16 +194,14 @@ def _build_replay_code(
 
 
 def _parse_replay_output(sandbox_result: dict) -> dict | None:
-    """Parse the JSON output from a replay run. Returns None on failure."""
-    if not sandbox_result.get("success"):
-        return None
-    stdout = sandbox_result.get("stdout", "").strip()
-    if not stdout:
-        return None
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
-        return None
+    """Parse the JSON output from a replay run. Returns None on failure.
+
+    Delegates to the shared ``parse_sandbox_last_json_line`` helper so
+    coverage replay tolerates debug-print prefixes before the final JSON
+    line.
+    """
+    from src.verification.sandbox_parse import parse_sandbox_last_json_line
+    return parse_sandbox_last_json_line(sandbox_result)
 
 
 def _variant_handles_case(
@@ -293,18 +242,12 @@ def _variant_handles_case(
     if not input_args_json:
         return False, (
             f"failure case task_id='{failure.task_id}' has no input_args "
-            "(pre-Step-4 record or never captured)"
+            "(legacy record or never captured)"
         )
 
-    # Security audit finding #16 (2026-04-20): detect the truncation
-    # sentinel emitted by ``serialize_for_invocation`` on oversize
-    # payloads. Pre-fix the function emitted invalid JSON which
-    # ``json.loads`` inside the replay sandbox rejected with
-    # ``JSONDecodeError``, causing every truncated case to be silently
-    # counted as "not handled" regardless of variant behavior. Post-fix
-    # the sentinel is valid JSON; explicitly report the case as
-    # unreproducible so the CoverageReport's ``execution_errors`` list
-    # carries the accurate reason.
+    # Detect the truncation sentinel emitted by ``serialize_for_invocation``
+    # on oversize payloads. Truncated cases are unreproducible, so report
+    # that explicitly in ``execution_errors``.
     try:
         parsed_args = json.loads(input_args_json)
     except (json.JSONDecodeError, ValueError):
@@ -384,13 +327,9 @@ def _variant_handles_case(
         # Count as not handled (conservative).
         return False, None
 
-    # Security audit finding #15 (2026-04-20) defence-in-depth: compare
-    # parsed values, not strings. This closes key-order asymmetry (fixed
-    # at the source by the sort_keys=True addition above), whitespace
-    # differences, int-vs-float (``1`` vs ``1.0`` — ``==`` in Python
-    # returns True), and any future ``default=str`` drift between the
-    # parent and variant serialization paths. Falls back to string
-    # compare on parse failure so legacy rows still work.
+    # Compare parsed values, not strings, so key order, whitespace, and
+    # int-vs-float representation differences do not create false coverage
+    # evidence. Fall back to string comparison for legacy non-JSON rows.
     if _semantic_equal(replay_result, parent_output):
         # Same output as the parent → variant didn't differentiate.
         # Not handled.
@@ -426,7 +365,7 @@ def verify_coverage(
 ) -> CoverageReport:
     """Verify split variants collectively cover the parent's failure cases.
 
-    The top-level entry point used by Step 8's per-type split helpers.
+    The top-level entry point used by the per-type split helpers.
     Dispatches by the variants' capability type:
 
     - **MCP_TOOL** (deterministic): replays each failure case against
@@ -435,8 +374,7 @@ def verify_coverage(
       full verified report.
     - **SKILL / AGENT** (LLM-mediated, nondeterministic): returns a
       ``CoverageReport(all_covered=True, status="unverifiable_type")``
-      per the MCP_TOOL-only scope documented in the module docstring
-      and in ``docs/MASTER_PLAN_2026_04_13.md`` §12 finding #5.
+      per the MCP_TOOL-only scope documented in the module docstring.
 
     Empty variant list or empty failure case list → vacuously covered.
 
@@ -479,7 +417,7 @@ def verify_coverage(
     if first_type != CapabilityType.MCP_TOOL:
         logger.info(
             "verify_coverage: variants are %s — returning unverifiable_type "
-            "per MCP_TOOL-only scope (finding #5). SKILL/AGENT splits rely "
+            "per MCP_TOOL-only scope. SKILL/AGENT splits rely "
             "on the three-tier gate per variant without collective coverage "
             "verification.",
             first_type.value,
@@ -540,9 +478,8 @@ def verify_coverage(
     # this as status='error' rather than 'verified' so callers can
     # distinguish "variants genuinely didn't cover anything" from
     # "replay infrastructure failed on everything".
-    # Step 13.7 Batch B4: emit LangFuse event so Chapter 5.3's
-    # coverage-verification narrative is traceable in the LangFuse UI
-    # alongside the split_variant / split_rollback events. Never raises.
+    # Emit a LangFuse event so coverage verification is traceable alongside
+    # split_variant and split_rollback events. Never raises.
     try:
         from src.orchestrator.tracing import emit_langfuse_event
         _cov_status = (

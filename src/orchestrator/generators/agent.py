@@ -20,7 +20,11 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from src.orchestrator.generators.skill import extract_skill_name, validate_skill_content
-from src.orchestrator.generators.utils import build_task_context, slugify_gap_hyphen
+from src.orchestrator.generators.utils import (
+    build_task_context,
+    stable_capability_name_for_gap,
+    stable_capability_name_for_gaps,
+)
 from src.orchestrator.prompts.agent_generator import (
     AGENT_GENERATOR_PROMPT,
     AGENT_LEAD_SUBAGENTS_PROMPT,
@@ -91,7 +95,10 @@ class LeadWithSubagentsResult(BaseModel):
     """
 
     agent_name: str = Field(..., description="Hyphen-case lead agent identifier (max 64 chars)")
-    system_prompt: str = Field(..., description="Lead agent system prompt — must use task() for delegation")
+    system_prompt: str = Field(
+        ...,
+        description="Lead agent system prompt; must use task() for delegation",
+    )
     node_name: str = Field(..., description="Snake_case LangGraph node function name")
     model: str = Field(default="", description="LLM model identifier (empty = system default)")
     description: str = Field(..., description="One-sentence summary of the lead agent's role")
@@ -138,16 +145,10 @@ def _get_llm():
 # ---------------------------------------------------------------------------
 
 _HYPHEN_CASE_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
-# NOTE: Intentional asymmetry with ``mcp_tool._SNAKE_CASE_RE`` (which is
-# ``r"^[a-z][a-z0-9_]*$"`` — no leading underscore). Agent *node names* appear
-# as LangGraph node identifiers and as DeepAgent subagent keys where a
-# ``_private_subagents`` / ``_helper`` convention is meaningful, so a leading
-# underscore is allowed. MCP tool names must be PyPI-/import-safe module
-# identifiers (``tool_loader.load_tool`` uses them as Python module names in
-# the sandbox runner), which forbids leading underscores. Any future unifier
-# should preserve this difference — see
-# ``tests/unit/test_agent_generator.py::test_node_name_with_leading_underscore_is_valid``
-# and ``tests/unit/test_mcp_tool_generator.py::TestValidateToolName::test_starts_with_underscore``.
+# Agent node names appear as LangGraph node identifiers and DeepAgent subagent
+# keys, where helper-style names such as ``_private_subagents`` are valid. MCP
+# tool names use a stricter import-safe rule because generated source is
+# materialized as Python modules.
 _SNAKE_CASE_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
@@ -198,12 +199,11 @@ def _validate_result(result: AgentGenerationResult) -> list[str]:
                 "skill_content validation skipped: agent_name is invalid"
             )
         else:
-            # Run full quick_validate.py check (same as skill generator does)
             is_valid, msg = validate_skill_content(result.skill_content, result.agent_name)
             if not is_valid:
                 errors.append(f"skill_content failed validation: {msg}")
             else:
-                # Verify the frontmatter name matches agent_name so DeepAgents can load the skill
+                # DeepAgents loads the skill by its frontmatter name.
                 content_name = extract_skill_name(result.skill_content)
                 if content_name and content_name != result.agent_name:
                     errors.append(
@@ -225,12 +225,17 @@ def _generate_single_agent(
     *,
     output_dir: Path | None = None,
     schema_context: str = "",
+    subtasks: list | None = None,
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate an agent config for a single classified gap.
 
     Returns (artifact, error). Exactly one will be non-None.
     """
-    forced_name = slugify_gap_hyphen(gap.query)
+    forced_name = stable_capability_name_for_gap(
+        gap,
+        list(subtasks or []),
+        hyphen_case=True,
+    )
 
     llm = _get_llm()
     structured_llm = llm.with_structured_output(AgentGenerationResult)
@@ -254,14 +259,12 @@ def _generate_single_agent(
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
     # handler propagates automatically via LangChain's contextvar inheritance.
 
-    # First attempt
     try:
         result: AgentGenerationResult = structured_llm.invoke(prompt)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Agent generation LLM call failed for %r: %s", gap.query, exc)
         return None, f"Agent generation failed for '{gap.query}': {exc}"
 
-    # Validate
     validation_errors = _validate_result(result)
 
     # Repair pass (one attempt)
@@ -312,7 +315,6 @@ def _generate_single_agent(
             )
             return None, f"Agent generation invalid after repair for '{gap.query}': {error_str}"
 
-    # Build the agent_config dict
     node_config = {
         "name": result.node_name,
         "model": result.model,
@@ -390,7 +392,6 @@ def _validate_lead_result(result: LeadWithSubagentsResult) -> list[str]:
     if not result.is_deep_agent:
         errors.append("is_deep_agent must be true for lead-with-subagents")
 
-    # Validate subagents
     if not result.subagents:
         errors.append("subagents list must not be empty")
     else:
@@ -401,6 +402,10 @@ def _validate_lead_result(result: LeadWithSubagentsResult) -> list[str]:
             elif not _HYPHEN_CASE_RE.match(sub.name):
                 errors.append(
                     f"subagents[{i}].name '{sub.name}' must be hyphen-case"
+                )
+            elif len(sub.name) > 64:
+                errors.append(
+                    f"subagents[{i}].name too long ({len(sub.name)} chars, max 64)"
                 )
             if sub.name in seen_names:
                 errors.append(f"subagents[{i}].name '{sub.name}' is duplicated")
@@ -418,6 +423,7 @@ def _generate_lead_with_subagents(
     task_context: str,
     *,
     output_dir: Path | None = None,
+    subtasks: list | None = None,
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate a lead agent with subagents for multiple AGENT gaps.
 
@@ -425,7 +431,11 @@ def _generate_lead_with_subagents(
     contains the subagent dicts and ``agent_config["subagent_gap_queries"]``
     lists all covered gap queries for resolution-map indexing.
     """
-    forced_name = slugify_gap_hyphen(gaps[0].query)
+    forced_name = stable_capability_name_for_gaps(
+        gaps,
+        list(subtasks or []),
+        hyphen_case=True,
+    )
 
     gap_descriptions = "\n\n".join(
         f"Step {i + 1}: {g.description or g.query}"
@@ -444,14 +454,12 @@ def _generate_lead_with_subagents(
         model_default=DEFAULT_LLM_MODEL,
     )
 
-    # First attempt
     try:
         result: LeadWithSubagentsResult = structured_llm.invoke(prompt)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Lead-with-subagents generation failed: %s", exc)
         return None, f"Lead-with-subagents generation failed: {exc}"
 
-    # Validate
     validation_errors = _validate_lead_result(result)
 
     # Repair pass (one attempt)
@@ -483,7 +491,6 @@ def _generate_lead_with_subagents(
             logger.warning("Lead-with-subagents still invalid after repair: %s", error_str)
             return None, f"Lead-with-subagents invalid after repair: {error_str}"
 
-    # Build agent_config with subagents
     node_config = {
         "name": result.node_name,
         "model": result.model,
@@ -562,7 +569,6 @@ def generate_agent(
 
     # On retry, skip gaps already covered by passing artifacts.
     existing_gap_queries = {a.gap_query for a in artifacts if a.gap_query is not None}
-    # Also check subagent_gap_queries on existing artifacts
     for a in artifacts:
         if a.agent_config and a.agent_config.get("subagent_gap_queries"):
             existing_gap_queries.update(a.agent_config["subagent_gap_queries"])
@@ -572,7 +578,11 @@ def generate_agent(
         if skipped.query in existing_gap_queries:
             logger.info("  → skipping (already passed verification): %s", skipped.query)
 
-    logger.info("generate_agent: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(agent_gaps) - len(gaps_to_generate))
+    logger.info(
+        "generate_agent: %d gap(s) to generate (%d skipped)",
+        len(gaps_to_generate),
+        len(agent_gaps) - len(gaps_to_generate),
+    )
 
     if not gaps_to_generate:
         return Command(
@@ -597,6 +607,7 @@ def generate_agent(
         )
         artifact, error = _generate_lead_with_subagents(
             gaps_to_generate, task_context,
+            subtasks=subtasks,
         )
         if artifact is not None:
             artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
@@ -612,6 +623,7 @@ def generate_agent(
                     pool.submit(
                         _generate_single_agent, gap, task_context,
                         schema_context=build_schema_context(gap, subtasks),
+                        subtasks=subtasks,
                     ): gap
                     for gap in gaps_to_generate
                 }
@@ -623,17 +635,21 @@ def generate_agent(
                         err = f"Generation failed for agent {gap.query!r}: {exc}"
                         art = None
                     if art is not None:
-                        artifacts = [a for a in artifacts if a.capability_name != art.capability_name]
+                        artifacts = [
+                            a for a in artifacts
+                            if a.capability_name != art.capability_name
+                        ]
                         artifacts.append(art)
                     if err is not None:
                         errors.append(err)
     else:
-        # Single AGENT gap → standalone agent (existing behavior)
+        # Single AGENT gap: generate one standalone agent.
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
             futures = {
                 pool.submit(
                     _generate_single_agent, gap, task_context,
                     schema_context=build_schema_context(gap, subtasks),
+                    subtasks=subtasks,
                 ): gap
                 for gap in gaps_to_generate
             }
@@ -650,8 +666,7 @@ def generate_agent(
                 if err is not None:
                     errors.append(err)
 
-    # Evolutionary taxonomy classification (B1 Step 3.5f). Tags each newly
-    # generated artifact with domain + is_generic. Never raises.
+    # Tag generated artifacts with domain + is_generic. Never raises.
     from src.orchestrator.taxonomy import classify_and_tag_artifacts
     classify_and_tag_artifacts(artifacts)
 

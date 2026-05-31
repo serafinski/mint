@@ -1,31 +1,21 @@
-"""Shared LangFuse event emission helper for orchestrator nodes.
+"""Shared LangFuse trace context and event emission helpers.
 
-All nodes that need to log structured events to LangFuse import
-``emit_langfuse_event`` from this module instead of duplicating the
-implementation.
-
-Step 13.7 tag-propagation fix (2026-04-19). Previously events emitted from
-contexts where ``langgraph.config.get_config()`` returned no metadata —
-ThreadPoolExecutor workers (verification_node's gate pool, adversarial
-pool), LangChain ``@tool`` runtime (``sandbox_execute`` called by
-``bind_tools`` LLMs / DeepAgents), and post-pipeline callers
-(``flush_task_cycle_state``, longitudinal ``distribution_shift`` event) —
-landed in LangFuse as untagged top-level traces, unfilterable by
-task/condition/tier. ``trace_context`` is the callers' fix: it sets both
-a ContextVar (for same-thread sync/async inheritance) and a module-level
-dict guarded by a lock (for cross-thread visibility, since ContextVars
-don't propagate to ``ThreadPoolExecutor`` workers by default). Callers
-wrap their pipeline.invoke site in it; ``emit_langfuse_event`` reads
-from both layers as a fallback when ``get_config()`` returns nothing.
+Pipeline nodes and runtime helpers call ``emit_langfuse_event`` instead
+of duplicating LangFuse SDK logic. ``trace_context`` carries task,
+session, user, and trace metadata across runner, pipeline, and worker
+thread boundaries; ``submit_with_context`` propagates ContextVar state
+into ThreadPool workers.
 """
 
 from __future__ import annotations
 
+import contextvars
 import threading
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator
-
+from typing import Any
 
 _trace_context_var: ContextVar[dict | None] = ContextVar(
     "mint_trace_context", default=None
@@ -42,31 +32,18 @@ def trace_context(
     user_id: str | None = None,
     trace_id: str | None = None,
 ) -> Iterator[None]:
-    """Set LangFuse trace tags/session/user/trace_id for emit_langfuse_event fallback.
+    """Set LangFuse metadata used by ``emit_langfuse_event`` fallbacks.
 
-    Wrap each task/cycle ``pipeline.invoke`` site (harness, longitudinal
-    runners, CLI runner) in this context manager so events emitted from
-    contexts where ``langgraph.config.get_config()`` returns nothing —
-    ThreadPool workers, LangChain ``@tool`` runtime, post-pipeline
-    callers — still inherit tags/session/user.
+    Wrap task/cycle ``pipeline.invoke`` calls in this context manager so
+    events emitted outside a LangGraph node context still inherit
+    tags/session/user metadata. Inner scopes may also pass ``trace_id``
+    once the pipeline trace is known, which lets worker-thread events
+    attach directly to the parent trace via LangFuse ``TraceContext``.
 
-    Fix #4 (2026-04-19): ``trace_id`` is a later addition used by inner
-    wraps (e.g. ``verification_node`` sets it to ``state.trace_id``
-    before spawning the gate ThreadPool). When an inner wrap passes a
-    trace_id, ThreadPool workers' ``emit_langfuse_event`` calls attach
-    events directly to the parent pipeline trace (via ``TraceContext``)
-    instead of creating standalone wrapper traces in the LangFuse UI.
-    The pipeline trace thus shows all its Pillar-2/3 events nested as
-    children, not scattered as siblings — ~80% fewer standalone-trace
-    rows. The outer wrap (harness/longitudinal/CLI) typically does NOT
-    pass trace_id because the handler hasn't minted one yet; inner
-    wraps (verification_node, optimizer's merge/split paths) DO pass it
-    because ``handler.last_trace_id`` is already populated by then.
-
-    Sets BOTH a ContextVar (same-thread sync/async inheritance) AND a
-    module-level dict (cross-thread, because ContextVars don't propagate
-    to ``ThreadPoolExecutor`` workers by default). Nested contexts merge:
-    inner values override outer values on the same key.
+    The context is stored both in a ContextVar for same-thread sync/async
+    inheritance and in a locked module-level fallback for callers that
+    cannot use ``submit_with_context``. Nested contexts merge; inner
+    values override outer values for the same key.
     """
     global _trace_context_global
 
@@ -105,6 +82,23 @@ def _read_trace_context() -> dict:
         return dict(_trace_context_global)
 
 
+def submit_with_context(pool: Any, fn: Callable, /, *args: Any, **kwargs: Any) -> Future:
+    """Submit ``fn`` to ``pool`` while propagating the current ContextVar state.
+
+    Plain ``pool.submit(fn, *args)`` does not carry the parent thread's
+    ``ContextVar`` values into the worker. ``copy_context().run(...)``
+    snapshots the submitting thread's context and restores it before the
+    callable runs, so tracing events read the correct task context
+    instead of falling back to the shared module-level safety net.
+
+    Use this helper for ``pool.submit(...)`` calls inside a
+    ``trace_context(...)`` scope. The module-level global fallback stays
+    in place for callers that cannot use this helper.
+    """
+    ctx = contextvars.copy_context()
+    return pool.submit(ctx.run, fn, *args, **kwargs)
+
+
 def emit_langfuse_event(
     langfuse_handler: object | None,
     name: str,
@@ -139,13 +133,10 @@ def emit_langfuse_event(
         else:
             trace_id = getattr(langfuse_handler, "last_trace_id", None)
 
-        # Fix #4 (2026-04-19): fallback to trace_context's trace_id.
-        # Populated by verification_node + optimizer_node before spawning
-        # ThreadPool workers / nested LLM invocations, so inner emit
-        # sites attach events to the parent pipeline trace as children
-        # (via TraceContext below) instead of creating standalone
-        # wrapper traces in the LangFuse UI. See
-        # ``docs/langfuse_redundancy_audit_2026_04_19.md`` Fix #4.
+        # Fallback to a trace_id supplied by an active ``trace_context``.
+        # Inner pipeline scopes set this before spawning workers or nested
+        # LLM calls, so those event sites attach to the parent pipeline
+        # trace instead of opening standalone wrapper traces.
         if not trace_id:
             fallback_trace_id = _read_trace_context().get("trace_id")
             if fallback_trace_id:
@@ -226,9 +217,9 @@ def emit_langfuse_event(
         # 3. No context at all → wrap in a fresh span so the event is
         #    discoverable via tags/session in the LangFuse UI.
         #
-        # Previous implementation used `lf.trace(...)` which was removed in
-        # SDK v3 — standalone events silently dropped. Fixed 2026-04-18
-        # during Step 13.7 Batch A probe.
+        # LangFuse SDK v3 removed the old ``lf.trace(...)`` path, so
+        # standalone emissions need either ``create_event`` with an
+        # explicit trace context or a short wrapper span.
         if trace_id:
             lf.create_event(
                 trace_context=TraceContext(trace_id=trace_id),
@@ -237,24 +228,11 @@ def emit_langfuse_event(
                 metadata=metadata,
             )
         else:
-            # Try attaching to the current (contextvar) trace first.
-            #
-            # Fix #2 (2026-04-19, docs/langfuse_redundancy_audit_2026_04_19.md):
-            # Previously checked ONLY ``lf.current_trace_id`` (LangFuse SDK's
-            # own contextvar, set by ``lf.start_as_current_span``). That check
-            # missed OTel-set contexts — when LangChain's callback handler
-            # auto-traces a pipeline node or tool-call, it sets an active
-            # OTel span but does NOT set LangFuse's ``current_trace_id``. So
-            # every emit_langfuse_event call inside an active pipeline created
-            # a redundant empty wrapper SPAN (input/output=null, latency=0,
-            # same name as the event) that OTel then re-parented to the
-            # LangChain span. Confirmed empirically across 6 event types
-            # (classifier.gap_classified, adversarial.completed, cycle_flush.
-            # completed, pillar3.pruned, registry.register_ok,
-            # verification.tier_3.pass) — all had such wrappers. Fix:
-            # also check OTel context; when EITHER LangFuse SDK OR OTel has
-            # an active parent, skip the wrapper and let ``lf.create_event``
-            # attach via OTel propagation.
+            # Try attaching to the current trace first. LangChain callback
+            # tracing usually provides an active OTel span without setting
+            # LangFuse's own ``current_trace_id`` contextvar, so parent-span
+            # detection checks both mechanisms before deciding that a wrapper
+            # span is required.
             in_active_trace = _has_active_parent_span(lf)
 
             if in_active_trace:
@@ -276,13 +254,9 @@ def emit_langfuse_event(
                 # tags/session_id/user_id above, which would otherwise be
                 # lost here (no active trace to inherit from).
                 #
-                # LangFuse SDK v3 bug (observed 2026-04-19): passing
-                # ``tags=[]`` (explicit empty list) to ``update_current_trace``
-                # causes the SDK to serialize the empty-list protobuf marker
-                # as the literal string ``{"arrayValue":{}}`` and attach it
-                # as a tag. Workaround: build the kwargs dict dynamically so
-                # empty tags/session_id/user_id are omitted rather than
-                # passed empty.
+                # LangFuse SDK v3 can serialize an explicit empty tags
+                # list as a protobuf marker tag. Build kwargs dynamically
+                # so empty tags/session/user fields are omitted.
                 with lf.start_as_current_span(name=name) as _span:
                     try:
                         _update_kwargs: dict = {"name": name}
@@ -306,7 +280,7 @@ def emit_langfuse_event(
 
 
 def _has_active_parent_span(lf: object) -> bool:
-    """Check if there's an active trace parent via EITHER mechanism.
+    """Check whether LangFuse can attach an event to an active parent trace.
 
     LangFuse SDK v3 uses OTel for context propagation. Two contextvars
     matter:
@@ -319,11 +293,11 @@ def _has_active_parent_span(lf: object) -> bool:
        attaches to OTel-current when ``create_event`` is called without
        explicit trace_context.
 
-    The narrow check (#1 only) misses LangChain-wrapped contexts — a
-    pipeline node's span is tracked by LangChain via OTel, but LangFuse's
-    SDK contextvar remains unset. Returning False there forces the
-    caller to wrap in a new SPAN, which OTel then re-parents to the
-    LangChain span → redundant empty middle layer.
+    Checking only LangFuse's own contextvar misses LangChain-wrapped
+    contexts: a pipeline node's span is tracked by LangChain via OTel,
+    while LangFuse's SDK contextvar remains unset. Returning False there
+    forces the caller to wrap in a new span, which OTel then re-parents
+    to the LangChain span as a redundant middle layer.
 
     This function returns True if EITHER mechanism has an active parent,
     so ``lf.create_event`` can attach without wrapping.

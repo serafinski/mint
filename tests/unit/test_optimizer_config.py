@@ -53,25 +53,6 @@ class TestIsEnabled:
             cfg.is_enabled("delete", invocation_count=0, threshold=20)
 
 
-class TestAnyEnabled:
-    def test_all_auto_below_threshold(self):
-        cfg = OptimizerConfig()
-        assert cfg.any_enabled(invocation_count=0, threshold=20) is False
-
-    def test_all_auto_at_threshold(self):
-        cfg = OptimizerConfig()
-        assert cfg.any_enabled(invocation_count=20, threshold=20) is True
-
-    def test_one_on_others_off(self):
-        cfg = OptimizerConfig(prune="on", split="off", merge="off")
-        assert cfg.any_enabled(invocation_count=0, threshold=20) is True
-
-    def test_all_off(self):
-        cfg = OptimizerConfig.all_off()
-        assert cfg.any_enabled(invocation_count=0, threshold=20) is False
-        assert cfg.any_enabled(invocation_count=1000, threshold=20) is False
-
-
 class TestFactories:
     def test_all_on(self):
         cfg = OptimizerConfig.all_on()

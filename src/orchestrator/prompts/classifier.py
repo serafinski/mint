@@ -5,17 +5,15 @@ Classification is based on three architectural layers (industry consensus):
 - Skill = knowledge layer (procedural expertise, prescribed workflow)
 - Agent = reasoning layer (autonomous, adaptive, unpredictable path)
 
-As of Stage 2 of the compositional refactor, the classifier decides a type
-for a SINGLE gap (one step of the workflow), not for the whole task. The
-task description is supplied as context so the classifier can reason about
-what the gap's role is within the larger workflow.
+The classifier decides a type for a SINGLE gap (one step of the workflow), not
+for the whole task. The task description is supplied as context so the
+classifier can reason about what the gap's role is within the larger workflow.
 
 References: MCP spec (modelcontextprotocol.io), Agent Skills spec
 (agentskills.io), Anthropic "Building Effective Agents", LangGraph docs.
 """
 
-# Per-gap classification prompt (Stage 2+). One LLM call classifies ONE gap
-# at a time, in the context of the whole task.
+# One LLM call classifies one gap at a time, in the context of the whole task.
 GAP_CLASSIFICATION_PROMPT = """\
 You are a capability classifier for a JIT synthesis pipeline. Your job is to \
 classify ONE STEP (a "gap") of a larger task into one architectural layer \
@@ -205,8 +203,8 @@ test is too permissive — it fires for almost any narrow gap, including \
 gaps that exist precisely to apply a skill-task's specialized expertise. \
 Lead with the parent-task assessment instead.
 
-**File-writer exception (Phase 3 Step 12, 2026-04-16).** One carve-out \
-to the parent-task-first rule: **a subtask whose job is to serialize \
+**File-writer exception.** One carve-out to the parent-task-first rule: \
+**a subtask whose job is to serialize \
 upstream data to a file is ALWAYS `mcp_tool`, regardless of the parent \
 task's type.** Signals that identify a file-writer subtask:
 
@@ -520,47 +518,4 @@ serialization, not adaptive reasoning. Do NOT collapse.
 parent-task assessment** (tool-task, skill-task, or agent-task), then \
 explain why THIS gap has its classified type within that parent context.
 4. `capability_name` — kebab-case name following the rules above\
-"""
-
-
-# Legacy task-level classification prompt — preserved for the ``classify_task``
-# convenience wrapper used by callers that still want whole-task classification
-# (tests, single-gap fallback). Equivalent to the pre-Stage-2 behaviour.
-TASK_CLASSIFICATION_PROMPT = """\
-You are a capability classifier for a JIT synthesis pipeline. Your job is to \
-classify an entire task into ONE architectural layer based on what kind of \
-capability best solves the task end-to-end.
-
-## The Three Layers
-
-These are complementary architectural layers, not points on a complexity axis. \
-Each solves a fundamentally different problem.
-
-### mcp_tool — The Execution Layer
-An MCP tool is a **single, stateless, well-defined operation** with clear \
-inputs and outputs.
-
-### skill — The Knowledge Layer
-A skill is **packaged procedural knowledge** that teaches an agent how to \
-approach a domain-specific task with a prescribed workflow.
-
-### agent — The Reasoning Layer
-An agent is an **autonomous entity that dynamically directs its own process** \
-based on intermediate findings.
-
-## Decomposition Context
-
-The task decomposition produced these required capabilities as guidance:
-{required_capabilities}
-
-## Task to Classify
-
-Full task description:
-{task_description}
-
-Classify this task. Respond with:
-1. `classified_type` — the architectural layer (mcp_tool, skill, or agent)
-2. `confidence` — 0.0 to 1.0
-3. `rationale` — brief explanation of why this type fits
-4. `capability_name` — kebab-case name describing WHAT THE CAPABILITY DOES\
 """

@@ -1,4 +1,4 @@
-"""Iteration 2 Phase C: Full JIT Capability Pipeline.
+"""JIT capability pipeline graph.
 
 Graph topology (without optimizer)::
 
@@ -10,7 +10,7 @@ Graph topology (without optimizer)::
       → generate_skill          # LLM: SKILL gaps → SKILL.md artifacts
       → generate_agent          # LLM: AGENT gaps → agent config artifacts
       → verification_node       # Gate: verify artifacts; retry up to 3× on failure
-      → loading_node            # Pure Python: load MCP tools + register all types
+      → loading_node            # Register generated artifacts for reuse
       → END
 
 With ``run_optimizer=True`` the graph gains one additional node::
@@ -20,7 +20,7 @@ With ``run_optimizer=True`` the graph gains one additional node::
 All nodes use the Command API for routing.  The registry and ToolLoader are
 injected via closures for the two nodes that need them.
 
-LangFuse tracing is handled at invocation time — pass a CallbackHandler in
+LangFuse tracing is handled at invocation time; pass a CallbackHandler in
 the ``config`` dict when calling ``pipeline.invoke()``:
 
     from langfuse.langchain import CallbackHandler
@@ -49,7 +49,7 @@ from src.orchestrator.loading_node import loading_node
 from src.orchestrator.tool_loader import ToolLoader
 from src.orchestrator.verification_node import verification_node
 from src.registry.metrics import MetricsStore
-from src.registry.store import SkillRegistry
+from src.registry.store import CapabilityRegistry
 from src.schemas.optimizer_config import OptimizerConfig
 from src.schemas.task import TaskState
 from src.verification.gate import verify as gate_verify
@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_pipeline(
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
     loader: ToolLoader,
     *,
     run_optimizer: bool = False,
@@ -66,35 +66,33 @@ def create_pipeline(
     metrics_store: MetricsStore | None = None,
     verification_enabled: bool = True,
 ) -> StateGraph:
-    """Build the JIT capability pipeline (Iterations 2–4).
+    """Build the JIT capability pipeline graph.
 
     Returns an *uncompiled* ``StateGraph`` — call ``.compile()`` before invoking.
 
     Args:
         registry: Capability registry used for gap detection and MCP tool registration.
-        loader: Tool loader used to dynamically load and register generated MCP tools.
-        run_optimizer: Legacy boolean — when ``True``, append the granularity
-            optimizer loop with all three operations forced on (backward-compat
-            alias for callers that haven't adopted ``optimizer_config``).
+        loader: Tool loader used to register generated MCP tool descriptors.
+        run_optimizer: Compatibility boolean. When ``True``, append the
+            granularity optimizer loop with all three operations enabled.
             Ignored if ``optimizer_config`` is provided explicitly.
-        optimizer_config: Per-operation optimizer config (§12 finding #8). When
-            provided, supersedes ``run_optimizer``. Any operation resolved to
-            "off" is skipped at apply time; if all three are off for the current
-            ``invocation_count`` the optimizer subgraph is not wired. When
+        optimizer_config: Per-operation optimizer config. When provided,
+            supersedes ``run_optimizer``. Any operation resolved to "off" is
+            skipped at apply time; if all three are off for the current
+            ``invocation_count``, the optimizer subgraph is not wired. When
             ``None`` and ``run_optimizer=True``, falls back to all-on; when
             ``None`` and ``run_optimizer=False``, falls back to all-off.
         metrics_store: DuckDB metrics store required when the optimizer is
             enabled.  Ignored when the optimizer is disabled.
         verification_enabled: When ``False``, the verification gate is bypassed
-            (``gate_fn=None`` → stub always passes).  Used for the no_verification
-            evaluation baseline.
+            (``gate_fn=None`` means generated artifacts pass). Used for the
+            no_verification evaluation baseline.
 
     Returns:
         An uncompiled ``StateGraph[TaskState]`` ready to be compiled and invoked.
     """
-    # Normalize to an OptimizerConfig — callers pass either the legacy bool
-    # (eval harness, older tests) or the new config (CLI runner). The new
-    # config takes precedence when both are provided.
+    # Normalize to an OptimizerConfig. Callers pass either the compatibility
+    # bool or a per-operation config. The config takes precedence.
     if optimizer_config is None:
         optimizer_config = OptimizerConfig.from_run_optimizer_bool(run_optimizer)
 
@@ -117,9 +115,9 @@ def create_pipeline(
     builder.add_node("generate_mcp_tool", generate_mcp_tool)
     builder.add_node("generate_skill", generate_skill)
     builder.add_node("generate_agent", generate_agent)
-    # verification_node wired with the real three-tier gate (Iteration 3).
-    # When verification_enabled=False (no_verification baseline), gate_fn=None
-    # causes the stub gate to pass all artifacts unconditionally.
+    # Wire verification with the real gate by default. When
+    # verification_enabled=False, gate_fn=None makes generated artifacts pass
+    # without gate execution for the no_verification baseline.
     _gate_fn = gate_verify if verification_enabled else None
     builder.add_node(
         "verification_node",
@@ -137,7 +135,7 @@ def create_pipeline(
 
     if run_optimizer and metrics_store is not None:
         # loading_node routes to optimizer_node instead of END.
-        # Preserve any non-END routing from loading_node (e.g., future retry paths).
+        # Preserve any non-END routing from loading_node.
         def _loading_then_optimize(state: TaskState) -> Command:
             cmd = loading_node(state, loader, registry)
             next_node = "optimizer_node" if cmd.goto == END else cmd.goto
@@ -153,28 +151,28 @@ def create_pipeline(
         _opt_loop = create_optimization_loop(
             registry, metrics_store, optimizer_config=optimizer_config,
         )
-        _prev_optimizer_scores: dict[str, float] = {}
 
         def _optimizer_node(state: TaskState) -> Command:
-            nonlocal _prev_optimizer_scores
             try:
-                # Step 14.12: carry the task's network policy into the
-                # optimizer subgraph so merge/split variant verification
-                # runs under the same policy the triggering task uses.
+                # Load previous utility scores from MetricsStore so optimizer
+                # KL divergence compares against the previous task's registry
+                # state rather than an empty in-memory baseline.
+                try:
+                    _prev_scores = metrics_store.load_previous_utility_scores()
+                except Exception:  # noqa: BLE001
+                    _prev_scores = {}
+                # Carry the task's network policy into the optimizer subgraph
+                # so merge/split variant verification uses the same policy as
+                # the triggering task.
                 init_state = OptimizerState(
-                    previous_utility_scores=_prev_optimizer_scores,
+                    previous_utility_scores=_prev_scores,
                     allow_network=bool(getattr(state, "allow_network", False)),
                 )
-                # Fix #4 (2026-04-19): wrap the optimizer sub-graph in
-                # trace_context(trace_id=...) so pillar3.* events and
-                # per-variant verification events emitted by operations.py
-                # attach to the parent pipeline trace as children rather
-                # than creating standalone wrapper traces. Prefer
-                # ``state.trace_id`` (set by verification_node from its
-                # own handler lookup); fall back to a fresh handler.last_
-                # trace_id lookup in case verification_node's mutation
-                # didn't persist (LangGraph reducers take the checkpoint,
-                # not the mutated state).
+                # Wrap the optimizer subgraph in trace_context(trace_id=...)
+                # so optimizer and per-variant verification events attach to
+                # the parent pipeline trace. Prefer ``state.trace_id``; fall
+                # back to the callback handler's last trace id if LangGraph
+                # checkpointing did not persist the state mutation.
                 from src.orchestrator.tracing import trace_context as _trace_context
 
                 _opt_trace_id = getattr(state, "trace_id", None)
@@ -203,9 +201,17 @@ def create_pipeline(
 
                 with _trace_context(trace_id=_opt_trace_id):
                     result = _opt_loop.invoke(init_state)
-                # Carry current utility scores forward for the next pipeline run.
+                # Persist current utility scores so the next task's optimizer
+                # can read them as the previous registry state.
                 if isinstance(result, dict):
-                    _prev_optimizer_scores = result.get("utility_scores", {})
+                    try:
+                        metrics_store.persist_utility_scores(
+                            result.get("utility_scores", {}) or {}
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "persist_utility_scores failed: %s", exc,
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Granularity optimizer failed (non-fatal): %s", exc)
             return Command(update={}, goto=END)
@@ -217,14 +223,24 @@ def create_pipeline(
             lambda state: loading_node(state, loader, registry),
         )
 
-    # Entry point — all subsequent routing is via Command returns from each node:
+    # Entry point — all subsequent routing is via Command returns from each node.
+    #
+    # The three type-specific generators are intentionally wired as a sequential
+    # chain rather than parallel graph branches. Each generator filters
+    # state.classified_gaps by its own CapabilityType; when no gaps of that type
+    # are present, the node is a cheap no-op with no LLM call. This keeps retry
+    # routing simple (verification_node can always return to generate_mcp_tool)
+    # while preserving intra-generator parallelism for multiple gaps of the same
+    # type. The trade-off is latency, not behavior: tasks that truly require
+    # generation across several capability types cannot overlap those generator
+    # stages.
     #   decomposition_node → "gap_detection"
     #   gap_detection      → "classifier_node"
     #   classifier_node    → "generate_mcp_tool"
     #   generate_mcp_tool  → "generate_skill"
     #   generate_skill     → "generate_agent"
     #   generate_agent     → "verification_node"
-    #   verification_node  → "loading_node"  (all pass / max attempts) or "generate_mcp_tool" (retry)
+    #   verification_node  → "loading_node" or "generate_mcp_tool" (retry)
     #   loading_node       → END  (or "optimizer_node" when run_optimizer=True)
     builder.add_edge(START, "decomposition_node")
 

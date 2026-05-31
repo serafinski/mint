@@ -1,19 +1,10 @@
-"""Unit tests for src/orchestrator/generators/utils.build_schema_context.
-
-Moved from tests/unit/test_composition.py (file-placement drift: the tests
-probe ``build_schema_context`` which lives in ``generators/utils.py``, not in
-``composition.py``). See Batch 02b audit for context.
-
-Sibling helper tests for ``build_task_context`` live in
-``tests/unit/test_build_task_context.py``.
-"""
+"""Unit tests for generator schema-context prompt helpers."""
 
 from __future__ import annotations
 
 from src.orchestrator.generators.utils import build_schema_context
 from src.schemas.capability import CapabilityType
 from src.schemas.task import ClassifiedGap, SubTask
-
 
 # ---------------------------------------------------------------------------
 # build_schema_context — inter-step schema contracts
@@ -110,3 +101,56 @@ class TestBuildSchemaContext:
         ctx = build_schema_context(gap, subtasks)
         assert '"data"' in ctx
         assert "receives" not in ctx.lower()  # no input contract for first step
+
+    def test_transitive_upstream_keys_are_included_in_input_contract(self):
+        """Downstream schema context should include transitive ancestor outputs.
+
+        Execution passes the transitive upstream closure to downstream steps,
+        so a downstream step that consumes an ancestor key such as ``targets``
+        must see that key in the generator prompt.
+        """
+        gap = ClassifiedGap(
+            description="compare revenues to targets",
+            query="compare-revenues-to-targets",
+            classified_type=CapabilityType.MCP_TOOL,
+            confidence=0.9,
+            rationale="",
+        )
+        subtasks = [
+            SubTask(
+                description="parse files",
+                required_capabilities=["parse-inputs"],
+                depends_on=[],
+                output_schema={
+                    "sales": "list[dict]",
+                    "products": "list[dict]",
+                    "targets": "list[dict]",
+                },
+            ),
+            SubTask(
+                description="aggregate region revenues",
+                required_capabilities=["aggregate-revenues"],
+                depends_on=[0],
+                output_schema={
+                    "region_revenues": "dict",
+                    "summary_row_count": "int",
+                },
+            ),
+            SubTask(
+                description="compare revenues to targets",
+                required_capabilities=["compare-revenues-to-targets"],
+                depends_on=[1],
+                output_schema={
+                    "summary_rows": "list[dict]",
+                    "regions_meeting_target": "int",
+                },
+            ),
+        ]
+
+        ctx = build_schema_context(gap, subtasks)
+
+        assert '"region_revenues"' in ctx
+        assert '"summary_row_count"' in ctx
+        assert '"targets"' in ctx
+        assert "from step 0" in ctx
+        assert "from step 1" in ctx

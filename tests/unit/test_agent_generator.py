@@ -1,8 +1,7 @@
 """Unit tests for the agent generator module.
 
-LLM-calling behaviour is covered by ``tests/integration/test_agent_generator.py``
-with real OpenAI calls.  These tests cover the pure-Python validation logic
-and the node's routing behaviour without any LLM mocking.
+These tests mock the LLM entry point and cover validation, repair behavior,
+skill-file writes, schema-context prompt plumbing, and LangGraph node routing.
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ from src.orchestrator.generators.agent import (
     AgentGenerationResult,
     LeadWithSubagentsResult,
     SubAgentConfig,
-    _generate_lead_with_subagents,
     _generate_single_agent,
     _validate_lead_result,
     _validate_result,
@@ -69,7 +67,7 @@ def _valid_deep_agent_result() -> AgentGenerationResult:
 
 
 # ---------------------------------------------------------------------------
-# Tests: _validate_result — pure Python, no LLM
+# Tests: _validate_result - pure Python, no LLM
 # ---------------------------------------------------------------------------
 
 
@@ -163,7 +161,7 @@ class TestValidateResult:
     def test_node_name_with_leading_underscore_is_valid(self):
         """Leading underscore in node_name is currently allowed by the snake_case regex.
 
-        This is intentional — Python function names may start with underscore.
+        This is intentional: Python function names may start with underscore.
         Document this as expected behavior so the test acts as a specification.
         """
         result = _valid_plain_result()
@@ -218,7 +216,7 @@ class TestValidateResult:
 
 
 # ---------------------------------------------------------------------------
-# Node routing tests — no LLM needed
+# Node routing tests - no LLM needed
 # ---------------------------------------------------------------------------
 
 
@@ -235,7 +233,7 @@ class TestGenerateAgentNode:
         assert cmd.update["status"] == TaskStatus.GENERATING
 
     def test_empty_gaps(self):
-        """Empty gaps → empty artifacts and errors."""
+        """Empty gaps produce empty artifacts and errors."""
         state = TaskState(task_description="Empty", classified_gaps=[])
         cmd = generate_agent(state)
 
@@ -352,7 +350,7 @@ class TestGenerateAgentNode:
         assert cmd.update["status"] == TaskStatus.GENERATING
 
     def test_mixed_success_and_failure(self):
-        """Lead-with-subagents fails → fallback to standalone; one succeeds, one fails."""
+        """Lead-with-subagents failure falls back to standalone generation."""
         state = TaskState(
             task_description="Two agents needed",
             classified_gaps=[
@@ -390,7 +388,7 @@ class TestGenerateAgentNode:
             (None, "Generation failed for anomaly-detector"),
         ]
 
-        # ≥2 AGENT gaps → lead mode first, then fallback to standalone
+        # Two AGENT gaps use lead mode first, then fallback to standalone.
         with patch(
             "src.orchestrator.generators.agent._generate_lead_with_subagents",
             return_value=(None, "Lead generation failed"),
@@ -471,7 +469,7 @@ class TestGenerateAgentNode:
 
 
 # ---------------------------------------------------------------------------
-# _generate_single_agent — repair-path unit tests (no real LLM calls)
+# _generate_single_agent - repair-path unit tests (no real LLM calls)
 # ---------------------------------------------------------------------------
 
 
@@ -482,7 +480,7 @@ class TestGenerateSingleAgent:
     path returns ``(None, error_string)`` rather than raising.
     """
 
-    # A result with an invalid agent_name (CamelCase) — triggers _validate_result failure
+    # A result with an invalid agent_name (CamelCase) triggers validation failure.
     _INVALID_RESULT = AgentGenerationResult(
         agent_name="InvalidName",
         system_prompt="You are a monitor agent.",
@@ -544,7 +542,7 @@ class TestGenerateSingleAgent:
 
         assert error is None
         assert artifact is not None
-        # Fix 5: name is now a deterministic slug, not the LLM-chosen name
+        # Name is a deterministic slug, not the LLM-chosen name.
         from src.orchestrator.generators.utils import slugify_gap_hyphen
         assert artifact.capability_name == slugify_gap_hyphen("data-quality-monitor")
         assert artifact.capability_type == CapabilityType.AGENT
@@ -631,11 +629,10 @@ class TestGenerateSingleAgent:
         assert custom_context in captured_prompts[0]
 
     def test_schema_context_reaches_prompt(self, tmp_path):
-        """Phase 3.5c wires ``build_schema_context(gap, subtasks)`` into the
-        AGENT generator prompt so each agent's system prompt knows its
-        upstream input keys and required output keys. Guard the injection
-        path with distinctive key tokens so a future refactor that drops
-        the plumbing is caught immediately.
+        """Schema context reaches the AGENT generator prompt.
+
+        Distinctive key tokens guard the plumbing from subtask output schemas
+        into the prompt contract section.
         """
         from src.orchestrator.generators.utils import build_schema_context
         from src.schemas.task import SubTask
@@ -683,7 +680,7 @@ class TestGenerateSingleAgent:
 
     def test_empty_schema_context_omits_contract_section(self, tmp_path):
         """Legacy decompositions without output_schema produce an empty
-        contract string — the generator must not emit a dangling heading.
+        contract string, so the generator must not emit a dangling heading.
         """
         captured_prompts: list = []
         valid_result = self._VALID_RESULT
@@ -777,7 +774,7 @@ class TestGenerateSingleAgent:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3.5b: Lead-with-subagents validation
+# Lead-with-subagents validation
 # ---------------------------------------------------------------------------
 
 VALID_LEAD_SKILL = """\
@@ -842,6 +839,12 @@ class TestValidateLeadResult:
         errors = _validate_lead_result(result)
         assert any("hyphen-case" in e for e in errors)
 
+    def test_subagent_name_too_long(self):
+        result = _valid_lead_result()
+        result.subagents[0].name = "a" * 65
+        errors = _validate_lead_result(result)
+        assert any("too long" in e for e in errors)
+
     def test_empty_subagent_system_prompt(self):
         result = _valid_lead_result()
         result.subagents[0].system_prompt = "  "
@@ -856,15 +859,15 @@ class TestValidateLeadResult:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3.5b: generate_agent mode selection
+# generate_agent mode selection
 # ---------------------------------------------------------------------------
 
 
 class TestLeadWithSubagentsModeSelection:
-    """Verify that generate_agent selects lead-with-subagents mode for ≥2 AGENT gaps."""
+    """Verify that generate_agent selects lead mode for multiple AGENT gaps."""
 
     def test_single_agent_gap_uses_standalone_mode(self):
-        """1 AGENT gap → standalone generation (no subagents)."""
+        """One AGENT gap uses standalone generation."""
         state = TaskState(
             task_description="Single agent task",
             classified_gaps=[
@@ -896,7 +899,7 @@ class TestLeadWithSubagentsModeSelection:
         assert len(cmd.update["generated_artifacts"]) == 1
 
     def test_multiple_agent_gaps_uses_lead_mode(self):
-        """≥2 AGENT gaps → lead-with-subagents mode."""
+        """Multiple AGENT gaps use lead-with-subagents mode."""
         state = TaskState(
             task_description="Multi-agent task",
             classified_gaps=[
@@ -923,7 +926,14 @@ class TestLeadWithSubagentsModeSelection:
                 "system_prompt": "lead",
                 "is_deep_agent": True,
                 "node_config": {"name": "n", "model": "", "description": "d"},
-                "subagents": [{"name": "sub-1", "description": "d", "system_prompt": "s", "tools": []}],
+                "subagents": [
+                    {
+                        "name": "sub-1",
+                        "description": "d",
+                        "system_prompt": "s",
+                        "tools": [],
+                    }
+                ],
                 "subagent_gap_queries": ["data-profiler", "anomaly-detector"],
             },
             gap_query="data-profiler",
@@ -977,7 +987,7 @@ class TestLeadWithSubagentsModeSelection:
         ) as mock_single:
             cmd = generate_agent(state)
 
-        # Lead failed → fell back to standalone for each gap
+        # Lead failed, so generation fell back to standalone for each gap.
         assert mock_single.call_count == 2
         # Should have the error from lead + artifacts from fallback
         assert any("LLM error" in e for e in cmd.update["errors"])
@@ -1015,8 +1025,8 @@ class TestLeadWithSubagentsModeSelection:
         ) as mock_single, patch(
             "src.orchestrator.generators.agent._generate_lead_with_subagents",
         ) as mock_lead:
-            cmd = generate_agent(state)
+            generate_agent(state)
 
-        # Only 1 AGENT gap → standalone mode
+        # Only one AGENT gap means standalone mode.
         mock_single.assert_called_once()
         mock_lead.assert_not_called()

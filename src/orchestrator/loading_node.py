@@ -1,23 +1,26 @@
-"""Loading node — loads MCP_TOOL artifacts and registers all artifact types.
+"""Loading node - registers generated artifacts in the capability registry.
 
-MCP_TOOL artifacts are dynamically loaded via importlib.  Skills and agents
-are already written to disk during generation and do not require dynamic
-loading, but all three types are registered in the capability registry here.
+MCP_TOOL artifacts are registered from generated source without importing or
+executing that source in the host process. Runtime execution happens through
+the sandbox path. Skills and agents are already written to disk during
+generation, but still need registry entries so future tasks can retrieve them.
 
 MCP_TOOL handling:
 
-1. Load the module via importlib (``ToolLoader.load_tool``).
-2. Smoke-test with empty inputs (``ToolLoader.execute_tool``) — log a warning
-   on failure but still register.
-3. Register in the capability registry (``ToolLoader.register_tool``).
+1. Register source metadata in the capability registry via
+   ``ToolLoader.register_tool``.
+2. Avoid host-side import or smoke execution.
 
 SKILL / AGENT handling:
 
-1. Register in the capability registry (already on disk from generation).
+1. Build a ``CapabilityDescriptor`` from artifact metadata and any matching
+   decomposed subtask schemas.
+2. Register the descriptor in the capability registry.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Literal
 
@@ -30,7 +33,7 @@ from src.orchestrator.schema_extraction import (
 )
 from src.orchestrator.tool_loader import ToolLoader
 from src.orchestrator.tracing import emit_langfuse_event
-from src.registry.store import SkillRegistry
+from src.registry.store import CapabilityRegistry
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 from src.schemas.task import TaskState, TaskStatus
 
@@ -44,11 +47,10 @@ def _emit_registration_event(
     passed: bool,
     error_msg: str | None = None,
 ) -> None:
-    """Emit a registration event (Step 13.7 Batch C1).
+    """Emit a registration event for trace/provenance consumers.
 
-    Traces capability lineage: Chapter 5's §3.5f evolutionary-taxonomy
-    narrative + gap-detection search-quality analysis depend on knowing
-    which caps entered the registry with which domain / is_generic flags.
+    The event records which capabilities entered the registry and preserves
+    taxonomy labels used by later registry retrieval.
     """
     emit_langfuse_event(
         None,
@@ -69,13 +71,13 @@ logger = logging.getLogger(__name__)
 def loading_node(
     state: TaskState,
     loader: ToolLoader,
-    registry: SkillRegistry,
+    registry: CapabilityRegistry,
 ) -> Command[Literal["__end__"]]:
-    """Load MCP_TOOL artifacts and register all artifact types in the registry.
+    """Register generated artifacts in the capability registry.
 
-    MCP_TOOL: dynamically loaded via importlib, smoke-tested, then registered.
-    SKILL/AGENT: already written to disk during generation — registered in the
-    capability registry here so ``gap_detection`` can find them on future runs.
+    MCP_TOOL: registered from source metadata without host-side import.
+    SKILL/AGENT: registered from artifact metadata and persisted content so
+    ``gap_detection`` can find them on future runs.
 
     Sets ``status`` to:
     - ``COMPLETED`` — no gaps were detected (all capabilities matched), or at
@@ -83,8 +85,8 @@ def loading_node(
     - ``FAILED`` — gaps were detected but no artifacts were registered (either
       none were generated, or all register attempts failed).
 
-    Errors from individual tool loads/registrations are recorded in
-    ``state.errors`` but do not abort the node — remaining tools continue.
+    Errors from individual registrations are recorded in ``state.errors`` but
+    do not abort the node; remaining artifacts continue.
     """
     errors: list[str] = list(state.errors)
 
@@ -93,28 +95,18 @@ def loading_node(
     ]
 
     registered = 0
-    # Security audit finding #1 (2026-04-19): pre-fix, this node called
-    # ``loader.load_tool(artifact)`` which invoked ``spec.loader.exec_module``
-    # in the current Python process — executing arbitrary top-level code
-    # from LLM-generated source on the host, AFTER the three-tier gate had
-    # signed off. The Docker-based gate (Tier 1.5 / Tier 2 / Tier 3) already
-    # covers import + behavioural + adversarial checks in the sandbox; the
-    # host import was a duplicate smoke test and the only host-execution
-    # path for generated code. Removing it aligns the code with the
-    # CLAUDE.md claim that MCP tools are "loaded via importlib dynamic
-    # import in a sandboxed subprocess" and with the Pillar-2 trust
-    # boundary the thesis claims. Finding #5's two ``dir()`` alphabetical-
-    # selection sites in ``ToolLoader.load_tool`` / ``execute_tool`` are
-    # simultaneously rendered unreachable from production flow; those
-    # methods remain in ``tool_loader.py`` for the unit tests that
-    # exercise them directly, marked as non-production paths.
+    mcp_registered = 0
+    non_mcp_registered = 0
+    # Do not import or smoke-test generated MCP source in this host process.
+    # The verification gate and runtime sandbox own execution; this node only
+    # persists the source metadata needed for sandbox execution and registry
+    # retrieval.
     for artifact in mcp_artifacts:
-        # --- Register (source_code is what downstream execution reads;
-        # no host-side import or smoke test is needed — the sandbox is
-        # the only execution path). ---
+        # source_code is what downstream sandbox execution reads.
         try:
             loader.register_tool(artifact, registry)
             registered += 1
+            mcp_registered += 1
             logger.info("Registered tool '%s' in registry", artifact.capability_name)
             _emit_registration_event(
                 artifact.capability_name, "mcp_tool",
@@ -146,20 +138,18 @@ def loading_node(
             if artifact.skill_content:
                 metadata["skill_content"] = artifact.skill_content
             if artifact.agent_config:
-                import json
-
                 metadata["agent_config"] = (
                     json.dumps(artifact.agent_config)
                     if isinstance(artifact.agent_config, dict)
                     else str(artifact.agent_config)
                 )
 
-            # Populate input_schema / output_schema for Pillar 3 Merge (B1).
+            # Populate input_schema / output_schema for registry reuse.
             # Priority order:
             #   1. Prefer artifact-provided schemas if the generator set them.
             #   2. Fall back to deriving from the matching SubTask using the
-            #      decomposer's output_schema (Phase 3.5c). Input contract
-            #      for middle/last steps comes from upstream subtasks.
+            #      decomposer's output_schema. Input contract for middle/last
+            #      steps comes from upstream subtasks.
             # SKILL/AGENT artifacts have no source code to AST-extract, so
             # subtask-based derivation is the only fallback.
             input_schema: dict = dict(artifact.input_schema or {})
@@ -178,11 +168,9 @@ def loading_node(
                         if derived_inputs:
                             input_schema = derived_inputs
 
-            # Forward domain / is_generic from the artifact if the generator
-            # set them (B1 Step 3.5f evolutionary taxonomy). Fall back to the
-            # historical "generated" default when the generator hasn't run
-            # through taxonomy classification yet (pre-3.5f integration, or
-            # when the taxonomy call failed and returned a fallback).
+            # Forward domain / is_generic from the artifact when available.
+            # Fall back to the "generated" default if taxonomy classification
+            # was skipped or returned a fallback.
             effective_domain = (
                 artifact.domain if artifact.domain is not None else "generated"
             )
@@ -207,10 +195,14 @@ def loading_node(
                 input_schema=input_schema,
                 output_schema=output_schema,
                 definition_token_cost=definition_token_cost,
+                # Preserve generator-declared pip packages through registry
+                # persistence and match reconstruction. Empty for SKILL/AGENT.
+                pip_packages=list(getattr(artifact, "pip_packages", []) or []),
                 metadata=metadata,
             )
             registry.add(descriptor)
             registered += 1
+            non_mcp_registered += 1
             logger.info(
                 "Registered %s '%s' in registry",
                 artifact.capability_type.value,
@@ -247,7 +239,7 @@ def loading_node(
         status = TaskStatus.FAILED
         logger.warning(
             "Loading complete: 0 capabilities deployed for %d detected gaps "
-            "(%d artifacts generated but none successfully loaded/registered)",
+            "(%d artifacts generated but none successfully registered)",
             len(state.gaps),
             len(state.generated_artifacts),
         )
@@ -255,9 +247,10 @@ def loading_node(
         status = TaskStatus.COMPLETED
         logger.info(
             "Loading complete: %d/%d MCP tools registered, "
-            "%d skill/agent artifacts on disk, %d new errors",
-            registered,
+            "%d/%d skill/agent artifacts registered, %d new errors",
+            mcp_registered,
             len(mcp_artifacts),
+            non_mcp_registered,
             len(non_mcp_artifacts),
             new_errors,
         )

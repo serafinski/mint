@@ -1,30 +1,32 @@
-"""Unit tests for the verify_coverage helper (Step 7 of the B1 Pillar 3 block).
+"""Unit tests for split coverage verification.
 
-Tests the five branches documented in docs/MASTER_PLAN_2026_04_13.md §12
-pre-registered finding #5:
+The coverage verifier supports five current outcomes:
 
-1. **Verified happy path** — every failure case is handled by at least one
-   variant → all_covered=True, status="verified".
-2. **Uncovered case** — at least one failure case has no handling variant →
-   all_covered=False, status="verified", uncovered_cases populated.
-3. **Vacuous empty failures** — no failure cases provided → all_covered=True,
-   status="vacuous".
-4. **Unverifiable type** — variants are SKILL or AGENT → all_covered=True,
-   status="unverifiable_type" (the Pillar 1 × Pillar 3 tension response).
-5. **Replay infrastructure error** — sandbox raises or variant source is
-   unparseable → execution_errors populated.
+1. Verified happy path: every failure case is handled by at least one
+   variant, so ``all_covered=True`` and ``status="verified"``.
+2. Uncovered case: at least one failure case has no handling variant, so
+   ``all_covered=False``, ``status="verified"``, and ``uncovered_cases``
+   is populated.
+3. Vacuous coverage: no replayable failure cases or no variants were
+   provided, so ``all_covered=True`` and ``status="vacuous"``.
+4. Unverifiable type: variants are SKILL or AGENT, so deterministic
+   replay coverage is outside scope and ``status="unverifiable_type"``.
+5. Replay infrastructure error: sandbox execution, source parsing, or
+   input parsing fails and ``execution_errors`` is populated.
 
-Plus the two "handled" semantics subcases from finding #5 sub-finding 5b:
+The tests also cover the two "handled" semantics:
 
-- Error-case (parent has error_message) → variant handles iff replay runs
+- Error case: a parent with ``error_message`` is handled when replay runs
   without raising.
-- Wrong-output-case (parent has actual_output, no error_message) → variant
-  handles iff replay runs without raising AND produces output ≠ parent's
-  recorded actual_output.
+- Wrong-output case: a parent with ``actual_output`` and no
+  ``error_message`` is handled when replay runs without raising and
+  produces output different from the parent's recorded output.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -37,7 +39,6 @@ from src.verification.coverage import (
     _variant_handles_case,
     verify_coverage,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -84,7 +85,10 @@ def _agent_variant(name: str) -> GeneratedArtifact:
     )
 
 
-def _error_case(task_id: str = "task-err", error: str = "IndexError: out of range") -> InvocationRecord:
+def _error_case(
+    task_id: str = "task-err",
+    error: str = "IndexError: out of range",
+) -> InvocationRecord:
     """Failure case where the parent errored."""
     return InvocationRecord(
         capability_id="parent-cap",
@@ -140,7 +144,7 @@ class TestCoverageReportSchema:
 
 
 # ---------------------------------------------------------------------------
-# Edge cases — empty variants, empty failures
+# Edge cases - empty variants, empty failures
 # ---------------------------------------------------------------------------
 
 
@@ -162,7 +166,7 @@ class TestVacuousCoverage:
 
 
 # ---------------------------------------------------------------------------
-# Type dispatch — SKILL/AGENT return unverifiable_type
+# Type dispatch - SKILL/AGENT return unverifiable_type
 # ---------------------------------------------------------------------------
 
 
@@ -196,20 +200,14 @@ class TestTypeDispatch:
         """Mixed-type variants are a caller bug but the verifier should
         still return a report, dispatching on the first variant's type
         and logging a warning.
-
-        Tightened (2026-04-19): the warning log was previously assumed but
-        never asserted, so a silent refactor that dropped the log would
-        still pass. ``caplog`` now fixes both the status and the surfacing
-        of the mixed-types signal to operators.
         """
-        import logging
 
         with caplog.at_level(logging.WARNING, logger="src.verification.coverage"):
             report = verify_coverage(
                 [_skill_variant("skill-a"), _mcp_variant("tool-b")],
                 [_error_case()],
             )
-        # Dispatch on SKILL (first variant) → unverifiable_type
+        # Dispatch on SKILL (first variant) -> unverifiable_type.
         assert report.status == "unverifiable_type"
         # Warning log surfaced for the mixed-types caller bug.
         warning_messages = [
@@ -221,16 +219,16 @@ class TestTypeDispatch:
 
 
 # ---------------------------------------------------------------------------
-# _variant_handles_case — error-case semantics
+# _variant_handles_case - error-case semantics
 # ---------------------------------------------------------------------------
 
 
 class TestVariantHandlesCase_ErrorCase:
-    """Parent errored → variant handles iff replay runs without raising."""
+    """Parent errored, so replay succeeds only when the variant runs cleanly."""
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_variant_runs_clean_on_error_case_handles(self, mock_sandbox):
-        """Replay completes with no error → failure mode fixed."""
+        """Replay completes with no error, so the failure mode changed."""
         mock_sandbox.return_value = {
             "success": True,
             "stdout": '{"result": "\\"ok\\"", "error": null}',
@@ -245,7 +243,7 @@ class TestVariantHandlesCase_ErrorCase:
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_variant_also_errors_on_error_case_does_not_handle(self, mock_sandbox):
-        """Replay itself raises → failure mode NOT fixed (variant is just as broken)."""
+        """Replay itself errors, so the failure mode is not fixed."""
         mock_sandbox.return_value = {
             "success": True,
             "stdout": '{"result": null, "error": "ValueError: still broken"}',
@@ -274,12 +272,12 @@ class TestVariantHandlesCase_ErrorCase:
 
 
 # ---------------------------------------------------------------------------
-# _variant_handles_case — wrong-output-case semantics
+# _variant_handles_case - wrong-output-case semantics
 # ---------------------------------------------------------------------------
 
 
 class TestVariantHandlesCase_WrongOutputCase:
-    """Parent didn't error → variant handles iff runs clean AND output differs."""
+    """Parent did not error, so clean replay must also change output."""
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_variant_produces_different_output_handles(self, mock_sandbox):
@@ -298,7 +296,7 @@ class TestVariantHandlesCase_WrongOutputCase:
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_variant_produces_same_output_does_not_handle(self, mock_sandbox):
-        """Variant runs clean but produces SAME output as parent → didn't fix anything."""
+        """Variant runs clean but produces the same output as the parent."""
         mock_sandbox.return_value = {
             "success": True,
             "stdout": '{"result": "\\"same-answer\\"", "error": null}',
@@ -313,7 +311,7 @@ class TestVariantHandlesCase_WrongOutputCase:
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_variant_errors_on_wrong_output_case_regression(self, mock_sandbox):
-        """Variant errors on input the parent didn't error on → regression, not handled."""
+        """Variant errors on input the parent did not error on, so it regresses."""
         mock_sandbox.return_value = {
             "success": True,
             "stdout": '{"result": null, "error": "ValueError: crashed"}',
@@ -327,7 +325,7 @@ class TestVariantHandlesCase_WrongOutputCase:
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_parent_has_no_recorded_output_cannot_verify(self, mock_sandbox):
-        """Wrong-output case with no recorded actual_output → conservative not-handled."""
+        """Wrong-output case with no recorded output is conservatively not handled."""
         mock_sandbox.return_value = {
             "success": True,
             "stdout": '{"result": "\\"something\\"", "error": null}',
@@ -351,7 +349,7 @@ class TestVariantHandlesCase_WrongOutputCase:
 
 
 # ---------------------------------------------------------------------------
-# _variant_handles_case — infrastructure error paths
+# _variant_handles_case - infrastructure error paths
 # ---------------------------------------------------------------------------
 
 
@@ -425,7 +423,7 @@ class TestVariantHandlesCase_InfrastructureErrors:
 
 
 # ---------------------------------------------------------------------------
-# verify_coverage — MCP_TOOL end-to-end paths
+# verify_coverage - MCP_TOOL end-to-end paths
 # ---------------------------------------------------------------------------
 
 
@@ -452,18 +450,18 @@ class TestVerifyCoverageMcpTool:
     def test_one_case_uncovered(self, mock_sandbox):
         """t1 is handled (replay clean), t2 is not (replay errors).
 
-        verify_coverage iterates case × variant, so call order for
-        [var-a, var-b] × [t1, t2] is:
-        1. t1 × var-a, 2. t1 × var-b, 3. t2 × var-a, 4. t2 × var-b.
+        verify_coverage iterates case by variant, so call order for
+        [var-a, var-b] by [t1, t2] is:
+        1. t1/var-a, 2. t1/var-b, 3. t2/var-a, 4. t2/var-b.
         """
         call_outputs = [
-            # t1 × var-a — clean
+            # t1/var-a - clean.
             '{"result": "\\"ok\\"", "error": null}',
-            # t1 × var-b — clean (already handled, won't change verdict)
+            # t1/var-b - clean (already handled, will not change verdict).
             '{"result": "\\"ok\\"", "error": null}',
-            # t2 × var-a — error
+            # t2/var-a - error.
             '{"result": null, "error": "ValueError"}',
-            # t2 × var-b — error (still not handled)
+            # t2/var-b - error (still not handled).
             '{"result": null, "error": "ValueError"}',
         ]
         call_idx = iter(call_outputs)
@@ -486,18 +484,18 @@ class TestVerifyCoverageMcpTool:
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_partial_coverage_one_variant_handles(self, mock_sandbox):
-        """Only var-a handles t1, only var-b handles t2 → both covered.
+        """Only var-a handles t1 and only var-b handles t2, so both are covered.
 
-        Call order: t1 × var-a, t1 × var-b, t2 × var-a, t2 × var-b.
+        Call order: t1/var-a, t1/var-b, t2/var-a, t2/var-b.
         """
         call_outputs = [
-            # t1 × var-a — handles
+            # t1/var-a - handles.
             '{"result": "\\"ok\\"", "error": null}',
-            # t1 × var-b — doesn't handle (errors)
+            # t1/var-b - does not handle (errors).
             '{"result": null, "error": "ValueError"}',
-            # t2 × var-a — doesn't handle (errors)
+            # t2/var-a - does not handle (errors).
             '{"result": null, "error": "ValueError"}',
-            # t2 × var-b — handles
+            # t2/var-b - handles.
             '{"result": "\\"ok\\"", "error": null}',
         ]
         call_idx = iter(call_outputs)
@@ -538,12 +536,11 @@ class TestVerifyCoverageMcpTool:
     def test_partial_coverage_with_some_execution_errors_still_verified(
         self, mock_sandbox
     ):
-        """Some execution errors but coverage still achieved → status='verified',
-        all_covered=True, execution_errors populated but non-fatal."""
+        """Coverage can still pass when another variant handles the case."""
         call_outputs: list = [
-            # var-a × t1 — handles
+            # var-a/t1 - handles.
             {"stdout_text": '{"result": "\\"ok\\"", "error": null}', "raise": False},
-            # var-b × t1 — infrastructure error
+            # var-b/t1 - infrastructure error.
             {"stdout_text": None, "raise": True},
         ]
         call_idx = iter(call_outputs)
@@ -594,24 +591,19 @@ class TestNeverRaises:
 
 
 # ---------------------------------------------------------------------------
-# Security audit finding #16 — truncation sentinel detection (2026-04-20)
+# Truncation sentinel handling
 # ---------------------------------------------------------------------------
 
 
 class TestTruncationSentinelHandling:
     """Coverage replay must detect the ``__truncated__`` sentinel
     emitted by ``serialize_for_invocation`` on oversize payloads and
-    report the case as unreproducible — NOT pass to the sandbox and
-    let the replay silently fail on a malformed `{"x": ...}` reconstruction.
-    Pre-fix the function emitted invalid JSON; now it emits a valid
-    sentinel and the coverage verifier has to recognise it.
+    report the case as unreproducible instead of passing truncated
+    input to the sandbox.
     """
 
     def test_truncation_sentinel_reports_unreproducible(self):
-        """Sentinel failure case → returns (False, <reason mentioning truncation>)
-        without invoking the sandbox."""
-        import json
-
+        """Sentinel failure case returns a reason without invoking the sandbox."""
         sentinel = json.dumps(
             {"__truncated__": True, "__original_size_bytes__": 128000},
             sort_keys=True,
@@ -635,21 +627,18 @@ class TestTruncationSentinelHandling:
         assert reason is not None
         assert "truncated" in reason.lower()
         assert "unreproducible" in reason.lower()
-        # Sandbox must NOT have been invoked — no point replaying a truncated input.
+        # No point replaying a truncated input.
         mock_sbx.assert_not_called()
 
-    def test_legacy_invalid_json_reports_unreproducible(self):
-        """Pre-fix rows carry the literal ``f'{head}..."__TRUNCATED__"'``
-        string which does not parse. The fix must tolerate these as
-        unreproducible rather than crashing the replay."""
+    def test_invalid_json_reports_unreproducible(self):
+        """Malformed recorded inputs are unreproducible and should not crash replay."""
         failure = InvocationRecord(
             capability_id="parent-cap",
-            task_id="legacy-truncated",
+            task_id="invalid-json",
             success=False,
             token_cost=0,
             latency_ms=1.0,
             error_message="boom",
-            # Pre-fix broken format verbatim.
             input_args='{"payload": "xxx...yyy..."__TRUNCATED__"',
             actual_output=None,
         )
@@ -665,36 +654,26 @@ class TestTruncationSentinelHandling:
 
 
 # ---------------------------------------------------------------------------
-# Security audit finding #15 — coverage sort_keys asymmetry (2026-04-20)
+# Semantic equality for wrong-output cases
 # ---------------------------------------------------------------------------
 
 
 class TestWrongOutputCase_SemanticEquality:
-    """Pre-fix, the variant's replay output was serialized without
-    ``sort_keys=True`` while the parent's ``actual_output`` was stored
-    with ``sort_keys=True``. Dicts with the same semantic content but
-    different Python iteration order string-compared unequal, and
-    ``_variant_handles_case`` returned ``(True, None)`` (falsely handled)
-    — manufacturing positive split-coverage evidence. Post-fix: sort_keys
-    applied symmetrically + defence-in-depth ``_semantic_equal`` parses
-    both sides before comparing.
+    """Semantically identical outputs are not treated as handled.
+
+    The verifier compares parsed JSON values, not only strings, so
+    key order and numeric representation differences do not create
+    false positive coverage evidence.
     """
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_key_order_asymmetry_rejected(self, mock_sandbox):
-        """Variant returns ``{"b": 2, "a": 1}`` — parent recorded
-        ``{"a": 1, "b": 2}`` (sort_keys ordering). Same semantic content,
-        different serialization. Must report handled=False."""
-        import json
-
+        """Different key order with the same values is not handled."""
         # Parent stored with sort_keys=True (matches serialize_for_invocation).
         parent_output_json = json.dumps({"a": 1, "b": 2}, default=str, sort_keys=True)
-        # Variant's sandbox would now emit with sort_keys=True too (the fix
-        # at coverage.py:228), but we're testing _semantic_equal's
-        # defence-in-depth: even if a future regression drops sort_keys,
-        # the parse-then-compare catches it.
-        variant_result_json = json.dumps({"b": 2, "a": 1}, default=str)  # different order
-        # Outer envelope (result + error) — matches _build_replay_code output.
+        # Intentionally omit sort_keys to exercise _semantic_equal.
+        variant_result_json = json.dumps({"b": 2, "a": 1}, default=str)
+        # Outer envelope (result + error) matches _build_replay_code output.
         mock_sandbox.return_value = {
             "success": True,
             "stdout": json.dumps({"result": variant_result_json, "error": None}),
@@ -712,16 +691,14 @@ class TestWrongOutputCase_SemanticEquality:
 
         assert handled is False, (
             "Semantically-identical outputs (same dict, different key order) "
-            "must be reported as NOT handled. Pre-fix returned True = "
-            "false-positive split coverage."
+            "must be reported as not handled."
         )
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_int_vs_float_treated_as_equal(self, mock_sandbox):
-        """JSON ``1`` vs ``1.0`` — Python ``1 == 1.0`` is True. The
-        _semantic_equal helper preserves this across JSON boundaries."""
-        import json
+        """JSON ``1`` vs ``1.0`` compare equal as parsed Python values.
 
+        _semantic_equal helper preserves this across JSON boundaries."""
         parent_output_json = json.dumps({"x": 1.0}, default=str, sort_keys=True)
         variant_result_json = json.dumps({"x": 1}, default=str, sort_keys=True)
         mock_sandbox.return_value = {
@@ -740,15 +717,13 @@ class TestWrongOutputCase_SemanticEquality:
         handled, _ = _variant_handles_case(variant, failure)
 
         assert handled is False, (
-            "1 vs 1.0 must compare equal — Python treats them as ==, "
-            "so the variant did NOT differentiate the output."
+            "1 vs 1.0 must compare equal because Python treats them as ==, "
+            "so the variant did not differentiate the output."
         )
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_nested_dict_key_order_also_contained(self, mock_sandbox):
-        """Nested dicts with reordered keys — still semantically equal."""
-        import json
-
+        """Nested dicts with reordered keys are still semantically equal."""
         parent_output_json = json.dumps(
             {"outer": {"a": 1, "b": 2}}, default=str, sort_keys=True,
         )
@@ -773,11 +748,7 @@ class TestWrongOutputCase_SemanticEquality:
 
     @patch("src.verification.coverage.sandbox_execute")
     def test_genuinely_different_output_still_handled(self, mock_sandbox):
-        """Regression guard: the fix must NOT break the legitimate
-        "variant differentiated the output" case. Different content →
-        handled=True."""
-        import json
-
+        """Different content still counts as handled."""
         parent_output_json = json.dumps({"answer": "wrong"}, default=str, sort_keys=True)
         variant_result_json = json.dumps({"answer": "right"}, default=str, sort_keys=True)
         mock_sandbox.return_value = {

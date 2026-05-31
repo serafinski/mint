@@ -1,9 +1,8 @@
 """Unit tests for the skill generator node.
 
-LLM-calling behaviour is covered by ``tests/integration/test_skill_generator.py``
-with real OpenAI calls.  These tests cover pure helper functions, content
-validation (via quick_validate.py), and the node's routing logic without any
-LLM mocking.
+These tests mock the LLM boundary and cover deterministic helper behavior,
+SKILL.md validation via ``tools/quick_validate.py``, node routing, repair
+handling, and artifact construction.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ import src.orchestrator.generators.skill as _skill_module
 from src.orchestrator.generators.skill import (
     _generate_single_skill,
     _get_validate_skill,
+    _sanitize_frontmatter_description,
     _strip_code_fences,
     extract_skill_name,
     generate_skill,
@@ -119,9 +119,9 @@ class TestStripCodeFences:
     def test_outer_closing_fence_absent_inner_fence_not_stripped(self):
         """When outer closing fence is absent, the inner code block's closing fence is kept.
 
-        Regression test for BUG-01: without parity counting, the closing-fence
-        regex incorrectly strips the final ``` of an inner code block when the
-        outer wrapping ``` is present but has no corresponding closing ```.
+        Without fence-parity counting, the closing-fence regex could strip the
+        final ``` of an inner code block when the outer wrapping ``` is present
+        but has no corresponding closing ```.
         """
         text = "```\n---\nname: test\n---\n\n# Body\n```python\npass\n```"
         result = _strip_code_fences(text)
@@ -145,6 +145,28 @@ class TestExtractSkillName:
     def test_missing_name(self):
         content = "---\ndescription: test\n---\ncontent"
         assert extract_skill_name(content) is None
+
+
+class TestSanitizeFrontmatterDescription:
+    def test_removes_angle_brackets_from_description_only(self):
+        content = """\
+---
+name: metric-skill
+description: "Apply <metric>_<function> thresholds and summarize alerts."
+---
+
+# Metric Skill
+
+Body keeps <angle brackets> if it wants them.
+"""
+        result = _sanitize_frontmatter_description(content)
+        assert 'description: Apply metric_function thresholds and summarize alerts.' in result
+        assert "Body keeps <angle brackets> if it wants them." in result
+        assert "<metric>" not in result
+
+    def test_no_frontmatter_is_unchanged(self):
+        content = "# No frontmatter\n\nBody"
+        assert _sanitize_frontmatter_description(content) == content
 
 
 class TestValidateSkillContent:
@@ -465,7 +487,7 @@ class TestGenerateSingleSkill:
 
         assert error is None
         assert artifact is not None
-        # Fix 5: name is now a deterministic slug, not the LLM-chosen name
+        # Artifact name is the deterministic stable slug, not the LLM-chosen name.
         from src.orchestrator.generators.utils import slugify_gap_hyphen
         assert artifact.capability_name == slugify_gap_hyphen("csv-loader")
         assert artifact.capability_type == CapabilityType.SKILL
@@ -483,6 +505,23 @@ class TestGenerateSingleSkill:
         assert artifact is not None
         from src.orchestrator.generators.utils import slugify_gap_hyphen
         assert artifact.capability_name == slugify_gap_hyphen("csv-loader")
+
+    def test_angle_brackets_in_description_are_sanitized_without_repair(self, tmp_path):
+        content = VALID_SKILL_MD.replace(
+            'description: "Load and parse CSV files for data pipeline ingestion."',
+            'description: "Load <metric>_<function> CSV files for data pipeline ingestion."',
+        )
+        mock_llm = self._make_mock_llm([content])
+        with patch(
+            "src.orchestrator.generators.skill._get_llm",
+            return_value=mock_llm,
+        ):
+            artifact, error = _generate_single_skill(self._gap(), "context", output_dir=tmp_path)
+
+        assert error is None
+        assert artifact is not None
+        assert "<" not in artifact.skill_content
+        assert "metric_function" in artifact.skill_content
 
     def test_first_llm_call_fails(self, tmp_path):
         """LLM error on first attempt returns (None, error) without raising."""
@@ -547,7 +586,7 @@ class TestGenerateSingleSkill:
 
         assert error is None
         assert artifact is not None
-        # Fix 5: name is now a deterministic slug from gap.query
+        # Artifact name is the deterministic slug derived from the gap query.
         from src.orchestrator.generators.utils import slugify_gap_hyphen
         assert artifact.capability_name == slugify_gap_hyphen("CSV Data Loader")
 
@@ -576,11 +615,10 @@ class TestGenerateSingleSkill:
         assert custom_context in captured_prompts[0]
 
     def test_schema_context_reaches_prompt(self, tmp_path):
-        """Phase 3.5c wires ``build_schema_context(gap, subtasks)`` into the
-        SKILL generator prompt so each step's SKILL.md workflow knows its
-        upstream input keys and required output keys. Guard the injection
-        path with distinctive key tokens so a future refactor that drops
-        the plumbing is caught immediately.
+        """Schema context reaches the SKILL generator prompt.
+
+        Distinctive key tokens verify that upstream input keys and required
+        output keys are included in the prompt.
         """
         from src.orchestrator.generators.utils import build_schema_context
         from src.schemas.task import SubTask
@@ -629,8 +667,7 @@ class TestGenerateSingleSkill:
         assert "reorder_plan_fixture" in prompt
 
     def test_empty_schema_context_omits_contract_section(self, tmp_path):
-        """Legacy decompositions without output_schema produce an empty
-        contract string — the generator must not emit a dangling heading.
+        """Empty schema context does not emit a dangling contract heading.
         """
         captured_prompts: list = []
 
@@ -658,7 +695,7 @@ class TestGenerateSingleSkill:
         assert "Input/Output Schema Contract" not in captured_prompts[0]
 
 # ---------------------------------------------------------------------------
-# Lazy-import safety: _VALIDATE_MODULE must not be cached on exec failure (Bug 2)
+# Lazy-import safety: _VALIDATE_MODULE must not be cached on exec failure
 # ---------------------------------------------------------------------------
 
 
@@ -666,9 +703,6 @@ class TestGetValidateSkillLazyImport:
     def test_module_not_cached_on_exec_failure(self):
         """If exec_module raises, _VALIDATE_MODULE must remain None so the next
         call retries the load rather than returning a broken module.
-
-        Regression test for Bug 2: previously _VALIDATE_MODULE was assigned
-        before exec_module ran, leaving a broken module in the cache.
         """
         original = _skill_module._VALIDATE_MODULE
         try:

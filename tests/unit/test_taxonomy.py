@@ -17,10 +17,12 @@ from src.orchestrator.taxonomy import (
     CapabilityDomainClassification,
     DomainTaxonomy,
     QueryDomainChoice,
+    _contains_domain_specific_literals,
+    _normalize_category_name,
+    classify_and_tag_artifacts,
 )
 from src.schemas.capability import CapabilityType
 from src.schemas.task import GeneratedArtifact
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -154,6 +156,26 @@ class TestCategoryGrowth:
         tmp_taxonomy.get_or_create_for_capability(artifact, llm)
         assert "unknown-domain" in tmp_taxonomy.list_categories()
 
+    def test_blank_domain_falls_back_without_creating_empty_category(
+        self, tmp_taxonomy: DomainTaxonomy,
+    ):
+        artifact = _make_artifact()
+        llm = _mock_llm_returning(
+            CapabilityDomainClassification(
+                domain="   ",
+                is_new=False,
+                new_description="",
+                is_generic=False,
+                rationale="LLM returned whitespace only.",
+            )
+        )
+
+        result = tmp_taxonomy.get_or_create_for_capability(artifact, llm)
+
+        assert result.domain == "general"
+        assert result.is_new is False
+        assert tmp_taxonomy.list_categories() == {}
+
     def test_growth_is_persistent_across_instances(self, tmp_path: Path):
         path = tmp_path / "domains.json"
         tx1 = DomainTaxonomy(path)
@@ -241,6 +263,33 @@ class TestQueryClassification:
         # "finance" isn't in the taxonomy — should be treated as None
         assert tmp_taxonomy.get_for_query("query", query_llm) is None
 
+    def test_blank_query_domain_treated_as_none(self, tmp_taxonomy: DomainTaxonomy):
+        seed_llm = _mock_llm_returning(
+            CapabilityDomainClassification(
+                domain="sales",
+                is_new=True,
+                new_description="Sales",
+                is_generic=False,
+                rationale="",
+            )
+        )
+        tmp_taxonomy.get_or_create_for_capability(_make_artifact(), seed_llm)
+
+        query_llm = _mock_query_llm_returning(
+            QueryDomainChoice(domain="   ", rationale="Bad whitespace response.")
+        )
+        assert tmp_taxonomy.get_for_query("parse sales csv", query_llm) is None
+
+
+class TestCategoryNameNormalization:
+    def test_blank_names_normalize_to_none(self):
+        assert _normalize_category_name(None) is None
+        assert _normalize_category_name("") is None
+        assert _normalize_category_name("   ") is None
+
+    def test_names_are_stripped(self):
+        assert _normalize_category_name("  sales  ") == "sales"
+
 
 # ---------------------------------------------------------------------------
 # LLM failure → safe defaults
@@ -268,6 +317,83 @@ class TestLLMFailureHandling:
         broken_llm = MagicMock()
         broken_llm.invoke.side_effect = RuntimeError("API down")
         assert tmp_taxonomy.get_for_query("some query", broken_llm) is None
+
+
+class TestTaxonomyRetry:
+    """get_for_query retries transient LLM failures before bypassing filtering."""
+
+    def test_retries_on_transient_failure_up_to_three_attempts(
+        self, tmp_taxonomy: DomainTaxonomy,
+    ):
+        # Pre-seed so the empty-taxonomy short-circuit doesn't fire.
+        seed_llm = _mock_llm_returning(
+            CapabilityDomainClassification(
+                domain="sales", is_new=True, new_description="",
+                is_generic=False, rationale="",
+            )
+        )
+        tmp_taxonomy.get_or_create_for_capability(_make_artifact(), seed_llm)
+
+        # Two transient failures, then success on the 3rd attempt.
+        flaky_llm = MagicMock()
+        flaky_llm.invoke.side_effect = [
+            RuntimeError("rate limit"),
+            RuntimeError("500 upstream"),
+            QueryDomainChoice(domain="sales", rationale="3rd try worked"),
+        ]
+        result = tmp_taxonomy.get_for_query("parse sales csv", flaky_llm)
+        assert result == "sales", (
+            "taxonomy classifier must retry through transient failures "
+            "before returning None"
+        )
+        assert flaky_llm.invoke.call_count == 3
+
+    def test_exhausted_retries_return_none_loud_fail(
+        self, tmp_taxonomy: DomainTaxonomy, caplog,
+    ):
+        seed_llm = _mock_llm_returning(
+            CapabilityDomainClassification(
+                domain="sales", is_new=True, new_description="",
+                is_generic=False, rationale="",
+            )
+        )
+        tmp_taxonomy.get_or_create_for_capability(_make_artifact(), seed_llm)
+
+        always_broken = MagicMock()
+        always_broken.invoke.side_effect = RuntimeError("persistent API down")
+
+        import logging
+        with caplog.at_level(logging.ERROR, logger="src.orchestrator.taxonomy"):
+            result = tmp_taxonomy.get_for_query("parse sales csv", always_broken)
+
+        assert result is None
+        assert always_broken.invoke.call_count == 3
+        # Must emit an ERROR log after exhausting retries (loud-fail contract).
+        assert any(
+            "exhausted" in rec.getMessage() and rec.levelname == "ERROR"
+            for rec in caplog.records
+        ), "retry exhaustion must emit an ERROR log, not just WARN."
+
+    def test_first_attempt_success_does_not_retry(
+        self, tmp_taxonomy: DomainTaxonomy,
+    ):
+        """Happy path: first-attempt success returns immediately without
+        retry overhead.
+        """
+        seed_llm = _mock_llm_returning(
+            CapabilityDomainClassification(
+                domain="sales", is_new=True, new_description="",
+                is_generic=False, rationale="",
+            )
+        )
+        tmp_taxonomy.get_or_create_for_capability(_make_artifact(), seed_llm)
+
+        happy_llm = _mock_query_llm_returning(
+            QueryDomainChoice(domain="sales", rationale="match")
+        )
+        result = tmp_taxonomy.get_for_query("parse sales csv", happy_llm)
+        assert result == "sales"
+        assert happy_llm.invoke.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -360,3 +486,133 @@ class TestImplementationExtraction:
     def test_empty_artifact_returns_empty(self):
         artifact = _make_artifact(source_code=None, skill_content=None, agent_config=None)
         assert DomainTaxonomy._extract_implementation(artifact) == ""
+
+
+class _FakeStructuredTaxonomyLLM:
+    def __init__(self):
+        self.prompts: list[str] = []
+
+    def invoke(self, prompt: str) -> CapabilityDomainClassification:
+        self.prompts.append(prompt)
+        if "NAME: aggregate-eligibility-counts" in prompt:
+            return CapabilityDomainClassification(
+                domain="eligibility-aggregation",
+                is_new=True,
+                new_description="Eligibility decisions and rollups.",
+                is_generic=False,
+                rationale="Aggregates eligibility outcomes.",
+            )
+        if "NAME: parse-eligibility-policy-and-applications-csv" in prompt:
+            if "- eligibility-aggregation:" in prompt:
+                return CapabilityDomainClassification(
+                    domain="eligibility-aggregation",
+                    is_new=False,
+                    new_description="",
+                    is_generic=False,
+                    rationale="Same eligibility workflow as the seeded aggregate step.",
+                )
+            return CapabilityDomainClassification(
+                domain="orders-csv-processing",
+                is_new=False,
+                new_description="",
+                is_generic=False,
+                rationale="Fallback to the only existing category.",
+            )
+        raise AssertionError(f"Unexpected prompt:\n{prompt}")
+
+
+class _FakeTaxonomyModel:
+    def __init__(self, structured_llm: _FakeStructuredTaxonomyLLM):
+        self._structured_llm = structured_llm
+
+    def with_structured_output(self, *_args, **_kwargs):
+        return self._structured_llm
+
+
+class TestClassifyAndTagArtifacts:
+    def test_domain_defining_artifact_seeds_taxonomy_before_parser(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import src.orchestrator.taxonomy as taxonomy_mod
+
+        taxonomy_path = tmp_path / "domains.json"
+        taxonomy_path.write_text(json.dumps({
+            "version": 1,
+            "categories": {
+                "orders-csv-processing": {
+                    "description": "Tools that process orders-related CSV files.",
+                    "created_at": "2026-04-22T00:00:00+00:00",
+                }
+            },
+        }))
+        monkeypatch.setattr(taxonomy_mod, "_TAXONOMY_PATH", taxonomy_path)
+
+        structured_llm = _FakeStructuredTaxonomyLLM()
+        fake_model = _FakeTaxonomyModel(structured_llm)
+        monkeypatch.setattr("langchain.chat_models.init_chat_model", lambda *a, **k: fake_model)
+
+        parse_artifact = _make_artifact(
+            name="parse-eligibility-policy-and-applications-csv",
+            description=(
+                "Parse eligibility policy JSON and applications CSV into "
+                "structured records."
+            ),
+            source_code="async def parse_eligibility_policy_and_applications_csv():\n    return {}",
+        )
+        aggregate_artifact = _make_artifact(
+            name="aggregate-eligibility-counts",
+            description="Aggregate eligibility decisions into counts and summaries.",
+            source_code="async def aggregate_eligibility_counts():\n    return {}",
+        )
+
+        classify_and_tag_artifacts([parse_artifact, aggregate_artifact])
+
+        assert aggregate_artifact.domain == "eligibility-aggregation"
+        assert parse_artifact.domain == "eligibility-aggregation"
+        categories = DomainTaxonomy(taxonomy_path).list_categories()
+        assert "eligibility-aggregation" in categories
+        assert structured_llm.prompts[0].count("eligibility-aggregation") == 0
+        assert "- eligibility-aggregation:" in structured_llm.prompts[1]
+
+
+class TestDomainSpecificLiteralDetection:
+    def test_source_with_order_id_literal_detected(self):
+        artifact = _make_artifact(
+            name="parse_sales",
+            source_code='cols = ["order_id", "product_id"]',
+            description="",
+        )
+
+        assert _contains_domain_specific_literals(artifact) is True
+
+    def test_source_without_domain_literals_not_detected(self):
+        artifact = _make_artifact(
+            name="parse_csv",
+            source_code='cols = ["col1", "col2", "col3"]',
+            description="",
+        )
+
+        assert _contains_domain_specific_literals(artifact) is False
+
+    def test_skill_content_checked(self):
+        artifact = _make_artifact(
+            name="inventory-skill",
+            capability_type=CapabilityType.SKILL,
+            source_code=None,
+            skill_content='Check "needs_reorder" field on each item.',
+            description="",
+        )
+
+        assert _contains_domain_specific_literals(artifact) is True
+
+    def test_prose_mention_without_quotes_not_detected(self):
+        """Only quoted string literals count; prose mentions do not trigger."""
+        artifact = _make_artifact(
+            name="general-analyzer",
+            capability_type=CapabilityType.SKILL,
+            source_code=None,
+            skill_content="This analyzer handles generic inventory use cases.",
+            description="",
+        )
+
+        assert _contains_domain_specific_literals(artifact) is False

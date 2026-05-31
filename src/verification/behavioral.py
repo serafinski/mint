@@ -3,17 +3,24 @@
 Generates edge-case test inputs, executes them in the Docker sandbox,
 and detects behavioral contamination. No LLM calls — pure Python.
 
-Six test categories:
+Regular probes:
+  - Parameterless smoke: non-empty output from zero-input tools
   - Nonexistent entity: empty / missing / invalid inputs
-  - Consistency: same input twice must produce same output
-  - Boundary: min/max values, zero, negative, empty strings
-  - Timeout: execution must complete within a reasonable timeout (5s)
-  - Latency (variance): mock-smell detection — very fast AND very uniform
+  - Consistency: same input twice must produce the same output
+  - Boundary: zero, empty, negative, extreme numeric, and large inputs
+  - KNN CSV identifier column: valid fixture with an integer ID column
+  - Timeout: execution must complete within a reasonable timeout
+  - Latency variance: suspiciously fast and uniform execution
   - Output variation: different inputs should produce different outputs
+
+For artifacts declared as network-dependent, an optional network-disconnect
+differential compares online and offline behavior when the task permits
+network access.
 """
 
 import ast
 import json
+import re
 import statistics
 import textwrap
 import time
@@ -32,50 +39,52 @@ TIMEOUT_THRESHOLD_S = 5.0
 # ---------------------------------------------------------------------------
 
 
-def extract_parameter_schema(source_code: str) -> dict[str, dict]:
-    """Extract {param_name: {"type": type_str}} from the async function signature.
+def _schema_from_async_def(node: ast.AsyncFunctionDef) -> dict[str, dict]:
+    """Return ``{param_name: {"type": type_str}}`` for an async def node."""
+    schema: dict[str, dict] = {}
+    for arg in (*node.args.args, *node.args.kwonlyargs):
+        annotation = arg.annotation
+        if isinstance(annotation, ast.Subscript):
+            # Annotated[X, ...] -> extract the first type argument
+            if isinstance(annotation.slice, ast.Tuple):
+                type_node = annotation.slice.elts[0]
+                schema[arg.arg] = {"type": ast.unparse(type_node)}
+            else:
+                schema[arg.arg] = {"type": ast.unparse(annotation.slice)}
+        elif annotation:
+            schema[arg.arg] = {"type": ast.unparse(annotation)}
+        else:
+            schema[arg.arg] = {"type": "unknown"}
+    return schema
 
-    Skips private functions (names starting with ``_``). Returns the schema
-    for the first public async function found.
+
+def extract_parameter_schema(
+    source_code: str,
+    func_name: str | None = None,
+) -> dict[str, dict]:
+    """Extract {param_name: {"type": type_str}} from the target function signature.
+
+    When ``func_name`` is omitted, the function is resolved by
+    ``_extract_function_name`` so parameter generation and sandbox execution
+    use the same entrypoint.
     """
     try:
         tree = ast.parse(source_code)
     except SyntaxError:
         return {}
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.AsyncFunctionDef):
-            continue
-        if node.name.startswith("_"):
-            continue
-        schema: dict[str, dict] = {}
-        for arg in (*node.args.args, *node.args.kwonlyargs):
-            annotation = arg.annotation
-            if isinstance(annotation, ast.Subscript):
-                # Annotated[X, ...] -> extract the first type argument
-                if isinstance(annotation.slice, ast.Tuple):
-                    type_node = annotation.slice.elts[0]
-                    schema[arg.arg] = {"type": ast.unparse(type_node)}
-                else:
-                    schema[arg.arg] = {"type": ast.unparse(annotation.slice)}
-            elif annotation:
-                schema[arg.arg] = {"type": ast.unparse(annotation)}
-            else:
-                schema[arg.arg] = {"type": "unknown"}
-        return schema
+    target_name = func_name or _extract_function_name(source_code)
+    if target_name is None:
+        return {}
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == target_name:
+            return _schema_from_async_def(node)
     return {}
 
 
 def _find_mcp_tool_function(source_code: str) -> str | None:
     """Return the name of the ``@mcp.tool``-decorated public async function.
-
-    Security audit finding #8 (2026-04-19): the decorator is the only
-    unambiguous signal that identifies the tool entrypoint in a FastMCP
-    module. Every pre-fix call site used an ordering heuristic (``dir()``
-    alphabetical in ``ToolLoader``, ``ast.walk`` source order elsewhere)
-    that silently picked the wrong function when a helper was defined
-    before the decorated entrypoint (reporter's repro:
-    ``helper_format_rows`` ordered before ``@mcp.tool summarize_sales``).
 
     Returns the function name when exactly one public async def carries
     an ``@mcp.tool`` / ``@mcp.tool()`` decorator. Returns ``None`` on
@@ -116,12 +125,9 @@ def _find_mcp_tool_function(source_code: str) -> str | None:
 def _extract_function_name(source_code: str) -> str | None:
     """Return the name of the MCP tool entrypoint in ``source_code``.
 
-    Resolution order (security audit finding #8, 2026-04-19):
-
+    Resolution order:
     1. **Decorator match** via :func:`_find_mcp_tool_function` — unambiguous,
-       uses the FastMCP ``@mcp.tool`` signal. This is the correct answer
-       for generator output and merge/split LLM output when the FastMCP
-       pattern is followed.
+       uses the FastMCP ``@mcp.tool`` signal.
     2. **Zero decorator matches, exactly one public async def** —
        legacy / non-FastMCP artifacts. Use that function, log a WARNING
        that the decorator was missing.
@@ -158,7 +164,7 @@ def _extract_function_name(source_code: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Test input generation
+# Input generation helpers
 # ---------------------------------------------------------------------------
 
 
@@ -183,7 +189,13 @@ def _generate_boundary_inputs(schema: dict[str, dict]) -> dict[str, Any]:
 
 
 def _generate_negative_inputs(schema: dict[str, dict]) -> dict[str, Any]:
-    """Generate negative / edge-case inputs for numeric params."""
+    """Generate the PRIMARY (-1/-1.0) negative-input variant.
+
+    Back-compat shim for callers that want a single representative
+    variant (e.g., latency-variance probe). Use
+    :func:`_generate_negative_input_variants` for the full edge-case
+    matrix consumed by the boundary probe.
+    """
     inputs: dict[str, Any] = {}
     for name, info in schema.items():
         type_str = info.get("type", "unknown")
@@ -198,6 +210,77 @@ def _generate_negative_inputs(schema: dict[str, dict]) -> dict[str, Any]:
         else:
             inputs[name] = ""
     return inputs
+
+
+def _generate_negative_input_variants(
+    schema: dict[str, dict],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Generate multiple negative / edge-case input variants.
+
+    Returns ``(label, inputs)`` pairs so the boundary probe can run each
+    variant independently and label findings by the specific edge case that
+    triggered them.
+
+    Variants per type:
+      - ``int``: ``-1``, ``-2**31`` (32-bit min), ``-2**62`` (very large)
+      - ``float``: ``-1.0``, ``-inf``, ``+inf``, ``NaN``, ``-1e308``
+      - non-numeric types: single representative (matches the back-compat
+        shim's behaviour)
+    """
+    int_variants = [
+        ("int_neg_one", -1),
+        ("int_neg_31bit", -(2**31)),
+        ("int_neg_62bit", -(2**62)),
+    ]
+    float_variants = [
+        ("float_neg_one", -1.0),
+        ("float_neg_inf", float("-inf")),
+        ("float_pos_inf", float("inf")),
+        ("float_nan", float("nan")),
+        ("float_neg_underflow", -1e308),
+    ]
+
+    # Non-numeric parameters keep fallback values in each variant.
+    base: dict[str, Any] = {}
+    numeric_params: list[tuple[str, str]] = []  # (param_name, "int" | "float")
+    for name, info in schema.items():
+        type_str = info.get("type", "unknown")
+        if type_str == "int":
+            numeric_params.append((name, "int"))
+        elif type_str == "float":
+            numeric_params.append((name, "float"))
+        elif type_str == "str":
+            base[name] = "nonexistent_entity_xyz"
+        elif type_str == "bool":
+            base[name] = True
+        else:
+            base[name] = ""
+
+    if not numeric_params:
+        # No numeric params — emit a single representative variant from
+        # the back-compat helper. Boundary probe still gets ONE shot at
+        # the schema's non-numeric edge cases.
+        return [("non_numeric", _generate_negative_inputs(schema))]
+
+    variants: list[tuple[str, dict[str, Any]]] = []
+    for param_name, type_str in numeric_params:
+        per_param_variants = (
+            int_variants if type_str == "int" else float_variants
+        )
+        for label, value in per_param_variants:
+            kwargs = dict(base)
+            kwargs[param_name] = value
+            # Fill OTHER numeric params with their primary -1/-1.0 so
+            # the probe focuses on one variable at a time.
+            for other_name, other_type in numeric_params:
+                if other_name == param_name:
+                    continue
+                kwargs[other_name] = -1 if other_type == "int" else -1.0
+            # Keep the label as part of the variant identity rather than
+            # relying on dict equality; NaN compares unequal to itself.
+            variants.append((f"{param_name}/{label}", kwargs))
+
+    return variants
 
 
 def _generate_large_inputs(schema: dict[str, dict]) -> dict[str, Any]:
@@ -246,23 +329,67 @@ def _build_sandbox_code(source_code: str, func_name: str, inputs: dict[str, Any]
                 print(json.dumps({{"result": repr(result), "elapsed": elapsed, "error": None}}))
             except Exception as exc:
                 elapsed = time.monotonic() - start
-                print(json.dumps({{"result": None, "elapsed": elapsed, "error": f"{{type(exc).__name__}}: {{exc}}"}}))
+                error = f"{{type(exc).__name__}}: {{exc}}"
+                print(json.dumps({{"result": None, "elapsed": elapsed, "error": error}}))
+
+        asyncio.run(_run())
+    """)
+
+
+def _build_sandbox_code_with_tempfiles(
+    source_code: str,
+    func_name: str,
+    inputs: dict[str, Any],
+    temp_files: dict[str, str],
+    path_inputs: dict[str, str],
+) -> str:
+    """Build sandbox code that writes temp files and passes their paths to the tool."""
+    inputs_json = json.dumps(inputs)
+    temp_files_json = json.dumps(temp_files)
+    path_inputs_json = json.dumps(path_inputs)
+    return textwrap.dedent(f"""\
+        import asyncio
+        import json
+        import tempfile
+        import time
+        from pathlib import Path
+
+        __name__ = "not_main"  # prevent if __name__ == "__main__": mcp.run() from firing
+        # --- Inline the tool source ---
+        {textwrap.indent(source_code, "        ").strip()}
+        # --- End tool source ---
+
+        async def _run():
+            start = time.monotonic()
+            try:
+                _inputs = json.loads({inputs_json!r})
+                with tempfile.TemporaryDirectory() as _tmpdir:
+                    _tmp = Path(_tmpdir)
+                    for _name, _content in json.loads({temp_files_json!r}).items():
+                        (_tmp / _name).write_text(_content, encoding="utf-8")
+                    for _param, _relpath in json.loads({path_inputs_json!r}).items():
+                        _inputs[_param] = str(_tmp / _relpath)
+                    result = await {func_name}(**_inputs)
+                elapsed = time.monotonic() - start
+                print(json.dumps({{"result": repr(result), "elapsed": elapsed, "error": None}}))
+            except Exception as exc:
+                elapsed = time.monotonic() - start
+                error = f"{{type(exc).__name__}}: {{exc}}"
+                print(json.dumps({{"result": None, "elapsed": elapsed, "error": error}}))
 
         asyncio.run(_run())
     """)
 
 
 def _parse_sandbox_output(result: dict) -> dict | None:
-    """Parse the JSON output from a sandbox execution. Returns None on failure."""
-    if not result.get("success"):
-        return None
-    stdout = result.get("stdout", "").strip()
-    if not stdout:
-        return None
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
-        return None
+    """Parse the JSON output from a sandbox execution. Returns None on failure.
+
+    Delegates to the shared ``parse_sandbox_last_json_line`` helper so
+    import warnings or debug prints before the final JSON line do not make
+    the probe inconclusive.
+    """
+    from src.verification.sandbox_parse import parse_sandbox_last_json_line
+    return parse_sandbox_last_json_line(result)
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +399,11 @@ def _parse_sandbox_output(result: dict) -> dict | None:
 _TRIVIAL_RESULTS = {"None", "''", '""', "[]", "{}", "0", "False", "True"}
 
 
-def _test_parameterless_smoke(source_code: str, func_name: str, _sandbox=sandbox_execute) -> list[VerificationFinding]:
+def _test_parameterless_smoke(
+    source_code: str,
+    func_name: str,
+    _sandbox=sandbox_execute,
+) -> list[VerificationFinding]:
     """Smoke-test a parameterless tool: flag non-empty canned-looking output.
 
     A tool with no parameters cannot perform dynamic computation based on caller
@@ -302,13 +433,96 @@ def _test_parameterless_smoke(source_code: str, func_name: str, _sandbox=sandbox
     return []
 
 
+def _test_knn_identifier_column_csv(
+    source_code: str,
+    func_name: str,
+    schema: dict[str, dict],
+    _sandbox=sandbox_execute,
+) -> list[VerificationFinding]:
+    """Probe KNN CSV tools with a valid fixture-shaped file containing an integer ID column.
+
+    This catches the common failure mode where a tool imputes *all* numeric
+    columns, including identifier columns such as ``id`` / ``*_id``, then
+    crashes or mutates schema on reassignment.
+    """
+    lowered = source_code.lower()
+    if "knnimputer" not in lowered and "sklearn.impute" not in lowered:
+        return []
+    if "read_csv" not in lowered:
+        return []
+
+    csv_params = [
+        name
+        for name, info in schema.items()
+        if info.get("type") == "str"
+        and any(token in name.lower() for token in ("csv", "path", "file"))
+    ]
+    if len(csv_params) != 1:
+        return []
+
+    path_param = csv_params[0]
+    inputs = _generate_boundary_inputs(schema)
+    inputs.pop(path_param, None)
+
+    probe_csv = "\n".join(
+        [
+            "id,feature_a,feature_b,feature_c,feature_d",
+            "1,10.0,20.0,,40.0",
+            "2,11.0,,31.0,41.0",
+            "3,,22.0,32.0,42.0",
+            "4,13.0,23.0,33.0,",
+            "5,14.0,24.0,34.0,44.0",
+            "6,15.0,25.0,35.0,45.0",
+        ]
+    )
+    code = _build_sandbox_code_with_tempfiles(
+        source_code,
+        func_name,
+        inputs,
+        {"probe.csv": probe_csv},
+        {path_param: "probe.csv"},
+    )
+    result = _sandbox(code, timeout=15)
+    parsed = _parse_sandbox_output(result)
+
+    if parsed is None:
+        return [
+            VerificationFinding(
+                tier=2,
+                category="tabular_identifier_column",
+                severity=Severity.HIGH,
+                message=(
+                    "KNN CSV probe produced no parseable output on a valid tabular fixture "
+                    "with an integer 'id' column"
+                ),
+                location="tabular_identifier_column",
+            )
+        ]
+
+    if parsed.get("error") is not None:
+        return [
+            VerificationFinding(
+                tier=2,
+                category="tabular_identifier_column",
+                severity=Severity.HIGH,
+                message=(
+                    "KNN CSV probe crashed on a valid tabular fixture with an integer 'id' "
+                    f"column: {parsed.get('error')}"
+                ),
+                location="tabular_identifier_column",
+            )
+        ]
+
+    return []
+
+
 def _test_output_variation(
     source_code: str, func_name: str, schema: dict[str, dict], _sandbox=sandbox_execute
 ) -> list[VerificationFinding]:
     """Check that different inputs produce different outputs.
 
     Tools that ignore parameters and return canned data will produce identical
-    outputs regardless of inputs (B2.3 bypass).
+    outputs regardless of inputs.
     """
     findings: list[VerificationFinding] = []
     if not schema:
@@ -351,16 +565,20 @@ def _test_output_variation(
         elif (
             err_a is None
             and err_b is None
-            and parsed_a.get("result") == parsed_b.get("result")
+            and _normalize_for_variation(parsed_a.get("result"))
+            == _normalize_for_variation(parsed_b.get("result"))
             and parsed_a.get("result") not in _TRIVIAL_RESULTS
         ):
+            # Compare normalized outputs so a canned response with a changing
+            # timestamp, UUID, or counter does not bypass the probe.
             findings.append(
                 VerificationFinding(
                     tier=2,
                     category="output_variation",
                     severity=Severity.MEDIUM,
                     message=(
-                        f"Tool returned identical output for very different inputs: "
+                        f"Tool returned near-identical output for very different "
+                        f"inputs (timestamps/UUIDs normalized): "
                         f"{parsed_a.get('result')!r} — may be ignoring parameters"
                     ),
                     location="output_variation",
@@ -368,6 +586,52 @@ def _test_output_variation(
             )
 
     return findings
+
+
+# Strips embedded timestamps, UUIDs, and counter-like fields before equality
+# comparison in the output-variation probe.
+_NORMALIZATION_PATTERNS = [
+    # ISO-8601 timestamps with optional fractional seconds and timezone.
+    (
+        re.compile(
+            r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+            r"(?:Z|[+-]\d{2}:?\d{2})?"
+        ),
+        "<TS>",
+    ),
+    # Epoch timestamps (10 or 13 digits standing alone or in quotes).
+    (re.compile(r"\b1[67]\d{8}(?:\d{3})?\b"), "<EPOCH>"),
+    # UUIDs.
+    (
+        re.compile(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}",
+            re.IGNORECASE,
+        ),
+        "<UUID>",
+    ),
+    # Counter/id/nonce fields with numeric values.
+    (
+        re.compile(
+            r"(?P<key>(?:count|counter|id|nonce|request_id|trace_id)"
+            r"\"?'?)\s*[:=]\s*\d+",
+            re.IGNORECASE,
+        ),
+        r"\g<key>: <N>",
+    ),
+]
+
+
+def _normalize_for_variation(result: Any) -> str:
+    """Normalize a probe result string by stripping timestamps/UUIDs/counters.
+
+    Accepts any type, stringifies it, and applies the normalization patterns.
+    Identical output modulo the masked fields compares equal.
+    """
+    s = result if isinstance(result, str) else repr(result)
+    for pattern, replacement in _NORMALIZATION_PATTERNS:
+        s = pattern.sub(replacement, s)
+    return s
 
 
 def _test_nonexistent_entity(
@@ -485,11 +749,13 @@ def _test_boundary(
     if not schema:
         return findings
 
+    # Separate probes make the failing numeric edge case explicit.
     test_cases = [
         ("zero/empty", _generate_boundary_inputs(schema)),
-        ("negative", _generate_negative_inputs(schema)),
-        ("large", _generate_large_inputs(schema)),
     ]
+    for variant_label, variant_inputs in _generate_negative_input_variants(schema):
+        test_cases.append((f"negative/{variant_label}", variant_inputs))
+    test_cases.append(("large", _generate_large_inputs(schema)))
 
     for label, inputs in test_cases:
         code = _build_sandbox_code(source_code, func_name, inputs)
@@ -523,7 +789,10 @@ def _test_boundary(
                         message=(
                             f"Dependency install failed: {stderr[:300] or '(no stderr)'}"
                             if is_dep_failure
-                            else f"Tool crashed on {label} boundary inputs: {stderr[:200] or '(no stderr)'}"
+                            else (
+                                f"Tool crashed on {label} boundary inputs: "
+                                f"{stderr[:200] or '(no stderr)'}"
+                            )
                         ),
                         location="pip_packages" if is_dep_failure else f"boundary/{label}",
                     )
@@ -557,7 +826,10 @@ def _test_timeout(
                 tier=2,
                 category="timeout",
                 severity=Severity.MEDIUM,
-                message=f"Tool execution took {elapsed:.2f}s (timeout threshold: {TIMEOUT_THRESHOLD_S}s)",
+                message=(
+                    f"Tool execution took {elapsed:.2f}s "
+                    f"(timeout threshold: {TIMEOUT_THRESHOLD_S}s)"
+                ),
                 location="timeout",
             )
         )
@@ -572,7 +844,7 @@ def _test_latency(
 
     Real computation has timing that varies with input. Constant lookup tables /
     hash tricks have near-zero variance and very low mean. We flag only when
-    BOTH conditions hold to keep false positives near zero (proposal: section 4).
+    BOTH conditions hold to keep false positives near zero.
     """
     findings: list[VerificationFinding] = []
     if not schema:
@@ -614,8 +886,11 @@ def _test_latency(
     stdev = statistics.stdev(elapsed_samples)
     cv = (stdev / mean) if mean > 0 else 0.0
 
-    # Two-condition gate: very fast AND very uniform.
-    if mean < 0.001 and cv < 0.10:
+    # For sub-millisecond means, natural Python GC/allocation jitter across a
+    # small sample can inflate coefficient of variation. Use an absolute
+    # stdev guard so very fast and very uniform outputs still get flagged.
+    absolute_stdev_threshold = max(2e-4, 0.5 * mean)  # 200µs or half the mean
+    if mean < 0.001 and stdev < absolute_stdev_threshold:
         findings.append(
             VerificationFinding(
                 tier=2,
@@ -643,20 +918,18 @@ def run(
     *,
     allow_network: bool = False,
 ) -> list[VerificationFinding]:
-    """Run all six behavioral test categories on an MCP_TOOL artifact.
+    """Run behavioral probes on an MCP_TOOL artifact.
 
-    Categories: nonexistent entity, consistency, boundary, timeout,
-    latency (variance), and output variation.  SKILL/AGENT artifacts
-    have no ``source_code`` and are skipped with an INFO finding.
+    Parameterized tools run nonexistent-entity, consistency, boundary,
+    KNN CSV, timeout, latency-variance, and output-variation probes.
+    Parameterless tools use a smoke probe. SKILL/AGENT artifacts have no
+    ``source_code`` in this tier and are skipped with an INFO finding.
 
-    Step 14.12: when ``allow_network=True``, every sandbox execution inside
-    this tier runs with ``--network bridge`` instead of ``--network none``
-    so artifacts that legitimately require network access can be behavior-
-    tested. Additionally, when ``artifact.needs_network=True``, a
-    differential disconnect test fires: the tool is invoked twice (network
-    on, network off) and flagged if the offline run returns a plausible
-    dict rather than a clean error — a direct detector for the F2
-    "silent fallback" failure mode.
+    When ``allow_network=True``, sandbox execution runs with
+    ``--network bridge`` so network-dependent artifacts can be tested.
+    If ``artifact.needs_network=True`` as well, a differential disconnect
+    probe invokes the tool once online and once offline to detect silent
+    fallback behavior.
 
     Returns a list of ``VerificationFinding`` objects (tier=2).
     """
@@ -678,7 +951,10 @@ def run(
                 tier=2,
                 category="behavioral",
                 severity=Severity.MEDIUM,
-                message="No public async function found in source code — cannot run behavioral tests",
+                message=(
+                    "No public async function found in source code — "
+                    "cannot run behavioral tests"
+                ),
             )
         ]
 
@@ -687,16 +963,20 @@ def run(
     declared_pkgs = artifact.pip_packages if artifact.pip_packages else None
     extra_pkgs = declared_pkgs or resolve_extra_packages(source_code) or None
 
-    # Upfront dependency check: if the sandbox can't install the tool's
-    # packages, all behavioral tests will fail with the same error.
-    # Report once as HIGH and skip the rest.
+    # When dependencies are required, build one cached sandbox image and reuse
+    # it across every probe. Dependency-free artifacts use the bare sandbox
+    # path, which also keeps unit-test monkeypatches straightforward.
+    from src.verification.sandbox_tool import (
+        cleanup_cached_image,
+        prepare_cached_image,
+        sandbox_execute_with_cached_image,
+    )
+
+    cached_image_tag: str | None = None
     if extra_pkgs:
-        dep_check = sandbox_execute(
-            'print("deps_ok")', timeout=60, extra_packages=extra_pkgs,
-            allow_network=allow_network,
-        )
-        if not dep_check.get("success"):
-            stderr = dep_check.get("stderr", "")
+        cached_image_tag, build_err = prepare_cached_image(extra_pkgs)
+        if build_err is not None:
+            stderr = build_err.get("stderr", "")
             return [
                 VerificationFinding(
                     tier=2,
@@ -707,36 +987,52 @@ def run(
                 )
             ]
 
-    _sandbox = partial(
-        sandbox_execute, extra_packages=extra_pkgs, allow_network=allow_network,
-    )
-
-    schema = extract_parameter_schema(source_code)
-    if not schema:
-        # B2.1: run smoke test instead of silently skipping.
-        return _test_parameterless_smoke(source_code, func_name, _sandbox)
-
-    findings: list[VerificationFinding] = []
-    findings.extend(_test_nonexistent_entity(source_code, func_name, schema, _sandbox))
-    findings.extend(_test_consistency(source_code, func_name, schema, _sandbox))
-    findings.extend(_test_boundary(source_code, func_name, schema, _sandbox))
-    findings.extend(_test_timeout(source_code, func_name, schema, _sandbox))
-    findings.extend(_test_latency(source_code, func_name, schema, _sandbox))
-    findings.extend(_test_output_variation(source_code, func_name, schema, _sandbox))
-
-    # Step 14.12: network-disconnect differential. Only fires when the
-    # generator declared the capability legitimately needs network AND the
-    # enclosing context allows network — otherwise the test is either
-    # vacuous (offline tool doesn't need network) or invalid (network
-    # should be blocked, so the on-comparison isn't meaningful).
-    if allow_network and getattr(artifact, "needs_network", False):
-        findings.extend(
-            _test_network_disconnect_differential(
-                source_code, func_name, schema, extra_pkgs,
+    try:
+        if cached_image_tag is not None:
+            _sandbox = partial(
+                sandbox_execute_with_cached_image,
+                image_tag=cached_image_tag,
+                allow_network=allow_network,
             )
-        )
+        else:
+            # Dependency-free artifacts use the bare base image; cached image
+            # setup is only needed when pip packages must be installed.
+            _sandbox = partial(
+                sandbox_execute,
+                extra_packages=None,
+                allow_network=allow_network,
+            )
 
-    return findings
+        schema = extract_parameter_schema(source_code)
+        if not schema:
+            return _test_parameterless_smoke(source_code, func_name, _sandbox)
+
+        findings: list[VerificationFinding] = []
+        findings.extend(_test_nonexistent_entity(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_consistency(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_boundary(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_knn_identifier_column_csv(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_timeout(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_latency(source_code, func_name, schema, _sandbox))
+        findings.extend(_test_output_variation(source_code, func_name, schema, _sandbox))
+
+        # Only run the network differential when the artifact declares a
+        # network dependency and the enclosing task policy allows network.
+        if allow_network and getattr(artifact, "needs_network", False):
+            findings.extend(
+                _test_network_disconnect_differential(
+                    source_code, func_name, schema, extra_pkgs,
+                    cached_image_tag=cached_image_tag,
+                )
+            )
+
+        return findings
+    finally:
+        # Cleanup the cached image so we don't accumulate
+        # ``jit-sandbox-cached-*`` images across the eval campaign.
+        # No-op when no cached image was built (zero-deps path).
+        if cached_image_tag is not None:
+            cleanup_cached_image(cached_image_tag)
 
 
 def _test_network_disconnect_differential(
@@ -744,14 +1040,14 @@ def _test_network_disconnect_differential(
     func_name: str,
     schema: dict[str, dict],
     extra_pkgs: list[str] | None,
+    *,
+    cached_image_tag: str | None = None,
 ) -> list[VerificationFinding]:
     """Run the tool twice (network on, network off) and flag silent fallbacks.
 
-    Direct detector for proposal §Pillar 2 F2 (silent fallbacks). A tool that
-    claims to fetch live data but actually returns hardcoded values will
-    succeed identically under both network policies — that matches the
-    contaminated pattern. A legitimate network tool fails cleanly with a
-    socket-level error when network is disabled.
+    A tool that claims to fetch live data but actually returns hardcoded
+    values can succeed under both network policies. A legitimate network tool
+    should fail cleanly with a socket-level error when network is disabled.
 
     Flags:
       * CRITICAL — offline run returned plausible-looking output (dict, no
@@ -761,21 +1057,35 @@ def _test_network_disconnect_differential(
       * INFO — offline run failed as expected and online run succeeded
         (legitimate network tool).
 
-    Step 14.12.
     """
     # Use boundary inputs as the canonical "normal" invocation.
     inputs = _generate_boundary_inputs(schema)
     code = _build_sandbox_code(source_code, func_name, inputs)
 
-    on_result = sandbox_execute(
-        code, timeout=30, extra_packages=extra_pkgs, allow_network=True,
-    )
-    off_result = sandbox_execute(
-        code, timeout=30, extra_packages=extra_pkgs, allow_network=False,
-    )
+    # Reuse the cached image when available so the differential only changes
+    # Docker's network flag, not the package-install environment.
+    if cached_image_tag is not None:
+        from src.verification.sandbox_tool import sandbox_execute_with_cached_image
+        on_result = sandbox_execute_with_cached_image(
+            code, image_tag=cached_image_tag, timeout=30, allow_network=True,
+        )
+        off_result = sandbox_execute_with_cached_image(
+            code, image_tag=cached_image_tag, timeout=30, allow_network=False,
+        )
+    else:
+        on_result = sandbox_execute(
+            code, timeout=30, extra_packages=extra_pkgs, allow_network=True,
+        )
+        off_result = sandbox_execute(
+            code, timeout=30, extra_packages=extra_pkgs, allow_network=False,
+        )
 
     def _parse(payload: dict) -> tuple[bool, dict | str]:
-        """Return (produced_plausible_dict, parsed_value)."""
+        """Return (produced_plausible_dict, parsed_value).
+
+        The sandbox wrapper emits ``"error": None`` on success and a string
+        error on failure, so this checks the value rather than key presence.
+        """
         if not payload.get("success"):
             return False, payload.get("stderr", "")[:300]
         stdout = (payload.get("stdout") or "").strip()
@@ -788,8 +1098,9 @@ def _test_network_disconnect_differential(
             return False, stdout[:300]
         if not isinstance(parsed, dict):
             return False, parsed
-        if "error" in parsed:
-            return False, parsed["error"]
+        err = parsed.get("error")
+        if err is not None:
+            return False, err
         return True, parsed.get("result", parsed)
 
     on_ok, on_value = _parse(on_result)
@@ -805,7 +1116,7 @@ def _test_network_disconnect_differential(
                 message=(
                     "Tool declared needs_network=True but returned plausible "
                     "output with network disabled. Likely hardcoded data or "
-                    "silent fallback (proposal §Pillar 2 F2)."
+                    "silent fallback."
                 ),
                 location="network_disconnect_differential",
             )
