@@ -1,0 +1,176 @@
+"""Unit tests for persisted evaluation schema models."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+
+from src.schemas.evaluation import (
+    BaselineCondition,
+    EvaluationRecord,
+    FailureReason,
+    HumanLabel,
+    TaskTier,
+)
+
+_BASE = dict(
+    run_id="run_001",
+    condition="full",
+    task_id="T01",
+    task_tier="trivial",
+    attempt_count=1,
+    capability_type="mcp_tool",
+    verification_tier_reached=2,
+    gate_passed=True,
+    output_in_range=True,
+    token_cost=500,
+    attempt_latency_ms=3200,
+    failure_reason="none",
+    registry_snapshot_id="snap_abc12345",
+    seed=42,
+)
+
+
+def _record(**overrides) -> EvaluationRecord:
+    return EvaluationRecord(**{**_BASE, **overrides})
+
+
+class TestEvaluationRecord:
+    def test_valid_full_record(self):
+        r = _record()
+        assert r.run_id == "run_001"
+        assert r.condition == "full"
+        assert r.success is True
+
+    def test_success_composite(self):
+        r = _record(gate_passed=True, output_in_range=True)
+        assert r.success is True
+
+    def test_success_requires_both(self):
+        r1 = _record(gate_passed=False, output_in_range=True)
+        assert r1.success is False
+        r2 = _record(gate_passed=True, output_in_range=False)
+        assert r2.success is False
+
+    def test_optional_fields_default_to_none(self):
+        r = _record(
+            capability_type=None,
+            human_label=None,
+            invocation_record_id=None,
+            verification_tier_reached=None,
+        )
+        assert r.capability_type is None
+        assert r.human_label is None
+        assert r.invocation_record_id is None
+
+    def test_is_pilot_defaults_false(self):
+        r = _record()
+        assert r.is_pilot is False
+
+    def test_timestamp_defaults_to_utc_now(self):
+        before = datetime.now(UTC)
+        r = _record()
+        assert r.timestamp >= before
+
+    def test_extra_fields_forbidden(self):
+        with pytest.raises(Exception):
+            EvaluationRecord(**_BASE, unexpected_field="oops")
+
+    def test_attempt_count_non_negative(self):
+        with pytest.raises(Exception):
+            _record(attempt_count=-1)
+
+    def test_token_cost_non_negative(self):
+        with pytest.raises(Exception):
+            _record(token_cost=-1)
+
+    def test_invalid_condition_rejected(self):
+        with pytest.raises(Exception):
+            _record(condition="unknown")
+
+    def test_invalid_failure_reason_rejected(self):
+        with pytest.raises(Exception):
+            _record(failure_reason="not_a_reason")
+
+    def test_invalid_human_label_rejected(self):
+        with pytest.raises(Exception):
+            _record(human_label="wrong")
+
+    def test_verification_tier_reached_bounds(self):
+        _record(verification_tier_reached=0)
+        _record(verification_tier_reached=3)
+        with pytest.raises(Exception):
+            _record(verification_tier_reached=4)
+
+    def test_all_conditions_valid(self):
+        for cond in BaselineCondition:
+            r = _record(condition=cond)
+            assert r.condition == cond
+
+    def test_all_tiers_valid(self):
+        for tier in TaskTier:
+            r = _record(task_tier=tier)
+            assert r.task_tier == tier
+
+    def test_all_failure_reasons_valid(self):
+        for reason in FailureReason:
+            r = _record(failure_reason=reason)
+            assert r.failure_reason == reason
+
+    def test_all_capability_types_valid(self):
+        for ct in ["mcp_tool", "skill", "agent", None]:
+            r = _record(capability_type=ct)
+            assert r.capability_type == ct
+
+
+class TestStrEnums:
+    def test_baseline_condition_values(self):
+        assert BaselineCondition.FULL == "full"
+        assert BaselineCondition.NO_VERIFICATION == "no_verification"
+        assert BaselineCondition.NO_OPTIMIZATION == "no_optimization"
+        assert BaselineCondition.STATIC == "static"
+        assert BaselineCondition.LONGITUDINAL == "longitudinal"
+        assert BaselineCondition.LONGITUDINAL_SHIFT == "longitudinal_shift"
+
+    def test_longitudinal_accepted_on_evaluation_record(self):
+        """Longitudinal records use a distinct accepted condition label."""
+        rec = EvaluationRecord(
+            run_id="longitudinal_test",
+            condition="longitudinal",
+            task_id="T01",
+            task_tier="trivial",
+            attempt_count=1,
+            gate_passed=True,
+            output_in_range=True,
+            token_cost=0,
+            attempt_latency_ms=100,
+            failure_reason="none",
+            registry_snapshot_id="snap",
+            seed=42,
+        )
+        assert rec.condition == "longitudinal"
+
+    def test_task_tier_values(self):
+        assert TaskTier.TRIVIAL == "trivial"
+        assert TaskTier.MODERATE == "moderate"
+        assert TaskTier.COMPLEX == "complex"
+
+    def test_failure_reason_values(self):
+        assert FailureReason.NONE == "none"
+        assert FailureReason.GENERATION_FAILED == "generation_failed"
+        assert FailureReason.TIER1 == "tier1"
+        assert FailureReason.TIER2 == "tier2"
+        assert FailureReason.TIER3 == "tier3"
+        assert FailureReason.OUTPUT_REJECTED == "output_rejected"
+        assert FailureReason.NO_SOURCE_CODE == "no_source_code"
+        assert FailureReason.CHAIN_STEP_FAILED == "chain_step_failed"
+        assert FailureReason.AGENT_EXECUTION_TIMEOUT == "agent_execution_timeout"
+        assert FailureReason.AGENT_EXECUTION_ERROR == "agent_execution_error"
+        assert FailureReason.OUTPUT_SHAPE_MISMATCH == "output_shape_mismatch"
+        assert FailureReason.WATCHDOG_ABORT == "watchdog_abort"
+
+    def test_human_label_values(self):
+        assert HumanLabel.CORRECT == "correct"
+        assert HumanLabel.CONTAMINATED == "contaminated"
+        assert HumanLabel.PARTIAL == "partial"
