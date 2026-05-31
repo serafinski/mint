@@ -2,7 +2,7 @@
 
 A plain LangGraph node (no DeepAgent) that generates SKILL.md files for each
 gap classified as ``CapabilityType.SKILL``.  Each generated skill is validated
-with ``tools/quick_validate.py`` and written to ``.deepagents/skills/<name>/``.
+with ``tools/quick_validate.py`` and written to ``data/eval/skills/<name>/``.
 """
 
 from __future__ import annotations
@@ -19,7 +19,10 @@ from typing import Literal
 import yaml
 from langgraph.types import Command
 
-from src.orchestrator.generators.utils import build_task_context, slugify_gap_hyphen
+from src.orchestrator.generators.utils import (
+    build_task_context,
+    stable_capability_name_for_gap,
+)
 from src.orchestrator.prompts.skill_generator import SKILL_GENERATOR_PROMPT, SKILL_REPAIR_PROMPT
 from src.orchestrator.tracing import emit_langfuse_event
 from src.schemas.capability import CapabilityType
@@ -32,7 +35,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-SKILLS_OUTPUT_DIR = _PROJECT_ROOT / ".deepagents" / "skills"
+SKILLS_OUTPUT_DIR = _PROJECT_ROOT / "data" / "eval" / "skills"
+
+
+def set_skills_output_dir(path: Path) -> None:
+    """Override the directory where generated skills are written.
+
+    Protocol runs write to ``data/eval/skills`` by default. Tests and custom
+    runners can override the path to isolate generated artifacts. The agent
+    generator writes agent artifacts into the same skill directory format, so
+    this helper updates its mirrored ``SKILLS_OUTPUT_DIR`` too.
+    """
+    global SKILLS_OUTPUT_DIR  # noqa: PLW0603
+    SKILLS_OUTPUT_DIR = path
+    # Keep agent generator in sync (it mirrors this value).
+    from src.orchestrator.generators import agent as _agent_mod
+    _agent_mod.SKILLS_OUTPUT_DIR = path
 
 # ---------------------------------------------------------------------------
 # Import validate_skill from tools/quick_validate.py
@@ -160,6 +178,38 @@ def extract_skill_description(content: str) -> str | None:
     return None
 
 
+def _sanitize_frontmatter_description(content: str) -> str:
+    """Remove validator-disallowed angle brackets from frontmatter description.
+
+    The skill prompt already forbids ``<`` / ``>`` in the YAML ``description``,
+    but models still occasionally emit idioms like ``<metric>_<function>``.
+    Sanitizing this single field avoids an otherwise pointless repair pass while
+    leaving the body untouched.
+    """
+    match = re.match(r"^---\n(.*?)\n---\n?(.*)$", content, re.DOTALL)
+    if not match:
+        return content
+
+    frontmatter = _parse_frontmatter(content)
+    if frontmatter is None:
+        return content
+
+    description = frontmatter.get("description")
+    if not isinstance(description, str) or ("<" not in description and ">" not in description):
+        return content
+
+    frontmatter["description"] = description.replace("<", "").replace(">", "")
+    frontmatter_yaml = yaml.safe_dump(
+        frontmatter,
+        sort_keys=False,
+        allow_unicode=False,
+    ).strip()
+    body = match.group(2).lstrip("\n")
+    if body:
+        return f"---\n{frontmatter_yaml}\n---\n\n{body}"
+    return f"---\n{frontmatter_yaml}\n---\n"
+
+
 def validate_skill_content(content: str, skill_name: str) -> tuple[bool, str]:
     """Validate SKILL.md content using ``tools/quick_validate.py``.
 
@@ -183,8 +233,7 @@ def validate_skill_content(content: str, skill_name: str) -> tuple[bool, str]:
             "(forward slash, backslash, or null byte are not allowed)"
         )
 
-    # Additional check: non-empty body after frontmatter closing ---
-    # quick_validate.py only validates frontmatter; it does not check body.
+    # quick_validate.py only checks frontmatter; a usable skill also needs a body.
     parts = re.split(r"^---\s*$", content, maxsplit=2, flags=re.MULTILINE)
     if len(parts) >= 3:
         body = parts[2].strip()
@@ -208,30 +257,43 @@ def _generate_single_skill(
     gap: ClassifiedGap,
     task_context: str,
     output_dir: Path | None = None,
+    schema_context: str = "",
+    subtasks: list | None = None,
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate a single SKILL.md for a classified gap.
 
     Returns:
         Tuple of (artifact, error).  Exactly one will be ``None``.
     """
-    forced_name = slugify_gap_hyphen(gap.query)
+    forced_name = stable_capability_name_for_gap(
+        gap,
+        list(subtasks or []),
+        hyphen_case=True,
+    )
 
     llm = _get_llm()
 
     # No per-node CallbackHandler: invoked from a LangGraph node so the pipeline-level
     # handler propagates automatically via LangChain's contextvar inheritance.
 
+    _schema_section = ""
+    if schema_context:
+        _schema_section = (
+            "## Input/Output Schema Contract\n\n" + schema_context
+        )
+
     prompt = SKILL_GENERATOR_PROMPT.format(
-        description=gap.description,
-        query=gap.query,
-        task_context=task_context,
+        task_context=task_context or gap.description,
+        gap_description=gap.description or gap.query,
         forced_name=forced_name,
+        schema_context=_schema_section,
     )
 
     # --- First attempt ---
     try:
         response = llm.invoke(prompt)
         content = _strip_code_fences(response.content)
+        content = _sanitize_frontmatter_description(content)
     except Exception as exc:  # noqa: BLE001
         error_msg = f"LLM call failed for skill '{gap.query}': {exc}"
         logger.warning(error_msg)
@@ -243,7 +305,6 @@ def _generate_single_skill(
 
     is_valid, message = validate_skill_content(content, skill_name)
 
-    # --- Repair pass ---
     if not is_valid:
         logger.warning(
             "Validation failed for skill '%s' — triggering repair pass. "
@@ -261,13 +322,13 @@ def _generate_single_skill(
         repair_prompt = SKILL_REPAIR_PROMPT.format(
             validation_error=message,
             skill_content=content,
-            gap_description=gap.description,
-            gap_query=gap.query,
-            task_context=task_context,
+            task_context=task_context or gap.description,
+            gap_description=gap.description or gap.query,
         )
         try:
             repair_response = llm.invoke(repair_prompt)
             content = _strip_code_fences(repair_response.content)
+            content = _sanitize_frontmatter_description(content)
             skill_name = extract_skill_name(content) or skill_name
             is_valid, message = validate_skill_content(content, skill_name)
         except Exception as exc:  # noqa: BLE001
@@ -305,7 +366,7 @@ def _generate_single_skill(
         return None, error_msg
     logger.info("Wrote skill '%s' to %s", skill_name, target_dir)
 
-    # Override whatever name the LLM chose with the deterministic slug
+    # Persist under the deterministic registry slug.
     if skill_name != forced_name:
         logger.debug(
             "Overriding LLM skill name '%s' with stable slug '%s'",
@@ -352,12 +413,23 @@ def generate_skill(
         if skipped.query in existing_gap_queries:
             logger.info("  → skipping (already passed verification): %s", skipped.query)
 
-    logger.info("generate_skill: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(skill_gaps) - len(gaps_to_generate))
+    logger.info(
+        "generate_skill: %d gap(s) to generate (%d skipped)",
+        len(gaps_to_generate),
+        len(skill_gaps) - len(gaps_to_generate),
+    )
     task_context = build_task_context(state)
+
+    from src.orchestrator.generators.utils import build_schema_context
+    subtasks = list(state.subtasks) if state.subtasks else []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
         futures = {
-            pool.submit(_generate_single_skill, gap, task_context): gap
+            pool.submit(
+                _generate_single_skill, gap, task_context,
+                schema_context=build_schema_context(gap, subtasks),
+                subtasks=subtasks,
+            ): gap
             for gap in gaps_to_generate
         }
         raw_results: list[tuple[GeneratedArtifact | None, str | None]] = []
@@ -382,6 +454,10 @@ def generate_skill(
             "generate_skill: %d/%d gaps failed generation: %s",
             len(failed_queries), len(gaps_to_generate), failed_queries,
         )
+
+    # Tag each newly generated artifact with domain + is_generic. Never raises.
+    from src.orchestrator.taxonomy import classify_and_tag_artifacts
+    classify_and_tag_artifacts(artifacts)
 
     return Command(
         update={

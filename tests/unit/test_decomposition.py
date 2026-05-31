@@ -1,8 +1,4 @@
-"""Unit tests for task decomposition schemas and node behaviour.
-
-Integration tests with real DeepAgent calls are in
-``tests/integration/test_decomposition.py``.
-"""
+"""Unit tests for task decomposition schemas, helpers, and node behavior."""
 
 from __future__ import annotations
 
@@ -11,9 +7,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.orchestrator.decomposition import decomposition_node
+from src.orchestrator.decomposition import (
+    MAX_DECOMPOSITION_ATTEMPTS,
+    _collect_transitive_key_producers,
+    _collect_transitive_upstream_keys,
+    _detect_upstream_key_collisions,
+    _ensure_file_writer_last_step,
+    _validate_chain_coherence,
+    _validate_depends_on_indices,
+    _validate_output_contract_coverage,
+    decomposition_node,
+)
 from src.schemas.task import (
     DecompositionResult,
+    OutputContract,
     SubTask,
     SubTaskItem,
     TaskState,
@@ -65,7 +72,7 @@ class TestDecompositionResult:
 
 
 # ---------------------------------------------------------------------------
-# decomposition_node — behaviour (mocking the DeepAgent)
+# decomposition_node behavior (mocking the DeepAgent)
 # ---------------------------------------------------------------------------
 
 
@@ -73,8 +80,9 @@ def _make_mock_pool(future_result=None, future_raises=None):
     """Return a (MockTPE class, future) pair for patching ThreadPoolExecutor.
 
     The executor is now used directly (not as a context manager), so the mock
-    only needs to support: ``ThreadPoolExecutor(max_workers=1)`` → pool,
-    ``pool.submit(...)`` → future, ``pool.shutdown(wait=False)``.
+    only needs to support: ``ThreadPoolExecutor(max_workers=1)`` returning
+    a pool, ``pool.submit(...)`` returning a future, and
+    ``pool.shutdown(wait=False)``.
     """
     mock_future = MagicMock()
     if future_raises is not None:
@@ -91,7 +99,7 @@ def _make_mock_pool(future_result=None, future_raises=None):
 
 
 class TestDecompositionNode:
-    """Unit tests for decomposition_node — all LLM/agent calls are mocked."""
+    """Unit tests for decomposition_node with all LLM/agent calls mocked."""
 
     @pytest.fixture
     def state(self):
@@ -143,8 +151,12 @@ class TestDecompositionNode:
 
         assert set(cmd.update["required_capabilities"]) == {"cap-a", "cap-b", "cap-c"}
 
-    def test_no_structured_response_falls_back_to_task_description(self, state):
-        """If structured_response is None, falls back to whole task as one capability."""
+    def test_no_structured_response_fails_closed_after_retries(self, state):
+        """None structured_response is retried and then fails closed.
+
+        No single-sentence fallback; decomposition_succeeded=False flips so
+        terminal callers classify this as a generation_failed run.
+        """
         mock_tpe, _ = _make_mock_pool({"structured_response": None})
 
         with patch("src.orchestrator.decomposition._get_agent"):
@@ -152,12 +164,22 @@ class TestDecompositionNode:
                 cmd = decomposition_node(state)
 
         assert cmd.update["subtasks"] == []
-        assert cmd.update["required_capabilities"] == [state.task_description]
+        assert cmd.update["required_capabilities"] == []  # no fallback
+        assert cmd.update["decomposition_succeeded"] is False
         errors = cmd.update["errors"]
-        assert any("no structured response" in e.lower() for e in errors)
+        # One "no structured response" error per attempt.
+        no_resp_errs = [e for e in errors if "no structured response" in e.lower()]
+        assert len(no_resp_errs) == MAX_DECOMPOSITION_ATTEMPTS
 
-    def test_timeout_falls_back_and_records_error(self, state):
-        """TimeoutError from the agent is caught and recorded in errors."""
+    def test_timeout_fails_closed_after_retries(self, state):
+        """TimeoutError on all attempts fails closed.
+
+        Under the new retry + fail-closed contract (MAX_DECOMPOSITION_ATTEMPTS=3):
+        - Every attempt times out, so errors list has 3 timeout entries
+        - No single-sentence fallback (required_capabilities stays empty)
+        - decomposition_succeeded=False sticky flag flips
+        - terminal callers detect the flag as a generation failure
+        """
         mock_tpe, _ = _make_mock_pool(
             future_raises=concurrent.futures.TimeoutError()
         )
@@ -167,12 +189,17 @@ class TestDecompositionNode:
                 cmd = decomposition_node(state)
 
         assert cmd.update["subtasks"] == []
-        assert cmd.update["required_capabilities"] == [state.task_description]
+        # No fallback: required_capabilities stays empty instead of
+        # degrading to the single-sentence path.
+        assert cmd.update["required_capabilities"] == []
+        assert cmd.update["decomposition_succeeded"] is False
         errors = cmd.update["errors"]
-        assert any("timed out" in e.lower() for e in errors)
+        # One "timed out" error per attempt.
+        timeout_errs = [e for e in errors if "timed out" in e.lower()]
+        assert len(timeout_errs) == MAX_DECOMPOSITION_ATTEMPTS
 
-    def test_arbitrary_exception_falls_back_and_records_error(self, state):
-        """Any unexpected exception is caught and recorded in errors."""
+    def test_arbitrary_exception_fails_closed_after_retries(self, state):
+        """Exception on all attempts fails closed."""
         mock_tpe, _ = _make_mock_pool(
             future_raises=RuntimeError("Connection refused")
         )
@@ -182,9 +209,12 @@ class TestDecompositionNode:
                 cmd = decomposition_node(state)
 
         assert cmd.update["subtasks"] == []
-        assert cmd.update["required_capabilities"] == [state.task_description]
+        assert cmd.update["required_capabilities"] == []  # no fallback
+        assert cmd.update["decomposition_succeeded"] is False
         errors = cmd.update["errors"]
-        assert any("Connection refused" in e for e in errors)
+        # One "Connection refused" per attempt.
+        match_errs = [e for e in errors if "Connection refused" in e]
+        assert len(match_errs) == MAX_DECOMPOSITION_ATTEMPTS
 
     def test_status_always_decomposing(self, state):
         """Status is DECOMPOSING regardless of success or failure."""
@@ -226,13 +256,13 @@ class TestDecompositionNode:
         assert "pre-existing error" in errors
         assert any("new error" in e for e in errors)
 
-    def test_empty_subtasks_list_falls_back_and_records_error(self, state):
-        """Agent returns DecompositionResult with 0 subtasks → fallback + error recorded.
+    def test_empty_subtasks_list_fails_closed_after_retries(self, state):
+        """Empty subtask lists are retried and then fail closed.
 
-        Unlike structured_response=None (no response at all), a valid response with
-        an empty subtasks list is a distinct failure mode — the agent succeeded
-        structurally but produced no useful output.  An error must be recorded so
-        operators can observe this in state.errors and in LangFuse.
+        A valid structured response with an empty subtasks list is treated
+        as a retryable failure. After MAX_DECOMPOSITION_ATTEMPTS consecutive
+        empty responses, the node fails closed with no single-sentence
+        fallback.
         """
         structured = DecompositionResult(subtasks=[], reasoning="Task seems trivial")
         mock_tpe, _ = _make_mock_pool({"structured_response": structured})
@@ -242,12 +272,76 @@ class TestDecompositionNode:
                 cmd = decomposition_node(state)
 
         assert cmd.update["subtasks"] == []
-        assert cmd.update["required_capabilities"] == [state.task_description]
+        assert cmd.update["required_capabilities"] == []  # no fallback
+        assert cmd.update["decomposition_succeeded"] is False
         errors = cmd.update["errors"]
-        assert any("0 subtasks" in e for e in errors)
+        # One "empty subtask list" error per attempt.
+        empty_errs = [e for e in errors if "empty subtask list" in e]
+        assert len(empty_errs) == MAX_DECOMPOSITION_ATTEMPTS
+
+    # ------------------------------------------------------------------
+    # Sticky decomposition_succeeded flag
+    # ------------------------------------------------------------------
+    # Terminal callers use this flag to distinguish a successful
+    # decomposition from a fail-closed decomposition attempt.
+
+    def test_success_sets_decomposition_succeeded_true(self, state):
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(description="A", required_capabilities=["cap-a"]),
+            ]
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is True
+
+    def test_timeout_sets_decomposition_succeeded_false(self, state):
+        mock_tpe, _ = _make_mock_pool(
+            future_raises=concurrent.futures.TimeoutError()
+        )
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is False
+
+    def test_no_structured_response_sets_decomposition_succeeded_false(self, state):
+        mock_tpe, _ = _make_mock_pool({"structured_response": None})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is False
+
+    def test_empty_subtasks_sets_decomposition_succeeded_false(self, state):
+        structured = DecompositionResult(subtasks=[], reasoning="trivial")
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is False
+
+    def test_generic_exception_sets_decomposition_succeeded_false(self, state):
+        mock_tpe, _ = _make_mock_pool(
+            future_raises=RuntimeError("Connection refused")
+        )
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is False
 
     def test_duplicate_required_capabilities_deduplicated(self, state):
-        """Shared capability names across subtasks appear only once in required_capabilities."""
+        """Shared capability names appear once in required_capabilities."""
         structured = DecompositionResult(
             subtasks=[
                 SubTaskItem(description="A", required_capabilities=["shared-cap", "cap-a"]),
@@ -266,7 +360,7 @@ class TestDecompositionNode:
 
 
 # ---------------------------------------------------------------------------
-# Circuit breaker tests (Fix 1)
+# Circuit breaker tests
 # ---------------------------------------------------------------------------
 
 
@@ -331,7 +425,6 @@ class TestCircuitBreaker:
 
         caps = cmd.update["required_capabilities"]
         assert len(caps) == 8
-        # Verify the truncation event was emitted
         truncation_calls = [
             c for c in mock_emit.call_args_list
             if c[0][1] == "decomposition.hard_truncation"
@@ -341,3 +434,1180 @@ class TestCircuitBreaker:
         assert meta["original_count"] == 10
         assert meta["truncated_to"] == 8
         assert len(meta["dropped"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Chain coherence validation
+# ---------------------------------------------------------------------------
+#
+# These tests cover the _validate_chain_coherence helper and its integration
+# into decomposition_node. They guard chains where a downstream subtask
+# declares an upstream key that no predecessor produces.
+
+
+class TestCollectTransitiveUpstreamKeys:
+    """Unit tests for the DAG walker that collects transitive predecessor keys."""
+
+    def test_single_direct_predecessor(self):
+        subtasks = [
+            SubTask(
+                description="Root",
+                required_capabilities=["root"],
+                depends_on=[],
+                output_schema={"a": "int", "b": "str"},
+            ),
+            SubTask(
+                description="Child",
+                required_capabilities=["child"],
+                depends_on=[0],
+                output_schema={"c": "int"},
+            ),
+        ]
+        keys = _collect_transitive_upstream_keys(subtasks, 1)
+        assert keys == {"a", "b"}
+
+    def test_transitive_two_hops(self):
+        subtasks = [
+            SubTask(
+                description="Grandparent",
+                required_capabilities=["gp"],
+                depends_on=[],
+                output_schema={"g1": "int"},
+            ),
+            SubTask(
+                description="Parent",
+                required_capabilities=["p"],
+                depends_on=[0],
+                output_schema={"p1": "str"},
+            ),
+            SubTask(
+                description="Child",
+                required_capabilities=["c"],
+                depends_on=[1],
+                output_schema={"c1": "bool"},
+            ),
+        ]
+        keys = _collect_transitive_upstream_keys(subtasks, 2)
+        assert keys == {"g1", "p1"}
+
+    def test_multiple_predecessors_merged(self):
+        subtasks = [
+            SubTask(
+                description="A",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="B",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"y": "str"},
+            ),
+            SubTask(
+                description="C",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"z": "bool"},
+            ),
+        ]
+        keys = _collect_transitive_upstream_keys(subtasks, 2)
+        assert keys == {"x", "y"}
+
+    def test_root_has_no_upstream(self):
+        subtasks = [
+            SubTask(
+                description="Root",
+                required_capabilities=["root"],
+                depends_on=[],
+                output_schema={"a": "int"},
+            ),
+        ]
+        assert _collect_transitive_upstream_keys(subtasks, 0) == set()
+
+    def test_invalid_index_returns_empty(self):
+        assert _collect_transitive_upstream_keys([], 0) == set()
+
+    def test_cycle_does_not_loop_forever(self):
+        """Pathological case: a subtask depending on itself or a cycle."""
+        subtasks = [
+            SubTask(
+                description="A",
+                required_capabilities=["a"],
+                depends_on=[1],  # cycle: 0 -> 1 -> 0
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="B",
+                required_capabilities=["b"],
+                depends_on=[0],
+                output_schema={"y": "str"},
+            ),
+        ]
+        # Should terminate and return the union of both output_schemas.
+        keys = _collect_transitive_upstream_keys(subtasks, 1)
+        assert keys == {"x", "y"}
+
+
+class TestCollectTransitiveKeyProducers:
+    """Unit tests for the producer-attribution helper used by collision detection."""
+
+    def test_empty_depends_on(self):
+        subtasks = [
+            SubTask(
+                description="Root.",
+                required_capabilities=["root"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+        ]
+        # Root subtask has no transitive predecessors, so producer map is empty.
+        assert _collect_transitive_key_producers(subtasks, 0) == {}
+
+    def test_single_predecessor_single_key(self):
+        subtasks = [
+            SubTask(
+                description="A.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"records": "list[dict]"},
+            ),
+            SubTask(
+                description="B.",
+                required_capabilities=["b"],
+                depends_on=[0],
+                output_schema={"summary": "dict"},
+            ),
+        ]
+        producers = _collect_transitive_key_producers(subtasks, 1)
+        assert producers == {"records": [0]}
+
+    def test_two_predecessors_disjoint_keys(self):
+        subtasks = [
+            SubTask(
+                description="A.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"alpha": "int"},
+            ),
+            SubTask(
+                description="B.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"beta": "str"},
+            ),
+            SubTask(
+                description="C.",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"final": "dict"},
+            ),
+        ]
+        producers = _collect_transitive_key_producers(subtasks, 2)
+        assert producers == {"alpha": [0], "beta": [1]}
+
+    def test_two_predecessors_colliding_key(self):
+        """The critical case: two transitive predecessors produce the same
+        top-level key. The producer list must contain both indices in
+        sorted order so downstream dedup logic is deterministic.
+        """
+        subtasks = [
+            SubTask(
+                description="Parses sales CSV.",
+                required_capabilities=["parse-sales"],
+                depends_on=[],
+                output_schema={"records": "list[dict]"},
+            ),
+            SubTask(
+                description="Parses inventory CSV.",
+                required_capabilities=["parse-inventory"],
+                depends_on=[],
+                output_schema={"records": "list[dict]"},
+            ),
+            SubTask(
+                description="Merge.",
+                required_capabilities=["merge"],
+                depends_on=[0, 1],
+                output_schema={"merged": "list"},
+            ),
+        ]
+        producers = _collect_transitive_key_producers(subtasks, 2)
+        assert producers == {"records": [0, 1]}
+
+    def test_transitive_walk_collects_grandparent_producers(self):
+        """Step 3 depends on step 2; step 2 depends on steps 0 and 1. The
+        producers map for step 3 must include the grandparent contributions.
+        """
+        subtasks = [
+            SubTask(
+                description="A.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"alpha": "int"},
+            ),
+            SubTask(
+                description="B.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"beta": "str"},
+            ),
+            SubTask(
+                description="C.",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"gamma": "dict"},
+            ),
+            SubTask(
+                description="D.",
+                required_capabilities=["d"],
+                depends_on=[2],
+                output_schema={"delta": "list"},
+            ),
+        ]
+        producers = _collect_transitive_key_producers(subtasks, 3)
+        assert producers == {"alpha": [0], "beta": [1], "gamma": [2]}
+
+    def test_cycle_protection(self):
+        """Cyclic depends_on (pathological decomposition) must not infinite-loop.
+        The visited set short-circuits the walk the first time it re-enters
+        an already-visited index.
+        """
+        subtasks = [
+            SubTask(
+                description="A.",
+                required_capabilities=["a"],
+                depends_on=[1],  # cycle: A depends on B
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="B.",
+                required_capabilities=["b"],
+                depends_on=[0],  # cycle: B depends on A
+                output_schema={"y": "int"},
+            ),
+        ]
+        producers = _collect_transitive_key_producers(subtasks, 0)
+        # Walks A's deps to B, collects y; walks B's deps to A, collects x;
+        # tries to revisit B but hits the visited set and halts.
+        assert set(producers.keys()) == {"x", "y"}
+
+
+class TestDetectUpstreamKeyCollisions:
+    """Unit tests for the soft-warning upstream key collision detector."""
+
+    def test_empty_and_single_subtask_chains(self):
+        # Empty chain: no collisions possible.
+        assert _detect_upstream_key_collisions([]) == []
+
+        # Single subtask: no predecessors, no collisions possible.
+        single = [
+            SubTask(
+                description="Only.",
+                required_capabilities=["only"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+        ]
+        assert _detect_upstream_key_collisions(single) == []
+
+    def test_no_collisions_disjoint_output_schemas(self):
+        """Chain where every predecessor's output_schema uses distinct key
+        names produces no collision warnings.
+        """
+        subtasks = [
+            SubTask(
+                description="Parse sales.",
+                required_capabilities=["parse-sales"],
+                depends_on=[],
+                output_schema={"sales": "list[dict]"},
+            ),
+            SubTask(
+                description="Parse inventory.",
+                required_capabilities=["parse-inventory"],
+                depends_on=[],
+                output_schema={"inventory": "list[dict]"},
+            ),
+            SubTask(
+                description="Merge sales and inventory.",
+                required_capabilities=["merge"],
+                depends_on=[0, 1],
+                output_schema={"merged": "list"},
+                requires_upstream_keys=["sales", "inventory"],
+            ),
+        ]
+        assert _detect_upstream_key_collisions(subtasks) == []
+
+    def test_canonical_collision_two_parsers_same_key(self):
+        """Two parsers both produce ``records`` and downstream merge silently
+        loses one of them at runtime. Must be flagged.
+        """
+        subtasks = [
+            SubTask(
+                description="Parse sales CSV.",
+                required_capabilities=["parse-sales-csv"],
+                depends_on=[],
+                output_schema={"records": "list[dict] - sales rows"},
+            ),
+            SubTask(
+                description="Parse inventory CSV.",
+                required_capabilities=["parse-inventory-csv"],
+                depends_on=[],
+                output_schema={"records": "list[dict] - inventory rows"},
+            ),
+            SubTask(
+                description="Analyze.",
+                required_capabilities=["analyze"],
+                depends_on=[0, 1],
+                output_schema={"report": "dict"},
+                requires_upstream_keys=["records"],
+            ),
+        ]
+        warnings = _detect_upstream_key_collisions(subtasks)
+        assert len(warnings) == 1
+        assert "'records'" in warnings[0]
+        assert "[0, 1]" in warnings[0]
+        assert "last-write-wins" in warnings[0]
+        assert "2" in warnings[0]  # reported at subtask index 2
+
+    def test_collision_reported_at_first_successor_only(self):
+        """If two successors both have the colliding predecessors in their
+        transitive set, the collision is reported at the earliest one only
+        (dedup by (key, producer_indices) fingerprint).
+        """
+        subtasks = [
+            SubTask(
+                description="A produces X.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="B also produces X.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="C depends on A and B.",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"c_out": "dict"},
+                requires_upstream_keys=["x"],
+            ),
+            SubTask(
+                description="D depends on C (transitively on A, B).",
+                required_capabilities=["d"],
+                depends_on=[2],
+                output_schema={"d_out": "dict"},
+                requires_upstream_keys=["c_out"],
+            ),
+        ]
+        warnings = _detect_upstream_key_collisions(subtasks)
+        # Only ONE warning: the collision fingerprint (('x', (0, 1)))
+        # is already seen by the time we walk D's predecessors.
+        assert len(warnings) == 1
+        # And it must be reported at subtask 2, not subtask 3.
+        assert "Subtask 2" in warnings[0]
+        assert "Subtask 3" not in warnings[0]
+
+    def test_multiple_distinct_collisions_all_reported(self):
+        """Two different colliding keys (different producer sets) must both
+        be reported.
+        """
+        subtasks = [
+            SubTask(
+                description="A.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"records": "list", "metadata": "dict"},
+            ),
+            SubTask(
+                description="B.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"records": "list", "metadata": "dict"},
+            ),
+            SubTask(
+                description="Merge.",
+                required_capabilities=["merge"],
+                depends_on=[0, 1],
+                output_schema={"result": "dict"},
+                requires_upstream_keys=["records", "metadata"],
+            ),
+        ]
+        warnings = _detect_upstream_key_collisions(subtasks)
+        # A single warning message for subtask 2 that lists BOTH colliding keys.
+        assert len(warnings) == 1
+        assert "'records'" in warnings[0]
+        assert "'metadata'" in warnings[0]
+
+    def test_successor_own_output_not_a_collision_with_predecessor(self):
+        """A key that appears in BOTH a predecessor's output_schema AND the
+        successor's own output_schema is not a collision because the successor's
+        own output is never merged into its own ``upstream_data``.
+        """
+        subtasks = [
+            SubTask(
+                description="Parse.",
+                required_capabilities=["parse"],
+                depends_on=[],
+                output_schema={"records": "list"},
+            ),
+            SubTask(
+                description="Transform and republish under same key.",
+                required_capabilities=["transform"],
+                depends_on=[0],
+                output_schema={"records": "list"},  # same name, but own output
+                requires_upstream_keys=["records"],
+            ),
+        ]
+        # The successor's own output_schema is NOT part of its transitive
+        # predecessor set: the walker starts from depends_on, not from
+        # subtask_index itself. So no collision.
+        assert _detect_upstream_key_collisions(subtasks) == []
+
+    def test_collision_across_transitive_predecessors_not_direct_deps(self):
+        """Collision between two grandparent producers must still be
+        detected when the successor only directly depends on a middle step.
+        """
+        subtasks = [
+            SubTask(
+                description="A produces X.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="B also produces X.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="C depends on A and B, produces Y.",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"y": "dict"},
+                requires_upstream_keys=["x"],
+            ),
+            SubTask(
+                description="D depends on C only, but transitively on A & B.",
+                required_capabilities=["d"],
+                depends_on=[2],
+                output_schema={"final": "dict"},
+                requires_upstream_keys=["y"],
+            ),
+        ]
+        warnings = _detect_upstream_key_collisions(subtasks)
+        # C sees the collision first (its direct depends_on is [0, 1]).
+        # D also transitively sees it but is deduplicated.
+        assert len(warnings) == 1
+        assert "Subtask 2" in warnings[0]
+
+    def test_collisions_do_not_trip_hard_violations(self):
+        """The validator (hard violations) and the collision detector (soft
+        warnings) are orthogonal. A chain that has only collisions but no
+        missing-key violations must pass ``_validate_chain_coherence`` and
+        only be flagged by ``_detect_upstream_key_collisions``.
+        """
+        subtasks = [
+            SubTask(
+                description="A produces X.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="B also produces X.",
+                required_capabilities=["b"],
+                depends_on=[],
+                output_schema={"x": "int"},
+            ),
+            SubTask(
+                description="C requires X - satisfied by some producer.",
+                required_capabilities=["c"],
+                depends_on=[0, 1],
+                output_schema={"y": "dict"},
+                requires_upstream_keys=["x"],
+            ),
+        ]
+        # Hard violations: none (x has a producer; in fact, two).
+        assert _validate_chain_coherence(subtasks) == []
+        # Soft warnings: one (the collision).
+        warnings = _detect_upstream_key_collisions(subtasks)
+        assert len(warnings) == 1
+
+
+class TestValidateChainCoherence:
+    """Unit tests for the coherence validator."""
+
+    def test_single_subtask_chain_trivially_coherent(self):
+        subtasks = [
+            SubTask(
+                description="Parse CSV and return row count.",
+                required_capabilities=["parse-csv"],
+                depends_on=[],
+                output_schema={"row_count": "int"},
+            ),
+        ]
+        assert _validate_chain_coherence(subtasks) == []
+
+    def test_coherent_two_step_chain(self):
+        """Step 1 produces 'rows'; step 2 declares it requires 'rows'."""
+        subtasks = [
+            SubTask(
+                description="Parse the CSV and return rows.",
+                required_capabilities=["parse-csv"],
+                depends_on=[],
+                output_schema={"rows": "list[dict]"},
+            ),
+            SubTask(
+                description="Aggregate the upstream rows by category.",
+                required_capabilities=["aggregate"],
+                depends_on=[0],
+                output_schema={"aggregated": "dict"},
+                requires_upstream_keys=["rows"],
+            ),
+        ]
+        assert _validate_chain_coherence(subtasks) == []
+
+    def test_missing_required_upstream_key_is_flagged(self):
+        """A subtask requiring an unproduced upstream key is flagged."""
+        subtasks = [
+            SubTask(
+                description="Parse the departments CSV.",
+                required_capabilities=["parse-csv-file"],
+                depends_on=[],
+                output_schema={"departments": "list[dict]"},
+            ),
+            SubTask(
+                description="Aggregate spending per department.",
+                required_capabilities=["parse-tsv-and-aggregate-by-department"],
+                depends_on=[0],
+                output_schema={"department_spending": "dict[str, float]"},
+                requires_upstream_keys=["departments", "transactions"],
+            ),
+            SubTask(
+                description="Format the final result dict.",
+                required_capabilities=["format-final-result-dict"],
+                depends_on=[1],
+                output_schema={
+                    "department_count": "int",
+                    "department_spending": "dict[str, float]",
+                },
+                requires_upstream_keys=["department_spending"],
+            ),
+        ]
+        violations = _validate_chain_coherence(subtasks)
+        assert len(violations) == 1
+        assert "transactions" in violations[0]
+        assert "1" in violations[0]  # subtask index
+        assert "parse-tsv-and-aggregate-by-department" in violations[0]
+
+    def test_transitive_coherent_chain_passes(self):
+        """Step 3 declares a requirement produced by step 1 (grandparent via step 2)."""
+        subtasks = [
+            SubTask(
+                description="Parse CSV.",
+                required_capabilities=["parse"],
+                depends_on=[],
+                output_schema={"raw_data": "list[dict]"},
+            ),
+            SubTask(
+                description="Normalize the data.",
+                required_capabilities=["normalize"],
+                depends_on=[0],
+                output_schema={"normalized": "list[dict]"},
+                requires_upstream_keys=["raw_data"],
+            ),
+            SubTask(
+                description="Generate a report.",
+                required_capabilities=["report"],
+                depends_on=[1],
+                output_schema={"report": "str"},
+                requires_upstream_keys=["raw_data", "normalized"],
+            ),
+        ]
+        # 'raw_data' comes from step 0 (transitive via step 1), 'normalized'
+        # comes from step 1. Both available.
+        assert _validate_chain_coherence(subtasks) == []
+
+    def test_empty_requires_upstream_keys_trivially_passes(self):
+        """A subtask with no upstream requirements needs no validation."""
+        subtasks = [
+            SubTask(
+                description="Step A produces output.",
+                required_capabilities=["a"],
+                depends_on=[],
+                output_schema={"a_out": "int"},
+            ),
+            SubTask(
+                description="Step B runs independently and returns its own output.",
+                required_capabilities=["b"],
+                depends_on=[0],
+                output_schema={"b_out": "str"},
+                # Intentionally empty: step B does not consume from upstream.
+                requires_upstream_keys=[],
+            ),
+        ]
+        assert _validate_chain_coherence(subtasks) == []
+
+    def test_root_subtask_with_requires_upstream_keys_is_flagged(self):
+        """A root subtask (no depends_on) cannot legally declare upstream keys."""
+        subtasks = [
+            SubTask(
+                description="Root step that nonsensically claims an upstream key.",
+                required_capabilities=["bad-root"],
+                depends_on=[],
+                output_schema={"out": "int"},
+                requires_upstream_keys=["nonexistent"],
+            ),
+            SubTask(
+                description="Downstream step.",
+                required_capabilities=["downstream"],
+                depends_on=[0],
+                output_schema={"final": "int"},
+                requires_upstream_keys=["out"],
+            ),
+        ]
+        violations = _validate_chain_coherence(subtasks)
+        assert len(violations) == 1
+        assert "Root subtasks must not require upstream keys" in violations[0]
+
+    def test_nested_key_access_uses_top_level_only(self):
+        """Nested accesses list the top-level key, not the nested field.
+
+        The decomposer reads upstream_data['rules']['min_days_of_stock'] at
+        runtime, but requires_upstream_keys lists 'rules' only. The
+        predecessor declares 'rules' in its output_schema, so the chain is
+        coherent because nested fields are opaque to the contract by design.
+        """
+        subtasks = [
+            SubTask(
+                description="Parse the inventory CSV and reorder rules YAML.",
+                required_capabilities=["parse-inventory-and-rules"],
+                depends_on=[],
+                output_schema={
+                    "inventory": "list[dict]",
+                    "rules": "dict",
+                },
+            ),
+            SubTask(
+                description="Compute per-product days_of_stock and flag below-threshold items.",
+                required_capabilities=["compute-days-of-stock-and-flag"],
+                depends_on=[0],
+                output_schema={
+                    "reorder_candidates": "list[dict]",
+                    "product_count": "int",
+                },
+                requires_upstream_keys=["inventory", "rules"],
+            ),
+        ]
+        assert _validate_chain_coherence(subtasks) == []
+
+    def test_aggregation_with_own_outputs_not_false_flagged(self):
+        """A subtask can produce output keys that happen to share names with
+        domain concepts from upstream without the validator confusing them;
+        the structured field only tracks explicit ``requires_upstream_keys``,
+        not prose. Regression guard for the false-positive class the prose-
+        parsing predecessor of this check produced.
+        """
+        subtasks = [
+            SubTask(
+                description="Parse departments CSV and transactions TSV.",
+                required_capabilities=["parse-csv-and-tsv"],
+                depends_on=[],
+                output_schema={
+                    "departments": "list[dict]",
+                    "transactions": "list[dict]",
+                },
+            ),
+            SubTask(
+                description="Aggregate transactions by department.",
+                required_capabilities=["aggregate-spending-by-department"],
+                depends_on=[0],
+                output_schema={
+                    "department_count": "int",
+                    "department_spending": "dict[str, float]",
+                },
+                requires_upstream_keys=["transactions"],
+            ),
+        ]
+        assert _validate_chain_coherence(subtasks) == []
+
+
+class TestDecompositionNodeCoherenceIntegration:
+    """Integration test: coherence failure in decomposition_node sets sticky flag."""
+
+    @pytest.fixture
+    def state(self):
+        return TaskState(task_description="Parse two files and aggregate")
+
+    def test_incoherent_chain_sets_decomposition_succeeded_false(self, state):
+        """A decomposer output with an incoherent chain trips the sticky flag."""
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(
+                    description="Parse the CSV file into a list of departments.",
+                    required_capabilities=["parse-csv"],
+                    depends_on=[],
+                    output_schema={"departments": "list[dict]"},
+                ),
+                SubTaskItem(
+                    description="Aggregate total spending by department.",
+                    required_capabilities=["aggregate"],
+                    depends_on=[0],
+                    output_schema={"result": "dict"},
+                    requires_upstream_keys=["departments", "transactions"],
+                ),
+            ]
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        # Subtasks are still returned (fail-open)
+        assert len(cmd.update["subtasks"]) == 2
+        # But the sticky flag is False
+        assert cmd.update["decomposition_succeeded"] is False
+        # And an error message is in the errors list
+        errors = cmd.update["errors"]
+        assert any(
+            "coherence" in e.lower() and "transactions" in e for e in errors
+        )
+
+    def test_coherent_chain_keeps_decomposition_succeeded_true(self, state):
+        """A coherent decomposition leaves the sticky flag True."""
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(
+                    description="Parse both files.",
+                    required_capabilities=["parse"],
+                    depends_on=[],
+                    output_schema={"a": "list", "b": "list"},
+                ),
+                SubTaskItem(
+                    description="Combine the upstream 'a' and 'b' lists.",
+                    required_capabilities=["combine"],
+                    depends_on=[0],
+                    output_schema={"result": "dict"},
+                    requires_upstream_keys=["a", "b"],
+                ),
+            ]
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is True
+        # No coherence violation messages
+        errors = cmd.update["errors"]
+        assert not any("coherence" in e.lower() for e in errors)
+
+    def test_upstream_key_collision_surfaces_warning_without_tripping_flag(self, state):
+        """Upstream key collisions surface warnings without failing decomposition.
+
+        The chain may still work at runtime if the successor happens to want
+        the last-writing predecessor's value, so collision handling leaves
+        ``decomposition_succeeded`` true and records a warning for diagnosis.
+        """
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(
+                    description="Parse sales CSV into records.",
+                    required_capabilities=["parse-sales"],
+                    depends_on=[],
+                    output_schema={"records": "list[dict] - sales rows"},
+                ),
+                SubTaskItem(
+                    description="Parse inventory CSV into records.",
+                    required_capabilities=["parse-inventory"],
+                    depends_on=[],
+                    output_schema={"records": "list[dict] - inventory rows"},
+                ),
+                SubTaskItem(
+                    description="Analyze upstream records.",
+                    required_capabilities=["analyze"],
+                    depends_on=[0, 1],
+                    output_schema={"report": "dict"},
+                    requires_upstream_keys=["records"],
+                ),
+            ]
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        # The chain has a real collision: step 2's transitive predecessors
+        # 0 and 1 both produce 'records'. But there's no HARD violation:
+        # step 2 declares requires_upstream_keys=['records'], and 'records'
+        # IS produced by the predecessor set (twice).
+        assert cmd.update["decomposition_succeeded"] is True
+
+        # The collision is reported as a soft warning in errors.
+        errors = cmd.update["errors"]
+        warning_entries = [
+            e for e in errors
+            if "coherence warning" in e.lower() and "'records'" in e
+        ]
+        assert len(warning_entries) == 1, (
+            f"expected exactly one collision warning in errors; got: {errors}"
+        )
+
+        # The warning message must cite last-write-wins so a reader
+        # understands the runtime consequence.
+        assert "last-write-wins" in warning_entries[0]
+
+
+class TestValidateOutputContractCoverage:
+    """Hard validator for task-level required_keys coverage."""
+
+    def test_empty_required_keys_is_trivially_satisfied(self):
+        subtasks = [
+            SubTask(
+                description="Return stats.",
+                required_capabilities=["stats"],
+                depends_on=[],
+                output_schema={"row_count": "int"},
+            ),
+        ]
+        assert _validate_output_contract_coverage(subtasks, []) == []
+
+    def test_union_of_subtask_keys_satisfies_contract(self):
+        subtasks = [
+            SubTask(
+                description="Profile the dataset.",
+                required_capabilities=["profile"],
+                depends_on=[],
+                output_schema={"n_rows": "int", "n_columns": "int"},
+            ),
+            SubTask(
+                description="Summarize issues.",
+                required_capabilities=["summarize-issues"],
+                depends_on=[0],
+                output_schema={
+                    "quality_issues_found": "list[str]",
+                    "issue_categories": "list[str]",
+                },
+                requires_upstream_keys=["n_rows", "n_columns"],
+            ),
+        ]
+        assert _validate_output_contract_coverage(
+            subtasks,
+            ["n_rows", "n_columns", "quality_issues_found", "issue_categories"],
+        ) == []
+
+    def test_missing_required_keys_are_flagged(self):
+        subtasks = [
+            SubTask(
+                description="Request the dataset file or a corrected path.",
+                required_capabilities=["request-missing-file-or-path"],
+                depends_on=[],
+                output_schema={
+                    "file_path_confirmed": "str",
+                    "file_upload_provided": "bool",
+                },
+            ),
+        ]
+        violations = _validate_output_contract_coverage(
+            subtasks,
+            ["n_rows", "n_columns", "quality_issues_found", "issue_categories"],
+        )
+        assert len(violations) == 1
+        assert "Missing keys" in violations[0]
+        assert "n_rows" in violations[0]
+        assert "issue_categories" in violations[0]
+
+
+class TestDecompositionNodeOutputContractCoverage:
+    def test_uncovered_required_keys_set_decomposition_succeeded_false(self):
+        state = TaskState(
+            task_description="Investigate the dataset and report quality issues.",
+            output_contract=OutputContract(
+                required_keys=[
+                    "n_rows",
+                    "n_columns",
+                    "quality_issues_found",
+                    "issue_categories",
+                ],
+            ),
+        )
+        structured = DecompositionResult(
+            subtasks=[
+                SubTaskItem(
+                    description="Request the dataset file or a corrected path.",
+                    required_capabilities=["request-missing-file-or-path"],
+                    output_schema={
+                        "file_path_confirmed": "str",
+                        "file_upload_provided": "bool",
+                    },
+                ),
+            ],
+            reasoning="Need the file before the investigation can proceed.",
+        )
+        mock_tpe, _ = _make_mock_pool({"structured_response": structured})
+
+        with patch("src.orchestrator.decomposition._get_agent"):
+            with patch("concurrent.futures.ThreadPoolExecutor", mock_tpe):
+                cmd = decomposition_node(state)
+
+        assert cmd.update["decomposition_succeeded"] is False
+        assert any(
+            "Output contract coverage violation:" in err
+            for err in cmd.update["errors"]
+        )
+
+
+# ---------------------------------------------------------------------------
+# File output writer step
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureFileWriterLastStep:
+    """Unit tests for automatic file-writer subtask insertion."""
+
+    def test_empty_required_files_noop(self):
+        subtasks = [
+            SubTask(
+                description="Parse CSV and return row count",
+                required_capabilities=["parse-csv"],
+                depends_on=[],
+                output_schema={"row_count": "int"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, [])
+        assert result == subtasks
+
+    def test_empty_subtasks_noop(self):
+        result = _ensure_file_writer_last_step([], ["output.csv"])
+        assert result == []
+
+    def test_decomposer_compliance_is_noop(self):
+        """When the last subtask already mentions the filename, no-op."""
+        subtasks = [
+            SubTask(
+                description="Aggregate revenue per region",
+                required_capabilities=["aggregate-revenue"],
+                depends_on=[],
+                output_schema={"region_revenues": "dict"},
+            ),
+            SubTask(
+                description="Write the per-region summary to output.xlsx as Excel",
+                required_capabilities=["write-xlsx-file"],
+                depends_on=[0],
+                output_schema={"output_file": "str"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, ["output.xlsx"])
+        assert result == subtasks  # no append
+
+    def test_decomposer_non_compliance_appends_writer(self):
+        """When the last subtask doesn't mention the file, append a writer."""
+        subtasks = [
+            SubTask(
+                description="Aggregate revenue per region and return a dict",
+                required_capabilities=["aggregate-revenue"],
+                depends_on=[],
+                output_schema={
+                    "region_revenues": "dict - region to total revenue",
+                    "summary_row_count": "int",
+                },
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, ["output.xlsx"])
+        assert len(result) == 2
+        writer = result[-1]
+        assert "output.xlsx" in writer.description
+        assert "excel" in writer.description.lower()
+        assert writer.required_capabilities == ["write-xlsx-file"]
+        assert writer.depends_on == [0]
+        assert list(writer.output_schema) == ["output_file"]
+        assert "path of the written file" in writer.output_schema["output_file"]
+        assert set(writer.requires_upstream_keys) == {"region_revenues", "summary_row_count"}
+
+    def test_multi_file_writers_run_in_parallel_off_original(self):
+        """Multiple required files: every writer depends on the original
+        predecessor in parallel (NOT chained writer-after-writer).
+
+        Each writer reads the same original upstream data and writes its own
+        file. Chaining writers would make later writers consume only a sibling
+        writer's ``output_file`` path instead of the original data.
+        """
+        subtasks = [
+            SubTask(
+                description="Summarize the incident report",
+                required_capabilities=["summarize-incident"],
+                depends_on=[],
+                output_schema={
+                    "summary": "str",
+                    "metrics_table": "list[dict]",
+                },
+            ),
+        ]
+        result = _ensure_file_writer_last_step(
+            subtasks, ["output.csv", "report.md"],
+        )
+        assert len(result) == 3
+        # Both writers depend on the original last step (index 0), in parallel.
+        assert result[1].depends_on == [0]
+        assert result[2].depends_on == [0]  # Not chained to writer 1.
+        # Both writers read the SAME original predecessor keys (so each
+        # has access to the actual data, not just a sibling writer's path).
+        assert set(result[1].requires_upstream_keys) == {"summary", "metrics_table"}
+        assert set(result[2].requires_upstream_keys) == {"summary", "metrics_table"}
+        # Each writer targets its own file + format.
+        assert "output.csv" in result[1].description
+        assert result[1].required_capabilities == ["write-csv-file"]
+        assert "report.md" in result[2].description
+        assert result[2].required_capabilities == ["write-md-file"]
+
+    def test_case_insensitive_filename_match(self):
+        """Decomposer may produce descriptions with different casing."""
+        subtasks = [
+            SubTask(
+                description="Write the SUMMARY to OUTPUT.XLSX as an Excel workbook",
+                required_capabilities=["write-xlsx-file"],
+                depends_on=[],
+                output_schema={"output_file": "str"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, ["output.xlsx"])
+        assert result == subtasks  # Case-insensitive match succeeds, so no-op.
+
+    def test_markdown_extension_maps_to_format_label(self):
+        subtasks = [
+            SubTask(
+                description="Summarize",
+                required_capabilities=["summarize"],
+                depends_on=[],
+                output_schema={"summary": "str"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, ["report.md"])
+        assert "Markdown" in result[-1].description
+
+    def test_unknown_extension_uppercase_fallback(self):
+        subtasks = [
+            SubTask(
+                description="Summarize",
+                required_capabilities=["summarize"],
+                depends_on=[],
+                output_schema={"summary": "str"},
+            ),
+        ]
+        result = _ensure_file_writer_last_step(subtasks, ["report.xyz"])
+        # Unknown extension: required_capabilities uses ext slug; description
+        # uses uppercased slug for the format label. No crash.
+        assert result[-1].required_capabilities == ["write-xyz-file"]
+        assert "XYZ" in result[-1].description
+
+
+# ---------------------------------------------------------------------------
+# depends_on index validator
+# ---------------------------------------------------------------------------
+
+
+class TestValidateDependsOnIndices:
+    """Decomposition-layer DAG validator for invalid indices and cycles.
+
+    Invalid ``depends_on`` indices and cycles flip
+    ``decomposition_succeeded=False`` and use the retry budget instead of
+    flowing through to execution.
+    """
+
+    def _subtask(self, i: int, depends_on: list[int] | None = None) -> SubTask:
+        return SubTask(
+            description=f"subtask {i}",
+            required_capabilities=[f"cap-{i}"],
+            depends_on=depends_on or [],
+        )
+
+    def test_valid_dag_returns_empty_violations(self):
+        subtasks = [
+            self._subtask(0),
+            self._subtask(1, depends_on=[0]),
+            self._subtask(2, depends_on=[0, 1]),
+        ]
+        assert _validate_depends_on_indices(subtasks) == []
+
+    def test_empty_and_single_subtask_are_trivially_valid(self):
+        assert _validate_depends_on_indices([]) == []
+        assert _validate_depends_on_indices([self._subtask(0)]) == []
+
+    def test_out_of_range_positive_index(self):
+        """Out-of-range positive depends_on index is reported."""
+        subtasks = [
+            self._subtask(0),
+            self._subtask(1),
+            self._subtask(2, depends_on=[99]),
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert violations
+        assert any("out-of-range" in v and "99" in v for v in violations)
+
+    def test_negative_index(self):
+        """Negative depends_on index is reported."""
+        subtasks = [
+            self._subtask(0),
+            self._subtask(1, depends_on=[-1]),
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert violations
+        assert any("out-of-range" in v and "-1" in v for v in violations)
+
+    def test_self_loop(self):
+        subtasks = [
+            self._subtask(0),
+            self._subtask(1, depends_on=[1]),  # self-reference
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert violations
+        assert any("self-loop" in v for v in violations)
+
+    def test_two_subtask_cycle(self):
+        """A two-subtask mutual dependency is reported."""
+        subtasks = [
+            self._subtask(0, depends_on=[1]),
+            self._subtask(1, depends_on=[0]),
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert violations
+        assert any("cycle" in v.lower() for v in violations)
+
+    def test_three_subtask_cycle(self):
+        """Larger cycles are also caught."""
+        subtasks = [
+            self._subtask(0, depends_on=[2]),
+            self._subtask(1, depends_on=[0]),
+            self._subtask(2, depends_on=[1]),
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert violations
+        assert any("cycle" in v.lower() for v in violations)
+
+    def test_diamond_dag_is_valid(self):
+        """Non-cyclic diamond dependencies must pass."""
+        subtasks = [
+            self._subtask(0),
+            self._subtask(1, depends_on=[0]),
+            self._subtask(2, depends_on=[0]),
+            self._subtask(3, depends_on=[1, 2]),
+        ]
+        assert _validate_depends_on_indices(subtasks) == []
+
+    def test_multiple_violations_all_reported(self):
+        """When multiple violations exist, all are surfaced (caller decides
+        whether to report them all or truncate)."""
+        subtasks = [
+            self._subtask(0, depends_on=[99]),      # out-of-range
+            self._subtask(1, depends_on=[-1]),       # negative
+            self._subtask(2, depends_on=[2]),        # self-loop
+        ]
+        violations = _validate_depends_on_indices(subtasks)
+        assert len(violations) >= 3

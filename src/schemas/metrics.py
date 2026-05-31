@@ -14,6 +14,28 @@ class InvocationRecord(BaseModel):
     error_message: str | None = Field(
         default=None, description="Error message if the invocation failed"
     )
+    # Inputs and outputs are captured for failure-case replay. Split
+    # operations pull recent failures via ``MetricsStore.get_recent_failures``
+    # and feed them to the coverage verifier as concrete test inputs. Without
+    # these fields, split variants cannot be evaluated against the input
+    # subspaces where the parent failed. Serialization is JSON-as-string by
+    # convention; the caller is responsible for producing stable JSON. Legacy
+    # rows may have both fields NULL, and the DuckDB migration in
+    # ``src.registry.metrics`` keeps those databases readable.
+    input_args: str | None = Field(
+        default=None,
+        description=(
+            "Serialized input arguments passed to the capability "
+            "(JSON string by convention). None when not captured."
+        ),
+    )
+    actual_output: str | None = Field(
+        default=None,
+        description=(
+            "Serialized actual output produced by the capability "
+            "(JSON string by convention). None when not captured."
+        ),
+    )
     invoked_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="When the invocation occurred",

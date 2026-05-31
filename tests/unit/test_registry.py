@@ -1,15 +1,17 @@
+"""Unit tests for the ChromaDB-backed capability registry."""
+
 import uuid
 
 import pytest
 
-from src.registry.store import SkillRegistry, seed_registry
+from src.registry.store import CapabilityRegistry, SkillRegistry, seed_registry
 from src.schemas.capability import CapabilityDescriptor, CapabilityType
 
 
 @pytest.fixture
 def registry():
     """Isolated ephemeral registry per test."""
-    return SkillRegistry(collection_name=f"test-{uuid.uuid4().hex[:8]}")
+    return CapabilityRegistry(collection_name=f"test-{uuid.uuid4().hex[:8]}")
 
 
 @pytest.fixture
@@ -38,7 +40,11 @@ def _make_cap(
     return CapabilityDescriptor(**safe_fields)
 
 
-# --- Existing tests (backward compatibility) ---
+# --- Core registry behavior ---
+
+
+def test_skill_registry_alias_remains_for_backwards_compatibility():
+    assert SkillRegistry is CapabilityRegistry
 
 
 def test_add_and_search(registry):
@@ -61,7 +67,7 @@ def test_search_empty_registry(registry):
 
 def test_seed_registry(registry):
     seed_registry(registry)
-    assert registry.count == 8
+    assert registry.count == 14
 
 
 def test_search_relevance(seeded_registry):
@@ -106,25 +112,26 @@ def test_detect_gaps_finds_gap(seeded_registry):
 
 
 def test_detect_gaps_mixed(seeded_registry):
+    queries = ["compute fibonacci number", "deploy kubernetes cluster"]
     matches, gaps = seeded_registry.detect_gaps(
-        ["compute fibonacci number", "deploy kubernetes cluster"],
+        queries,
         threshold=0.5,
     )
-    assert len(matches) >= 1
-    # kubernetes is far from any seeded capability
-    assert len(gaps) >= 0  # depends on embedding model's judgment
+    handled_queries = {match[2] for match in matches} | {gap[0] for gap in gaps}
+    assert handled_queries == set(queries)
+    assert any(match[0].name == "fibonacci" for match in matches)
 
 
 def test_persistent_registry(tmp_path):
     persist_dir = str(tmp_path / "registry")
     col_name = f"test-{uuid.uuid4().hex[:8]}"
-    registry = SkillRegistry(persist_directory=persist_dir, collection_name=col_name)
+    registry = CapabilityRegistry(persist_directory=persist_dir, collection_name=col_name)
     seed_registry(registry)
-    assert registry.count == 8
+    assert registry.count == 14
 
     # Reopen from disk
-    registry2 = SkillRegistry(persist_directory=persist_dir, collection_name=col_name)
-    assert registry2.count == 8
+    registry2 = CapabilityRegistry(persist_directory=persist_dir, collection_name=col_name)
+    assert registry2.count == 14
     results = registry2.search("fibonacci")
     assert results[0][0].name == "fibonacci"
 
@@ -167,7 +174,6 @@ def test_update_capability(registry):
     assert updated.version == 2
     assert registry.count == 1
 
-    # Verify the update persisted
     fetched = registry.get("fibonacci")
     assert fetched is not None
     assert fetched.description == "Compute fibonacci numbers fast"
@@ -191,7 +197,6 @@ def test_deactivate_capability(registry):
     registry.add(cap)
     registry.deactivate("fibonacci")
 
-    # Verify metadata shows inactive
     result = registry._collection.get(ids=["fibonacci"])
     assert result["metadatas"][0]["is_active"] is False
 
@@ -247,7 +252,7 @@ def test_delete_nonexistent(registry):
 
 def test_list_all(seeded_registry):
     all_caps = seeded_registry.list_all(is_active=None)
-    assert len(all_caps) == 8
+    assert len(all_caps) == 14
 
 
 def test_list_by_type(seeded_registry):
@@ -256,12 +261,12 @@ def test_list_by_type(seeded_registry):
     assert all(c.capability_type == CapabilityType.MCP_TOOL for c in tools)
 
     skills = seeded_registry.list_all(capability_type=CapabilityType.SKILL)
-    assert len(skills) == 2
+    assert len(skills) == 7
     assert all(c.capability_type == CapabilityType.SKILL for c in skills)
 
     agents = seeded_registry.list_all(capability_type=CapabilityType.AGENT)
-    assert len(agents) == 1
-    assert agents[0].capability_type == CapabilityType.AGENT
+    assert len(agents) == 2
+    assert all(agent.capability_type == CapabilityType.AGENT for agent in agents)
 
 
 def test_list_by_domain(seeded_registry):
@@ -350,18 +355,24 @@ def test_search_relevance_with_hierarchical_docs(seeded_registry):
 
 def test_expanded_seed(registry):
     seed_registry(registry)
-    assert registry.count == 8
+    assert registry.count == 14
 
     all_caps = registry.list_all(is_active=None)
     names = {c.name for c in all_caps}
     expected = {
+        "anomaly-investigation-agent",
+        "budget-allocation-policy",
         "fibonacci",
         "csv-parser",
         "date-formatter",
         "json-validator",
         "text-statistics",
         "data-cleaning-workflow",
+        "eligibility-policy-classifier",
+        "inventory-reorder-policy",
+        "monitoring-aggregation-policy",
         "report-generation",
+        "sales-integration-report",
         "data-analysis-agent",
     }
     assert names == expected
@@ -381,7 +392,7 @@ def test_persistence_survives_crud(tmp_path):
     col_name = f"test-{uuid.uuid4().hex[:8]}"
 
     # Session 1: add, update, deactivate
-    reg1 = SkillRegistry(persist_directory=persist_dir, collection_name=col_name)
+    reg1 = CapabilityRegistry(persist_directory=persist_dir, collection_name=col_name)
     reg1.add(
         CapabilityDescriptor(
             name="tool-a",
@@ -400,7 +411,7 @@ def test_persistence_survives_crud(tmp_path):
     reg1.deactivate("tool-b")
 
     # Session 2: reopen and verify
-    reg2 = SkillRegistry(persist_directory=persist_dir, collection_name=col_name)
+    reg2 = CapabilityRegistry(persist_directory=persist_dir, collection_name=col_name)
     assert reg2.count == 2
 
     tool_a = reg2.get("tool-a")
@@ -446,7 +457,7 @@ def test_add_and_get_roundtrip(registry):
     assert result.version == cap.version
 
 
-# --- created_at round-trip (Bug 3 fix) ---
+# --- created_at round-trip ---
 
 
 def test_created_at_preserved_on_get(registry):
@@ -476,30 +487,30 @@ def test_created_at_preserved_on_search(registry):
     assert results and results[0][0].created_at == original_ts
 
 
-# --- detect_gaps respects is_active (Bug 1 fix) ---
+# --- detect_gaps respects is_active ---
 
 
 def test_detect_gaps_treats_deactivated_capability_as_gap(registry):
     """A deactivated capability must NOT count as a match — it must be a gap."""
     cap = CapabilityDescriptor(
-        name="legacy-tool",
+        name="inactive-tool",
         description="Compute the nth Fibonacci number",
         capability_type=CapabilityType.MCP_TOOL,
     )
     registry.add(cap)
-    registry.deactivate("legacy-tool")
+    registry.deactivate("inactive-tool")
 
     matches, gaps = registry.detect_gaps(["compute fibonacci number"])
 
     assert len(matches) == 0
     assert len(gaps) == 1
-    # Deactivated caps are now filtered from search results (M6 fix),
-    # so the gap reason is a generic low-score message, not "deactivated"
+    # Deactivated caps are filtered from active search results, so the exact
+    # reason text can vary by embedding score but must remain informative.
     assert gaps[0][1]  # reason is non-empty
 
 
 def test_detect_gaps_active_capability_still_matches(registry):
-    """An active capability above threshold must still be a match after the fix."""
+    """An active capability above threshold must still be a match."""
     cap = CapabilityDescriptor(
         name="active-tool",
         description="Compute the nth Fibonacci number",
@@ -512,3 +523,176 @@ def test_detect_gaps_active_capability_still_matches(registry):
     assert len(matches) == 1
     assert len(gaps) == 0
     assert matches[0][0].name == "active-tool"
+
+
+# --- Description summarization for embedding efficiency ---
+
+
+class TestDescriptionSummarization:
+    def test_short_description_unchanged(self):
+        desc = "Parse a CSV file and return rows"
+        assert CapabilityRegistry._summarize_description(desc) == desc
+
+    def test_long_description_truncated_to_50_words(self):
+        words = [f"word{i}" for i in range(100)]
+        desc = " ".join(words)
+        summary = CapabilityRegistry._summarize_description(desc)
+        assert summary.endswith("…")
+        # 50 words + ellipsis
+        assert len(summary.split()) == 50  # trailing … is part of last token
+
+    def test_exactly_50_words_unchanged(self):
+        words = [f"word{i}" for i in range(50)]
+        desc = " ".join(words)
+        summary = CapabilityRegistry._summarize_description(desc)
+        assert summary == desc
+        assert "…" not in summary
+
+    def test_build_document_uses_summary(self, registry):
+        long_desc = " ".join(f"word{i}" for i in range(100))
+        cap = _make_cap(name="long-desc-cap", description=long_desc)
+        doc = CapabilityRegistry._build_document(cap)
+        # Document should contain the truncated summary, not the full description
+        assert "…" in doc
+        assert "word99" not in doc
+
+    def test_full_description_preserved_in_metadata(self, registry):
+        long_desc = " ".join(f"word{i}" for i in range(100))
+        cap = _make_cap(name="long-desc-cap", description=long_desc)
+        registry.add(cap)
+        fetched = registry.get("long-desc-cap")
+        assert fetched is not None
+        assert fetched.description == long_desc
+
+
+# --- Dual-query search ---
+#
+# The decomposer produces short hyphen-case slugs in `required_capabilities`
+# which systematically fall below the 0.6 cosine threshold against the
+# registry's prose-style `_build_document()` output. Dual-query search
+# runs a second search on the natural-language `SubTask.description` and
+# takes the max-scoring hit.
+
+
+class TestDetectGapsDualQuery:
+    """Tests for the dual-query auxiliary_queries parameter on detect_gaps."""
+
+    def test_backward_compat_no_auxiliary(self, seeded_registry):
+        """When auxiliary_queries is None, only the primary query is used."""
+        matches, gaps = seeded_registry.detect_gaps(
+            ["compute fibonacci number"],
+            auxiliary_queries=None,
+        )
+        assert len(matches) == 1
+        assert len(gaps) == 0
+        assert matches[0][0].name == "fibonacci"
+
+    def test_slug_below_threshold_description_above_is_match(self, seeded_registry):
+        """The T01 csv-parser case: short slug misses, description hits.
+
+        Empirically measured: slug ``parse-csv-and-return-stats`` scores
+        0.5425 against csv-parser's seed doc (below 0.6 threshold), while
+        the corresponding prose description scores 0.7653 (above threshold).
+        Dual-query takes the max, which lifts the match above threshold.
+        """
+        matches, gaps = seeded_registry.detect_gaps(
+            ["parse-csv-and-return-stats"],
+            auxiliary_queries=[
+                "Parse the provided CSV file and return a dict with 'row_count' "
+                "(int) and 'column_names' (list of str)."
+            ],
+        )
+        assert len(matches) == 1, f"expected 1 match, got gaps={gaps}"
+        assert matches[0][0].name == "csv-parser"
+        # Score should reflect the auxiliary (description) winning, i.e.
+        # comfortably above the slug-only score of ~0.54.
+        assert matches[0][1] > 0.6
+
+    def test_attribution_preserves_slug_in_match_tuple(self, seeded_registry):
+        """The match tuple's third element is the original slug, not the aux.
+
+        Metrics and LangFuse traces attribute matches to the slug the
+        decomposer chose. Dual-query should not change that — only
+        change the SCORE comparison.
+        """
+        matches, _ = seeded_registry.detect_gaps(
+            ["parse-csv-and-return-stats"],
+            auxiliary_queries=[
+                "Parse the provided CSV file and return row count and column names."
+            ],
+        )
+        assert len(matches) == 1
+        _, _, original_query = matches[0]
+        assert original_query == "parse-csv-and-return-stats"
+
+    def test_both_below_threshold_is_gap(self, seeded_registry):
+        """When neither slug nor description matches, it's still a gap."""
+        matches, gaps = seeded_registry.detect_gaps(
+            ["deploy kubernetes cluster"],
+            auxiliary_queries=[
+                "Deploy a Kubernetes cluster with 3 worker nodes and configure ingress."
+            ],
+            threshold=0.8,  # force below-threshold outcome
+        )
+        assert len(matches) == 0
+        assert len(gaps) == 1
+        # Gap reason should show BOTH scores when auxiliary was provided
+        reason = gaps[0][1]
+        assert "primary" in reason.lower() or "auxiliary" in reason.lower()
+
+    def test_none_auxiliary_in_list_treated_as_single_query(self, seeded_registry):
+        """Per-query None auxiliary works — some slugs may lack descriptions."""
+        matches, gaps = seeded_registry.detect_gaps(
+            ["compute fibonacci number"],
+            auxiliary_queries=[None],
+        )
+        assert len(matches) == 1
+        assert matches[0][0].name == "fibonacci"
+
+    def test_empty_string_auxiliary_treated_as_none(self, seeded_registry):
+        """Empty-string auxiliary is equivalent to None (defensive)."""
+        matches, gaps = seeded_registry.detect_gaps(
+            ["compute fibonacci number"],
+            auxiliary_queries=[""],
+        )
+        assert len(matches) == 1
+
+    def test_mismatched_lengths_raises(self, seeded_registry):
+        """auxiliary_queries length must match queries length."""
+        with pytest.raises(ValueError, match="length"):
+            seeded_registry.detect_gaps(
+                ["slug-a", "slug-b"],
+                auxiliary_queries=["only one auxiliary"],
+            )
+
+    def test_mixed_matches_and_gaps_with_auxiliary(self, seeded_registry):
+        """Dual-query works across a list with some matches and some gaps."""
+        matches, gaps = seeded_registry.detect_gaps(
+            ["parse-csv-and-return-stats", "deploy kubernetes cluster"],
+            auxiliary_queries=[
+                "Parse the provided CSV file and return row_count and column_names.",
+                "Deploy a Kubernetes cluster with worker nodes and ingress config.",
+            ],
+            threshold=0.6,
+        )
+        # csv-parser should match via its auxiliary description
+        assert any(m[0].name == "csv-parser" for m in matches)
+        # kubernetes should remain a gap
+        assert any("kubernetes" in g[0] for g in gaps)
+
+    def test_max_score_wins_on_both_above(self, seeded_registry):
+        """When both queries match, take the higher-scoring hit."""
+        # Both queries should match fibonacci, the natural-language one
+        # typically scores higher than the short slug.
+        matches, _ = seeded_registry.detect_gaps(
+            ["compute-fibonacci"],
+            auxiliary_queries=[
+                "Compute the nth Fibonacci number given an integer index n."
+            ],
+        )
+        assert len(matches) == 1
+        assert matches[0][0].name == "fibonacci"
+        # Score should be at least as good as the single-query baseline
+        single_matches, _ = seeded_registry.detect_gaps(["compute-fibonacci"])
+        if single_matches:
+            assert matches[0][1] >= single_matches[0][1]

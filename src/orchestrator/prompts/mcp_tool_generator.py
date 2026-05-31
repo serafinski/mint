@@ -1,4 +1,59 @@
 """Prompts for the MCP tool generator."""
+# ruff: noqa: E501 — prompt strings intentionally use long lines; line continuation
+# backslashes add noise to the LLM's view of the prompt.
+
+# ---------------------------------------------------------------------------
+# Step position directive for chain-position-specific function signatures
+# ---------------------------------------------------------------------------
+#
+# The MCP_TOOL generator occasionally emitted step-0 functions with
+# ``upstream_data`` as a REQUIRED positional parameter even though step 0
+# has no upstream dependencies. The executor correctly calls step-0
+# functions WITHOUT ``upstream_data`` (only fixture paths), so the tool
+# crashed with ``missing 1 required positional argument: 'upstream_data'``.
+#
+# The current generator injects an explicit step-position block into the user
+# prompt so the LLM cannot confuse step role based on the gap name. A
+# post-generation AST check also flags signature/position mismatches for the
+# repair pass.
+
+FIRST_STEP_DIRECTIVE = """\
+
+## Step Position (HARD CONSTRAINT)
+
+**THIS IS THE FIRST STEP of the workflow. It has NO upstream dependencies.**
+
+Your function signature MUST follow these rules:
+- **DO NOT declare an ``upstream_data`` parameter.** There is no upstream
+  data for step 0. If you declare ``upstream_data`` as a required parameter,
+  the executor will crash with
+  ``missing 1 required positional argument: 'upstream_data'``.
+- The only required parameters are file path strings — e.g.
+  ``csv_path: Annotated[str, Field(description="...")]``,
+  ``yaml_path: Annotated[str, Field(description="...")]``.
+- Every non-path parameter MUST have a Python default value after the
+  closing ``Annotated[...]`` bracket.
+- Read each file using the appropriate library (csv, openpyxl, json,
+  yaml, etc.) and return a JSON-serializable dict with the parsed data.\
+"""
+
+DOWNSTREAM_STEP_DIRECTIVE = """\
+
+## Step Position (HARD CONSTRAINT)
+
+**THIS IS A DOWNSTREAM STEP of the workflow. It depends on earlier steps.**
+
+Your function signature MUST follow these rules:
+- Declare exactly ONE required parameter:
+  ``upstream_data: Annotated[dict, Field(description="Upstream step outputs")]``.
+- **DO NOT declare file path parameters.** The executor passes upstream
+  data as a parsed dict, not as files. The data is already JSON.
+- **DO NOT use ``open()``, ``pd.read_csv()``, or any file reader.**
+- Read upstream keys from ``upstream_data[...]`` (e.g.
+  ``inventory = upstream_data["inventory"]``).
+- Every other parameter MUST have a Python default value.\
+"""
+
 
 MCP_TOOL_SYSTEM_PROMPT = """\
 You are an expert Python developer specializing in MCP (Model Context Protocol)
@@ -81,22 +136,129 @@ scikit-learn, scipy, requests, beautifulsoup4, etc.)
 - Tool name should be snake_case for both FastMCP() and the function
 - Include appropriate `annotations` for tool hints
 - The tool must be self-contained — no dependencies on external state or files
-- All non-file parameters (thresholds, limits, flags, etc.) MUST have sensible \
-default values so the tool can be called with just the data inputs. Only file \
-path parameters should be required (no default).
+- **CRITICAL: Parameter defaults.** The pipeline calls your tool with ONLY \
+file paths. Every parameter that is NOT a file path MUST have a Python default \
+value in the function signature — the `= value` AFTER the closing parenthesis \
+of `Annotated[...]`. Example:
+  CORRECT: `delimiter: Annotated[str, Field(...)] = ","` — has Python default
+  WRONG:   `delimiter: Annotated[str, Field(default=",")] — NO Python default
+The `Field(default=...)` inside Annotated is Pydantic metadata only — it does \
+NOT make the parameter optional in Python. Without `= value` at the end, the \
+parameter is a required positional argument and the tool WILL fail at runtime. \
+Only file path parameters should be required (no default).
+- **Binary files in workspace.** When the tool reads files from a \
+workspace directory (``/workspace/``), it may encounter binary files \
+like ``.xlsx``, ``.xls``, ``.parquet``, ``.pkl``, or ``.zip``. When \
+iterating directory contents, skip files you don't need. When opening \
+files, use the appropriate reader: ``openpyxl`` for ``.xlsx``, \
+``pandas.read_parquet`` for ``.parquet``, etc. Do NOT blindly \
+``open(path, 'r')`` on all files — binary files will crash with a \
+UnicodeDecodeError.
 - In the `pip_packages` field, list ALL non-stdlib PyPI packages your code \
-imports. Use the **pip install name**, not the Python import name. Common \
-mappings: yaml → pyyaml, sklearn → scikit-learn, cv2 → opencv-python, \
-PIL → Pillow, bs4 → beautifulsoup4. If you only use stdlib + mcp + pydantic, \
-leave pip_packages empty.\
+imports. Use the **pip install name** (what you'd pass to `pip install`), not \
+the Python import name — e.g. `pyyaml` not `yaml`. If you only use \
+stdlib + mcp + pydantic, leave pip_packages empty.
+- **Do NOT catch exceptions and return them as structured "error result" \
+dicts.** If something goes wrong (file missing, JSON parse failure, schema \
+mismatch, division by zero), let the exception propagate so the calling \
+pipeline reports it as an execution error. Returning \
+``{"summary": "Failed to parse: ...", "data": []}`` instead of raising looks \
+like a successful result to the caller and silently hides the failure. The \
+*only* time you may catch an exception is to add diagnostic context, and \
+in that case you MUST re-raise it (e.g. \
+``raise RuntimeError(f"Failed to parse {path}: {original_exc}") from original_exc``). \
+The pipeline's verification gate, retry loop, and caller diagnostics all \
+depend on real exceptions reaching them. Returning a soft-failure dict \
+defeats every layer of error handling above the tool.\
 """
 
 MCP_TOOL_USER_PROMPT = """\
-Generate a complete MCP tool implementation for the following capability:
+Generate a complete MCP tool implementation that performs ONE STEP of a \
+larger workflow. Classification has decided this specific step is best \
+implemented as an MCP tool (a single deterministic function).
 
-Description: {description}
-Search query: {query}
-Task context: {task_context}
+## Full Task Context (for reference only)
+
+This is the overall task the step belongs to. Other steps of this task are \
+handled by separate artifacts — your tool only implements the single step \
+described below, not the whole task.
+
+{task_context}
+
+## The Specific Step to Implement
+
+Your tool implements this step of the workflow:
+
+    {gap_description}
+
+Focus on exactly this step. Do NOT try to solve the whole task in one tool. \
+If the workflow has other steps (parsing, aggregation, reporting, etc.) \
+those are handled by separate tools — you must NOT duplicate their work.
+{step_position}
+
+## CRITICAL: Do Not Build a Monolith
+
+Your tool must produce ONLY the output described in the step above. \
+It must NOT compute or return fields that belong to later steps in the \
+workflow. The decomposer split this task into separate steps for a reason \
+— each tool does its own part and passes intermediate data forward.
+
+**Bad example (MONOLITH — DO NOT DO THIS):**
+Step says: "Parse the three input files into structured tables"
+Tool returns: {{"summary_row_count": 3, "region_revenues": {{"North": 20000}}, "regions_meeting_target": 1}}
+This is WRONG — the tool jumped ahead and computed the final answer. \
+Parsing should return the parsed tables, not the aggregated results.
+
+**Good example (STEP-SPECIFIC):**
+Step says: "Parse the three input files into structured tables"
+Tool returns: {{"sales": [...rows...], "products": [...rows...], "targets": [...rows...]}}
+This is CORRECT — the tool returns only what the step asks for.
+
+If you find yourself computing something that a later step is supposed \
+to do, STOP. Return only the intermediate data this step produces.
+
+## Chain Data Flow Contract
+
+Tools in a multi-step workflow follow a strict data flow:
+
+- **First step (no depends_on):** receives raw file paths as parameters. \
+Read them using appropriate libraries (csv, openpyxl, json, yaml, etc.). \
+Output a JSON-serializable dict containing the parsed data.
+- **Middle steps (depends_on earlier steps):** receive **all upstream data \
+as a single ``upstream_data`` parameter** — a dict containing every key \
+produced by earlier steps. Your function signature MUST include \
+``upstream_data: Annotated[dict, Field(description="Upstream step outputs")]`` \
+as its ONLY required parameter. Read the keys you need from inside it: \
+``inventory = upstream_data["inventory"]``. Do NOT use separate parameters \
+for each upstream key. Do NOT use `pd.read_csv()`, `open()`, or any file \
+reader — the data is already parsed JSON. Output a JSON-serializable dict.
+- **Last step (nothing depends on it):** same as middle steps — receives \
+``upstream_data: dict`` as its only required parameter. Output a JSON \
+dict by default. If the task EXPLICITLY asks for a file output (CSV, \
+Excel, Markdown, etc.), write the file to ``/workspace/<filename>`` \
+where ``<filename>`` is whatever the task or subtask description names \
+(e.g. ``/workspace/output.csv``, ``/workspace/output.xlsx``, \
+``/workspace/report.md``, ``/workspace/metrics.csv``) AND return a JSON \
+dict with metadata about the file \
+(e.g. ``{{"output_file": "report.md", "row_count": 42}}``). \
+The pipeline will collect the file from the workspace automatically.
+
+**CRITICAL — file path placement.** The Docker sandbox ONLY mounts \
+``/workspace/``. Writing to any other absolute path (``/report.md``, ``/output.csv``, \
+``/tmp/report.md``, ``/metrics.csv``) will either raise \
+``PermissionError: [Errno 13]`` (root paths) or land in a directory \
+``_collect_output_files`` does not scan, in which case the file is \
+silently lost and the task fails the output_contract check downstream. \
+If the subtask description references a bare filename like ``report.md`` \
+or ``metrics.csv`` (no leading ``/``), you MUST treat it as a workspace \
+path: ``open("/workspace/report.md", "w")`` — NEVER \
+``open("/report.md", "w")`` and NEVER ``open("report.md", "w")`` \
+(cwd-relative paths are also unreliable in the sandbox).
+
+All inter-step communication uses JSON. This is the pipeline's "world \
+state at each handoff point."
+
+{schema_context}
 
 The tool function MUST be named exactly `{forced_name}` (snake_case). \
 Do not choose a different name.
@@ -109,11 +271,13 @@ MCP_TOOL_REPAIR_PROMPT = """\
 The generated MCP tool has a validation error. Fix the issues and return \
 the corrected version.
 
-## Original Request
+## Full Task Context (reference only)
 
-Description: {gap_description}
-Search query: {gap_query}
-Task context: {task_context}
+{task_context}
+
+## The Specific Step to Implement
+
+{gap_description}
 
 ## Your Previous Output
 

@@ -13,7 +13,7 @@ class CapabilityType(StrEnum):
 
 
 class CapabilityDescriptor(BaseModel):
-    """Metadata for a registered capability in the skill registry."""
+    """Metadata for a registered capability in the capability registry."""
 
     name: str = Field(..., description="Unique capability name")
     description: str = Field(..., description="What this capability does")
@@ -30,10 +30,43 @@ class CapabilityDescriptor(BaseModel):
         default_factory=list, description="Searchable tags for hierarchical matching"
     )
     domain: str = Field(
-        default="general", description="Domain category for hierarchical embeddings"
+        default="general",
+        description="Domain category used by taxonomy-aware registry retrieval",
+    )
+    is_generic: bool = Field(
+        default=False,
+        description=(
+            "True if this capability has no hardcoded business vocabulary "
+            "and should bypass the domain filter at gap detection time. "
+            "Generic capabilities, such as CSV parsers or mathematical "
+            "utilities, can serve any business sub-domain regardless of the "
+            "query's inferred domain."
+        ),
     )
     is_active: bool = Field(
         default=True, description="Whether capability is active in registry"
+    )
+    definition_token_cost: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Static token count of the capability definition: the MCP tool "
+            "JSON schema, SKILL.md body, or parent agent system prompt. "
+            "Computed at registration time and used as the context-economy "
+            "penalty term in utility scoring; reported separately from "
+            "runtime per-invocation token cost."
+        ),
+    )
+    pip_packages: list[str] = Field(
+        default_factory=list,
+        description=(
+            "PyPI package names required by MCP_TOOL execution at runtime. "
+            "Populated at generation time by the MCP tool generator from "
+            "the LLM's GeneratedToolCode.pip_packages and persisted via "
+            "ChromaDB metadata (JSON-encoded), so that registry-matched "
+            "tools restore their dependency list at retrieval time. "
+            "Empty for SKILL/AGENT capabilities."
+        ),
     )
     metadata: dict[str, str] = Field(
         default_factory=dict, description="Additional key-value metadata"

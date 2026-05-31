@@ -1,0 +1,39 @@
+{
+  "program_name": "Small Business Innovation Grant",
+  "rules": [
+    {
+      "rule_id": "R1",
+      "field": "annual_revenue",
+      "operator": "less_than",
+      "threshold": 500000,
+      "description": "Annual revenue must be under $500,000"
+    },
+    {
+      "rule_id": "R2",
+      "field": "employee_count",
+      "operator": "between",
+      "min": 1,
+      "max": 50,
+      "description": "Must have between 1 and 50 employees"
+    },
+    {
+      "rule_id": "R3",
+      "field": "years_in_business",
+      "operator": "greater_than_or_equal",
+      "threshold": 2,
+      "description": "Must be in business for at least 2 years"
+    },
+    {
+      "rule_id": "R4",
+      "field": "industry",
+      "operator": "in_list",
+      "allowed": [
+        "Technology",
+        "Healthcare",
+        "Manufacturing",
+        "Education"
+      ],
+      "description": "Must be in an eligible industry"
+    }
+  ]
+}

@@ -28,10 +28,11 @@ The `deepagents` package provides an agent harness with built-in planning (`writ
 ```python
 from deepagents import create_deep_agent
 from langchain.chat_models import init_chat_model
+from src.config import DEFAULT_LLM_MODEL
 
 agent = create_deep_agent(
-    model=init_chat_model("deepseek:deepseek-chat"),  # reasoner lacks tool_choice support
-    tools=[my_tool],
+    model=init_chat_model(DEFAULT_LLM_MODEL),
+    tools=[my_tool],                          # Optional — built-ins are always available
     system_prompt="You are...",
     # Optional:
     subagents=[...],
@@ -55,9 +56,24 @@ These come for free with every DeepAgent — no configuration needed:
 
 - **Planning**: `write_todos` tool for task decomposition and progress tracking
 - **File system**: `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`
+- **Shell execution**: `execute` tool for running shell commands — requires a `backend` implementing `SandboxBackendProtocol`; without one, returns an error. **None of our current invocations pass a backend**, so `execute` is non-functional in this project. We use the explicit `sandbox_execute` tool instead.
 - **Context management**: Large tool results (>20k tokens) auto-evict to files
-- **Subagent spawning**: `task` tool delegates work with context isolation
+- **Subagent spawning**: `task` tool delegates work with context isolation — requires `subagents=` parameter. **None of our current invocations pass subagents**, so `task` is non-functional in this project.
 - **Conversation summarization**: Auto-compresses old messages at 85% context usage
+
+The `tools` parameter in `create_deep_agent()` is **optional** — it adds custom tools on top of the built-ins. If the agent only needs planning and file operations (e.g., task decomposition), omit it entirely. In this project, we pass `tools=[sandbox_execute]` when the agent needs Docker-isolated Python execution (adversarial probing, agent evaluation).
+
+**IMPORTANT: Filesystem isolation.** The built-in file tools (`read_file`, `write_file`, `ls`, etc.) operate on the agent's in-memory workspace (`StateBackend`), NOT on the Docker sandbox filesystem. Files written with `write_file` are NOT accessible inside `sandbox_execute`. Data for sandbox execution must be embedded directly in the Python code string.
+
+### Execution Backends (Three Types)
+
+Each capability type uses a different execution backend in `tests/evaluation/execution.py`:
+
+- **MCP_TOOL**: `sandbox_execute()` runs generated code directly. No LLM at runtime.
+- **SKILL**: Constrained LLM with `bind_tools([sandbox_execute])`, max 3 tool calls. No DeepAgent, no `write_todos`. Prescribed workflow.
+- **AGENT**: Full DeepAgent with `skills=` parameter for progressive disclosure. Agent discovers skills via `StateBackend` (`invoke(files={...})`). Adaptive reasoning.
+
+Skills are NOT executed via DeepAgent — they use a simpler tool-calling loop. Only AGENT artifacts use DeepAgent.
 
 ## Integration Pattern: DeepAgent Inside a LangGraph Node
 
@@ -70,7 +86,7 @@ from src.schemas.task import TaskState
 
 # Create the agent once at module level
 decomposition_agent = create_deep_agent(
-    model=init_chat_model("deepseek:deepseek-chat"),  # reasoner lacks tool_choice support
+    model=init_chat_model(DEFAULT_LLM_MODEL),  # reasoner lacks tool_choice support
     system_prompt="""You are a task decomposition specialist.
 
     Break the given task into independent subtasks.
@@ -98,7 +114,7 @@ For the adversarial probing tier, the DeepAgent needs to execute code in isolati
 
 ```python
 adversarial_agent = create_deep_agent(
-    model=init_chat_model("deepseek:deepseek-chat"),
+    model=init_chat_model(DEFAULT_LLM_MODEL),
     system_prompt="""You are a red-team agent testing whether a generated
     capability is genuinely functional or faking its outputs.
 
@@ -124,11 +140,11 @@ research_subagent = {
     "description": "Analyzes capability gaps in depth",
     "system_prompt": "You analyze capability gaps and classify them...",
     "tools": [registry_search_tool],
-    "model": "deepseek:deepseek-chat",
+    "model": DEFAULT_LLM_MODEL,
 }
 
 orchestrator = create_deep_agent(
-    model=init_chat_model("deepseek:deepseek-chat"),
+    model=init_chat_model(DEFAULT_LLM_MODEL),
     system_prompt="You orchestrate the JIT capability pipeline...",
     subagents=[research_subagent],
 )
@@ -195,30 +211,28 @@ These rules are enforced by `tools/quick_validate.py`:
 
 ## Model Selection
 
-Use `deepseek-chat` (DeepSeek-V3.2) for all components, including DeepAgents. The `deepseek-reasoner` (thinking mode) does **not** support `tool_choice`, which DeepAgents requires for tool calling. This was discovered during Iteration 2 integration testing — the reasoner model rejects requests with `tool_choice` set, causing all DeepAgent invocations to fail.
-
-Use `init_chat_model("provider:model")` for provider-agnostic switching:
+All components use `DEFAULT_LLM_MODEL` from `src.config` (currently `openai:gpt-5-mini`, overridable via `JIT_LLM_MODEL` env var). Never hardcode a model string — always import from config.
 
 ```python
 from langchain.chat_models import init_chat_model
+from src.config import DEFAULT_LLM_MODEL
 
-# For DeepAgents (deepseek-chat — reasoner lacks tool_choice support)
-agent_llm = init_chat_model("deepseek:deepseek-chat")
+# For DeepAgents
+agent_llm = init_chat_model(DEFAULT_LLM_MODEL)
 agent = create_deep_agent(model=agent_llm, ...)
 
 # For plain nodes (same model, single-step)
-fast_llm = init_chat_model("deepseek:deepseek-chat")
-
-# Switch to Anthropic if needed (e.g., for evaluation comparison)
-anthropic_llm = init_chat_model("anthropic:claude-sonnet-4-5-20250929")
+fast_llm = init_chat_model(DEFAULT_LLM_MODEL)
 ```
+
+**Important:** The chosen model must support `tool_choice`, which DeepAgents requires for tool calling. Models with thinking/reasoning modes (e.g., `deepseek-reasoner`) may not support this — test before switching.
 
 | Component | Model | Why |
 |---|---|---|
-| Task decomposition (DeepAgent) | `deepseek-chat` | `deepseek-reasoner` lacks `tool_choice` support |
-| Adversarial probing (DeepAgent) | `deepseek-chat` | Same limitation |
-| Failure analysis (DeepAgent, optional) | `deepseek-chat` | Same limitation |
-| Classifier, generators, behavioral testing | `deepseek-chat` | Single-step, speed matters |
+| Task decomposition (DeepAgent) | `DEFAULT_LLM_MODEL` | Multi-step planning |
+| Adversarial probing (DeepAgent) | `DEFAULT_LLM_MODEL` | Multi-step reasoning + sandbox |
+| Failure analysis (DeepAgent, optional) | `DEFAULT_LLM_MODEL` | Investigation |
+| Classifier, generators, behavioral testing | `DEFAULT_LLM_MODEL` | Single-step, speed matters |
 
 ## Token Budget
 

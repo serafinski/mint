@@ -19,8 +19,13 @@ import json
 import math
 import random
 import re
+import xml.etree.ElementTree as ET
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
+
+import openpyxl
+import yaml
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -32,7 +37,7 @@ FIXTURES_DIR = Path(__file__).parent
 def generate_all_fixtures(
     fixtures_dir: Path = FIXTURES_DIR, seed: int = 42
 ) -> dict:
-    """Generate all 17 task fixtures and return the expected_values dict.
+    """Generate the canonical breadth fixtures and expected values.
 
     Idempotent — safe to call multiple times; files are overwritten.
     """
@@ -58,6 +63,8 @@ def generate_all_fixtures(
     expected.update(_gen_t16(fixtures_dir, rng))
     expected.update(_gen_t17(fixtures_dir, rng))
     expected.update(_gen_t18(fixtures_dir, rng))
+    expected.update(_gen_t19(fixtures_dir))
+    expected.update(_gen_t20(fixtures_dir))
 
     out_path = fixtures_dir / "expected_values.json"
     out_path.write_text(json.dumps(expected, indent=2))
@@ -279,8 +286,9 @@ def _gen_t04(fixtures_dir: Path, rng: random.Random) -> dict:
         "reorder_days_supply": reorder_multiplier,
         "max_order_value": 5000.0,
     }
-    import yaml
-    (fixtures_dir / "t04_reorder_rules.yaml").write_text(yaml.dump(rules, default_flow_style=False))
+    (fixtures_dir / "t04_reorder_rules.yaml").write_text(
+        yaml.dump(rules, default_flow_style=False)
+    )
 
     # --- Compute expected values ---
     items_below_threshold = 0
@@ -462,7 +470,11 @@ _T07_NOISE = [
 def _gen_t07(fixtures_dir: Path, rng: random.Random) -> dict:
     # Right dataset: clean canonical names
     right_rows = [
-        {"company_id": i + 1, "company_name": name, "industry": rng.choice(["Tech", "Finance", "Retail"])}
+        {
+            "company_id": i + 1,
+            "company_name": name,
+            "industry": rng.choice(["Tech", "Finance", "Retail"]),
+        }
         for i, name in enumerate(_T07_BASE_COMPANIES)
     ]
 
@@ -482,7 +494,13 @@ def _gen_t07(fixtures_dir: Path, rng: random.Random) -> dict:
             noisy = noise_fn(name)
         else:
             noisy = name
-        left_rows.append({"order_id": i + 1, "company_name": noisy, "amount": round(rng.uniform(100, 10000), 2)})
+        left_rows.append(
+            {
+                "order_id": i + 1,
+                "company_name": noisy,
+                "amount": round(rng.uniform(100, 10000), 2),
+            }
+        )
 
     buf_left = io.StringIO()
     writer = csv.DictWriter(buf_left, fieldnames=["order_id", "company_name", "amount"])
@@ -614,12 +632,14 @@ def _gen_t09(fixtures_dir: Path, rng: random.Random) -> dict:
     for i in range(5):
         data["records"][i]["revenue"] = round(rng.uniform(500000, 1000000), 2)
 
-    # Write as XML for format diversity
-    import xml.etree.ElementTree as ET
-
     root_el = ET.Element("report")
     ET.SubElement(root_el, "title").text = data["title"]
-    period_el = ET.SubElement(root_el, "period", start=data["period"]["start"], end=data["period"]["end"])
+    ET.SubElement(
+        root_el,
+        "period",
+        start=data["period"]["start"],
+        end=data["period"]["end"],
+    )
     records_el = ET.SubElement(root_el, "records")
     for rec in data["records"]:
         rec_el = ET.SubElement(records_el, "record")
@@ -708,11 +728,13 @@ def _gen_t11(fixtures_dir: Path, rng: random.Random) -> dict:
     """Three data sources: sales CSV, products JSON, targets CSV."""
     # --- Products catalog (JSON) ---
     products = [
-        {"product_id": i + 1, "name": f"Product_{chr(65 + i)}", "category": rng.choice(_T11_CATEGORIES)}
+        {
+            "product_id": i + 1,
+            "name": f"Product_{chr(65 + i)}",
+            "category": rng.choice(_T11_CATEGORIES),
+        }
         for i in range(10)
     ]
-    # Write as Excel for format diversity
-    import openpyxl
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -739,7 +761,10 @@ def _gen_t11(fixtures_dir: Path, rng: random.Random) -> dict:
         })
 
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["order_id", "product_id", "quantity", "unit_price", "region"])
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=["order_id", "product_id", "quantity", "unit_price", "region"],
+    )
     writer.writeheader()
     writer.writerows(sales_rows)
     (fixtures_dir / "t11_sales.csv").write_text(buf.getvalue())
@@ -1031,7 +1056,16 @@ def _gen_t15(fixtures_dir: Path, rng: random.Random) -> dict:
         })
 
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["timestamp", "cpu_pct", "memory_pct", "requests_per_sec", "error_count"])
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=[
+            "timestamp",
+            "cpu_pct",
+            "memory_pct",
+            "requests_per_sec",
+            "error_count",
+        ],
+    )
     writer.writeheader()
     writer.writerows(metrics_rows)
     (fixtures_dir / "t15_hourly_metrics.csv").write_text(buf.getvalue())
@@ -1054,7 +1088,6 @@ def _gen_t15(fixtures_dir: Path, rng: random.Random) -> dict:
     (fixtures_dir / "t15_agg_config.json").write_text(json.dumps(agg_config, indent=2))
 
     # Pre-compute daily aggregates
-    from collections import defaultdict
     daily_data: dict[str, list[dict]] = defaultdict(list)
     for row in metrics_rows:
         day = row["timestamp"][:10]
@@ -1112,19 +1145,38 @@ def _gen_t16(fixtures_dir: Path, rng: random.Random) -> dict:
             # Cascading failure with staggered onset
             elapsed = i - incident_start
             # Root cause: db_connections spike immediately
-            row["db_connections"] = rng.randint(80, 100) if elapsed >= 0 else rng.randint(5, 30)
+            row["db_connections"] = (
+                rng.randint(80, 100) if elapsed >= 0 else rng.randint(5, 30)
+            )
             # query_latency follows after ~5 steps
-            row["query_latency_ms"] = round(rng.uniform(500, 2000), 1) if elapsed >= 5 else round(rng.uniform(5, 50), 1)
+            row["query_latency_ms"] = (
+                round(rng.uniform(500, 2000), 1)
+                if elapsed >= 5
+                else round(rng.uniform(5, 50), 1)
+            )
             # request_queue follows after ~10 steps
-            row["request_queue_depth"] = rng.randint(50, 200) if elapsed >= 10 else rng.randint(0, 10)
+            row["request_queue_depth"] = (
+                rng.randint(50, 200) if elapsed >= 10 else rng.randint(0, 10)
+            )
             # error_rate follows after ~15 steps
-            row["error_rate"] = round(rng.uniform(0.1, 0.5), 4) if elapsed >= 15 else round(rng.uniform(0.0, 0.02), 4)
+            row["error_rate"] = (
+                round(rng.uniform(0.1, 0.5), 4)
+                if elapsed >= 15
+                else round(rng.uniform(0.0, 0.02), 4)
+            )
             # cpu stays normal (red herring)
             row["cpu_usage"] = round(rng.uniform(20, 60), 1)
 
         rows.append(row)
 
-    fieldnames = ["timestamp", "db_connections", "query_latency_ms", "request_queue_depth", "error_rate", "cpu_usage"]
+    fieldnames = [
+        "timestamp",
+        "db_connections",
+        "query_latency_ms",
+        "request_queue_depth",
+        "error_rate",
+        "cpu_usage",
+    ]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames)
     writer.writeheader()
@@ -1142,9 +1194,9 @@ def _gen_t16(fixtures_dir: Path, rng: random.Random) -> dict:
         "onset_time": rows[incident_start]["timestamp"],
         "affected_service": "api-gateway",
     }
-    # Write as YAML for format diversity
-    import yaml
-    (fixtures_dir / "t16_incident.yaml").write_text(yaml.dump(incident_report, default_flow_style=False))
+    (fixtures_dir / "t16_incident.yaml").write_text(
+        yaml.dump(incident_report, default_flow_style=False)
+    )
 
     return {
         "T16": {
@@ -1176,7 +1228,10 @@ def _gen_t17(fixtures_dir: Path, rng: random.Random) -> dict:
             "risk_score": round(rng.uniform(0, 1), 2),
         })
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["customer_id", "name", "account_age_days", "risk_score"])
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=["customer_id", "name", "account_age_days", "risk_score"],
+    )
     writer.writeheader()
     writer.writerows(customers)
     (fixtures_dir / "t17_customers.csv").write_text(buf.getvalue())
@@ -1187,17 +1242,28 @@ def _gen_t17(fixtures_dir: Path, rng: random.Random) -> dict:
     for i in range(1, 101):
         cid = rng.choice(range(1, len(_T17_NAMES) + 1))
         is_fraud = cid in fraud_customer_ids and rng.random() < 0.4
-        amount = round(rng.uniform(5000, 50000) if is_fraud else rng.uniform(10, 2000), 2)
-        transactions.append({
-            "txn_id": i,
-            "customer_id": cid,
-            "amount": amount,
-            "merchant": rng.choice(["ShopA", "ShopB", "ShopC", "OnlineX", "OnlineY"]),
-            "timestamp": f"2024-06-{rng.randint(1,30):02d} {rng.randint(0,23):02d}:{rng.randint(0,59):02d}:00",
-            "flagged": is_fraud,
-        })
+        amount = round(
+            rng.uniform(5000, 50000) if is_fraud else rng.uniform(10, 2000),
+            2,
+        )
+        transactions.append(
+            {
+                "txn_id": i,
+                "customer_id": cid,
+                "amount": amount,
+                "merchant": rng.choice(["ShopA", "ShopB", "ShopC", "OnlineX", "OnlineY"]),
+                "timestamp": (
+                    f"2024-06-{rng.randint(1, 30):02d} "
+                    f"{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:00"
+                ),
+                "flagged": is_fraud,
+            }
+        )
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["txn_id", "customer_id", "amount", "merchant", "timestamp", "flagged"])
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=["txn_id", "customer_id", "amount", "merchant", "timestamp", "flagged"],
+    )
     writer.writeheader()
     writer.writerows(transactions)
     (fixtures_dir / "t17_transactions.csv").write_text(buf.getvalue())
@@ -1295,7 +1361,295 @@ def _gen_t18(fixtures_dir: Path, rng: random.Random) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# T19 — Exploratory data analysis (seeded AGENT baseline)
+# ---------------------------------------------------------------------------
+
+_T19_PRODUCT_SALES_CSV = """product_id,category,revenue,units_sold,return_rate,satisfaction_score
+P001,Electronics,45230.50,312,0.08,4.2
+P002,Electronics,38100.00,245,0.12,3.8
+P003,Clothing,12450.75,520,0.15,3.5
+P004,Clothing,8900.00,310,0.18,3.2
+P005,Home,22340.00,178,0.05,4.5
+P006,Home,19870.25,165,0.06,4.3
+P007,Electronics,52100.00,380,0.07,4.4
+P008,Clothing,15600.50,480,0.14,3.6
+P009,Home,28900.00,210,0.04,4.6
+P010,Electronics,41200.00,290,0.09,4.1
+P011,Clothing,9800.00,350,0.20,3.0
+P012,Home,31500.75,225,0.03,4.7
+P013,Electronics,36400.00,260,0.10,3.9
+P014,Clothing,11200.00,420,0.16,3.4
+P015,Home,25600.00,195,0.05,4.4
+P016,Electronics,48700.50,340,0.06,4.3
+P017,Clothing,13800.00,490,0.13,3.7
+P018,Home,20100.00,170,0.07,4.2
+P019,Electronics,29500.00,200,0.11,3.7
+P020,Clothing,7500.00,280,0.22,2.9
+P021,Home,35200.50,240,0.04,4.8
+P022,Electronics,43600.00,305,0.08,4.0
+P023,Clothing,14300.75,440,0.17,3.3
+P024,Home,26800.00,185,0.06,4.5
+P025,Electronics,50800.00,365,0.05,4.5
+"""
+
+
+def _gen_t19(fixtures_dir: Path) -> dict:
+    """Write the fixed canonical EDA fixture."""
+    (fixtures_dir / "t19_product_sales.csv").write_text(_T19_PRODUCT_SALES_CSV)
+    categories = ["Clothing", "Electronics", "Home"]
+    return {
+        "T19": {
+            "n_rows": 25,
+            "n_columns": 6,
+            "n_categories": len(categories),
+            "categories": categories,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# T20 — Eligibility classification (targets SKILL classification)
+# ---------------------------------------------------------------------------
+
+_T20_POLICY = {
+    "program_name": "Small Business Innovation Grant",
+    "rules": [
+        {
+            "rule_id": "R1",
+            "field": "annual_revenue",
+            "operator": "less_than",
+            "threshold": 500000,
+            "description": "Annual revenue must be under $500,000",
+        },
+        {
+            "rule_id": "R2",
+            "field": "employee_count",
+            "operator": "between",
+            "min": 1,
+            "max": 50,
+            "description": "Must have between 1 and 50 employees",
+        },
+        {
+            "rule_id": "R3",
+            "field": "years_in_business",
+            "operator": "greater_than_or_equal",
+            "threshold": 2,
+            "description": "Must be in business for at least 2 years",
+        },
+        {
+            "rule_id": "R4",
+            "field": "industry",
+            "operator": "in_list",
+            "allowed": ["Technology", "Healthcare", "Manufacturing", "Education"],
+            "description": "Must be in an eligible industry",
+        },
+    ],
+}
+
+_T20_FIELDNAMES = [
+    "applicant_id",
+    "business_name",
+    "annual_revenue",
+    "employee_count",
+    "years_in_business",
+    "industry",
+]
+
+_T20_APPLICATION_ROWS = [
+    {
+        "applicant_id": "A001",
+        "business_name": "TechStart Solutions",
+        "annual_revenue": 120000,
+        "employee_count": 8,
+        "years_in_business": 3,
+        "industry": "Technology",
+    },
+    {
+        "applicant_id": "A002",
+        "business_name": "GreenGrow Farms",
+        "annual_revenue": 450000,
+        "employee_count": 35,
+        "years_in_business": 5,
+        "industry": "Agriculture",
+    },
+    {
+        "applicant_id": "A003",
+        "business_name": "MedDevice Labs",
+        "annual_revenue": 380000,
+        "employee_count": 22,
+        "years_in_business": 4,
+        "industry": "Healthcare",
+    },
+    {
+        "applicant_id": "A004",
+        "business_name": "QuickBite Catering",
+        "annual_revenue": 90000,
+        "employee_count": 5,
+        "years_in_business": 1,
+        "industry": "Food Service",
+    },
+    {
+        "applicant_id": "A005",
+        "business_name": "EduTech Academy",
+        "annual_revenue": 250000,
+        "employee_count": 15,
+        "years_in_business": 6,
+        "industry": "Education",
+    },
+    {
+        "applicant_id": "A006",
+        "business_name": "BuildRight Mfg",
+        "annual_revenue": 600000,
+        "employee_count": 45,
+        "years_in_business": 10,
+        "industry": "Manufacturing",
+    },
+    {
+        "applicant_id": "A007",
+        "business_name": "CloudPeak Software",
+        "annual_revenue": 200000,
+        "employee_count": 12,
+        "years_in_business": 3,
+        "industry": "Technology",
+    },
+    {
+        "applicant_id": "A008",
+        "business_name": "WellCare Clinic",
+        "annual_revenue": 180000,
+        "employee_count": 18,
+        "years_in_business": 2,
+        "industry": "Healthcare",
+    },
+    {
+        "applicant_id": "A009",
+        "business_name": "NanoFab Corp",
+        "annual_revenue": 420000,
+        "employee_count": 48,
+        "years_in_business": 7,
+        "industry": "Manufacturing",
+    },
+    {
+        "applicant_id": "A010",
+        "business_name": "LuxeRetail Co",
+        "annual_revenue": 350000,
+        "employee_count": 55,
+        "years_in_business": 4,
+        "industry": "Retail",
+    },
+    {
+        "applicant_id": "A011",
+        "business_name": "DataMinds AI",
+        "annual_revenue": 95000,
+        "employee_count": 6,
+        "years_in_business": 2,
+        "industry": "Technology",
+    },
+    {
+        "applicant_id": "A012",
+        "business_name": "TeachForward",
+        "annual_revenue": 310000,
+        "employee_count": 20,
+        "years_in_business": 8,
+        "industry": "Education",
+    },
+    {
+        "applicant_id": "A013",
+        "business_name": "FreshFields Ag",
+        "annual_revenue": 280000,
+        "employee_count": 30,
+        "years_in_business": 3,
+        "industry": "Agriculture",
+    },
+    {
+        "applicant_id": "A014",
+        "business_name": "PrintPrecise 3D",
+        "annual_revenue": 150000,
+        "employee_count": 10,
+        "years_in_business": 1,
+        "industry": "Manufacturing",
+    },
+    {
+        "applicant_id": "A015",
+        "business_name": "HealthBridge",
+        "annual_revenue": 490000,
+        "employee_count": 40,
+        "years_in_business": 5,
+        "industry": "Healthcare",
+    },
+]
+
+_T20_RECURRENCE_INDUSTRIES = [
+    "Technology",
+    "Healthcare",
+    "Manufacturing",
+    "Education",
+    "Retail",
+    "Hospitality",
+    "Construction",
+    "Finance",
+]
+
+
+def _t20_is_eligible(row: dict) -> bool:
+    allowed_industries = set(_T20_POLICY["rules"][3]["allowed"])
+    return (
+        int(row["annual_revenue"]) < 500_000
+        and 1 <= int(row["employee_count"]) <= 50
+        and int(row["years_in_business"]) >= 2
+        and row["industry"] in allowed_industries
+    )
+
+
+def _write_t20_fixture(fixtures_dir: Path, rows: list[dict]) -> dict:
+    (fixtures_dir / "t20_eligibility_policy.json").write_text(
+        json.dumps(_T20_POLICY, indent=2)
+    )
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=_T20_FIELDNAMES, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    (fixtures_dir / "t20_applications.csv").write_text(buf.getvalue())
+
+    eligible_ids = [row["applicant_id"] for row in rows if _t20_is_eligible(row)]
+    return {
+        "T20": {
+            "total_applications": len(rows),
+            "eligible_count": len(eligible_ids),
+            "ineligible_count": len(rows) - len(eligible_ids),
+            "eligible_ids": eligible_ids,
+            "rules_applied": len(_T20_POLICY["rules"]),
+        }
+    }
+
+
+def _gen_t20(fixtures_dir: Path) -> dict:
+    """Write the fixed canonical eligibility-policy fixture."""
+    return _write_t20_fixture(fixtures_dir, _T20_APPLICATION_ROWS)
+
+
+def _gen_t20_recurrence(fixtures_dir: Path, rng: random.Random) -> dict:
+    """Write a seeded T20 variant for the recurrence benchmark."""
+    rows = []
+    for i in range(1, 37):
+        rows.append(
+            {
+                "applicant_id": f"A{i:03d}",
+                "business_name": f"Business_{i}",
+                "annual_revenue": rng.randint(50_000, 900_000),
+                "employee_count": rng.randint(1, 90),
+                "years_in_business": rng.randint(0, 15),
+                "industry": rng.choice(_T20_RECURRENCE_INDUSTRIES),
+            }
+        )
+
+    expected = _write_t20_fixture(fixtures_dir, rows)
+    expected["T20"].pop("eligible_ids")
+    return expected
+
+
+# ---------------------------------------------------------------------------
+# Script entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":

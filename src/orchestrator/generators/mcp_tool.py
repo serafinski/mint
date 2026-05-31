@@ -20,8 +20,13 @@ from typing import Literal
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from src.orchestrator.generators.utils import build_task_context, slugify_gap
+from src.orchestrator.generators.utils import (
+    build_task_context,
+    stable_capability_name_for_gap,
+)
 from src.orchestrator.prompts.mcp_tool_generator import (
+    DOWNSTREAM_STEP_DIRECTIVE,
+    FIRST_STEP_DIRECTIVE,
     MCP_TOOL_REPAIR_PROMPT,
     MCP_TOOL_SYSTEM_PROMPT,
     MCP_TOOL_USER_PROMPT,
@@ -47,7 +52,8 @@ class GeneratedToolCode(BaseModel):
     pip_packages: list[str] = Field(
         default_factory=list,
         description=(
-            "PyPI package names required by this tool (e.g. ['pyyaml', 'scikit-learn', 'openpyxl']). "
+            "PyPI package names required by this tool "
+            "(e.g. ['pyyaml', 'scikit-learn', 'openpyxl']). "
             "Use the pip install name, NOT the Python import name "
             "(e.g. 'pyyaml' not 'yaml', 'scikit-learn' not 'sklearn', 'Pillow' not 'PIL'). "
             "Omit stdlib and packages already in the base image (mcp, pydantic)."
@@ -89,15 +95,19 @@ def _get_llm():
 # Validation
 # ---------------------------------------------------------------------------
 
+# MCP tool names become public Python function/module identifiers in the
+# sandbox, so they cannot start with an underscore. Agent node names use a
+# looser rule because LangGraph/DeepAgent identifiers can intentionally use
+# helper-style names such as ``_private_subagents``.
 _SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 def _validate_tool_name(tool_name: str) -> str | None:
     """Validate the tool_name field from the LLM response.
 
-    Returns an error string or None if valid.  Invalid names break
-    ``tool_loader.load_tool`` because the name is used as a Python module
-    name in the sandbox runner script.
+    Returns an error string or None if valid. Invalid names break sandbox
+    execution because generated MCP tools are addressed through public Python
+    identifiers.
     """
     if not tool_name.strip():
         return "tool_name must be non-empty"
@@ -120,13 +130,12 @@ def _validate_code(source_code: str) -> str | None:
 
     Returns a semicolon-joined error string, or None if valid.
     """
-    # Syntax check — stop here because structural checks may be unreliable
+    # Structural checks depend on a parseable module.
     try:
         compile(source_code, "<generated>", "exec")
     except SyntaxError as exc:
         return f"SyntaxError at line {exc.lineno}: {exc.msg}"
 
-    # Structural check: collect all missing elements
     errors: list[str] = []
     if "FastMCP" not in source_code:
         errors.append("Missing FastMCP instance (expected: mcp = FastMCP(...))")
@@ -139,9 +148,8 @@ def _validate_code(source_code: str) -> str | None:
     # excluding private helpers whose names start with "_").
     # - ast.iter_child_nodes avoids nested defs (e.g. a coroutine defined inside
     #   the tool body) that never appear in dir(module).
-    # - The "_" filter mirrors the tool runner's dir(module) filter so that a
-    #   module-level private helper (async def _helper()) doesn't trigger a false
-    #   positive; the runner skips it alphabetically and always picks the public tool.
+    # - The "_" filter mirrors sandbox execution so that a module-level private
+    #   helper (async def _helper()) doesn't trigger a false positive.
     async_def_count = sum(
         1
         for n in ast.iter_child_nodes(tree)
@@ -152,7 +160,7 @@ def _validate_code(source_code: str) -> str | None:
     elif async_def_count > 1:
         errors.append(
             f"Found {async_def_count} public top-level async def functions; exactly 1 is required "
-            "(tool runner picks the first non-private async function alphabetically)"
+            "(sandbox execution requires one unambiguous public async function)"
         )
     # Collect all imported names via AST — substring search would match docstrings/comments
     # and produce false positives for code that mentions but does not import these names.
@@ -177,6 +185,74 @@ def _validate_code(source_code: str) -> str | None:
     return "; ".join(errors) if errors else None
 
 
+def _validate_step_signature(
+    source_code: str,
+    is_first_step: bool | None,
+) -> str | None:
+    """Validate the generated function's signature against its chain position.
+
+    Catches step-0 functions that declare ``upstream_data`` as a required
+    parameter and downstream functions that forget ``upstream_data`` entirely.
+    Those signatures do not match the compositional executor's calling
+    convention.
+
+    Returns ``None`` when ``is_first_step`` is ``None`` (gap couldn't be
+    matched to a subtask — no position information available), when the
+    source is unparseable (``_validate_code`` will report the syntax error),
+    or when no public async function is found (``_validate_code`` will
+    report the missing function).
+    """
+    if is_first_step is None:
+        return None
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return None
+
+    func: ast.AsyncFunctionDef | None = None
+    for n in ast.iter_child_nodes(tree):
+        if isinstance(n, ast.AsyncFunctionDef) and not n.name.startswith("_"):
+            func = n
+            break
+    if func is None:
+        return None
+
+    args = func.args
+    positional = list(args.posonlyargs) + list(args.args)
+    n_required_positional = len(positional) - len(args.defaults)
+    required_names: list[str] = [a.arg for a in positional[:n_required_positional]]
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+        if default is None:
+            required_names.append(arg.arg)
+
+    has_required_upstream = "upstream_data" in required_names
+
+    if is_first_step and has_required_upstream:
+        return (
+            "step-0 function declares 'upstream_data' as a required parameter, "
+            "but the first step has no upstream data (executor will crash with "
+            "'missing 1 required positional argument: upstream_data'). Remove "
+            "upstream_data from the signature — step 0 takes only file-path "
+            "parameters."
+        )
+    if is_first_step is False and not has_required_upstream:
+        return (
+            "downstream step function is missing the required 'upstream_data: "
+            "Annotated[dict, Field(...)]' parameter. Downstream steps receive "
+            "parsed upstream outputs via upstream_data, not via file paths."
+        )
+    return None
+
+
+def _step_position_block(is_first_step: bool | None) -> str:
+    """Return the hard-constraint directive for the LLM prompt."""
+    if is_first_step is True:
+        return FIRST_STEP_DIRECTIVE
+    if is_first_step is False:
+        return DOWNSTREAM_STEP_DIRECTIVE
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Single tool generation
 # ---------------------------------------------------------------------------
@@ -185,13 +261,33 @@ def _validate_code(source_code: str) -> str | None:
 def generate_single_tool(
     gap: ClassifiedGap,
     task_context: str = "",
+    schema_context: str = "",
+    is_first_step: bool | None = None,
+    subtasks: list | None = None,
 ) -> tuple[GeneratedArtifact | None, str | None]:
     """Generate a single MCP tool from a classified gap.
+
+    Args:
+        gap: The classified capability gap to generate a tool for.
+        task_context: Full task description (with retry feedback appended
+            on attempt > 0).
+        schema_context: Per-step I/O schema contract derived from the
+            decomposer's ``output_schema`` fields.
+        is_first_step: ``True`` if the gap's subtask has no upstream
+            dependencies (``depends_on == []``), ``False`` for a downstream
+            step, ``None`` when the gap cannot be matched to a subtask. When
+            not ``None``, a hard-constraint step-position block is injected
+            into the user prompt AND a post-generation AST check validates
+            the function signature against the chain position.
 
     Returns:
         (artifact, None) on success, (None, error_message) on failure.
     """
-    forced_name = slugify_gap(gap.query)
+    forced_name = stable_capability_name_for_gap(
+        gap,
+        list(subtasks or []),
+        hyphen_case=False,
+    )
 
     llm = _get_llm()
     structured_llm = llm.with_structured_output(GeneratedToolCode)
@@ -201,11 +297,18 @@ def generate_single_tool(
     # inherited via LangChain's contextvar-based callback propagation.  Creating an
     # additional handler here would generate duplicate traces.
 
+    _schema_section = ""
+    if schema_context:
+        _schema_section = (
+            "## Input/Output Schema Contract\n\n" + schema_context
+        )
+
     user_prompt = MCP_TOOL_USER_PROMPT.format(
-        description=gap.description,
-        query=gap.query,
-        task_context=task_context or "No additional context",
+        task_context=task_context or gap.description,
+        gap_description=gap.description or gap.query,
         forced_name=forced_name,
+        schema_context=_schema_section,
+        step_position=_step_position_block(is_first_step),
     )
 
     messages = [
@@ -213,7 +316,6 @@ def generate_single_tool(
         {"role": "user", "content": user_prompt},
     ]
 
-    # --- First attempt ---
     try:
         result: GeneratedToolCode = structured_llm.invoke(messages)
     except Exception as exc:  # noqa: BLE001
@@ -221,12 +323,13 @@ def generate_single_tool(
         logger.warning(error_msg)
         return None, error_msg
 
-    # --- Validate source code and tool name (collect both so the repair prompt is complete) ---
+    # Keep all validation errors so the repair prompt has complete context.
     _code_err = _validate_code(result.source_code)
     _name_err = _validate_tool_name(result.tool_name)
-    validation_error = "; ".join(e for e in [_code_err, _name_err] if e) or None
+    _sig_err = _validate_step_signature(result.source_code, is_first_step)
+    validation_error = "; ".join(e for e in [_code_err, _name_err, _sig_err] if e) or None
     if validation_error is None:
-        # Success on first attempt — override whatever name the LLM chose
+        # Persist under the deterministic registry slug.
         if result.tool_name != forced_name:
             logger.debug(
                 "Overriding LLM name '%s' with stable slug '%s'",
@@ -259,9 +362,8 @@ def generate_single_tool(
     )
 
     repair_prompt = MCP_TOOL_REPAIR_PROMPT.format(
-        gap_description=gap.description,
-        gap_query=gap.query,
-        task_context=task_context or "No additional context",
+        task_context=task_context or gap.description,
+        gap_description=gap.description or gap.query,
         tool_name=result.tool_name,
         description=result.description,
         source_code=result.source_code,
@@ -291,7 +393,11 @@ def generate_single_tool(
 
     _repair_code_err = _validate_code(repaired.source_code)
     _repair_name_err = _validate_tool_name(repaired.tool_name)
-    repair_validation = "; ".join(e for e in [_repair_code_err, _repair_name_err] if e) or None
+    _repair_sig_err = _validate_step_signature(repaired.source_code, is_first_step)
+    repair_validation = (
+        "; ".join(e for e in [_repair_code_err, _repair_name_err, _repair_sig_err] if e)
+        or None
+    )
     if repair_validation is not None:
         error_msg = (
             f"Repair pass failed for {gap.query!r}: {repair_validation}"
@@ -356,13 +462,28 @@ def generate_mcp_tool(
         if skipped.query in existing_gap_queries:
             logger.info("  → skipping (already passed verification): %s", skipped.query)
 
-    logger.info("generate_mcp_tool: %d gap(s) to generate (%d skipped)", len(gaps_to_generate), len(mcp_gaps) - len(gaps_to_generate))
+    logger.info(
+        "generate_mcp_tool: %d gap(s) to generate (%d skipped)",
+        len(gaps_to_generate),
+        len(mcp_gaps) - len(gaps_to_generate),
+    )
     task_context = build_task_context(state)
 
-    # Parallel generation — collect results then merge sequentially
+    from src.orchestrator.generators.utils import (
+        build_schema_context,
+        is_first_step_for_gap,
+    )
+    subtasks = list(state.subtasks) if state.subtasks else []
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_GENERATION_WORKERS) as pool:
         futures = {
-            pool.submit(generate_single_tool, gap, task_context=task_context): gap
+            pool.submit(
+                generate_single_tool, gap,
+                task_context=task_context,
+                schema_context=build_schema_context(gap, subtasks),
+                is_first_step=is_first_step_for_gap(gap, subtasks),
+                subtasks=subtasks,
+            ): gap
             for gap in gaps_to_generate
         }
         raw_results: list[tuple[GeneratedArtifact | None, str | None]] = []
@@ -373,14 +494,12 @@ def generate_mcp_tool(
                 gap = futures[future]
                 raw_results.append((None, f"Generation failed for {gap.query!r}: {exc}"))
 
-    # Merge after pool closes — sequential, no concurrent mutation
-    n_succeeded = 0
+    # Registry-facing state is updated after the pool closes.
     failed_queries: list[str] = []
     for artifact, error in raw_results:
         if artifact is not None:
             artifacts = [a for a in artifacts if a.capability_name != artifact.capability_name]
             artifacts.append(artifact)
-            n_succeeded += 1
         if error is not None:
             errors.append(error)
             failed_queries.append(error[:80])
@@ -390,6 +509,13 @@ def generate_mcp_tool(
             "generate_mcp_tool: %d/%d gaps failed generation: %s",
             len(failed_queries), len(gaps_to_generate), failed_queries,
         )
+
+    # Tag generated artifacts with domain + is_generic so gap_detection can
+    # apply the domain filter with generic-cap bypass on subsequent runs. Never
+    # raises: failures leave artifact.domain=None and downstream code falls
+    # back to "generated".
+    from src.orchestrator.taxonomy import classify_and_tag_artifacts
+    classify_and_tag_artifacts(artifacts)
 
     return Command(
         update={

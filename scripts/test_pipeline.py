@@ -1,13 +1,15 @@
-"""Integration test for the full JIT capability pipeline (Pillar 1).
+"""Integration smoke for the base JIT capability pipeline (Pillar 1).
 
-Runs tasks through the complete 9-node pipeline and verifies every
+Runs tasks through the base pipeline and verifies every
 intermediate state: decomposition -> gap detection -> classification
 -> generation -> verification -> loading -> registration.
 
-Tests all three capability types:
-- MCP_TOOL: T05 (dirty CSV cleaning)
-- SKILL: multi-source data integration (T11-like)
-- AGENT: anomaly investigation (T13-like)
+Uses inline prompts intended to exercise all three capability types
+(not imported from `tests/evaluation/tasks.py`), so this script is
+independent of testbed changes. Representative shapes:
+- MCP_TOOL: dirty CSV cleaning
+- SKILL: multi-source data integration
+- AGENT: anomaly investigation
 
 Usage::
 
@@ -26,19 +28,22 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
+# Route dev-script LangFuse emissions to ``environment=test`` so they do not
+# pollute protocol eval data. Must be set before ``load_dotenv`` so ambient
+# .env values cannot override it.
+os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "test")
 
 load_dotenv(ROOT / ".env")
-
-logger = logging.getLogger(__name__)
 
 FIXTURES_DIR = ROOT / "tests" / "evaluation" / "fixtures"
 
@@ -53,7 +58,7 @@ def run_pipeline_and_verify(
     expected_type: str,
     test_name: str,
     *,
-    validate_output: Any | None = None,
+    validate_output,
 ) -> bool:
     """Run a task through the full pipeline and verify each stage.
 
@@ -61,17 +66,16 @@ def run_pipeline_and_verify(
         task_prompt: The task description to send to the pipeline.
         expected_type: Expected capability type ("mcp_tool", "skill", "agent").
         test_name: Display name for the test.
-        validate_output: Optional callable(artifacts, registry) -> bool for
-            output validation. If None, skips execution validation.
+        validate_output: callable(artifacts) -> bool for output validation.
 
     Returns:
         True if all checks pass.
     """
     from src.orchestrator.pipeline import create_pipeline
+    from src.orchestrator.task_state_builder import build_initial_state_from_prompt
     from src.orchestrator.tool_loader import ToolLoader
-    from src.registry.store import SkillRegistry, seed_registry
+    from src.registry.store import CapabilityRegistry, seed_registry
     from src.schemas.capability import CapabilityType
-    from src.schemas.task import TaskState
 
     type_map = {
         "mcp_tool": CapabilityType.MCP_TOOL,
@@ -85,7 +89,7 @@ def run_pipeline_and_verify(
     print(f"{'=' * 70}")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        registry = SkillRegistry(persist_directory=tmp_dir, collection_name="test_pipeline")
+        registry = CapabilityRegistry(persist_directory=tmp_dir, collection_name="test_pipeline")
         seed_registry(registry)
         loader = ToolLoader()
 
@@ -93,9 +97,10 @@ def run_pipeline_and_verify(
         print(f"\n  Registry: {initial_count} seeded capabilities")
         print(f"  Task: {task_prompt[:100]}...")
 
-        # --- Run pipeline ---
+        # Use the same entry-point shape as protocol eval: an output contract
+        # object is always present, even for prompt-only smoke tests.
         pipeline = create_pipeline(registry, loader).compile()
-        initial_state = TaskState(task_description=task_prompt)
+        initial_state = build_initial_state_from_prompt(task_prompt)
 
         print("\n  Running pipeline...", flush=True)
         try:
@@ -181,8 +186,18 @@ def run_pipeline_and_verify(
                 sev = str(getattr(f, "severity", "")).upper()
                 msg = getattr(f, "message", "")[:80]
                 print(f"       [{sev}] {msg}")
+        # Artifacts must produce verification reports; otherwise the gate was
+        # skipped even though generation occurred.
         if verif_results:
             print("     OK")
+        elif artifacts:
+            print(
+                "     FAIL: artifacts generated but no verification "
+                "reports — Pillar 2 gate was skipped entirely"
+            )
+            all_pass = False
+        else:
+            print("     OK (no artifacts to verify)")
 
         # --- 6. Loading + registration ---
         status = _get("status", "?")
@@ -194,29 +209,31 @@ def run_pipeline_and_verify(
         new_caps = final_count - initial_count
         print(f"     Registry: {initial_count} -> {final_count} ({new_caps} new)")
 
+        # Generated artifacts must be registered when gaps were detected.
         if artifacts and new_caps > 0:
             print("     OK")
+        elif gaps and artifacts and new_caps == 0:
+            print(
+                "     FAIL: gaps detected and artifacts generated, but no "
+                "new capabilities registered — loader no-op"
+            )
+            all_pass = False
         elif gaps and new_caps == 0:
             print("     WARN: Gaps existed but no new capabilities registered")
         else:
             print("     OK")
 
-        # --- 7. Output validation (optional) ---
-        if validate_output is not None:
-            print("\n  7. Output validation:")
-            try:
-                valid = validate_output(artifacts, registry)
-                if valid:
-                    print("     OK")
-                else:
-                    all_pass = False
-            except Exception as exc:
-                print(f"     FAIL: Validation raised: {exc}")
+        # --- 7. Output validation ---
+        print("\n  7. Output validation:")
+        try:
+            valid = validate_output(artifacts)
+            if valid:
+                print("     OK")
+            else:
                 all_pass = False
-        else:
-            print("\n  7. Output validation: SKIP (no validator provided)")
-
-        loader.cleanup()
+        except Exception as exc:
+            print(f"     FAIL: Validation raised: {exc}")
+            all_pass = False
 
     if all_pass:
         print(f"\n  PASS: {test_name}")
@@ -226,11 +243,11 @@ def run_pipeline_and_verify(
 
 
 # ---------------------------------------------------------------------------
-# MCP_TOOL test (T04: pipe-delimited CSV)
+# MCP_TOOL test (T05: dirty CSV cleaning)
 # ---------------------------------------------------------------------------
 
 
-def _validate_mcp_output(artifacts, registry) -> bool:
+def _validate_mcp_output(artifacts) -> bool:
     """Execute the generated MCP tool in sandbox and verify output."""
     from src.verification.behavioral import _extract_function_name
     from src.verification.sandbox_tool import resolve_extra_packages, sandbox_execute
@@ -254,9 +271,25 @@ pathlib.Path("/tmp/fixture.csv").write_text({fixture_content!r})
 async def _run():
     try:
         _sig = inspect.signature({func_name})
-        _valid = set(_sig.parameters.keys())
+        _valid = list(_sig.parameters.keys())
+        # First try named exact matches for the common shapes.
         _inputs = {{"file_path": "/tmp/fixture.csv", "filepath": "/tmp/fixture.csv"}}
         _kwargs = {{k: v for k, v in _inputs.items() if k in _valid}}
+        # Path-keyword fallback so the validator doesn't FAIL just because the
+        # LLM named the param `csv_path` / `input_csv` / `data_path` / etc.
+        # Mirrors the path-keyword heuristic used by the chain executor in
+        # tests/evaluation/execution.py::execute_mcp_tool_in_chain.
+        if not _kwargs:
+            _PATH_KEYWORDS = ("path", "file", "csv", "input", "src", "source")
+            _required = [
+                name for name, p in _sig.parameters.items()
+                if p.default is inspect.Parameter.empty
+            ]
+            for _p in _required:
+                _pl = _p.lower()
+                if any(kw in _pl for kw in _PATH_KEYWORDS):
+                    _kwargs[_p] = "/tmp/fixture.csv"
+                    break
         result = await {func_name}(**_kwargs)
         print(json.dumps({{"result": result}}))
     except Exception as e:
@@ -323,8 +356,8 @@ def test_mcp_tool() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _validate_skill_output(artifacts, registry) -> bool:
-    """Check that a SKILL artifact was produced with valid content."""
+def _validate_skill_output(artifacts) -> bool:
+    """Validate that a SKILL artifact was produced with valid content."""
     skill_artifacts = [
         a for a in artifacts
         if getattr(a, "capability_type", None).__class__.__name__ == "CapabilityType"
@@ -332,10 +365,9 @@ def _validate_skill_output(artifacts, registry) -> bool:
     ]
     # Also accept MCP_TOOL (classifier may route differently)
     if not skill_artifacts:
-        # Check if any artifact was generated at all
         if artifacts:
             atype = str(getattr(artifacts[-1], "capability_type", "")).split(".")[-1]
-            print(f"     NOTE: Classifier routed to {atype} instead of SKILL")
+            print(f"     Info: Classifier routed to {atype} instead of SKILL")
             print("     OK (artifact generated, type selection is stochastic)")
             return True
         print("     FAIL: No artifacts generated")
@@ -350,7 +382,10 @@ def _validate_skill_output(artifacts, registry) -> bool:
     # Basic structural checks
     has_frontmatter = content.startswith("---")
     has_name = "name:" in content
-    print(f"     SKILL content: {len(content)} chars, frontmatter={has_frontmatter}, name={has_name}")
+    print(
+        f"     SKILL content: {len(content)} chars, "
+        f"frontmatter={has_frontmatter}, name={has_name}"
+    )
     print(f"     Preview: {content[:150]}...")
     return True
 
@@ -380,8 +415,8 @@ def test_skill() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _validate_agent_output(artifacts, registry) -> bool:
-    """Check that an AGENT artifact was produced with valid config."""
+def _validate_agent_output(artifacts) -> bool:
+    """Validate that an AGENT artifact was produced with valid config."""
     agent_artifacts = [
         a for a in artifacts
         if str(getattr(a, "capability_type", "")).endswith("AGENT")
@@ -389,7 +424,7 @@ def _validate_agent_output(artifacts, registry) -> bool:
     if not agent_artifacts:
         if artifacts:
             atype = str(getattr(artifacts[-1], "capability_type", "")).split(".")[-1]
-            print(f"     NOTE: Classifier routed to {atype} instead of AGENT")
+            print(f"     Info: Classifier routed to {atype} instead of AGENT")
             print("     OK (artifact generated, type selection is stochastic)")
             return True
         print("     FAIL: No artifacts generated")

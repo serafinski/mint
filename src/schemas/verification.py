@@ -43,5 +43,14 @@ class VerificationReport(BaseModel):
         default_factory=lambda: datetime.now(UTC),
         description="When the verification was performed",
     )
+    artifact_hash: str = Field(
+        default="",
+        description=(
+            "SHA-256 of the verified artifact's content "
+            "(source_code + skill_content + agent_config). "
+            "Used by retry logic to skip only unchanged artifacts. "
+            "Empty values force re-verification for legacy reports."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
