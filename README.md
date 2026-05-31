@@ -6,7 +6,6 @@ self-developing multi-agent system.
 
 The primary supported operator surface is the **evaluation protocol**:
 
-- protocol spec: [`docs/EVAL_PROTOCOL.md`](docs/EVAL_PROTOCOL.md)
 - protocol wrappers: [`scripts/eval_protocol/`](scripts/eval_protocol/)
 - chapter-ready outputs: [`docs/chapter6_numbers.md`](docs/chapter6_numbers.md), [`docs/chapter6_fact_pack.md`](docs/chapter6_fact_pack.md), [`docs/chapter6_evaluation_report.md`](docs/chapter6_evaluation_report.md)
 
