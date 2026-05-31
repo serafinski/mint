@@ -1,6 +1,6 @@
-# Eval protocol scripts — with Claude/Codex+LangFuse audit checkpoints
+# Eval protocol scripts — with LangFuse-backed audit checkpoints
 
-Six stage scripts plus one helper. Audit-gated stages run automated checks, then **refuse to advance** until a Claude/Codex-assisted LangFuse trace audit confirms the data is real. The full specification lives in [`docs/EVAL_PROTOCOL.md`](../../docs/EVAL_PROTOCOL.md).
+Six stage scripts plus one helper. Audit-gated stages run automated checks, then **refuse to advance** until a reviewer completes a LangFuse-backed trace audit confirming the data is real. The full specification lives in [`docs/EVAL_PROTOCOL.md`](../../docs/EVAL_PROTOCOL.md).
 
 ## The audit checkpoint flow
 
@@ -11,8 +11,8 @@ Six stage scripts plus one helper. Audit-gated stages run automated checks, then
     ▼
 SHAPE_OK ─── audit request generated at $EVAL_OUT/stage<N>_audit_request.md
     │
-    │ you paste request into Claude/Codex; the audit session pulls traces via LangFuse MCP;
-    │ you save response to $EVAL_OUT/stage<N>_audit_verdicts.md;
+    │ you complete the audit request using a reviewer workflow with LangFuse trace access;
+    │ you save the response to $EVAL_OUT/stage<N>_audit_verdicts.md;
     │ you re-run the stage script
     ▼
 PASS  (0 FAILs in audit)   OR   FAIL  (≥1 FAIL or automated gate failed)
@@ -26,13 +26,14 @@ The next stage's `require_prior_stage` gate refuses to run until the marker is `
 # Stage 0 — preflight (pytest, pipeline smoke, verification smoke, 3-task longitudinal smoke)
 scripts/eval_protocol/stage0_preflight.sh                # creates capture dir
 # → runs shape checks, writes stage0.marker = SHAPE_OK, generates stage0_audit_request.md
-# → paste stage0_audit_request.md into Claude/Codex+MCP, save response as stage0_audit_verdicts.md
+# → complete stage0_audit_request.md via a reviewer workflow with LangFuse trace access,
+#   save the response as stage0_audit_verdicts.md
 scripts/eval_protocol/stage0_preflight.sh docs/eval_runs/<ts>    # re-run: reads verdicts → PASS
 
 # Stage 1 — main eval (240 records, roughly a day unattended; 32h hard ceiling)
 scripts/eval_protocol/stage1_main_eval.sh docs/eval_runs/<ts>    # launch, detached
 scripts/eval_protocol/stage1_main_eval.sh docs/eval_runs/<ts>    # next morning: verify + generate audit
-# → paste stage1_audit_request.md → save verdicts → re-run → PASS
+# → complete stage1_audit_request.md → save verdicts → re-run → PASS
 
 # Stage 2 — headline M1/M3/M5/ClassAcc with machine-readable two-source agreement
 scripts/eval_protocol/stage2_headline.sh docs/eval_runs/<ts>
@@ -42,7 +43,7 @@ scripts/eval_protocol/stage2_headline.sh docs/eval_runs/<ts>
 # Stage 3 — supplemental recurrence track for Pillar 3
 scripts/eval_protocol/stage3_recurrence.sh docs/eval_runs/<ts>    # launch, detached
 scripts/eval_protocol/stage3_recurrence.sh docs/eval_runs/<ts>    # verify + audit handoff
-# → defaults to the 216-row 4-condition matrix from docs/RECURRENCE_EVAL_PLAN.md
+# → defaults to the 216-row 4-condition matrix baked into stage3_recurrence.sh
 # → override via RECURRENCE_TASKS / RECURRENCE_VARIANTS / RECURRENCE_CONDITIONS / RECURRENCE_RUNS
 
 # Stage 4 — longitudinal M6 (parallel to Stage 2; different DB)
@@ -62,12 +63,12 @@ scripts/eval_protocol/stage5_plausibility.sh docs/eval_runs/<ts>
 Each stage generates a file like `$EVAL_OUT/stage1_audit_request.md`. It contains:
 
 - The capture-dir path and DB path
-- The exact LangFuse MCP tool calls the audit session should make (`mcp__langfuse__fetch_trace`, etc.)
+- Suggested LangFuse trace-fetch queries / calls for the reviewer workflow
 - A stratified sample of rows selected for that stage's profile
 - Per-row "what to check" guidance
 - The exact output format the audit response must use
 
-You paste it into a Claude/Codex session with LangFuse MCP tools. The audit session pulls each trace, reads the actual execution, and returns a verdict table. The mandatory summary line is:
+You complete it using any reviewer workflow that can inspect the referenced LangFuse traces. The reviewer reads the actual execution and returns a verdict table. The mandatory summary line is:
 
 ```
 AUDIT SUMMARY: 12 OK / 2 SUSPICIOUS / 0 FAIL
@@ -109,13 +110,13 @@ Use sparingly — this is why the automated gates exist. Every use of this escap
 
 ## The four defense layers
 
-Each layer catches a different failure class. The audit layer (Claude/Codex+MCP) is the critical addition — without it, the scripts only catch shape + agreement + plausibility, which misses "numbers look fine, agent fabricated output."
+Each layer catches a different failure class. The audit layer is the critical addition — without it, the scripts only catch shape + agreement + plausibility, which misses "numbers look fine, agent fabricated output."
 
 | Layer | Mechanism | Catches | Misses |
 |---|---|---|---|
 | **Shape** | Stage 1/4 completeness queries | missing rows, NULL labels, dupes | values wrong but shaped right |
 | **Agreement** | Stage 2/4 two-source cross-check | analyzer bugs | both sides wrong the same way |
 | **Plausibility** | Stage 5 priors | impossibly-shaped numbers | plausible-but-wrong numbers |
-| **Semantic (trace)** | Claude/Codex+LangFuse audit | "agent fabricated output", "tool no-op", "silent swallow" | cohort-level systematic effects (advisor / committee catches these) |
+| **Semantic (trace)** | reviewer-performed LangFuse trace audit | "agent fabricated output", "tool no-op", "silent swallow" | cohort-level systematic effects (advisor / committee catches these) |
 
 All four + one advisor read = thesis-level defensibility. That is the whole plan.

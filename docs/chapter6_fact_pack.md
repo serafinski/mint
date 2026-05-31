@@ -130,8 +130,6 @@ Sampled directory listing (27 SKILL artifacts persisted at campaign closeout, af
   - sub-C (cross-step name reuse): same skill matched twice in single decomposition's gap_detection (multiple Phase 3b instances).
 - **Pillar 1 registry-rescue case (Phase 4 task 33):** cached `parse_and_clean_csv_remove_duplicates_an_b31d78` (generated Phase 4 task 4) succeeded on T05 pass-2 fixture where fresh regeneration consistently fails — qualitative evidence of registry reuse defending against LLM-correctness defects Pillar 2 cannot catch by design.
 
-Directory contents not exhaustively re-validated; per CLAUDE.md, generated artifacts are not the metric source and the verification gate already vouches for them.
-
 ## F. Provenance files
 
 See `chapter6_numbers.md` §6 for the full HEAD-by-stage table. Net summary:
@@ -208,7 +206,7 @@ These disclosures live in the phase findings docs and must be carried into Chapt
 4. **ShapeMismatch is a Pillar 3 boundary effect** (`phase1_2_findings.md` §3.2).
 5. **§3.6 registry-reuse drift has three sub-types** (A value-shape, B cached-broken-tool, C cross-step name reuse — `phase3b_findings.md` §4.2).
 6. **Phase 3b static = 100% is sampling-bias** (`phase3b_findings.md` §4.1).
-7. **Tier 1.5 sandbox import probe is cost-optimization, not a fourth methodological tier** (`CLAUDE.md` §Verification Gate; master plan Step 12.5).
+7. **Tier 1.5 sandbox import probe is cost-optimization, not a fourth methodological tier**.
 8. **Tier 3 capability-type coverage gap** — prose-only SKILL/AGENT un-probed because sandbox-payload requires inlined source (`MEMORY.md` Tier 3 drift recharacterization).
 9. **Two harness validation-path findings (Phase 4)** — solo registry-match `upstream_data` drop (T06 task 29) and AGENT registry-match `source_code` absence (T10 task 34). Disclose harness-corrected sensitivity 35/40 = 87.5% alongside raw 33/40 = 82.5% (`phase4_longitudinal_findings.md` §4.2).
 10. **Pillar 1 registry-rescue is qualitative-only**, not a frequency claim (Phase 4 task 33 T05 single instance — `stage5_dead_task_findings.md` §2.2 + §4.2).
