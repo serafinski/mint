@@ -30,7 +30,6 @@ The evaluation protocol exercises those pillars across:
 - **Phase 4 longitudinal**: 40-task warm-registry run for convergence / M6
 
 ## References
-- [`docs/EVAL_PROTOCOL.md`](docs/EVAL_PROTOCOL.md): canonical Chapter 6 protocol
 - [`scripts/eval_protocol/README.md`](scripts/eval_protocol/README.md): wrapper-stage flow
 - [`pyproject.toml`](pyproject.toml): dependency groups and Python version
 - [`.env.example`](.env.example): supported repo-level environment variables
@@ -405,7 +404,7 @@ If you are new to this repo and want the supported path:
 1. install deps with `uv`
 2. copy [`.env.example`](.env.example) to `.env`
 3. build `jit-sandbox`
-4. use [`docs/EVAL_PROTOCOL.md`](docs/EVAL_PROTOCOL.md) plus the wrappers in [`scripts/eval_protocol/`](scripts/eval_protocol/)
+4. use wrappers in [`scripts/eval_protocol/`](scripts/eval_protocol/)
 5. treat `docs/archive/` as history, not setup documentation
 
 That is the supported setup path for this repository.
