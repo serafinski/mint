@@ -126,7 +126,7 @@ def render_m1_success(metrics_path: Path, output_dir: Path) -> Path:
     bars = ax.bar(x, percentages, color=colors, width=0.64)
 
     ax.set_ylabel("Skuteczność [%]")
-    ax.set_xlabel("Warunek")
+    ax.set_xlabel("Wariant")
     ax.set_ylim(0, 100)
     ax.set_xticks(list(x), [CONDITION_LABELS[c] for c in CONDITION_ORDER])
     ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0f}%"))
@@ -342,7 +342,7 @@ def render_failure_breakdown(db_path: Path, output_dir: Path) -> Path | None:
         ax.text(xpos, total + 0.55, str(total), ha="center", va="bottom", fontsize=9.5)
 
     ax.set_ylabel("Liczba nieudanych przebiegów")
-    ax.set_xlabel("Warunek")
+    ax.set_xlabel("Wariant")
     ax.set_xticks(x, [CONDITION_LABELS[c] for c in CONDITION_ORDER])
     ax.set_ylim(0, max(bottoms) + 4)
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
@@ -399,7 +399,11 @@ def main() -> None:
 
     print("Generated thesis figures:")
     for path in generated:
-        print(f"  {path.relative_to(ROOT)}")
+        try:
+            display_path = path.relative_to(ROOT)
+        except ValueError:
+            display_path = path
+        print(f"  {display_path}")
 
 
 if __name__ == "__main__":
