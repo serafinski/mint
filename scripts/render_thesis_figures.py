@@ -370,12 +370,12 @@ def render_failure_breakdown(db_path: Path, output_dir: Path) -> Path | None:
         return None
 
     reason_colors = {
-        "agent_execution_error": "#7B5E68",
-        "chain_step_failed": "#4E6E8E",
-        "generation_failed": "#8B7D5A",
-        "output_rejected": "#7A8A92",
-        "tier3": "#8F4E4E",
-        "unknown": "#8C8C8C",
+        "agent_execution_error": "#D55E00",
+        "chain_step_failed": "#0072B2",
+        "generation_failed": "#E69F00",
+        "output_rejected": "#009E73",
+        "tier3": "#CC79A7",
+        "unknown": "#999999",
     }
     reason_labels = {
         "agent_execution_error": "błąd wykonania agenta",
@@ -396,6 +396,8 @@ def render_failure_breakdown(db_path: Path, output_dir: Path) -> Path | None:
             values,
             bottom=bottoms,
             color=reason_colors.get(reason, "#777777"),
+            edgecolor="white",
+            linewidth=0.6,
             width=0.64,
             label=reason_labels.get(reason, reason.replace("_", " ")),
         )
