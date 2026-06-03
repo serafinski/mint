@@ -829,10 +829,21 @@ def main() -> int:
         gini_incremental = (
             _gini_coefficient(list(incremental.values())) if incremental else 0.0
         )
+        events = c.get("events", [])
+        merge_event_rows = sum(
+            1 for event in events if event.get("event_type") == "merged"
+        )
+        merge_operations = sum(
+            1
+            for event in events
+            if event.get("event_type") == "merged"
+            and str(event.get("details", "")).startswith("from ")
+        )
         rows.append({
             "cycle": c["cycle"],
             "task_id": c["task_id"],
             "n_active_caps": c["active_cap_count"],
+            "registry_snapshot_size": len(utility) if utility else 0,
             "kl_utility": kl_utility,
             "kl_invocations": kl_invocations,
             # Back-compat: ``gini`` keeps the cumulative semantics so
@@ -844,7 +855,9 @@ def main() -> int:
             "gini_cumulative": gini_cumulative,
             "gini_incremental": gini_incremental,
             "n_new_invocations": sum(incremental.values()),
-            "events": c.get("events", []),
+            "merge_operations": merge_operations,
+            "merge_event_rows": merge_event_rows,
+            "events": events,
         })
         prev_snapshot = snapshot
         prev_utility = utility
@@ -1027,9 +1040,9 @@ def main() -> int:
 
     if args.csv or args.plot:
         csv_columns = [
-            "cycle", "task_id", "n_active_caps",
+            "cycle", "task_id", "n_active_caps", "registry_snapshot_size",
             "kl_utility", "kl_invocations",
-            "gini", "n_new_invocations",
+            "gini", "n_new_invocations", "merge_operations", "merge_event_rows",
         ]
         # Flatten events into a count column per row for CSV simplicity.
         csv_rows = []
