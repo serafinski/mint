@@ -85,13 +85,20 @@ def _load_longitudinal_csv(path: Path) -> list[dict[str, Any]]:
 
     parsed: list[dict[str, Any]] = []
     for row in rows:
+        registry_snapshot_size = (
+            int(row["registry_snapshot_size"])
+            if row.get("registry_snapshot_size")
+            else None
+        )
         parsed.append(
             {
                 "cycle": int(row["cycle"]),
                 "task_id": row.get("task_id", ""),
                 "n_active_caps": int(row["n_active_caps"]),
+                "registry_snapshot_size": registry_snapshot_size,
                 "kl_utility": float(row["kl_utility"]),
                 "gini": float(row["gini"]),
+                "merge_operations": int(row.get("merge_operations") or 0),
             }
         )
     return parsed
@@ -221,8 +228,25 @@ def render_longitudinal_kl(m6_path: Path, output_dir: Path) -> Path:
 def render_registry_evolution(longitudinal_path: Path, output_dir: Path) -> Path:
     rows = _load_longitudinal_csv(longitudinal_path)
     cycles = [row["cycle"] for row in rows]
-    n_active_caps = [row["n_active_caps"] for row in rows]
+    registry_sizes = [
+        row["registry_snapshot_size"]
+        if row["registry_snapshot_size"] is not None
+        else row["n_active_caps"]
+        for row in rows
+    ]
+    merge_operations = [row["merge_operations"] for row in rows]
     gini = [row["gini"] for row in rows]
+    initial_registry_size = registry_sizes[0]
+    line_cycles = [0, *cycles]
+    line_registry_sizes = [initial_registry_size, *registry_sizes]
+
+    inferred_additions: list[int] = []
+    previous_size = initial_registry_size
+    for registry_size, merge_count in zip(registry_sizes, merge_operations, strict=True):
+        net_delta = registry_size - previous_size
+        inferred_additions.append(max(0, net_delta + merge_count))
+        previous_size = registry_size
+    merge_reductions = [-count for count in merge_operations]
 
     fig, (ax_caps, ax_gini) = plt.subplots(
         2,
@@ -232,19 +256,58 @@ def render_registry_evolution(longitudinal_path: Path, output_dir: Path) -> Path
         gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.08},
     )
 
-    ax_caps.plot(
-        cycles,
-        n_active_caps,
+    ax_delta = ax_caps.twinx()
+
+    line_caps = ax_caps.plot(
+        line_cycles,
+        line_registry_sizes,
         color="#3F6B57",
         marker="o",
         markersize=3.0,
         linewidth=1.45,
+        label="liczba zdolności w migawce",
     )
-    ax_caps.set_ylabel("Liczba aktywnych zdolności")
-    ax_caps.set_ylim(0, max(n_active_caps) + 8)
+    bars_add = ax_delta.bar(
+        cycles,
+        inferred_additions,
+        width=0.46,
+        color="#9FBCA9",
+        alpha=0.58,
+        label="przyrost w cyklu",
+    )
+    bars_merge = ax_delta.bar(
+        cycles,
+        merge_reductions,
+        width=0.46,
+        color="#B58B74",
+        alpha=0.72,
+        label="redukcja przez scalenie",
+    )
+    ax_delta.axhline(0, color="#777777", linewidth=0.75)
+    ax_caps.set_ylabel("Liczba zdolności\nw migawce rejestru")
+    ax_caps.set_ylim(0, max(registry_sizes) + 8)
     ax_caps.yaxis.set_major_locator(MaxNLocator(integer=True, nbins=6))
     ax_caps.grid(axis="y", color="#DDDDDD", linewidth=0.7)
     ax_caps.set_axisbelow(True)
+    ax_delta.set_ylabel("Zmiana liczby\nzdolności w cyklu")
+    max_positive_delta = max(inferred_additions) if inferred_additions else 1
+    max_negative_delta = abs(min(merge_reductions)) if merge_reductions else 1
+    ax_delta.set_ylim(
+        -max(2, max_negative_delta + 1),
+        max(6, max_positive_delta + 1),
+    )
+    ax_delta.yaxis.set_major_locator(MaxNLocator(integer=True, nbins=5))
+    ax_delta.spines.right.set_visible(True)
+    ax_caps.legend(
+        [line_caps[0], bars_add, bars_merge],
+        [
+            "liczba zdolności w migawce",
+            "przyrost w cyklu",
+            "redukcja przez scalenie",
+        ],
+        loc="upper left",
+        fontsize=8.8,
+    )
 
     ax_gini.plot(
         cycles,
@@ -255,8 +318,8 @@ def render_registry_evolution(longitudinal_path: Path, output_dir: Path) -> Path
         linewidth=1.45,
     )
     ax_gini.set_xlabel("Cykl")
-    ax_gini.set_ylabel("Współczynnik Giniego")
-    ax_gini.set_xlim(1, 40)
+    ax_gini.set_ylabel("Współczynnik Giniego\nskumulowanych wywołań")
+    ax_gini.set_xlim(0, 40)
     ax_gini.set_ylim(0, max(0.10, max(gini) * 1.25))
     ax_gini.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=10))
     ax_gini.grid(axis="y", color="#DDDDDD", linewidth=0.7)
